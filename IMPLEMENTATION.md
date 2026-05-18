@@ -1078,6 +1078,8 @@ Defer:
 - `[T]` Has automated tests
 - `[M]` Needs manual or integration verification
 
+`[M]` is additive, not a replacement for automated tests. Tasks with manual verification should still have as much automated coverage as practical. The default expectation is high automated test coverage for core parsing, config, auth decisions, provider adapters, storage logic, migration planning, and safety checks, with manual verification reserved for behavior that genuinely depends on external services, OS integration, network interfaces, OAuth browser flows, or real filesystem CoW behavior.
+
 ### Phase 0: Foundations
 
 #### Epic 0.1: Rust Project Shape
