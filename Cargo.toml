@@ -1,0 +1,10 @@
+[package]
+name = "lfs-cloud"
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+description = "Git LFS-compatible server and CLI for routing LFS objects to user-controlled storage."
+
+[dependencies]
+

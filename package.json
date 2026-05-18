@@ -1,0 +1,18 @@
+{
+  "name": "lfs-cloud",
+  "displayName": "LFS Cloud",
+  "version": "0.1.0",
+  "publisher": "Quicksaver",
+  "license": "UNLICENSED",
+  "private": true,
+  "packageManager": "yarn@4.14.1",
+  "scripts": {
+    "lint:check": "yarn lint:prettier",
+    "lint:fix": "yarn lint:prettier --write",
+    "lint:prettier": "prettier --log-level=warn --check .",
+    "merge": "./scripts/git/merge.sh"
+  },
+  "devDependencies": {
+    "prettier": "^3.8.3"
+  }
+}

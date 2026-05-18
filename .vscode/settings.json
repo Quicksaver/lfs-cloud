@@ -1,0 +1,33 @@
+{
+  "[json]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[markdown]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.rulers": [166]
+  },
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "cSpell.words": [],
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  "editor.formatOnSave": true,
+  "evenBetterToml.formatter.indentEntries": true,
+  "evenBetterToml.formatter.reorderKeys": true,
+  "evenBetterToml.formatter.trailingNewline": true,
+  "evenBetterToml.schema.enabled": true,
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "json.format.enable": true,
+  "json.validate.enable": true,
+  "lgtm.contextFiles": ["AGENTS.md", "IMPLEMENTATION.md", "README.md"],
+  "prettier.configPath": "prettier.config.mjs",
+  "prettier.enable": true,
+  "prettier.ignorePath": ".prettierignore",
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.testExplorer": true,
+  "yaml.format.printWidth": 120,
+  "yaml.format.singleQuote": true
+}

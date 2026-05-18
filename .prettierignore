@@ -1,0 +1,10 @@
+.prettierignore
+.stylelintignore
+
+# YAML VSCode extension as default formatter
+**/*.yml
+**/*.yaml
+
+# Rust/cargo stuff
+**/target
+**/Cargo.lock
