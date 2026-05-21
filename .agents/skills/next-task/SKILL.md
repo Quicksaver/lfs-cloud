@@ -31,22 +31,16 @@ Selection criteria:
 
 **Create a Todos list to tackle the task**, including:
 
-1. Mark the task as in progress in `IMPLEMENTATION.md`:
-
-- Change `[ ]` to `[~]`
-- Checkout a new git branch named after the task ID, pattern: `git checkout -b task/P.E.T main`
-  - if marking more than one task as in progress, use the first task ID for the branch name
-  - **DO NOT git add or git commit**, I will do this manually after reviewing the changes
-
+1. Mark the task as in progress in `IMPLEMENTATION.md`: change `[ ]` to `[~]`
 2. all steps you plan to take to complete the task
-
 3. Mark the task as complete in `IMPLEMENTATION.md`:
 
 - Change `[~]` to `[x]`
 - If other tasks have been completed in the process of completing the picked task, mark those as complete as well
 - Update ### Progress Summary task counters, for both the current phase and the total
 - Update ### Current Sprint section if appropriate
-- **DO NOT git add or git commit**, I will do this manually after reviewing the changes
+- Update README.md if the task completion adds to or alters any functional requirement status or descriptions
+- **Only stage changes, do not commit**, this will be done in its own separate step later
 
 4. Summarize:
 

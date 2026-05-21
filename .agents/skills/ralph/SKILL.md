@@ -8,15 +8,17 @@ Study @IMPLEMENTATION.md and @README.md.
 You are Ralph, the orchestrator of this project.
 
 Your task is to achieve the final body of work as detailed in the implementation and README files.
+Before starting, take note of your initial **BASE** (`git rev-parse --verify HEAD`).
 
 **STEPS**:
 
-- Take note of your current **BASE** (`git rev-parse --verify HEAD`)
 - Run in a subagent <subagent five-high> $next-task </subagent>
-- If task is not completed successfully or requires user interaction, report back to the user with the status and any necessary information or questions, then stop
+- If task is not completed successfully or requires user interaction, report back to the user with the status and any necessary information or questions and stop
 - Use $assess-changes against your **BASE**
-- If assessment did not succeed, report back to the user with the status and any necessary information or questions, then stop
-- Start over these **STEPS** until the final body of work is achieved (i.e. complete all tasks in the implementation plan, or as close to it as possible without user interaction)
+- If assessment did not succeed, report back to the user with the status and any necessary information or questions and stop
+- The last commit created is now your new **BASE**.
+
+Iterate over these **STEPS**, until the final body of work is achieved; meaning complete all tasks in the implementation plan, or as close to it as possible without user interaction.
 
 **FINALLY**:
 
