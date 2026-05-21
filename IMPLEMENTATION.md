@@ -821,6 +821,45 @@ The storage provider is an implementation detail of the configured repository. U
 
 These decisions define the first working local-network MVP.
 
+### Project Shape
+
+Use a single root Rust package for the MVP, with a library target for shared
+logic and a small binary target for CLI entry points. The current scaffold
+already follows this shape through `src/lib.rs` and `src/main.rs`.
+
+Do not split into a Cargo workspace until module boundaries become concrete
+enough to justify separate crates. The expected pressure points are the CLI,
+server protocol, provider adapters, storage adapters, migration logic, and local
+cache/materialization code. Keeping those areas as root-package modules first
+avoids creating crate boundaries before their public APIs are proven.
+
+The root package should preserve clean internal boundaries so a later workspace
+split can move modules into crates without changing user-facing behavior.
+
+### Baseline Dependency Set
+
+The MVP root package starts with dependencies that match the planned feature
+areas:
+
+| Area                        | Crate(s)                        | Reason                                        |
+| --------------------------- | ------------------------------- | --------------------------------------------- |
+| CLI parsing                 | `clap`                          | Derive-based command and flag definitions     |
+| HTTP server                 | `axum`                          | Git LFS batch and transfer routes             |
+| Async runtime               | `tokio`                         | Network I/O, server runtime, signal handling  |
+| Errors                      | `anyhow`, `thiserror`           | CLI boundaries and library/domain errors      |
+| Logging                     | `tracing`, `tracing-subscriber` | Structured application logs and env filtering |
+| Serialization/config        | `serde`, `config`               | Typed `lfs-cloud.yml` loading                 |
+| SQLite metadata             | `rusqlite`                      | Local MVP object/session metadata             |
+| OAuth and provider HTTP     | `oauth2`, `reqwest`             | OAuth request construction and HTTP calls     |
+| Temporary files             | `tempfile`                      | Upload staging before hash/size verification  |
+| Manifest architecture tests | `toml`                          | Parse `Cargo.toml` in project-shape tests     |
+
+Use the `config` crate with only its YAML feature enabled for server
+configuration. Avoid adding a direct dependency on deprecated YAML parsers.
+Use `reqwest` with Rustls and no default TLS features for provider HTTP calls.
+Keep the `oauth2` crate's HTTP-client features disabled initially so OAuth URL,
+CSRF, and token types can be used without pulling in a second HTTP client stack.
+
 ### Supported Providers
 
 Initially supported repository provider:
@@ -1076,9 +1115,11 @@ Defer:
 - `[x]` Completed
 - `[d]` Descoped
 - `[T]` Has automated tests
-- `[M]` Needs manual or integration verification
+- `[M]` For manual or integration verification
 
 `[M]` is additive, not a replacement for automated tests. Tasks with manual verification should still have as much automated coverage as practical. The default expectation is high automated test coverage for core parsing, config, auth decisions, provider adapters, storage logic, migration planning, and safety checks, with manual verification reserved for behavior that genuinely depends on external services, OS integration, network interfaces, OAuth browser flows, or real filesystem CoW behavior.
+
+`[M]` tasks should include either detailed instructions for manual verification, or a shell script that performs the verification steps and checks expected outcomes. The goal is to make manual verification as easy and repeatable as possible, even if it cannot be fully automated. Full manual verification is not needed for completion of the task, as long as the instructions are available for future manual testing and regression checks; for those with shell scripts, they must be verified and confirmed passing.
 
 ### Phase 0: Foundations
 

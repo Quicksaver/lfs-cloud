@@ -1,6 +1,6 @@
 ---
-argument-hint: Results in a committable unit of work. Learnings accumulate in AGENTS.md. The checklist in IMPLEMENTATION.md tracks overall progress.
-description: Pick and complete next task
+description: Results in a committable unit of work. Learnings accumulate in AGENTS.md. The checklist in IMPLEMENTATION.md tracks overall progress.
+name: 'next-task'
 ---
 
 Choose either the single most appropriate task, based on its `[P.E.T]` identifier, or most appropriate group of tasks that are tightly coupled and optimally done together, to work on next. Do NOT simply pick the first uncompleted task. Think about what enables the most progress. Complete the chosen task(s) fully.
