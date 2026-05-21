@@ -12,7 +12,7 @@ Before starting, take note of your initial **BASE** (`git rev-parse --verify HEA
 
 **STEPS**:
 
-- Run in a subagent <subagent five-high> $next-task </subagent>
+- Run in a subagent <subagent five-high> $next-task </subagent>; you **do not load this skill** yourself, it is your responsibility to instruct the subagent to load it, it is the subagent's responsibility to follow its instructions
 - If task is not completed successfully or requires user interaction, report back to the user with the status and any necessary information or questions and stop
 - Use $assess-changes against your **BASE**
 - If assessment did not succeed (no changes to address or no review comments raised is still success), report back to the user with the status and any necessary information or questions and stop
