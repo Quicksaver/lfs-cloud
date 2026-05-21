@@ -20,6 +20,8 @@ Before starting, take note of your initial **BASE** (`git rev-parse --verify HEA
 
 Iterate over these **STEPS**, until the final body of work is achieved; meaning all tasks in the implementation plan are marked as complete, or as close to it as is possible without user interaction.
 
+**NO VALIDATION**: You do not validate the work yourself (i.e. no cargo checks, shell scripts runs, tests, etc), that is the responsibility of subagents. You only identify when a task fails or requires user interaction, and report that back to the user.
+
 **FINALLY**:
 
 When all tasks are completed, report back to the user with a summary of the work done, any remaining open tasks, and any recommendations for required manual validation or user intervention.
