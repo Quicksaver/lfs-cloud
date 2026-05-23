@@ -97,6 +97,7 @@ fn dependency_features_match_mvp_decisions() {
     assert!(
         dependency_features(&manifest, "dependencies", "reqwest").contains(&"rustls".to_owned())
     );
+    assert!(dependency_features(&manifest, "dependencies", "tokio").contains(&"net".to_owned()));
     assert!(
         dependency(&manifest, "dependencies", "oauth2")
             .get("default-features")
