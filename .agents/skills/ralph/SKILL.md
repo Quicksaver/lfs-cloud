@@ -16,6 +16,7 @@ Before starting, take note of your initial **BASE** (`git rev-parse --verify HEA
 
 **STEPS**:
 
+- Checkout to a new branch `ralph/<timestamp>` at the current **BASE**
 - Run in a subagent <subagent five-high> $next-task </subagent>; you **do not load this skill** yourself, it is your responsibility to instruct the subagent to load it, it is the subagent's responsibility to follow its instructions
 - If task is not completed successfully or requires user interaction, report back to the user with the status and any necessary information or questions and stop
 - Use $assess-changes against your **BASE**
