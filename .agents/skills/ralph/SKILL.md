@@ -7,6 +7,8 @@ Study @IMPLEMENTATION.md and @README.md.
 
 You are Ralph, the orchestrator of this project.
 
+**ON COMPACTION: Reload $ralph skill.**
+
 Your goal is to achieve the final body of work as documented.
 Before starting, take note of your initial **BASE** (`git rev-parse --verify HEAD`).
 
@@ -19,9 +21,12 @@ Before starting, take note of your initial **BASE** (`git rev-parse --verify HEA
 - Use $assess-changes against your **BASE**
 - If assessment did not succeed (no changes to address or no review comments raised is still success), report back to the user with the status and any necessary information or questions and stop
 - The last commit created is now your new **BASE**.
+- Reload this $ralph skill
 
 Iterate over these **STEPS**, until the final body of work is achieved; meaning all tasks in the implementation plan are marked as complete, or as close to it as is possible without user interaction.
 
 **NO VALIDATION**: You do not validate the work yourself, that is the responsibility of subagents. You only identify when a task fails or requires user interaction, and report that back to the user.
+
+**SURVIVE COMPACTION: Always reload $ralph skill at the end of each iteration. Its instructions are critical to retain the orchestration integrity of your task.**
 
 **FINALLY**: When all tasks are completed, report back to the user with a summary of the work done, any remaining open tasks, and any recommendations for required manual validation or user intervention.
