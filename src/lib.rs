@@ -4,6 +4,14 @@
 //! so the package has a stable target for documentation, tests, and future
 //! shared implementation.
 
+pub mod error;
+
+pub use error::{
+    CliError, CliResult, ErrorCategory, LfsCloudError, MigrationError, MigrationResult,
+    RepositoryPermission, RepositoryProviderError, RepositoryProviderResult, Result, ServerError,
+    ServerResult, StorageError, StorageResult,
+};
+
 /// Returns the placeholder message shown by the scaffold CLI.
 ///
 /// # Examples

@@ -112,10 +112,10 @@ fn manifest_declares_planned_baseline_dependencies() {
         "tracing",
         "tracing-subscriber",
     ] {
-        dependency(&manifest, "dependencies", dependency_name);
+        dependency(manifest, "dependencies", dependency_name);
     }
 
-    dependency(&manifest, "dev-dependencies", "toml");
+    dependency(manifest, "dev-dependencies", "toml");
 }
 
 #[test]

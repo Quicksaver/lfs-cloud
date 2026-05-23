@@ -251,3 +251,4 @@ You have access to the following specialized protocols. **Activate** a skill by 
 > ```
 
 - **[build] Reqwest Rustls feature**: Current `reqwest` uses the `rustls` feature name with `default-features = false`; the older `rustls-tls` spelling is invalid for this dependency line. See `reqwest` in Cargo.toml.
+- **[errors] Boundary categories**: Cross-domain code should wrap failures in `LfsCloudError` at the boundary that handled them, so `category()` reports the handling area while `source` preserves the underlying provider/storage cause. See `LfsCloudError` in src/error.rs.
