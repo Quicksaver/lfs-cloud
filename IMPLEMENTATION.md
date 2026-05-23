@@ -1091,13 +1091,14 @@ Defer:
 ### Current Sprint
 
 > **Status**: Phase 0 foundations in progress; root package shape and
-> dependency baseline, and shared error/result types complete.
+> dependency baseline, shared error/result types, and logging initialization
+> complete.
 
 ### Progress Summary
 
 | Phase                                    | Total Tasks | Done  | Remaining |
 | ---------------------------------------- | ----------- | ----- | --------- |
-| 0. Foundations                           | 8           | 3     | 5         |
+| 0. Foundations                           | 8           | 4     | 4         |
 | 1. Server Config                         | 8           | 0     | 8         |
 | 2. GitHub Auth                           | 12          | 0     | 12        |
 | 3. Google Drive Storage                  | 9           | 0     | 9         |
@@ -1107,7 +1108,7 @@ Defer:
 | 7. Migration                             | 12          | 0     | 12        |
 | 8. Local Cache And Materialization       | 8           | 0     | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0     | 8         |
-| **Total**                                | **98**      | **3** | **95**    |
+| **Total**                                | **98**      | **4** | **94**    |
 
 ### Legend
 
@@ -1129,7 +1130,7 @@ Defer:
 - [x] [T] Choose the MVP crate layout: root package only or workspace with CLI/server/core crates.
 - [x] [T] Add baseline dependencies for CLI, HTTP server, async runtime, errors, logging, config, SQLite, OAuth HTTP, and temp files.
 - [x] [T] Create shared error/result types for CLI, server, providers, storage, and migration.
-- [ ] [T] Add tracing/logging initialization usable by CLI and server.
+- [x] [T] Add tracing/logging initialization usable by CLI and server.
 
 #### Epic 0.2: Core Abstractions
 

@@ -5,11 +5,16 @@
 //! shared implementation.
 
 pub mod error;
+pub mod logging;
 
 pub use error::{
     CliError, CliResult, ErrorCategory, LfsCloudError, LfsCloudResult, MigrationError,
     MigrationResult, RepositoryPermission, RepositoryProviderError, RepositoryProviderResult,
     SanitizedMessage, ServerError, ServerResult, StorageError, StorageResult,
+};
+pub use logging::{
+    DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, init_tracing,
+    tracing_filter,
 };
 
 /// Returns the placeholder message shown by the scaffold CLI.
