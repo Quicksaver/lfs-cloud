@@ -249,3 +249,5 @@ You have access to the following specialized protocols. **Activate** a skill by 
 > ```
 > - **[migration] Pointer stability**: Git LFS pointers contain SHA-256 and size, not provider URLs, so provider migration should copy object bytes and update LFS config rather than rewrite history. See \`LfsPointer\` in crates/lfs-cloud-core/src/pointer.rs.
 > ```
+
+- **[build] Reqwest Rustls feature**: Current `reqwest` uses the `rustls` feature name with `default-features = false`; the older `rustls-tls` spelling is invalid for this dependency line. See `reqwest` in Cargo.toml.
