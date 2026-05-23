@@ -7,7 +7,7 @@
 use std::{fmt, path::PathBuf};
 
 /// Project-wide result type for operations that can fail with [`LfsCloudError`].
-pub type Result<T> = std::result::Result<T, LfsCloudError>;
+pub type LfsCloudResult<T> = std::result::Result<T, LfsCloudError>;
 
 /// Result type for command-line interface operations.
 pub type CliResult<T> = std::result::Result<T, CliError>;
@@ -25,6 +25,7 @@ pub type StorageResult<T> = std::result::Result<T, StorageError>;
 pub type MigrationResult<T> = std::result::Result<T, MigrationError>;
 
 /// High-level area responsible for an LFS Cloud failure.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorCategory {
     /// A command-line input, output, or process-boundary failure.
@@ -52,6 +53,7 @@ impl fmt::Display for ErrorCategory {
 }
 
 /// Top-level error type for library operations that cross domain boundaries.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum LfsCloudError {
     /// Failure from command-line input, output, or process-boundary handling.
@@ -74,7 +76,6 @@ pub enum LfsCloudError {
     #[error("repository provider error: {source}")]
     RepositoryProvider {
         /// Underlying repository-provider failure.
-        #[from]
         source: RepositoryProviderError,
     },
 
@@ -82,7 +83,6 @@ pub enum LfsCloudError {
     #[error("storage error: {source}")]
     Storage {
         /// Underlying storage-provider failure.
-        #[from]
         source: StorageError,
     },
 
@@ -122,6 +122,7 @@ impl LfsCloudError {
 }
 
 /// Error type for command-line interface operations.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     /// The user supplied invalid or incomplete command-line input.
@@ -143,7 +144,10 @@ pub enum CliError {
 }
 
 impl CliError {
-    /// Returns the high-level domain responsible for this failure.
+    /// Returns this error type's own domain.
+    ///
+    /// When this error is nested inside [`LfsCloudError`], use
+    /// [`LfsCloudError::category`] to report the handling boundary.
     #[must_use]
     pub fn category(&self) -> ErrorCategory {
         ErrorCategory::Cli
@@ -151,6 +155,7 @@ impl CliError {
 }
 
 /// Error type for server configuration, routing, and request handling.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     /// Server configuration is syntactically valid but semantically invalid.
@@ -192,7 +197,10 @@ pub enum ServerError {
 }
 
 impl ServerError {
-    /// Returns the high-level domain responsible for this failure.
+    /// Returns this error type's own domain.
+    ///
+    /// When this error is nested inside [`LfsCloudError`], use
+    /// [`LfsCloudError::category`] to report the handling boundary.
     #[must_use]
     pub fn category(&self) -> ErrorCategory {
         ErrorCategory::Server
@@ -200,6 +208,7 @@ impl ServerError {
 }
 
 /// Repository access level required by an LFS Cloud operation.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryPermission {
     /// Read access, sufficient for LFS object downloads.
@@ -221,6 +230,7 @@ impl fmt::Display for RepositoryPermission {
 }
 
 /// Error type for repository-provider identity and permission operations.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryProviderError {
     /// The provider operation requires an authenticated repository identity.
@@ -278,12 +288,15 @@ pub enum RepositoryProviderError {
         /// Optional upstream HTTP status code.
         status: Option<u16>,
         /// Sanitized upstream error message.
-        message: String,
+        message: SanitizedMessage,
     },
 }
 
 impl RepositoryProviderError {
-    /// Returns the high-level domain responsible for this failure.
+    /// Returns this error type's own domain.
+    ///
+    /// When this error is nested inside [`LfsCloudError`], use
+    /// [`LfsCloudError::category`] to report the handling boundary.
     #[must_use]
     pub fn category(&self) -> ErrorCategory {
         ErrorCategory::RepositoryProvider
@@ -291,6 +304,7 @@ impl RepositoryProviderError {
 }
 
 /// Error type for storage-provider object and backend operations.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     /// The storage provider operation requires valid backend credentials.
@@ -368,12 +382,15 @@ pub enum StorageError {
         /// Optional upstream HTTP status code.
         status: Option<u16>,
         /// Sanitized upstream error message.
-        message: String,
+        message: SanitizedMessage,
     },
 }
 
 impl StorageError {
-    /// Returns the high-level domain responsible for this failure.
+    /// Returns this error type's own domain.
+    ///
+    /// When this error is nested inside [`LfsCloudError`], use
+    /// [`LfsCloudError::category`] to report the handling boundary.
     #[must_use]
     pub fn category(&self) -> ErrorCategory {
         ErrorCategory::Storage
@@ -381,6 +398,7 @@ impl StorageError {
 }
 
 /// Error type for migration discovery, transfer, and safety operations.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
     /// The selected working directory is not inside a Git repository.
@@ -428,15 +446,63 @@ pub enum MigrationError {
 }
 
 impl MigrationError {
-    /// Returns the high-level domain responsible for this failure.
+    /// Returns this error type's own domain.
+    ///
+    /// When this error is nested inside [`LfsCloudError`], use
+    /// [`LfsCloudError::category`] to report the handling boundary.
     #[must_use]
     pub fn category(&self) -> ErrorCategory {
         ErrorCategory::Migration
     }
 }
 
-fn status_text(status: Option<u16>) -> String {
-    status.map_or_else(String::new, |status| format!(" ({status})"))
+/// A message that callers have scrubbed for safe diagnostic display.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SanitizedMessage(String);
+
+impl SanitizedMessage {
+    /// Wraps an upstream message after the caller has removed secrets and PII.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::SanitizedMessage;
+    ///
+    /// let message = SanitizedMessage::new("rate limit exceeded");
+    /// assert_eq!(message.as_str(), "rate limit exceeded");
+    /// ```
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// Returns the scrubbed message text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SanitizedMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+struct StatusText(Option<u16>);
+
+impl fmt::Display for StatusText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(status) = self.0 {
+            write!(formatter, " ({status})")?;
+        }
+
+        Ok(())
+    }
+}
+
+fn status_text(status: Option<u16>) -> StatusText {
+    StatusText(status)
 }
 
 #[cfg(test)]
@@ -444,8 +510,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CliError, ErrorCategory, LfsCloudError, MigrationError, RepositoryPermission,
-        RepositoryProviderError, Result, ServerError, StorageError, StorageResult,
+        CliError, ErrorCategory, LfsCloudError, LfsCloudResult, MigrationError,
+        RepositoryPermission, RepositoryProviderError, SanitizedMessage, ServerError, StorageError,
+        StorageResult,
     };
 
     #[test]
@@ -457,17 +524,21 @@ mod tests {
             LfsCloudError::from(ServerError::RouteNotConfigured {
                 path: "/github.com/owner/repo.git/info/lfs".to_owned(),
             }),
-            LfsCloudError::from(RepositoryProviderError::PermissionDenied {
-                provider: "github-main".to_owned(),
-                owner: "owner".to_owned(),
-                repo: "repo".to_owned(),
-                required: RepositoryPermission::Write,
-            }),
-            LfsCloudError::from(StorageError::ObjectNotFound {
-                provider: "drive-user-a".to_owned(),
-                oid: "abc123".to_owned(),
-                size: 42,
-            }),
+            LfsCloudError::RepositoryProvider {
+                source: RepositoryProviderError::PermissionDenied {
+                    provider: "github-main".to_owned(),
+                    owner: "owner".to_owned(),
+                    repo: "repo".to_owned(),
+                    required: RepositoryPermission::Write,
+                },
+            },
+            LfsCloudError::Storage {
+                source: StorageError::ObjectNotFound {
+                    provider: "drive-user-a".to_owned(),
+                    oid: "abc123".to_owned(),
+                    size: 42,
+                },
+            },
             LfsCloudError::from(MigrationError::SourceEndpointMissing),
         ];
 
@@ -476,6 +547,27 @@ mod tests {
         assert_eq!(errors[2].category(), ErrorCategory::RepositoryProvider);
         assert_eq!(errors[3].category(), ErrorCategory::Storage);
         assert_eq!(errors[4].category(), ErrorCategory::Migration);
+    }
+
+    #[test]
+    fn provider_and_storage_errors_require_explicit_top_level_boundaries() {
+        let provider_error = RepositoryProviderError::PermissionDenied {
+            provider: "github-main".to_owned(),
+            owner: "owner".to_owned(),
+            repo: "repo".to_owned(),
+            required: RepositoryPermission::Write,
+        };
+        let storage_error = StorageError::ObjectNotFound {
+            provider: "drive-user-a".to_owned(),
+            oid: "abc123".to_owned(),
+            size: 42,
+        };
+
+        let server_provider_error = LfsCloudError::from(ServerError::from(provider_error));
+        let server_storage_error = LfsCloudError::from(ServerError::from(storage_error));
+
+        assert_eq!(server_provider_error.category(), ErrorCategory::Server);
+        assert_eq!(server_storage_error.category(), ErrorCategory::Server);
     }
 
     #[test]
@@ -510,6 +602,47 @@ mod tests {
     }
 
     #[test]
+    fn upstream_errors_format_optional_status_without_extra_spacing() {
+        let provider_without_status = RepositoryProviderError::Upstream {
+            provider: "github-main".to_owned(),
+            status: None,
+            message: SanitizedMessage::new("request timed out"),
+        };
+        let provider_with_status = RepositoryProviderError::Upstream {
+            provider: "github-main".to_owned(),
+            status: Some(502),
+            message: SanitizedMessage::new("bad gateway"),
+        };
+        let storage_without_status = StorageError::Upstream {
+            provider: "drive-user-a".to_owned(),
+            status: None,
+            message: SanitizedMessage::new("backend unavailable"),
+        };
+        let storage_with_status = StorageError::Upstream {
+            provider: "drive-user-a".to_owned(),
+            status: Some(429),
+            message: SanitizedMessage::new("rate limit exceeded"),
+        };
+
+        assert_eq!(
+            provider_without_status.to_string(),
+            "github-main upstream failure: request timed out"
+        );
+        assert_eq!(
+            provider_with_status.to_string(),
+            "github-main upstream failure (502): bad gateway"
+        );
+        assert_eq!(
+            storage_without_status.to_string(),
+            "drive-user-a upstream failure: backend unavailable"
+        );
+        assert_eq!(
+            storage_with_status.to_string(),
+            "drive-user-a upstream failure (429): rate limit exceeded"
+        );
+    }
+
+    #[test]
     fn migration_dry_run_errors_include_the_blocked_write_path() {
         let error = MigrationError::DryRunWriteAttempt {
             path: PathBuf::from(".lfsconfig"),
@@ -525,7 +658,8 @@ mod tests {
             provider: "drive-user-a".to_owned(),
             message: "storage limit reached".to_owned(),
         });
-        let top_level_result: Result<()> = storage_result.map_err(LfsCloudError::from);
+        let top_level_result: LfsCloudResult<()> =
+            storage_result.map_err(|source| LfsCloudError::Storage { source });
 
         assert_eq!(
             top_level_result.unwrap_err().to_string(),

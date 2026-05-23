@@ -7,9 +7,9 @@
 pub mod error;
 
 pub use error::{
-    CliError, CliResult, ErrorCategory, LfsCloudError, MigrationError, MigrationResult,
-    RepositoryPermission, RepositoryProviderError, RepositoryProviderResult, Result, ServerError,
-    ServerResult, StorageError, StorageResult,
+    CliError, CliResult, ErrorCategory, LfsCloudError, LfsCloudResult, MigrationError,
+    MigrationResult, RepositoryPermission, RepositoryProviderError, RepositoryProviderResult,
+    SanitizedMessage, ServerError, ServerResult, StorageError, StorageResult,
 };
 
 /// Returns the placeholder message shown by the scaffold CLI.
