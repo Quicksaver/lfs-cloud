@@ -4,7 +4,7 @@
 //! `tracing-subscriber` directly, so log filtering and formatting behavior stay
 //! consistent as the root package grows new modules.
 
-use std::{env, error::Error};
+use std::{env, error::Error, io::IsTerminal};
 
 use tracing_subscriber::{EnvFilter, filter::ParseError};
 
@@ -30,7 +30,7 @@ impl Default for TracingConfig {
         Self {
             default_filter: DEFAULT_LOG_FILTER.to_owned(),
             env_filter_var: Some(DEFAULT_LOG_ENV_VAR.to_owned()),
-            ansi: true,
+            ansi: std::io::stderr().is_terminal(),
         }
     }
 }
@@ -116,6 +116,16 @@ pub enum TracingInitError {
         source: ParseError,
     },
 
+    /// The selected environment variable contains a non-Unicode filter value.
+    #[error("tracing filter environment variable {var_name:?} is not valid Unicode: {source}")]
+    InvalidEnvironmentFilter {
+        /// Environment variable that contained the invalid filter value.
+        var_name: String,
+        /// Environment variable decoding error.
+        #[source]
+        source: env::VarError,
+    },
+
     /// A process-wide tracing subscriber was already installed or unavailable.
     #[error("failed to install tracing subscriber: {source}")]
     Install {
@@ -136,21 +146,20 @@ pub enum TracingInitError {
 /// use lfs_cloud::{TracingConfig, tracing_filter};
 ///
 /// let config = TracingConfig::new("warn,lfs_cloud=debug").without_env_filter();
-/// let filter = tracing_filter(&config)?;
-///
-/// let filter_text = filter.to_string();
-/// assert!(filter_text.contains("warn"));
-/// assert!(filter_text.contains("lfs_cloud=debug"));
+/// tracing_filter(&config)?;
 /// # Ok::<(), lfs_cloud::TracingInitError>(())
 /// ```
 pub fn tracing_filter(config: &TracingConfig) -> Result<EnvFilter, TracingInitError> {
-    let value = configured_filter_value(config);
+    let value = configured_filter_value(config)?;
 
     EnvFilter::try_new(value.as_str())
         .map_err(|source| TracingInitError::InvalidFilter { value, source })
 }
 
 /// Installs the default process-wide tracing subscriber.
+///
+/// This installs a process-global subscriber. Calling it after another global
+/// subscriber has already been installed returns [`TracingInitError::Install`].
 ///
 /// # Examples
 ///
@@ -164,24 +173,81 @@ pub fn init_tracing(config: &TracingConfig) -> Result<(), TracingInitError> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_filter(config)?)
         .with_ansi(config.ansi)
+        .with_writer(std::io::stderr)
         .try_init()
         .map_err(|source| TracingInitError::Install { source })
 }
 
-fn configured_filter_value(config: &TracingConfig) -> String {
-    config
-        .env_filter_var
-        .as_deref()
-        .and_then(|var_name| env::var(var_name).ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| config.default_filter.clone())
+fn configured_filter_value(config: &TracingConfig) -> Result<String, TracingInitError> {
+    let Some(var_name) = config.env_filter_var.as_deref() else {
+        return Ok(config.default_filter.clone());
+    };
+
+    match env::var(var_name) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(config.default_filter.clone()),
+        Err(source @ env::VarError::NotUnicode(_)) => {
+            Err(TracingInitError::InvalidEnvironmentFilter {
+                var_name: var_name.to_owned(),
+                source,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, tracing_filter,
+    use std::{
+        env,
+        ffi::OsString,
+        io::IsTerminal,
+        sync::{Mutex, MutexGuard},
     };
+
+    use super::{
+        DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError,
+        configured_filter_value, tracing_filter,
+    };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: String,
+        original: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: Tests that mutate environment variables serialize through
+            // ENV_LOCK, and the guard restores the original value before unlock.
+            unsafe {
+                match &self.original {
+                    Some(value) => env::set_var(&self.name, value),
+                    None => env::remove_var(&self.name),
+                }
+            }
+        }
+    }
+
+    fn set_env_var(name: &str, value: Option<OsString>) -> EnvVarGuard {
+        let lock = ENV_LOCK.lock().expect("environment lock should not poison");
+        let original = env::var_os(name);
+
+        // SAFETY: ENV_LOCK serializes environment mutation in these tests.
+        unsafe {
+            match value {
+                Some(value) => env::set_var(name, value),
+                None => env::remove_var(name),
+            }
+        }
+
+        EnvVarGuard {
+            name: name.to_owned(),
+            original,
+            _lock: lock,
+        }
+    }
 
     #[test]
     fn default_config_uses_project_filter_and_rust_log_override() {
@@ -189,17 +255,63 @@ mod tests {
 
         assert_eq!(config.default_filter, DEFAULT_LOG_FILTER);
         assert_eq!(config.env_filter_var.as_deref(), Some(DEFAULT_LOG_ENV_VAR));
-        assert!(config.ansi);
+        assert_eq!(config.ansi, std::io::stderr().is_terminal());
     }
 
     #[test]
-    fn tracing_filter_uses_explicit_default_when_env_override_is_disabled() {
+    fn configured_filter_uses_explicit_default_when_env_override_is_disabled() {
         let config = TracingConfig::new("warn,lfs_cloud=debug").without_env_filter();
-        let filter = tracing_filter(&config).expect("filter should parse");
-        let filter_text = filter.to_string();
 
-        assert!(filter_text.contains("warn"));
-        assert!(filter_text.contains("lfs_cloud=debug"));
+        assert_eq!(
+            configured_filter_value(&config).expect("filter value should resolve"),
+            "warn,lfs_cloud=debug"
+        );
+        tracing_filter(&config).expect("filter should parse");
+    }
+
+    #[test]
+    fn configured_filter_env_override_wins_over_default() {
+        let _guard = set_env_var("LFS_CLOUD_TEST_LOG", Some("lfs_cloud=trace".into()));
+        let config = TracingConfig::new("warn").with_env_filter_var("LFS_CLOUD_TEST_LOG");
+
+        assert_eq!(
+            configured_filter_value(&config).expect("filter value should resolve"),
+            "lfs_cloud=trace"
+        );
+    }
+
+    #[test]
+    fn configured_filter_ignores_empty_env_override() {
+        let _guard = set_env_var("LFS_CLOUD_TEST_LOG", Some(" \t\n".into()));
+        let config =
+            TracingConfig::new("warn,lfs_cloud=info").with_env_filter_var("LFS_CLOUD_TEST_LOG");
+
+        assert_eq!(
+            configured_filter_value(&config).expect("filter value should resolve"),
+            "warn,lfs_cloud=info"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_filter_reports_non_unicode_env_override() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = set_env_var(
+            "LFS_CLOUD_TEST_LOG",
+            Some(OsString::from_vec(vec![0xff, b'w', b'a', b'r', b'n'])),
+        );
+        let config = TracingConfig::new("warn").with_env_filter_var("LFS_CLOUD_TEST_LOG");
+        let error = configured_filter_value(&config).expect_err("non-Unicode value should fail");
+
+        match error {
+            TracingInitError::InvalidEnvironmentFilter { var_name, .. } => {
+                assert_eq!(var_name, "LFS_CLOUD_TEST_LOG");
+            }
+            TracingInitError::InvalidFilter { .. } | TracingInitError::Install { .. } => {
+                panic!("non-Unicode env value should be reported before parsing")
+            }
+        }
     }
 
     #[test]
@@ -211,7 +323,8 @@ mod tests {
             TracingInitError::InvalidFilter { value, .. } => {
                 assert_eq!(value, "lfs_cloud=not-a-level");
             }
-            TracingInitError::Install { .. } => {
+            TracingInitError::InvalidEnvironmentFilter { .. }
+            | TracingInitError::Install { .. } => {
                 panic!("invalid filter should fail before subscriber installation")
             }
         }
