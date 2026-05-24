@@ -6,10 +6,10 @@
 //! non-secret identity metadata.
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     fmt,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -38,6 +38,8 @@ const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
 const MAX_GITHUB_ERROR_BODY_LEN: usize = 16 * 1024;
 const GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_USER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_PENDING_GITHUB_OAUTH_STATES: usize = 1024;
 const GITHUB_USER_AGENT: &str = concat!("lfs-cloud/", env!("CARGO_PKG_VERSION"));
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 
@@ -197,8 +199,8 @@ impl fmt::Debug for GitHubOAuthCallbackRouteState {
             .field("provider_id", &self.provider.id)
             .field("csrf_states", &self.csrf_states)
             .field("redirect_url", &self.redirect_url)
-            .field("token_exchanger", &self.token_exchanger)
-            .field("user_client", &self.user_client)
+            .field("token_exchanger", &"<redacted>")
+            .field("user_client", &"<redacted>")
             .finish()
     }
 }
@@ -214,6 +216,12 @@ pub struct GitHubOAuthCallbackRouteResponse {
     pub stable_id: Option<String>,
     /// OAuth scopes granted by GitHub.
     pub granted_scopes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GitHubOAuthCallbackRouteErrorBody {
+    error: &'static str,
+    message: &'static str,
 }
 
 impl GitHubOAuthCallbackRouteResponse {
@@ -266,28 +274,51 @@ impl From<ServerError> for GitHubOAuthCallbackRouteError {
 
 impl IntoResponse for GitHubOAuthCallbackRouteError {
     fn into_response(self) -> Response {
-        let status = match &self.0 {
-            ServerError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
-            ServerError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+        let (status, error, message) = match &self.0 {
+            ServerError::InvalidRequest { .. } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Invalid GitHub OAuth callback request.",
+            ),
+            ServerError::Unauthorized { .. } => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "GitHub OAuth callback was not authorized.",
+            ),
             ServerError::RepositoryProvider {
                 source:
                     RepositoryProviderError::AuthenticationRequired { .. }
                     | RepositoryProviderError::PermissionDenied { .. }
                     | RepositoryProviderError::SsoRequired { .. },
-            } => StatusCode::UNAUTHORIZED,
+            } => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "GitHub OAuth callback was not authorized.",
+            ),
             ServerError::RepositoryProvider {
                 source: RepositoryProviderError::RepositoryNotFound { .. },
-            } => StatusCode::NOT_FOUND,
-            ServerError::RepositoryProvider { .. } | ServerError::Storage { .. } => {
-                StatusCode::BAD_GATEWAY
-            }
+            } => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "GitHub repository was not found.",
+            ),
+            ServerError::RepositoryProvider { .. } | ServerError::Storage { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "GitHub OAuth callback could not be completed.",
+            ),
             ServerError::ConfigRead { .. }
             | ServerError::ConfigParse { .. }
             | ServerError::InvalidConfiguration { .. }
-            | ServerError::RouteNotConfigured { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | ServerError::RouteNotConfigured { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "GitHub OAuth callback could not be completed.",
+            ),
         };
+        let body = GitHubOAuthCallbackRouteErrorBody { error, message };
 
-        (status, self.0.to_string()).into_response()
+        (status, Json(body)).into_response()
     }
 }
 
@@ -687,10 +718,12 @@ impl fmt::Debug for GitHubOAuthAuthorization {
 /// Register each generated [`GitHubOAuthAuthorization::csrf_state`] before
 /// returning the authorization URL. The callback route consumes the matching
 /// state before exchanging the code, which lets one mounted router handle many
-/// concurrent login attempts without accepting replayed callbacks.
+/// concurrent login attempts without accepting replayed callbacks. Abandoned
+/// states expire and the registry evicts old entries before accepting more than
+/// the maximum pending state count.
 #[derive(Clone, Default)]
 pub struct GitHubOAuthStateRegistry {
-    states: Arc<Mutex<BTreeSet<String>>>,
+    states: Arc<Mutex<BTreeMap<String, Instant>>>,
 }
 
 impl GitHubOAuthStateRegistry {
@@ -710,35 +743,50 @@ impl GitHubOAuthStateRegistry {
 
     /// Registers a generated CSRF state for one future callback.
     pub fn register(&self, state: GitHubOAuthState) {
-        self.states
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(state.0);
-    }
-
-    fn consume(&self, state: &GitHubOAuthState) -> bool {
+        let now = Instant::now();
         let mut states = self
             .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let matched_state = states
-            .iter()
-            .find(|candidate| constant_time_str_eq(candidate, state.as_str()))
-            .cloned();
-
-        if let Some(matched_state) = matched_state {
-            states.remove(&matched_state);
-            true
-        } else {
-            false
+        prune_expired_oauth_states(&mut states, now);
+        if !states.contains_key(state.as_str()) && states.len() >= MAX_PENDING_GITHUB_OAUTH_STATES {
+            evict_oldest_oauth_state(&mut states);
         }
+        states.insert(state.0, now);
+    }
+
+    fn consume(&self, state: &GitHubOAuthState) -> bool {
+        let now = Instant::now();
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_oauth_states(&mut states, now);
+        states.remove(state.as_str()).is_some()
     }
 
     fn len(&self) -> usize {
-        self.states
+        let now = Instant::now();
+        let mut states = self
+            .states
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_oauth_states(&mut states, now);
+        states.len()
+    }
+}
+
+fn prune_expired_oauth_states(states: &mut BTreeMap<String, Instant>, now: Instant) {
+    states.retain(|_, registered_at| now.duration_since(*registered_at) <= GITHUB_OAUTH_STATE_TTL);
+}
+
+fn evict_oldest_oauth_state(states: &mut BTreeMap<String, Instant>) {
+    if let Some(oldest_state) = states
+        .iter()
+        .min_by_key(|(_, registered_at)| **registered_at)
+        .map(|(state, _)| state.clone())
+    {
+        states.remove(&oldest_state);
     }
 }
 
@@ -959,6 +1007,8 @@ impl GitHubOAuthCallback {
             });
         }
 
+        // Consume the one-time state before honoring provider-denied callbacks so
+        // denied OAuth redirects cannot be replayed with an authorization code.
         if let Some(error) = query.error {
             let error = sanitize_oauth_diagnostic_value(&validate_required_callback_error(error)?);
             let description = query
@@ -1579,15 +1629,16 @@ mod tests {
         routing::{get, post},
     };
     use oauth2::CsrfToken;
-    use tokio::sync::Mutex;
+    use tokio::{sync::Mutex, task::JoinHandle};
 
     use super::{
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
         GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization,
         GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteState,
         GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthTokenExchanger, GitHubUserClient,
-        exchange_github_oauth_code, fetch_authenticated_github_user,
-        github_oauth_authorization_url, github_oauth_callback_router,
+        MAX_PENDING_GITHUB_OAUTH_STATES, exchange_github_oauth_code,
+        fetch_authenticated_github_user, github_oauth_authorization_url,
+        github_oauth_callback_router,
     };
     use crate::{GitHubProviderConfig, RepositoryProviderError, ServerError};
 
@@ -2213,7 +2264,10 @@ mod tests {
             provider_config(),
             csrf_states,
             REDIRECT_URL,
-            GitHubOAuthTokenExchanger::new().expect("token exchanger should build"),
+            GitHubOAuthTokenExchanger::with_token_url(
+                "http://127.0.0.1:9/login/oauth/access_token",
+            )
+            .expect("token exchanger should build"),
             GitHubUserClient::new().expect("user client should build"),
         )
         .expect("callback route state should build");
@@ -2224,6 +2278,21 @@ mod tests {
         assert!(rendered.contains("github-main"));
         assert!(!rendered.contains("client-secret"));
         assert!(!rendered.contains("csrf-state"));
+        assert!(!rendered.contains("login/oauth/access_token"));
+    }
+
+    #[test]
+    fn state_registry_limits_pending_states() {
+        let registry = GitHubOAuthStateRegistry::new();
+
+        for index in 0..=MAX_PENDING_GITHUB_OAUTH_STATES {
+            registry.register(
+                GitHubOAuthState::from_secret(format!("csrf-state-{index}"))
+                    .expect("state should parse"),
+            );
+        }
+
+        assert_eq!(registry.len(), MAX_PENDING_GITHUB_OAUTH_STATES);
     }
 
     #[test]
@@ -2254,11 +2323,12 @@ mod tests {
             GitHubUserClient::new().expect("user client should build"),
         )
         .expect("callback route state should build");
-        let callback_url = callback_server(route_state).await;
+        let callback_server = callback_server(route_state).await;
 
         let response = reqwest::Client::new()
             .get(format!(
-                "{callback_url}{GITHUB_OAUTH_CALLBACK_PATH}?code=oauth-code&state=csrf-state"
+                "{}{GITHUB_OAUTH_CALLBACK_PATH}?code=oauth-code&state=csrf-state",
+                callback_server.url()
             ))
             .send()
             .await
@@ -2314,7 +2384,7 @@ mod tests {
             GitHubUserClient::new().expect("user client should build"),
         )
         .expect("callback route state should build");
-        let callback_url = callback_server(route_state).await;
+        let callback_server = callback_server(route_state).await;
         let client = reqwest::Client::new();
 
         for (code, state) in [
@@ -2323,7 +2393,8 @@ mod tests {
         ] {
             let response = client
                 .get(format!(
-                    "{callback_url}{GITHUB_OAUTH_CALLBACK_PATH}?code={code}&state={state}"
+                    "{}{GITHUB_OAUTH_CALLBACK_PATH}?code={code}&state={state}",
+                    callback_server.url()
                 ))
                 .send()
                 .await
@@ -2334,7 +2405,8 @@ mod tests {
 
         let replay = client
             .get(format!(
-                "{callback_url}{GITHUB_OAUTH_CALLBACK_PATH}?code=replay-code&state=first-state"
+                "{}{GITHUB_OAUTH_CALLBACK_PATH}?code=replay-code&state=first-state",
+                callback_server.url()
             ))
             .send()
             .await
@@ -2366,11 +2438,12 @@ mod tests {
             GitHubUserClient::new().expect("user client should build"),
         )
         .expect("callback route state should build");
-        let callback_url = callback_server(route_state).await;
+        let callback_server = callback_server(route_state).await;
 
         let response = reqwest::Client::new()
             .get(format!(
-                "{callback_url}{GITHUB_OAUTH_CALLBACK_PATH}?code=oauth-code&state=returned-state"
+                "{}{GITHUB_OAUTH_CALLBACK_PATH}?code=oauth-code&state=returned-state",
+                callback_server.url()
             ))
             .send()
             .await
@@ -2381,6 +2454,60 @@ mod tests {
         assert!(!body.contains("oauth-code"));
         assert!(!body.contains("returned-state"));
         assert!(!body.contains("expected-state"));
+        assert!(token_server.requests.lock().await.is_empty());
+        assert!(user_server.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn callback_route_consumes_state_on_github_oauth_error_without_exchange() {
+        let (token_url, token_server) = token_server(
+            StatusCode::OK,
+            r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user"}"#,
+        )
+        .await;
+        let (api_url, user_server) =
+            user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
+        let csrf_states = GitHubOAuthStateRegistry::with_state(
+            GitHubOAuthState::from_secret("csrf-state").expect("state should parse"),
+        );
+        let route_state = GitHubOAuthCallbackRouteState::with_clients(
+            provider_config_with_api_url(api_url),
+            csrf_states,
+            REDIRECT_URL,
+            GitHubOAuthTokenExchanger::with_token_url(token_url)
+                .expect("mock token URL should parse"),
+            GitHubUserClient::new().expect("user client should build"),
+        )
+        .expect("callback route state should build");
+        let callback_server = callback_server(route_state).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!(
+                "{}{GITHUB_OAUTH_CALLBACK_PATH}?error=access_denied&error_description=User+denied&state=csrf-state",
+                callback_server.url()
+            ))
+            .send()
+            .await
+            .expect("callback request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value = response.json().await.expect("error body should be JSON");
+        assert_eq!(body["error"], "unauthorized");
+        assert_eq!(body["message"], "GitHub OAuth callback was not authorized.");
+        assert!(token_server.requests.lock().await.is_empty());
+        assert!(user_server.requests.lock().await.is_empty());
+
+        let replay = client
+            .get(format!(
+                "{}{GITHUB_OAUTH_CALLBACK_PATH}?code=oauth-code&state=csrf-state",
+                callback_server.url()
+            ))
+            .send()
+            .await
+            .expect("replay callback request should complete");
+
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
         assert!(token_server.requests.lock().await.is_empty());
         assert!(user_server.requests.lock().await.is_empty());
     }
@@ -2632,7 +2759,24 @@ mod tests {
         (format!("http://{address}/api/v3"), state)
     }
 
-    async fn callback_server(state: GitHubOAuthCallbackRouteState) -> String {
+    struct CallbackServer {
+        url: String,
+        task: JoinHandle<()>,
+    }
+
+    impl CallbackServer {
+        fn url(&self) -> &str {
+            &self.url
+        }
+    }
+
+    impl Drop for CallbackServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn callback_server(state: GitHubOAuthCallbackRouteState) -> CallbackServer {
         let app = github_oauth_callback_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2641,13 +2785,16 @@ mod tests {
             .local_addr()
             .expect("mock callback server address should be available");
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
                 .expect("mock callback server should run");
         });
 
-        format!("http://{address}")
+        CallbackServer {
+            url: format!("http://{address}"),
+            task,
+        }
     }
 
     async fn capture_token_request(
