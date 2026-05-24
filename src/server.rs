@@ -20,7 +20,7 @@ use axum::{
     extract::{FromRequest, OriginalUri, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+        header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
     },
     response::{IntoResponse, Response},
 };
@@ -45,6 +45,7 @@ use crate::{
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
 const GIT_LFS_JSON_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
+const MAX_UPLOAD_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Runtime options supplied by `lfs-cloud serve`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -657,9 +658,24 @@ async fn handle_lfs_upload_request(
         return git_lfs_authorization_error_response(error);
     }
 
-    let staged_upload = match stage_upload_request_body(&oid, request).await {
+    let declared_size = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(size) = declared_size
+        && size > MAX_UPLOAD_OBJECT_BYTES
+    {
+        return upload_payload_too_large_response();
+    }
+
+    let staged_upload = match stage_upload_request_body(&oid, declared_size, request).await {
         Ok(staged_upload) => staged_upload,
+        Err(UploadStagingError::PayloadTooLarge) => {
+            return upload_payload_too_large_response();
+        }
         Err(error) => {
+            let error = error.into_storage_error();
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = oid.as_hex(),
@@ -703,6 +719,13 @@ async fn handle_lfs_upload_request(
     }
 }
 
+fn upload_payload_too_large_response() -> Response {
+    git_lfs_json_error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Git LFS upload object exceeds the configured request size limit",
+    )
+}
+
 struct StagedUpload {
     temp_file: tempfile::NamedTempFile,
     size_bytes: u64,
@@ -716,8 +739,24 @@ impl StagedUpload {
 
 async fn stage_upload_request_body(
     expected_oid: &LfsOid,
+    expected_size: Option<u64>,
     request: Request,
-) -> Result<StagedUpload, StorageError> {
+) -> Result<StagedUpload, UploadStagingError> {
+    stage_upload_request_body_with_limit(
+        expected_oid,
+        expected_size,
+        request,
+        MAX_UPLOAD_OBJECT_BYTES,
+    )
+    .await
+}
+
+async fn stage_upload_request_body_with_limit(
+    expected_oid: &LfsOid,
+    expected_size: Option<u64>,
+    request: Request,
+    max_upload_bytes: u64,
+) -> Result<StagedUpload, UploadStagingError> {
     let temp_file = tempfile::Builder::new()
         .prefix("lfs-cloud-upload-")
         .tempfile()
@@ -742,8 +781,14 @@ async fn stage_upload_request_body(
             provider: "lfs-cloud".to_owned(),
             message: format!("upload request body could not be read: {source}"),
         })?;
+        let next_size = actual_size
+            .checked_add(chunk.len() as u64)
+            .ok_or(UploadStagingError::PayloadTooLarge)?;
+        if next_size > max_upload_bytes {
+            return Err(UploadStagingError::PayloadTooLarge);
+        }
         hasher.update(&chunk);
-        actual_size += chunk.len() as u64;
+        actual_size = next_size;
         file.write_all(&chunk)
             .await
             .map_err(|source| StorageError::Retryable {
@@ -763,16 +808,41 @@ async fn stage_upload_request_body(
     if actual_oid != expected_oid.as_hex() {
         return Err(StorageError::IntegrityMismatch {
             expected_oid: expected_oid.as_hex().to_owned(),
-            expected_size: actual_size,
+            expected_size: expected_size.unwrap_or(actual_size),
             actual_oid,
             actual_size,
-        });
+        }
+        .into());
     }
 
     Ok(StagedUpload {
         temp_file,
         size_bytes: actual_size,
     })
+}
+
+#[derive(Debug)]
+enum UploadStagingError {
+    PayloadTooLarge,
+    Storage(StorageError),
+}
+
+impl UploadStagingError {
+    fn into_storage_error(self) -> StorageError {
+        match self {
+            Self::PayloadTooLarge => StorageError::QuotaExceeded {
+                provider: "lfs-cloud".to_owned(),
+                message: "upload object exceeded request size limit".to_owned(),
+            },
+            Self::Storage(error) => error,
+        }
+    }
+}
+
+impl From<StorageError> for UploadStagingError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 async fn handle_parsed_lfs_batch_request(
@@ -1447,7 +1517,7 @@ mod tests {
         extract::Path,
         http::{
             HeaderMap, HeaderValue, Method, Request, StatusCode,
-            header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+            header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
         },
         routing::get,
     };
@@ -1455,19 +1525,20 @@ mod tests {
 
     use super::{
         BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsBatchAuthorizer, LfsObjectTransferStore,
-        LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, ServerBind, advertised_server_urls,
-        authenticate_lfs_session, lfs_server_router_with_sessions,
+        LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind,
+        advertised_server_urls, authenticate_lfs_session, lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
-        render_server_startup_message, server_router_with_sessions,
+        render_server_startup_message, server_router_with_sessions, stage_upload_request_body,
+        stage_upload_request_body_with_limit,
     };
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
 
     use crate::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, LfsBatchOperation,
-        LfsBatchResponse, LfsObject, LocalLfsSessionStore, ProviderFuture, RepositoryMapping,
-        RepositoryPermission, RepositoryProviderError, RepositoryUser, ServerConfig, ServerError,
-        ServerResult, StoredObject,
+        LfsBatchResponse, LfsObject, LfsOid, LocalLfsSessionStore, ProviderFuture,
+        RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
+        ServerConfig, ServerError, ServerResult, StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -2113,6 +2184,98 @@ repositories:
         )
         .await;
         assert!(transfer_store.uploads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_rejects_declared_oversized_uploads_before_staging() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let transfer_store = RecordingTransferStore::missing();
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_LENGTH, (MAX_UPLOAD_OBJECT_BYTES + 1).to_string())
+                    .body(Body::from("small body"))
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Git LFS upload object exceeds the configured request size limit",
+        )
+        .await;
+        assert!(transfer_store.uploads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn staged_upload_uses_declared_content_length_in_integrity_errors() {
+        let body = "declared size should be preserved";
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .header(CONTENT_LENGTH, "1234")
+            .body(Body::from(body))
+            .expect("test request should build");
+
+        let error = match stage_upload_request_body(
+            &LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("test oid should parse"),
+            Some(1234),
+            request,
+        )
+        .await
+        {
+            Ok(_) => panic!("mismatched object should fail staging"),
+            Err(error) => error,
+        };
+
+        match error {
+            super::UploadStagingError::Storage(crate::StorageError::IntegrityMismatch {
+                expected_size,
+                actual_size,
+                ..
+            }) => {
+                assert_eq!(expected_size, 1234);
+                assert_eq!(actual_size, body.len() as u64);
+            }
+            other => panic!("unexpected staging error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_upload_aborts_when_stream_exceeds_size_limit() {
+        let body = "0123456789";
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .body(Body::from(body))
+            .expect("test request should build");
+
+        let error = match stage_upload_request_body_with_limit(
+            &LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("test oid should parse"),
+            None,
+            request,
+            4,
+        )
+        .await
+        {
+            Ok(_) => panic!("oversized body should fail staging"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, super::UploadStagingError::PayloadTooLarge));
     }
 
     #[tokio::test]
