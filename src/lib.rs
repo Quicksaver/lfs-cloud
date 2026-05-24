@@ -4,6 +4,7 @@
 //! so the package has a stable target for documentation, tests, and future
 //! shared implementation.
 
+pub mod credentials;
 pub mod error;
 pub mod github_auth;
 pub mod lfs;
@@ -12,6 +13,7 @@ pub mod providers;
 pub mod server_config;
 pub mod sessions;
 
+pub use credentials::{DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval};
 pub use error::{
     CliError, CliResult, ErrorCategory, LfsCloudError, LfsCloudResult, MigrationError,
     MigrationResult, RepositoryPermission, RepositoryProviderError, RepositoryProviderResult,

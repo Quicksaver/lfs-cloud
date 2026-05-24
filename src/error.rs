@@ -141,6 +141,17 @@ pub enum CliError {
         #[source]
         source: std::io::Error,
     },
+
+    /// An external command completed unsuccessfully.
+    #[error("{command} failed with status {status}: {stderr}")]
+    ExternalCommand {
+        /// Command line being executed, without secret arguments.
+        command: String,
+        /// Process exit status or signal summary.
+        status: String,
+        /// Sanitized stderr emitted by the command.
+        stderr: SanitizedMessage,
+    },
 }
 
 impl CliError {
