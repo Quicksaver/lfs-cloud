@@ -129,10 +129,52 @@ struct FakeRepositoryRecord {
     permissions_by_login: BTreeMap<String, RepositoryPermission>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FakeRepositoryKey {
+    provider_id: String,
+    host: String,
+    owner: String,
+    name: String,
+}
+
+impl FakeRepositoryKey {
+    fn from_parts(
+        provider_id: impl Into<String>,
+        host: impl Into<String>,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            host: host.into(),
+            owner: owner.into(),
+            name: name.into(),
+        }
+    }
+
+    fn from_handle(repository: &RepositoryHandle) -> Self {
+        Self::from_parts(
+            repository.provider_id.clone(),
+            repository.host.clone(),
+            repository.owner.clone(),
+            repository.name.clone(),
+        )
+    }
+
+    fn from_identity(repository: &RepositoryIdentity) -> Self {
+        Self::from_parts(
+            repository.provider_id.clone(),
+            repository.host.clone(),
+            repository.owner.clone(),
+            repository.name.clone(),
+        )
+    }
+}
+
 /// Configurable repository provider fake for integration tests.
 pub struct FakeRepositoryProvider {
     provider_id: String,
-    repositories: Mutex<BTreeMap<(String, String), FakeRepositoryRecord>>,
+    repositories: Mutex<BTreeMap<FakeRepositoryKey, FakeRepositoryRecord>>,
 }
 
 impl FakeRepositoryProvider {
@@ -148,6 +190,7 @@ impl FakeRepositoryProvider {
     /// Adds a repository identity that the fake can resolve.
     pub fn add_repository(
         &self,
+        host: impl Into<String>,
         owner: impl Into<String>,
         name: impl Into<String>,
         stable_id: Option<String>,
@@ -156,7 +199,7 @@ impl FakeRepositoryProvider {
             .lock()
             .expect("fake repository lock should not poison")
             .insert(
-                (owner.into(), name.into()),
+                FakeRepositoryKey::from_parts(self.provider_id.clone(), host, owner, name),
                 FakeRepositoryRecord {
                     stable_id,
                     permissions_by_login: BTreeMap::new(),
@@ -167,12 +210,13 @@ impl FakeRepositoryProvider {
     /// Grants a repository permission to a fake provider user.
     pub fn grant_permission(
         &self,
+        host: impl Into<String>,
         owner: impl Into<String>,
         name: impl Into<String>,
         login: impl Into<String>,
         permission: RepositoryPermission,
     ) {
-        let key = (owner.into(), name.into());
+        let key = FakeRepositoryKey::from_parts(self.provider_id.clone(), host, owner, name);
         let mut repositories = self
             .repositories
             .lock()
@@ -201,9 +245,7 @@ impl RepositoryProvider for FakeRepositoryProvider {
                 .repositories
                 .lock()
                 .expect("fake repository lock should not poison");
-            let Some(record) =
-                repositories.get(&(repository.owner.clone(), repository.name.clone()))
-            else {
+            let Some(record) = repositories.get(&FakeRepositoryKey::from_handle(repository)) else {
                 return Err(RepositoryProviderError::RepositoryNotFound {
                     provider: self.provider_id.clone(),
                     owner: repository.owner.clone(),
@@ -229,8 +271,7 @@ impl RepositoryProvider for FakeRepositoryProvider {
                 .repositories
                 .lock()
                 .expect("fake repository lock should not poison");
-            let Some(record) =
-                repositories.get(&(repository.owner.clone(), repository.name.clone()))
+            let Some(record) = repositories.get(&FakeRepositoryKey::from_identity(repository))
             else {
                 return Err(RepositoryProviderError::RepositoryNotFound {
                     provider: self.provider_id.clone(),
@@ -358,6 +399,16 @@ impl StorageProvider for FakeStorageProvider {
         Box::pin(async move {
             let bytes =
                 fs::read(source).map_err(|source| io_storage_error(&self.provider_id, source))?;
+            let actual_size = bytes.len() as u64;
+
+            if actual_size != object.size.bytes() {
+                return Err(StorageError::IntegrityMismatch {
+                    expected_oid: object.oid.as_hex().to_owned(),
+                    expected_size: object.size.bytes(),
+                    actual_oid: object.oid.as_hex().to_owned(),
+                    actual_size,
+                });
+            }
 
             self.insert_object(object.clone(), bytes);
             Ok(stored_object(&self.provider_id, object))

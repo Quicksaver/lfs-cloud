@@ -29,8 +29,14 @@ fn temp_git_repo_writes_and_commits_pointer_files() {
 #[tokio::test]
 async fn fake_repository_provider_resolves_and_denies_permissions() {
     let provider = FakeRepositoryProvider::new("github-main");
-    provider.add_repository("owner", "repo", Some("repo-123".to_owned()));
-    provider.grant_permission("owner", "repo", "reader", RepositoryPermission::Read);
+    provider.add_repository("github.com", "owner", "repo", Some("repo-123".to_owned()));
+    provider.grant_permission(
+        "github.com",
+        "owner",
+        "repo",
+        "reader",
+        RepositoryPermission::Read,
+    );
 
     let handle = RepositoryHandle::new("github-main", "github.com", "owner", "repo");
     let identity = provider
@@ -56,6 +62,39 @@ async fn fake_repository_provider_resolves_and_denies_permissions() {
             required: RepositoryPermission::Write,
             ..
         }
+    ));
+}
+
+#[tokio::test]
+async fn fake_repository_provider_requires_exact_repository_identity() {
+    let provider = FakeRepositoryProvider::new("github-main");
+    provider.add_repository("github.com", "owner", "repo", Some("repo-123".to_owned()));
+    provider.grant_permission(
+        "github.com",
+        "owner",
+        "repo",
+        "reader",
+        RepositoryPermission::Read,
+    );
+    let reader = RepositoryUser::new("github-main", "reader", Some("user-123".to_owned()));
+
+    let wrong_provider = RepositoryHandle::new("github-alt", "github.com", "owner", "repo");
+    let wrong_host = RepositoryHandle::new("github-main", "gitlab.example.com", "owner", "repo");
+    let spoofed_identity = lfs_cloud::RepositoryIdentity::from_handle(&wrong_host, None);
+
+    assert!(matches!(
+        provider.repository_identity(&wrong_provider).await,
+        Err(RepositoryProviderError::RepositoryNotFound { .. })
+    ));
+    assert!(matches!(
+        provider.repository_identity(&wrong_host).await,
+        Err(RepositoryProviderError::RepositoryNotFound { .. })
+    ));
+    assert!(matches!(
+        provider
+            .check_permission(&spoofed_identity, &reader, RepositoryPermission::Read)
+            .await,
+        Err(RepositoryProviderError::RepositoryNotFound { .. })
     ));
 }
 
@@ -91,6 +130,29 @@ async fn fake_storage_provider_uploads_downloads_and_deletes_bytes() {
 
     assert_eq!(deletion, lfs_cloud::StorageDeleteOutcome::Deleted);
     assert!(!provider.object_exists(&object).await.unwrap());
+}
+
+#[tokio::test]
+async fn fake_storage_provider_rejects_size_mismatched_uploads() {
+    let repo = TempGitRepo::new();
+    let source = repo.write_file("objects/source.bin", "large file bytes");
+    let object = lfs_object(TEST_OID_B, 15);
+    let provider = FakeStorageProvider::new("drive-user-a");
+
+    let error = provider
+        .upload_object(&object, &source)
+        .await
+        .expect_err("fixture upload should enforce exact LFS object size");
+
+    assert!(matches!(
+        error,
+        StorageError::IntegrityMismatch {
+            expected_size: 15,
+            actual_size: 16,
+            ..
+        }
+    ));
+    assert_eq!(provider.object_bytes(&object), None);
 }
 
 #[tokio::test]
