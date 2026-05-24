@@ -232,7 +232,12 @@ pub struct ServerSettings {
     pub port: u16,
     /// Public base URL used when constructing Git LFS action URLs.
     pub public_url: String,
-    /// Local SQLite database path for server-owned metadata.
+    /// Local SQLite database file path for server-owned metadata.
+    ///
+    /// Relative configuration values are resolved against the server config
+    /// file directory, while absolute paths are preserved. The server expects
+    /// to create or open this SQLite database with normal filesystem write
+    /// permissions when metadata storage is initialized.
     pub metadata_path: PathBuf,
 }
 
