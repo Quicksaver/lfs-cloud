@@ -25,7 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -48,6 +48,7 @@ use crate::{
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
 const GIT_LFS_JSON_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 const MAX_UPLOAD_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const BATCH_STORAGE_LOOKUP_CONCURRENCY: usize = 16;
 
 /// Runtime options supplied by `lfs-cloud serve`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -286,7 +287,7 @@ trait LfsObjectTransferStore: Send + Sync {
         &'a self,
         repository: &'a RepositoryMapping,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<Response>>;
+    ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>>;
 
     fn record_verified_object<'a>(
         &'a self,
@@ -295,6 +296,28 @@ trait LfsObjectTransferStore: Send + Sync {
         backend_id: &'a str,
         created_by: &'a RepositoryUser,
     ) -> ProviderFuture<'a, ServerResult<()>>;
+}
+
+struct LfsDownloadResponse {
+    stored_object: StoredObject,
+    response: Response,
+}
+
+impl LfsDownloadResponse {
+    fn new(stored_object: StoredObject, response: Response) -> Self {
+        Self {
+            stored_object,
+            response,
+        }
+    }
+
+    fn stored_object(&self) -> &StoredObject {
+        &self.stored_object
+    }
+
+    fn into_response(self) -> Response {
+        self.response
+    }
 }
 
 struct PendingLfsObjectTransferStore;
@@ -334,7 +357,7 @@ impl LfsObjectTransferStore for PendingLfsObjectTransferStore {
         &'a self,
         _repository: &'a RepositoryMapping,
         _object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<Response>> {
+    ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
         Box::pin(async {
             Err(ServerError::Storage {
                 source: StorageError::Unsupported {
@@ -436,19 +459,14 @@ impl LfsObjectTransferStore for GoogleDriveTransferStore {
         &'a self,
         repository: &'a RepositoryMapping,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<Response>> {
+    ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
         Box::pin(async move {
             let store = self.object_store_for_repository(repository).await?;
             let download = store.download_object_response(object).await?;
-            tracing::debug!(
-                repo_id = repository.id.as_str(),
-                storage_provider = download.stored_object().provider_id.as_str(),
-                backend_id = download.stored_object().backend_id.as_str(),
-                oid = object.oid.as_hex(),
-                size = object.size.bytes(),
-                "prepared verified Git LFS download response"
-            );
-            Ok(download.into_response())
+            Ok(LfsDownloadResponse::new(
+                download.stored_object().clone(),
+                download.into_response(),
+            ))
         })
     }
 
@@ -776,7 +794,17 @@ async fn handle_lfs_download_request(
         .download_object_response(&repository, &object)
         .await
     {
-        Ok(response) => response,
+        Ok(download) => {
+            tracing::debug!(
+                repo_id = repository.id.as_str(),
+                storage_provider = download.stored_object().provider_id.as_str(),
+                backend_id = download.stored_object().backend_id.as_str(),
+                oid = object.oid.as_hex(),
+                size = object.size.bytes(),
+                "prepared verified Git LFS download response"
+            );
+            download.into_response()
+        }
         Err(error) => {
             tracing::debug!(
                 repo_id = repository.id.as_str(),
@@ -951,6 +979,13 @@ fn transfer_request_expected_size(request: &Request, action: &str) -> ServerResu
                 .map_err(|_| ServerError::InvalidRequest {
                     message: format!("invalid {action} size query value {value:?}"),
                 })?;
+            if size > MAX_UPLOAD_OBJECT_BYTES {
+                return Err(ServerError::InvalidRequest {
+                    message: format!(
+                        "{action} action size {size} exceeds the maximum supported object size"
+                    ),
+                });
+            }
 
             return Ok(size);
         }
@@ -1169,22 +1204,24 @@ async fn download_batch_response_with_storage_lookup(
     state: &LfsServerState,
     request: LfsBatchRequest,
 ) -> ServerResult<LfsBatchResponse> {
-    let mut objects = Vec::with_capacity(request.objects.len());
-
-    for object in request.objects {
-        match state
-            .transfer_store
-            .lookup_object(repository, &object)
-            .await
-        {
-            Ok(Some(_)) => objects.push(LfsBatchDownloadObject::available(object)),
-            Ok(None) => objects.push(LfsBatchDownloadObject::missing(object)),
-            Err(error) => objects.push(LfsBatchDownloadObject::error(
-                object,
-                lfs_batch_object_error_from_server_error(&error),
-            )),
-        }
-    }
+    let objects = stream::iter(request.objects)
+        .map(|object| async move {
+            match state
+                .transfer_store
+                .lookup_object(repository, &object)
+                .await
+            {
+                Ok(Some(_)) => LfsBatchDownloadObject::available(object),
+                Ok(None) => LfsBatchDownloadObject::missing(object),
+                Err(error) => LfsBatchDownloadObject::error(
+                    object,
+                    lfs_batch_object_error_from_server_error(&error),
+                ),
+            }
+        })
+        .buffered(BATCH_STORAGE_LOOKUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
 
     Ok(LfsBatchResponse::download(
         &state.public_url,
@@ -1811,9 +1848,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsBatchAuthorizer, LfsObjectTransferStore,
-        LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind,
-        advertised_server_urls, authenticate_lfs_session, lfs_server_router_with_sessions,
+        BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsBatchAuthorizer, LfsDownloadResponse,
+        LfsObjectTransferStore, LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord,
+        MAX_UPLOAD_OBJECT_BYTES, ServerBind, advertised_server_urls, authenticate_lfs_session,
+        lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
         render_server_startup_message, server_router_with_sessions, stage_upload_request_body,
         stage_upload_request_body_with_limit,
@@ -1825,7 +1863,7 @@ mod tests {
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, LfsBatchOperation,
         LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LocalLfsSessionStore, ProviderFuture,
         RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
-        ServerConfig, ServerError, ServerResult, StoredObject,
+        ServerConfig, ServerError, ServerResult, StorageError, StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -1954,6 +1992,7 @@ repositories:
     #[derive(Clone, Default)]
     struct RecordingTransferStore {
         lookup_object: Arc<Mutex<Option<StoredObject>>>,
+        lookup_unsupported: bool,
         download_body: Arc<Mutex<Option<Vec<u8>>>>,
         download_integrity_mismatch: bool,
         downloads: Arc<Mutex<Vec<RecordedDownload>>>,
@@ -1969,25 +2008,34 @@ repositories:
         }
 
         fn existing() -> Self {
-            Self {
-                lookup_object: Arc::new(Mutex::new(Some(StoredObject::new(
-                    "drive-user-a",
-                    LfsObject::new(
-                        LfsOid::new(
-                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        )
+            let stored_object = StoredObject::new(
+                "drive-user-a",
+                LfsObject::new(
+                    LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                         .expect("test oid should parse"),
-                        LfsObjectSize::new(42),
-                    ),
-                    "drive-file-existing",
-                )))),
-                download_body: Arc::new(Mutex::new(Some(vec![0; 42]))),
+                    LfsObjectSize::new(42),
+                ),
+                "drive-file-existing",
+            );
+            let body_len = usize::try_from(stored_object.object.size.bytes())
+                .expect("test object size should fit usize");
+            Self {
+                lookup_object: Arc::new(Mutex::new(Some(stored_object))),
+                download_body: Arc::new(Mutex::new(Some(vec![0; body_len]))),
                 download_integrity_mismatch: false,
                 downloads: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(Vec::new())),
                 verified: Arc::new(Mutex::new(Vec::new())),
                 upload_started: None,
                 upload_release: None,
+                ..Self::default()
+            }
+        }
+
+        fn lookup_unsupported() -> Self {
+            Self {
+                lookup_unsupported: true,
+                ..Self::default()
             }
         }
 
@@ -2001,6 +2049,7 @@ repositories:
                 verified: Arc::new(Mutex::new(Vec::new())),
                 upload_started: None,
                 upload_release: None,
+                ..Self::default()
             }
         }
 
@@ -2014,6 +2063,7 @@ repositories:
                 verified: Arc::new(Mutex::new(Vec::new())),
                 upload_started: Some(upload_started),
                 upload_release: Some(upload_release),
+                ..Self::default()
             }
         }
 
@@ -2027,19 +2077,21 @@ repositories:
                 verified: Arc::new(Mutex::new(Vec::new())),
                 upload_started: None,
                 upload_release: None,
+                ..Self::default()
             }
         }
 
         fn existing_object_with_download_integrity_mismatch(stored_object: StoredObject) -> Self {
             Self {
                 lookup_object: Arc::new(Mutex::new(Some(stored_object))),
-                download_body: Arc::new(Mutex::new(None)),
+                download_body: Arc::new(Mutex::new(Some(Vec::new()))),
                 download_integrity_mismatch: true,
                 downloads: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(Vec::new())),
                 verified: Arc::new(Mutex::new(Vec::new())),
                 upload_started: None,
                 upload_release: None,
+                ..Self::default()
             }
         }
 
@@ -2094,6 +2146,14 @@ repositories:
             object: &'a LfsObject,
         ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
             Box::pin(async move {
+                if self.lookup_unsupported {
+                    return Err(ServerError::Storage {
+                        source: StorageError::Unsupported {
+                            provider_type: "test-storage".to_owned(),
+                        },
+                    });
+                }
+
                 let lookup_object = self
                     .lookup_object
                     .lock()
@@ -2149,7 +2209,7 @@ repositories:
             &'a self,
             repository: &'a RepositoryMapping,
             object: &'a LfsObject,
-        ) -> ProviderFuture<'a, ServerResult<Response>> {
+        ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
             Box::pin(async move {
                 let Some(stored_object) = self.lookup_object(repository, object).await? else {
                     return Err(ServerError::Storage {
@@ -2193,14 +2253,16 @@ repositories:
                         object: object.clone(),
                     });
 
-                Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "application/octet-stream")
                     .header(CONTENT_LENGTH, body.len().to_string())
                     .body(Body::from(body))
                     .map_err(|source| ServerError::Internal {
                         message: format!("test download response could not be built: {source}"),
-                    })
+                    })?;
+
+                Ok(LfsDownloadResponse::new(stored_object, response))
             })
         }
 
@@ -2540,6 +2602,42 @@ repositories:
     }
 
     #[tokio::test]
+    async fn authenticated_download_batch_route_maps_storage_lookup_errors_per_object() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            RecordingBatchAuthorizer::allow(),
+            RecordingTransferStore::lookup_unsupported(),
+        );
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                VALID_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        let body: LfsBatchResponse =
+            serde_json::from_slice(&body).expect("response should be Git LFS batch JSON");
+
+        assert_eq!(body.objects.len(), 1);
+        assert!(body.objects[0].actions.is_empty());
+        let error = body.objects[0]
+            .error
+            .as_ref()
+            .expect("storage lookup failure should be object-level");
+        assert_eq!(error.code, 501);
+        assert_eq!(error.message, "object storage lookup is not configured");
+    }
+
+    #[tokio::test]
     async fn authenticated_batch_route_rejects_unsupported_transfers() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
         let router = test_router_with_authorizer(store, RecordingBatchAuthorizer::allow());
@@ -2799,6 +2897,39 @@ repositories:
             .oneshot(lfs_request_with_method_and_body(
                 Method::GET,
                 "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Some(&format!("Bearer {token}")),
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "Git LFS download action did not include a valid size query parameter",
+        )
+        .await;
+        assert!(transfer_store.downloads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_endpoint_rejects_oversized_size_query_parameter() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let transfer_store = RecordingTransferStore::existing();
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+        );
+        let path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size={}",
+            MAX_UPLOAD_OBJECT_BYTES + 1
+        );
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::GET,
+                &path,
                 Some(&format!("Bearer {token}")),
                 Body::empty(),
             ))

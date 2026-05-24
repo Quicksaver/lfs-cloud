@@ -7,6 +7,7 @@
 use std::{collections::BTreeMap, fmt, num::ParseIntError, str::FromStr};
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Git LFS pointer file version supported by this package.
 pub const LFS_POINTER_VERSION: &str = "https://git-lfs.github.com/spec/v1";
@@ -863,13 +864,7 @@ fn lfs_object_action_url(
     repository_lfs_path: &str,
     object: &LfsObject,
 ) -> String {
-    format!(
-        "{}/{}/objects/{}?size={}",
-        public_url.trim_end_matches('/'),
-        repository_lfs_path.trim_matches('/'),
-        object.oid.as_hex(),
-        object.size.bytes()
-    )
+    lfs_object_transfer_action_url(public_url, repository_lfs_path, object)
 }
 
 fn lfs_upload_object_action_url(
@@ -877,13 +872,38 @@ fn lfs_upload_object_action_url(
     repository_lfs_path: &str,
     object: &LfsObject,
 ) -> String {
-    format!(
-        "{}/{}/objects/{}?size={}",
-        public_url.trim_end_matches('/'),
+    lfs_object_transfer_action_url(public_url, repository_lfs_path, object)
+}
+
+fn lfs_object_transfer_action_url(
+    public_url: &str,
+    repository_lfs_path: &str,
+    object: &LfsObject,
+) -> String {
+    let fallback = || {
+        format!(
+            "{}/{}/objects/{}?size={}",
+            public_url.trim_end_matches('/'),
+            repository_lfs_path.trim_matches('/'),
+            object.oid.as_hex(),
+            object.size.bytes()
+        )
+    };
+
+    let Ok(mut url) = Url::parse(public_url.trim_end_matches('/')) else {
+        return fallback();
+    };
+    let path = format!(
+        "{}/{}/objects/{}",
+        url.path().trim_end_matches('/'),
         repository_lfs_path.trim_matches('/'),
-        object.oid.as_hex(),
-        object.size.bytes()
-    )
+        object.oid.as_hex()
+    );
+    url.set_path(&path);
+    url.set_query(None);
+    url.query_pairs_mut()
+        .append_pair("size", &object.size.bytes().to_string());
+    url.to_string()
 }
 
 /// HTTP action advertised to a Git LFS client.
