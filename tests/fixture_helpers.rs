@@ -3,12 +3,12 @@
 mod support;
 
 use lfs_cloud::{
-    LfsPointer, RepositoryHandle, RepositoryPermission, RepositoryProvider,
+    LfsPointer, RepositoryHandle, RepositoryIdentity, RepositoryPermission, RepositoryProvider,
     RepositoryProviderError, RepositoryUser, StorageError, StorageProvider,
 };
 use support::{
     FakeRepositoryProvider, FakeStorageProvider, TEST_OID_A, TEST_OID_B, TempGitRepo, lfs_object,
-    lfs_pointer_file, write_lfs_pointer,
+    lfs_object_for_bytes, lfs_pointer_file, write_lfs_pointer,
 };
 
 #[test]
@@ -80,7 +80,9 @@ async fn fake_repository_provider_requires_exact_repository_identity() {
 
     let wrong_provider = RepositoryHandle::new("github-alt", "github.com", "owner", "repo");
     let wrong_host = RepositoryHandle::new("github-main", "gitlab.example.com", "owner", "repo");
-    let spoofed_identity = lfs_cloud::RepositoryIdentity::from_handle(&wrong_host, None);
+    let spoofed_identity = RepositoryIdentity::from_handle(&wrong_host, None);
+    let wrong_provider_user =
+        RepositoryUser::new("github-alt", "reader", Some("user-123".to_owned()));
 
     assert!(matches!(
         provider.repository_identity(&wrong_provider).await,
@@ -96,14 +98,30 @@ async fn fake_repository_provider_requires_exact_repository_identity() {
             .await,
         Err(RepositoryProviderError::RepositoryNotFound { .. })
     ));
+    let identity = provider
+        .repository_identity(&RepositoryHandle::new(
+            "github-main",
+            "github.com",
+            "owner",
+            "repo",
+        ))
+        .await
+        .expect("configured repository should resolve");
+    assert!(matches!(
+        provider
+            .check_permission(&identity, &wrong_provider_user, RepositoryPermission::Read)
+            .await,
+        Err(RepositoryProviderError::PermissionDenied { .. })
+    ));
 }
 
 #[tokio::test]
 async fn fake_storage_provider_uploads_downloads_and_deletes_bytes() {
     let repo = TempGitRepo::new();
+    let bytes = b"large file bytes";
     let source = repo.write_file("objects/source.bin", "large file bytes");
     let destination = repo.path().join("downloads/source.bin");
-    let object = lfs_object(TEST_OID_B, 16);
+    let object = lfs_object_for_bytes(bytes);
     let provider = FakeStorageProvider::new("drive-user-a");
 
     let uploaded = provider
@@ -115,13 +133,10 @@ async fn fake_storage_provider_uploads_downloads_and_deletes_bytes() {
         .await
         .expect("fixture download should succeed");
 
-    assert!(uploaded.backend_id.contains(TEST_OID_B));
+    assert!(uploaded.backend_id.contains(object.oid.as_hex()));
     assert_eq!(downloaded.object, object);
     assert_eq!(repo.read_file("downloads/source.bin"), "large file bytes");
-    assert_eq!(
-        provider.object_bytes(&object),
-        Some(b"large file bytes".to_vec())
-    );
+    assert_eq!(provider.object_bytes(&object), Some(bytes.to_vec()));
 
     let deletion = provider
         .delete_or_mark_object(&object)
@@ -156,6 +171,30 @@ async fn fake_storage_provider_rejects_size_mismatched_uploads() {
 }
 
 #[tokio::test]
+async fn fake_storage_provider_rejects_oid_mismatched_uploads() {
+    let repo = TempGitRepo::new();
+    let source = repo.write_file("objects/source.bin", "large file bytes");
+    let object = lfs_object(TEST_OID_B, 16);
+    let provider = FakeStorageProvider::new("drive-user-a");
+
+    let error = provider
+        .upload_object(&object, &source)
+        .await
+        .expect_err("fixture upload should enforce exact LFS object oid");
+
+    assert!(matches!(
+        error,
+        StorageError::IntegrityMismatch {
+            expected_oid,
+            expected_size: 16,
+            actual_oid,
+            actual_size: 16,
+        } if expected_oid == TEST_OID_B && actual_oid != TEST_OID_B
+    ));
+    assert_eq!(provider.object_bytes(&object), None);
+}
+
+#[tokio::test]
 async fn fake_storage_provider_reports_missing_objects() {
     let repo = TempGitRepo::new();
     let provider = FakeStorageProvider::new("drive-user-a");
@@ -169,6 +208,20 @@ async fn fake_storage_provider_reports_missing_objects() {
 
     assert!(matches!(
         error,
+        StorageError::ObjectNotFound {
+            provider,
+            size: 42,
+            ..
+        } if provider == "drive-user-a"
+    ));
+
+    let delete_error = provider
+        .delete_or_mark_object(&object)
+        .await
+        .expect_err("missing object deletion should fail");
+
+    assert!(matches!(
+        delete_error,
         StorageError::ObjectNotFound {
             provider,
             size: 42,

@@ -17,6 +17,7 @@ use lfs_cloud::{
     RepositoryProviderError, RepositoryProviderResult, RepositoryUser, StorageDeleteOutcome,
     StorageError, StorageProvider, StorageResult, StoredObject,
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 /// Stable SHA-256 test object ID using only the `a` nibble.
@@ -36,7 +37,18 @@ impl TempGitRepo {
         let root = tempfile::tempdir().expect("temporary repository directory should be created");
         let repo = Self { root };
 
-        repo.git(["init", "--initial-branch", "main"]);
+        let init = repo.try_git(["init", "--initial-branch", "main"]);
+        if !init.status.success() {
+            if String::from_utf8_lossy(&init.stderr).contains("unknown option") {
+                // Git 2.28+ supports --initial-branch. Older versions need a
+                // rename after repository creation so tests can assert `main`.
+                repo.git(["init"]);
+                repo.git(["branch", "-M", "main"]);
+            } else {
+                assert_git_success(&init);
+            }
+        }
+
         repo.git(["config", "user.email", "lfs-cloud@example.invalid"]);
         repo.git(["config", "user.name", "LFS Cloud Test"]);
 
@@ -74,19 +86,21 @@ impl TempGitRepo {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let output = self.try_git(args);
+        assert_git_success(&output);
+        output
+    }
+
+    fn try_git<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let output = Command::new("git")
             .args(args)
             .current_dir(self.root.path())
             .output()
             .expect("git command should start");
-
-        assert!(
-            output.status.success(),
-            "git command failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
 
         output
     }
@@ -104,6 +118,15 @@ pub fn lfs_object(oid_hex: &str, size: u64) -> LfsObject {
     LfsObject::new(
         LfsOid::new(oid_hex).expect("test object oid should be valid"),
         LfsObjectSize::new(size),
+    )
+}
+
+/// Creates an LFS object identity for exact byte contents.
+#[must_use]
+pub fn lfs_object_for_bytes(bytes: &[u8]) -> LfsObject {
+    lfs_object(
+        &sha256_hex(bytes),
+        u64::try_from(bytes.len()).expect("usize object length should always fit in u64"),
     )
 }
 
@@ -267,6 +290,15 @@ impl RepositoryProvider for FakeRepositoryProvider {
         required: RepositoryPermission,
     ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryAuthorization>> {
         Box::pin(async move {
+            if user.provider_id != self.provider_id {
+                return Err(RepositoryProviderError::PermissionDenied {
+                    provider: self.provider_id.clone(),
+                    owner: repository.owner.clone(),
+                    repo: repository.name.clone(),
+                    required,
+                });
+            }
+
             let repositories = self
                 .repositories
                 .lock()
@@ -322,7 +354,6 @@ fn permission_allows(granted: RepositoryPermission, required: RepositoryPermissi
 
 #[derive(Clone, Debug)]
 struct FakeStoredBytes {
-    object: LfsObject,
     bytes: Vec<u8>,
     backend_id: String,
 }
@@ -330,6 +361,8 @@ struct FakeStoredBytes {
 /// In-memory storage provider fake for integration tests.
 pub struct FakeStorageProvider {
     provider_id: String,
+    // These fixtures expose synchronous setup/assertion helpers, and no lock is
+    // held across an await point in the async provider methods.
     objects: Mutex<BTreeMap<LfsObject, FakeStoredBytes>>,
 }
 
@@ -353,7 +386,6 @@ impl FakeStorageProvider {
             .insert(
                 object.clone(),
                 FakeStoredBytes {
-                    object,
                     bytes: bytes.into(),
                     backend_id: stored.backend_id.clone(),
                 },
@@ -399,13 +431,15 @@ impl StorageProvider for FakeStorageProvider {
         Box::pin(async move {
             let bytes =
                 fs::read(source).map_err(|source| io_storage_error(&self.provider_id, source))?;
-            let actual_size = bytes.len() as u64;
+            let actual_size =
+                u64::try_from(bytes.len()).expect("usize object length should always fit in u64");
+            let actual_oid = sha256_hex(&bytes);
 
-            if actual_size != object.size.bytes() {
+            if actual_size != object.size.bytes() || actual_oid != object.oid.as_hex() {
                 return Err(StorageError::IntegrityMismatch {
                     expected_oid: object.oid.as_hex().to_owned(),
                     expected_size: object.size.bytes(),
-                    actual_oid: object.oid.as_hex().to_owned(),
+                    actual_oid,
                     actual_size,
                 });
             }
@@ -445,7 +479,7 @@ impl StorageProvider for FakeStorageProvider {
 
             Ok(StoredObject::new(
                 self.provider_id.clone(),
-                stored.object,
+                object.clone(),
                 stored.backend_id,
             ))
         })
@@ -456,12 +490,22 @@ impl StorageProvider for FakeStorageProvider {
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
         Box::pin(async move {
-            self.objects
+            let deleted = self
+                .objects
                 .lock()
                 .expect("fake storage lock should not poison")
-                .remove(object);
+                .remove(object)
+                .is_some();
 
-            Ok(StorageDeleteOutcome::Deleted)
+            if deleted {
+                Ok(StorageDeleteOutcome::Deleted)
+            } else {
+                Err(StorageError::ObjectNotFound {
+                    provider: self.provider_id.clone(),
+                    oid: object.oid.as_hex().to_owned(),
+                    size: object.size.bytes(),
+                })
+            }
         })
     }
 }
@@ -479,4 +523,18 @@ fn io_storage_error(provider_id: &str, source: io::Error) -> StorageError {
         provider: provider_id.to_owned(),
         message: source.to_string(),
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn assert_git_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "git command failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

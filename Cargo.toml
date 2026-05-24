@@ -22,4 +22,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+sha2 = "0.10.9"
 toml = "1.1.2"
