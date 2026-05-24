@@ -1092,8 +1092,8 @@ Defer:
 
 > **Status**: Phase 2 GitHub authentication has started with OAuth
 > authorization URL generation, CSRF state creation, and callback state
-> validation, code-to-token exchange, and authenticated GitHub user identity
-> lookup. Callback routing and local session/token metadata remain.
+> validation, callback routing, code-to-token exchange, and authenticated
+> GitHub user identity lookup. Local session/token metadata remains.
 
 ### Progress Summary
 
@@ -1101,7 +1101,7 @@ Defer:
 | ---------------------------------------- | ----------- | ------ | --------- |
 | 0. Foundations                           | 8           | 8      | 0         |
 | 1. Server Config                         | 8           | 8      | 0         |
-| 2. GitHub Auth                           | 12          | 4      | 8         |
+| 2. GitHub Auth                           | 12          | 5      | 7         |
 | 3. Google Drive Storage                  | 9           | 0      | 9         |
 | 4. Metadata DB                           | 8           | 0      | 8         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
@@ -1109,7 +1109,7 @@ Defer:
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **98**      | **20** | **78**    |
+| **Total**                                | **98**      | **21** | **77**    |
 
 ### Legend
 
@@ -1162,7 +1162,7 @@ Defer:
 
 - [x] [T] Implement GitHub OAuth authorization URL generation with CSRF state.
 - [x] [T] Implement OAuth callback query parsing and CSRF state validation helper.
-- [ ] [T] Implement OAuth callback route that uses the validated callback.
+- [x] [T] Implement OAuth callback route that uses the validated callback.
 - [x] [T] Implement GitHub OAuth code-to-token exchange.
 - [x] [T] Fetch authenticated GitHub user identity with the OAuth token.
 - [ ] [T] Store local `lfs-cloud` session/token metadata without exposing the GitHub token to Git LFS.

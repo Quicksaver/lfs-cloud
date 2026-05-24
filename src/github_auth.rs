@@ -1,11 +1,18 @@
 //! GitHub OAuth helpers for repository-provider login.
 //!
-//! This module owns the browser-facing authorization URL construction used at
-//! the start of the GitHub login flow. Later callback and token-exchange code
-//! should validate the returned CSRF state before accepting an OAuth code.
+//! This module owns the browser-facing authorization URL construction and
+//! callback handling used by the GitHub login flow. The callback route validates
+//! the returned CSRF state before exchanging an OAuth code and only returns
+//! non-secret identity metadata.
 
 use std::{fmt, sync::OnceLock, time::Duration};
 
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use oauth2::{
     AuthUrl, ClientId, CsrfToken, RedirectUrl, Scope, basic::BasicClient,
     url::ParseError as UrlParseError,
@@ -14,7 +21,7 @@ use reqwest::{
     Client, StatusCode,
     header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
@@ -56,6 +63,157 @@ pub const GITHUB_OAUTH_CALLBACK_PATH: &str = "/auth/github/callback";
 /// `read:user` lets the server identify the authenticated GitHub account
 /// without putting the broader repository scope decision into this URL helper.
 pub const DEFAULT_GITHUB_OAUTH_SCOPES: &[&str] = &["read:user"];
+
+/// State required by the GitHub OAuth callback route.
+#[derive(Clone, Debug)]
+pub struct GitHubOAuthCallbackRouteState {
+    provider: GitHubProviderConfig,
+    expected_state: GitHubOAuthState,
+    redirect_url: String,
+    token_exchanger: GitHubOAuthTokenExchanger,
+    user_client: GitHubUserClient,
+}
+
+impl GitHubOAuthCallbackRouteState {
+    /// Creates callback route state using default GitHub HTTP clients.
+    ///
+    /// `expected_state` must be the CSRF value generated for the matching
+    /// authorization URL, and `redirect_url` must match the OAuth app callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when default HTTP clients cannot be created or
+    /// the redirect URL is not a valid absolute URL.
+    pub fn new(
+        provider: GitHubProviderConfig,
+        expected_state: GitHubOAuthState,
+        redirect_url: impl Into<String>,
+    ) -> ServerResult<Self> {
+        Self::with_clients(
+            provider,
+            expected_state,
+            redirect_url,
+            GitHubOAuthTokenExchanger::new()?,
+            GitHubUserClient::new()?,
+        )
+    }
+
+    /// Creates callback route state with explicit provider clients.
+    ///
+    /// This constructor is useful for tests and for server code that shares
+    /// tuned HTTP clients across provider components.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when `redirect_url` is not a valid absolute URL.
+    pub fn with_clients(
+        provider: GitHubProviderConfig,
+        expected_state: GitHubOAuthState,
+        redirect_url: impl Into<String>,
+        token_exchanger: GitHubOAuthTokenExchanger,
+        user_client: GitHubUserClient,
+    ) -> ServerResult<Self> {
+        let redirect_url = redirect_url.into();
+        RedirectUrl::new(redirect_url.clone())
+            .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
+
+        Ok(Self {
+            provider,
+            expected_state,
+            redirect_url,
+            token_exchanger,
+            user_client,
+        })
+    }
+}
+
+/// Response returned by the GitHub OAuth callback route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GitHubOAuthCallbackRouteResponse {
+    /// Configured repository provider that authenticated the user.
+    pub provider_id: String,
+    /// Authenticated GitHub login.
+    pub login: String,
+    /// Stable GitHub user ID, when GitHub returned one.
+    pub stable_id: Option<String>,
+    /// OAuth scopes granted by GitHub.
+    pub granted_scopes: Vec<String>,
+}
+
+impl GitHubOAuthCallbackRouteResponse {
+    fn new(provider: &GitHubProviderConfig, user: RepositoryUser, scopes: Vec<String>) -> Self {
+        Self {
+            provider_id: provider.id.clone(),
+            login: user.login,
+            stable_id: user.stable_id,
+            granted_scopes: scopes,
+        }
+    }
+}
+
+/// Creates an Axum router for the GitHub OAuth callback endpoint.
+///
+/// The route is mounted at [`GITHUB_OAUTH_CALLBACK_PATH`] and performs callback
+/// validation, code exchange, and authenticated-user lookup. It never returns
+/// the GitHub OAuth access token in the HTTP response.
+pub fn github_oauth_callback_router(state: GitHubOAuthCallbackRouteState) -> Router {
+    Router::new()
+        .route(GITHUB_OAUTH_CALLBACK_PATH, get(github_oauth_callback_route))
+        .with_state(state)
+}
+
+async fn github_oauth_callback_route(
+    State(state): State<GitHubOAuthCallbackRouteState>,
+    Query(query): Query<GitHubOAuthCallbackQuery>,
+) -> Result<Json<GitHubOAuthCallbackRouteResponse>, GitHubOAuthCallbackRouteError> {
+    let callback = GitHubOAuthCallback::validate(query, &state.expected_state)?;
+    let token = state
+        .token_exchanger
+        .exchange_code(&state.provider, &callback, &state.redirect_url)
+        .await?;
+    let user = state
+        .user_client
+        .fetch_authenticated_user(&state.provider, &token.access_token)
+        .await?;
+    let response = GitHubOAuthCallbackRouteResponse::new(&state.provider, user, token.scopes);
+
+    Ok(Json(response))
+}
+
+struct GitHubOAuthCallbackRouteError(ServerError);
+
+impl From<ServerError> for GitHubOAuthCallbackRouteError {
+    fn from(error: ServerError) -> Self {
+        Self(error)
+    }
+}
+
+impl IntoResponse for GitHubOAuthCallbackRouteError {
+    fn into_response(self) -> Response {
+        let status = match &self.0 {
+            ServerError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
+            ServerError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            ServerError::RepositoryProvider {
+                source:
+                    RepositoryProviderError::AuthenticationRequired { .. }
+                    | RepositoryProviderError::PermissionDenied { .. }
+                    | RepositoryProviderError::SsoRequired { .. },
+            } => StatusCode::UNAUTHORIZED,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::RepositoryNotFound { .. },
+            } => StatusCode::NOT_FOUND,
+            ServerError::RepositoryProvider { .. } | ServerError::Storage { .. } => {
+                StatusCode::BAD_GATEWAY
+            }
+            ServerError::ConfigRead { .. }
+            | ServerError::ConfigParse { .. }
+            | ServerError::InvalidConfiguration { .. }
+            | ServerError::RouteNotConfigured { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        (status, self.0.to_string()).into_response()
+    }
+}
 
 /// GitHub OAuth access token returned after exchanging an authorization code.
 #[derive(Clone, Eq, PartialEq)]
@@ -1247,9 +1405,10 @@ mod tests {
     use super::{
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
         GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization,
-        GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthState, GitHubOAuthTokenExchanger,
-        GitHubUserClient, exchange_github_oauth_code, fetch_authenticated_github_user,
-        github_oauth_authorization_url,
+        GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteState,
+        GitHubOAuthState, GitHubOAuthTokenExchanger, GitHubUserClient, exchange_github_oauth_code,
+        fetch_authenticated_github_user, github_oauth_authorization_url,
+        github_oauth_callback_router,
     };
     use crate::{GitHubProviderConfig, RepositoryProviderError, ServerError};
 
@@ -1872,6 +2031,101 @@ mod tests {
         assert!(REDIRECT_URL.ends_with(GITHUB_OAUTH_CALLBACK_PATH));
     }
 
+    #[tokio::test]
+    async fn callback_route_exchanges_code_and_returns_user_without_token() {
+        let (token_url, token_server) = token_server(
+            StatusCode::OK,
+            r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user,repo"}"#,
+        )
+        .await;
+        let (api_url, user_server) =
+            user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
+        let provider = provider_config_with_api_url(api_url);
+        let expected_state =
+            GitHubOAuthState::from_secret("csrf-state").expect("state should parse");
+        let route_state = GitHubOAuthCallbackRouteState::with_clients(
+            provider,
+            expected_state,
+            REDIRECT_URL,
+            GitHubOAuthTokenExchanger::with_token_url(token_url)
+                .expect("mock token URL should parse"),
+            GitHubUserClient::new().expect("user client should build"),
+        )
+        .expect("callback route state should build");
+        let callback_url = callback_server(route_state).await;
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{callback_url}{GITHUB_OAUTH_CALLBACK_PATH}?code=oauth-code&state=csrf-state"
+            ))
+            .send()
+            .await
+            .expect("callback request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("response body should read");
+        assert!(!body.contains("gho_token"));
+        assert!(!body.contains("oauth-code"));
+        assert!(!body.contains("csrf-state"));
+        let body: serde_json::Value =
+            serde_json::from_str(&body).expect("callback response should be JSON");
+        assert_eq!(body["provider_id"], "github-main");
+        assert_eq!(body["login"], "octocat");
+        assert_eq!(body["stable_id"], "42");
+        assert_eq!(
+            body["granted_scopes"],
+            serde_json::json!(["read:user", "repo"])
+        );
+
+        let token_requests = token_server.requests.lock().await;
+        assert_eq!(token_requests.len(), 1);
+        let user_requests = user_server.requests.lock().await;
+        assert_eq!(user_requests.len(), 1);
+        assert_eq!(
+            user_requests[0].authorization.as_deref(),
+            Some("Bearer gho_token")
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_route_rejects_csrf_mismatch_before_token_exchange() {
+        let (token_url, token_server) = token_server(
+            StatusCode::OK,
+            r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user"}"#,
+        )
+        .await;
+        let (api_url, user_server) =
+            user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
+        let expected_state =
+            GitHubOAuthState::from_secret("expected-state").expect("state should parse");
+        let route_state = GitHubOAuthCallbackRouteState::with_clients(
+            provider_config_with_api_url(api_url),
+            expected_state,
+            REDIRECT_URL,
+            GitHubOAuthTokenExchanger::with_token_url(token_url)
+                .expect("mock token URL should parse"),
+            GitHubUserClient::new().expect("user client should build"),
+        )
+        .expect("callback route state should build");
+        let callback_url = callback_server(route_state).await;
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{callback_url}{GITHUB_OAUTH_CALLBACK_PATH}?code=oauth-code&state=returned-state"
+            ))
+            .send()
+            .await
+            .expect("callback request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.text().await.expect("response body should read");
+        assert!(!body.contains("oauth-code"));
+        assert!(!body.contains("returned-state"));
+        assert!(!body.contains("expected-state"));
+        assert!(token_server.requests.lock().await.is_empty());
+        assert!(user_server.requests.lock().await.is_empty());
+    }
+
     #[test]
     fn callback_validation_accepts_matching_state_and_code() {
         let expected_state =
@@ -2117,6 +2371,24 @@ mod tests {
         });
 
         (format!("http://{address}/api/v3"), state)
+    }
+
+    async fn callback_server(state: GitHubOAuthCallbackRouteState) -> String {
+        let app = github_oauth_callback_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock callback server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock callback server address should be available");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock callback server should run");
+        });
+
+        format!("http://{address}")
     }
 
     async fn capture_token_request(

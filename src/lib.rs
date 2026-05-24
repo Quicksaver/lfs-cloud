@@ -19,9 +19,10 @@ pub use error::{
 pub use github_auth::{
     DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
     GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization, GitHubOAuthCallback,
-    GitHubOAuthCallbackQuery, GitHubOAuthCode, GitHubOAuthState, GitHubOAuthToken,
-    GitHubOAuthTokenExchanger, GitHubUserClient, exchange_github_oauth_code,
-    fetch_authenticated_github_user, github_oauth_authorization_url,
+    GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteResponse, GitHubOAuthCallbackRouteState,
+    GitHubOAuthCode, GitHubOAuthState, GitHubOAuthToken, GitHubOAuthTokenExchanger,
+    GitHubUserClient, exchange_github_oauth_code, fetch_authenticated_github_user,
+    github_oauth_authorization_url, github_oauth_callback_router,
 };
 pub use lfs::{
     LFS_POINTER_VERSION, LfsBatchAction, LfsBatchObjectError, LfsBatchObjectResponse,
