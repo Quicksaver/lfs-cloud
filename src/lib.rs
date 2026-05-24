@@ -5,16 +5,27 @@
 //! shared implementation.
 
 pub mod error;
+pub mod lfs;
 pub mod logging;
+pub mod providers;
 
 pub use error::{
     CliError, CliResult, ErrorCategory, LfsCloudError, LfsCloudResult, MigrationError,
     MigrationResult, RepositoryPermission, RepositoryProviderError, RepositoryProviderResult,
     SanitizedMessage, ServerError, ServerResult, StorageError, StorageResult,
 };
+pub use lfs::{
+    LFS_POINTER_VERSION, LfsBatchAction, LfsBatchObjectError, LfsBatchObjectResponse,
+    LfsBatchOperation, LfsBatchRef, LfsBatchRequest, LfsBatchResponse, LfsObject, LfsObjectError,
+    LfsObjectSize, LfsOid, LfsPointer,
+};
 pub use logging::{
     DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, init_tracing,
     tracing_filter,
+};
+pub use providers::{
+    RepositoryAuthorization, RepositoryHandle, RepositoryIdentity, RepositoryProvider,
+    RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
 };
 
 /// Returns the placeholder message shown by the scaffold CLI.

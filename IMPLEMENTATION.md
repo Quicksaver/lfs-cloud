@@ -1090,15 +1090,15 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 0 foundations in progress; root package shape and
-> dependency baseline, shared error/result types, and logging initialization
-> complete.
+> **Status**: Phase 0 foundations in progress; root package shape,
+> dependency baseline, shared error/result types, logging initialization,
+> shared LFS object types, and provider abstraction traits complete.
 
 ### Progress Summary
 
 | Phase                                    | Total Tasks | Done  | Remaining |
 | ---------------------------------------- | ----------- | ----- | --------- |
-| 0. Foundations                           | 8           | 4     | 4         |
+| 0. Foundations                           | 8           | 7     | 1         |
 | 1. Server Config                         | 8           | 0     | 8         |
 | 2. GitHub Auth                           | 12          | 0     | 12        |
 | 3. Google Drive Storage                  | 9           | 0     | 9         |
@@ -1108,7 +1108,7 @@ Defer:
 | 7. Migration                             | 12          | 0     | 12        |
 | 8. Local Cache And Materialization       | 8           | 0     | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0     | 8         |
-| **Total**                                | **98**      | **4** | **94**    |
+| **Total**                                | **98**      | **7** | **91**    |
 
 ### Legend
 
@@ -1134,9 +1134,9 @@ Defer:
 
 #### Epic 0.2: Core Abstractions
 
-- [ ] [T] Define repository-provider trait with identity and permission-check methods.
-- [ ] [T] Define storage-provider trait with exists/upload/download/delete-or-mark methods.
-- [ ] [T] Define shared LFS object types: OID, size, pointer, batch request, batch response.
+- [x] [T] Define repository-provider trait with identity and permission-check methods.
+- [x] [T] Define storage-provider trait with exists/upload/download/delete-or-mark methods.
+- [x] [T] Define shared LFS object types: OID, size, pointer, batch request, batch response.
 - [ ] [T] Build test fixture helpers for temp repos, fake providers, and LFS pointer files.
 
 ### Phase 1: Server Config

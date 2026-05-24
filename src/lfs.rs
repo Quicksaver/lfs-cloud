@@ -1,0 +1,566 @@
+//! Shared Git LFS object and batch-protocol types.
+//!
+//! These types model the provider-independent parts of Git LFS: object
+//! identity, pointer-file metadata, and the batch request/response payloads
+//! exchanged with Git LFS clients.
+
+use std::{collections::BTreeMap, fmt, num::ParseIntError, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+
+/// Git LFS pointer file version supported by this package.
+pub const LFS_POINTER_VERSION: &str = "https://git-lfs.github.com/spec/v1";
+
+const SHA256_PREFIX: &str = "sha256:";
+const SHA256_HEX_LENGTH: usize = 64;
+
+/// Error returned when Git LFS object or pointer metadata is invalid.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum LfsObjectError {
+    /// The object identifier was empty.
+    #[error("LFS object identifier is empty")]
+    EmptyOid,
+
+    /// The object identifier used a hash algorithm other than SHA-256.
+    #[error("unsupported LFS object hash algorithm: {algorithm}")]
+    UnsupportedOidAlgorithm {
+        /// Hash algorithm prefix found before the colon.
+        algorithm: String,
+    },
+
+    /// The SHA-256 object identifier had the wrong number of hexadecimal bytes.
+    #[error("invalid SHA-256 object identifier length: expected 64 hex characters, got {actual}")]
+    InvalidSha256Length {
+        /// Number of characters supplied.
+        actual: usize,
+    },
+
+    /// The SHA-256 object identifier contained a non-hexadecimal character.
+    #[error("invalid SHA-256 object identifier: non-hex character at byte {index}")]
+    InvalidSha256Hex {
+        /// Byte index of the first invalid character.
+        index: usize,
+    },
+
+    /// The pointer file was missing the required version line.
+    #[error("LFS pointer is missing the version line")]
+    PointerMissingVersion,
+
+    /// The pointer file used an unsupported version URL.
+    #[error("unsupported LFS pointer version: {version}")]
+    PointerInvalidVersion {
+        /// Version URL found in the pointer file.
+        version: String,
+    },
+
+    /// The pointer file was missing the required object identifier line.
+    #[error("LFS pointer is missing the oid line")]
+    PointerMissingOid,
+
+    /// The pointer file was missing the required size line.
+    #[error("LFS pointer is missing the size line")]
+    PointerMissingSize,
+
+    /// The pointer file size value was not a valid unsigned integer.
+    #[error("invalid LFS pointer size {value:?}: {source}")]
+    PointerInvalidSize {
+        /// Text found after the `size` key.
+        value: String,
+        /// Integer parsing failure.
+        #[source]
+        source: ParseIntError,
+    },
+
+    /// The pointer file included an unsupported line.
+    #[error("unexpected LFS pointer line: {line}")]
+    PointerUnexpectedLine {
+        /// Unsupported pointer line.
+        line: String,
+    },
+}
+
+/// A validated SHA-256 Git LFS object identifier without the `sha256:` prefix.
+///
+/// # Examples
+///
+/// ```
+/// use std::str::FromStr;
+///
+/// use lfs_cloud::LfsOid;
+///
+/// let oid = LfsOid::from_str("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+/// assert_eq!(oid.as_hex(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+/// # Ok::<(), lfs_cloud::LfsObjectError>(())
+/// ```
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LfsOid(String);
+
+impl LfsOid {
+    /// Validates a SHA-256 object identifier.
+    ///
+    /// The input may be either the raw 64-character hex digest or the pointer
+    /// form prefixed with `sha256:`.
+    pub fn new(value: impl AsRef<str>) -> Result<Self, LfsObjectError> {
+        let value = value.as_ref().trim();
+
+        if value.is_empty() {
+            return Err(LfsObjectError::EmptyOid);
+        }
+
+        let hex = match value.split_once(':') {
+            Some(("sha256", hex)) => hex,
+            Some((algorithm, _)) => {
+                return Err(LfsObjectError::UnsupportedOidAlgorithm {
+                    algorithm: algorithm.to_owned(),
+                });
+            }
+            None => value,
+        };
+
+        if hex.len() != SHA256_HEX_LENGTH {
+            return Err(LfsObjectError::InvalidSha256Length { actual: hex.len() });
+        }
+
+        if let Some((index, _)) = hex
+            .bytes()
+            .enumerate()
+            .find(|(_, byte)| !byte.is_ascii_hexdigit())
+        {
+            return Err(LfsObjectError::InvalidSha256Hex { index });
+        }
+
+        Ok(Self(hex.to_ascii_lowercase()))
+    }
+
+    /// Returns the raw 64-character SHA-256 hex digest.
+    #[must_use]
+    pub fn as_hex(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the pointer-file form, including the `sha256:` prefix.
+    #[must_use]
+    pub fn as_pointer_oid(&self) -> String {
+        format!("{SHA256_PREFIX}{}", self.0)
+    }
+}
+
+impl fmt::Display for LfsOid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_hex())
+    }
+}
+
+impl FromStr for LfsOid {
+    type Err = LfsObjectError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for LfsOid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for LfsOid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Exact size in bytes of a Git LFS object.
+///
+/// # Examples
+///
+/// ```
+/// use lfs_cloud::LfsObjectSize;
+///
+/// let size = LfsObjectSize::new(42);
+/// assert_eq!(size.bytes(), 42);
+/// ```
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct LfsObjectSize(u64);
+
+impl LfsObjectSize {
+    /// Creates an object size from an exact byte count.
+    #[must_use]
+    pub fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact byte count.
+    #[must_use]
+    pub fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for LfsObjectSize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// Provider-independent identity of a Git LFS object.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct LfsObject {
+    /// SHA-256 object identifier.
+    pub oid: LfsOid,
+    /// Exact object size in bytes.
+    pub size: LfsObjectSize,
+}
+
+impl LfsObject {
+    /// Creates object identity metadata from a validated OID and byte size.
+    #[must_use]
+    pub fn new(oid: LfsOid, size: LfsObjectSize) -> Self {
+        Self { oid, size }
+    }
+}
+
+/// Parsed Git LFS pointer-file metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LfsPointer {
+    /// Pointer version URL.
+    pub version: &'static str,
+    /// Object referenced by the pointer file.
+    pub object: LfsObject,
+}
+
+impl LfsPointer {
+    /// Creates a pointer for the supported Git LFS pointer version.
+    #[must_use]
+    pub fn new(object: LfsObject) -> Self {
+        Self {
+            version: LFS_POINTER_VERSION,
+            object,
+        }
+    }
+
+    /// Parses a Git LFS pointer file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::LfsPointer;
+    ///
+    /// let pointer = LfsPointer::parse(
+    ///     "version https://git-lfs.github.com/spec/v1\n\
+    ///      oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+    ///      size 42\n",
+    /// )?;
+    ///
+    /// assert_eq!(pointer.object.size.bytes(), 42);
+    /// # Ok::<(), lfs_cloud::LfsObjectError>(())
+    /// ```
+    pub fn parse(contents: &str) -> Result<Self, LfsObjectError> {
+        let mut version = None;
+        let mut oid = None;
+        let mut size = None;
+
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            if let Some(value) = line.strip_prefix("version ") {
+                version = Some(value);
+            } else if let Some(value) = line.strip_prefix("oid ") {
+                oid = Some(LfsOid::new(value)?);
+            } else if let Some(value) = line.strip_prefix("size ") {
+                let parsed_size =
+                    value
+                        .parse::<u64>()
+                        .map_err(|source| LfsObjectError::PointerInvalidSize {
+                            value: value.to_owned(),
+                            source,
+                        })?;
+                size = Some(LfsObjectSize::new(parsed_size));
+            } else {
+                return Err(LfsObjectError::PointerUnexpectedLine {
+                    line: line.to_owned(),
+                });
+            }
+        }
+
+        match version {
+            Some(LFS_POINTER_VERSION) => {}
+            Some(version) => {
+                return Err(LfsObjectError::PointerInvalidVersion {
+                    version: version.to_owned(),
+                });
+            }
+            None => return Err(LfsObjectError::PointerMissingVersion),
+        }
+
+        Ok(Self::new(LfsObject::new(
+            oid.ok_or(LfsObjectError::PointerMissingOid)?,
+            size.ok_or(LfsObjectError::PointerMissingSize)?,
+        )))
+    }
+
+    /// Renders this pointer in the canonical three-line Git LFS form.
+    #[must_use]
+    pub fn to_pointer_file(&self) -> String {
+        format!(
+            "version {}\noid {}\nsize {}\n",
+            self.version,
+            self.object.oid.as_pointer_oid(),
+            self.object.size
+        )
+    }
+}
+
+impl fmt::Display for LfsPointer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.to_pointer_file())
+    }
+}
+
+impl FromStr for LfsPointer {
+    type Err = LfsObjectError;
+
+    fn from_str(contents: &str) -> Result<Self, Self::Err> {
+        Self::parse(contents)
+    }
+}
+
+/// Git LFS batch operation requested by the client.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LfsBatchOperation {
+    /// Request download actions for the listed objects.
+    Download,
+    /// Request upload actions for the listed objects.
+    Upload,
+}
+
+/// Optional Git ref context supplied in a batch request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LfsBatchRef {
+    /// Fully qualified ref name, such as `refs/heads/main`.
+    pub name: String,
+}
+
+/// Git LFS batch request payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LfsBatchRequest {
+    /// Requested transfer operation.
+    pub operation: LfsBatchOperation,
+    /// Transfer adapters supported by the client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfers: Vec<String>,
+    /// Optional ref context for future ref-aware authorization.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_context: Option<LfsBatchRef>,
+    /// Objects included in this batch request.
+    pub objects: Vec<LfsObject>,
+}
+
+/// Git LFS batch response payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LfsBatchResponse {
+    /// Transfer adapter selected by the server.
+    pub transfer: String,
+    /// Per-object batch results.
+    pub objects: Vec<LfsBatchObjectResponse>,
+}
+
+/// Per-object result in a Git LFS batch response.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LfsBatchObjectResponse {
+    /// SHA-256 object identifier.
+    pub oid: LfsOid,
+    /// Exact object size in bytes.
+    pub size: LfsObjectSize,
+    /// Whether the returned actions require authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated: Option<bool>,
+    /// Upload/download/verify actions keyed by action name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actions: BTreeMap<String, LfsBatchAction>,
+    /// Object-level error returned instead of actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<LfsBatchObjectError>,
+}
+
+impl LfsBatchObjectResponse {
+    /// Creates an action-bearing object response.
+    #[must_use]
+    pub fn with_actions(
+        object: &LfsObject,
+        authenticated: bool,
+        actions: BTreeMap<String, LfsBatchAction>,
+    ) -> Self {
+        Self {
+            oid: object.oid.clone(),
+            size: object.size,
+            authenticated: Some(authenticated),
+            actions,
+            error: None,
+        }
+    }
+
+    /// Creates an object-level error response.
+    #[must_use]
+    pub fn with_error(object: &LfsObject, error: LfsBatchObjectError) -> Self {
+        Self {
+            oid: object.oid.clone(),
+            size: object.size,
+            authenticated: None,
+            actions: BTreeMap::new(),
+            error: Some(error),
+        }
+    }
+}
+
+/// HTTP action advertised to a Git LFS client.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LfsBatchAction {
+    /// URL the client should call for this action.
+    pub href: String,
+    /// Additional HTTP headers required for the action.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub header: BTreeMap<String, String>,
+    /// RFC 3339 expiration timestamp, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Expiration lifetime in seconds, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
+}
+
+impl LfsBatchAction {
+    /// Creates an action with no extra headers or expiration metadata.
+    #[must_use]
+    pub fn new(href: impl Into<String>) -> Self {
+        Self {
+            href: href.into(),
+            header: BTreeMap::new(),
+            expires_at: None,
+            expires_in: None,
+        }
+    }
+}
+
+/// Git LFS object-level error response.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LfsBatchObjectError {
+    /// HTTP-like status code for the object-level failure.
+    pub code: u16,
+    /// Human-readable error message safe to show to the Git LFS client.
+    pub message: String,
+}
+
+impl LfsBatchObjectError {
+    /// Creates an object-level error payload.
+    #[must_use]
+    pub fn new(code: u16, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::{
+        LfsBatchObjectError, LfsBatchObjectResponse, LfsObject, LfsObjectError, LfsObjectSize,
+        LfsOid, LfsPointer,
+    };
+
+    const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn oid_accepts_raw_or_prefixed_sha256_and_normalizes_case() {
+        let raw = LfsOid::from_str(OID).expect("raw sha256 oid should parse");
+        let prefixed = LfsOid::from_str(
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .expect("prefixed sha256 oid should parse");
+
+        assert_eq!(raw, prefixed);
+        assert_eq!(prefixed.as_hex(), OID);
+        assert_eq!(prefixed.as_pointer_oid(), format!("sha256:{OID}"));
+    }
+
+    #[test]
+    fn oid_rejects_invalid_digest_text() {
+        let short = LfsOid::from_str("abc").expect_err("short oid should fail");
+        let wrong_algorithm =
+            LfsOid::from_str(&format!("sha1:{OID}")).expect_err("wrong algorithm should fail");
+        let non_hex =
+            LfsOid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz")
+                .expect_err("non-hex oid should fail");
+
+        assert!(matches!(
+            short,
+            LfsObjectError::InvalidSha256Length { actual: 3 }
+        ));
+        assert!(matches!(
+            wrong_algorithm,
+            LfsObjectError::UnsupportedOidAlgorithm { .. }
+        ));
+        assert!(matches!(
+            non_hex,
+            LfsObjectError::InvalidSha256Hex { index: 63 }
+        ));
+    }
+
+    #[test]
+    fn pointer_parses_and_renders_canonical_metadata() {
+        let contents = "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             size 42\n";
+
+        let pointer = LfsPointer::parse(contents).expect("pointer should parse");
+
+        assert_eq!(pointer.object.oid.as_hex(), OID);
+        assert_eq!(pointer.object.size.bytes(), 42);
+        assert_eq!(pointer.to_pointer_file(), contents);
+    }
+
+    #[test]
+    fn pointer_rejects_missing_and_unexpected_lines() {
+        let missing_size = "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let unexpected = "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             size 42\n\
+             ext-key value\n";
+
+        assert!(matches!(
+            LfsPointer::parse(missing_size),
+            Err(LfsObjectError::PointerMissingSize)
+        ));
+        assert!(matches!(
+            LfsPointer::parse(unexpected),
+            Err(LfsObjectError::PointerUnexpectedLine { .. })
+        ));
+    }
+
+    #[test]
+    fn batch_object_response_separates_actions_from_errors() {
+        let object = LfsObject::new(LfsOid::from_str(OID).unwrap(), LfsObjectSize::new(42));
+        let response = LfsBatchObjectResponse::with_error(
+            &object,
+            LfsBatchObjectError::new(404, "object not found"),
+        );
+
+        assert_eq!(response.oid, object.oid);
+        assert_eq!(response.size, object.size);
+        assert!(response.actions.is_empty());
+        assert_eq!(response.error.as_ref().map(|error| error.code), Some(404));
+    }
+}
