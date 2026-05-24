@@ -6,9 +6,11 @@
 
 use std::{
     fmt,
-    io::Write,
+    io::{Read, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use url::Url;
@@ -20,6 +22,7 @@ pub const DEFAULT_GIT_CREDENTIAL_USERNAME: &str = "lfs-cloud";
 
 const MAX_CREDENTIAL_FIELD_LEN: usize = 2048;
 const MAX_COMMAND_STDERR_LEN: usize = 4096;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Credential-helper payload for approving one configured LFS URL.
 #[derive(Clone, Eq, PartialEq)]
@@ -89,6 +92,8 @@ impl GitCredentialApproval {
     /// argument, so process listings do not expose the secret. Before storing
     /// the credential, this persists path-aware lookup for the LFS Cloud host so
     /// future Git LFS credential fills also keep repository paths separate.
+    /// This writes `credential.<lfs-host>.useHttpPath=true` to the user's global
+    /// Git config because Git LFS resolves credentials in later processes.
     ///
     /// # Errors
     ///
@@ -116,28 +121,27 @@ impl GitCredentialApproval {
         let credential_scope = credential_host_scope(&self.lfs_url);
         let config_key = format!("credential.{credential_scope}.useHttpPath");
         let command_name = format!("git config --global {config_key} true");
-        let output = Command::new(git_program)
+        let mut child = Command::new(git_program)
             .args(["config", "--global", &config_key, "true"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|source| CliError::Io {
                 context: format!("failed to start {command_name}"),
                 source,
             })?;
+        let (status, stderr) =
+            wait_for_git_command(&mut child, &command_name, self.token.as_str())?;
 
-        if output.status.success() {
+        if status.success() {
             return Ok(());
         }
 
         Err(CliError::ExternalCommand {
             command: command_name,
-            status: output
-                .status
-                .code()
-                .map_or_else(|| output.status.to_string(), |code| code.to_string()),
-            stderr: sanitize_command_stderr(&output.stderr, self.token.as_str()),
+            status: command_status_text(status),
+            stderr: sanitize_command_stderr(&stderr, self.token.as_str()),
         })
     }
 
@@ -170,22 +174,16 @@ impl GitCredentialApproval {
                 })?;
         }
 
-        let output = child.wait_with_output().map_err(|source| CliError::Io {
-            context: format!("failed to wait for {command_name}"),
-            source,
-        })?;
+        let (status, stderr) = wait_for_git_command(&mut child, command_name, self.token.as_str())?;
 
-        if output.status.success() {
+        if status.success() {
             return Ok(());
         }
 
         Err(CliError::ExternalCommand {
             command: command_name.to_owned(),
-            status: output
-                .status
-                .code()
-                .map_or_else(|| output.status.to_string(), |code| code.to_string()),
-            stderr: sanitize_command_stderr(&output.stderr, self.token.as_str()),
+            status: command_status_text(status),
+            stderr: sanitize_command_stderr(&stderr, self.token.as_str()),
         })
     }
 
@@ -201,6 +199,8 @@ impl GitCredentialApproval {
 
 fn credential_host_scope(url: &Url) -> String {
     let mut scope = url.clone();
+    // Git matches this URL-shaped credential section with a trailing slash; the
+    // manual credential-helper check protects this exact global config key.
     scope.set_path("");
     scope.set_query(None);
     scope.set_fragment(None);
@@ -235,6 +235,18 @@ fn validate_lfs_credential_url(value: &str) -> CliResult<Url> {
         });
     }
 
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CliError::InvalidArguments {
+            message: "configured LFS URL must not include a username or password".to_owned(),
+        });
+    }
+
+    if url.query().is_some() {
+        return Err(CliError::InvalidArguments {
+            message: "configured LFS URL must not include a query string".to_owned(),
+        });
+    }
+
     Ok(url)
 }
 
@@ -252,10 +264,7 @@ fn validate_credential_field(label: &str, value: String) -> CliResult<String> {
         });
     }
 
-    if value
-        .chars()
-        .any(|character| character == '\n' || character == '\r' || character.is_control())
-    {
+    if value.chars().any(char::is_control) {
         return Err(CliError::InvalidArguments {
             message: format!("{label} must not contain control characters"),
         });
@@ -267,8 +276,11 @@ fn validate_credential_field(label: &str, value: String) -> CliResult<String> {
 fn sanitize_command_stderr(stderr: &[u8], token: &str) -> SanitizedMessage {
     let mut message = String::from_utf8_lossy(stderr).into_owned();
     if !token.is_empty() {
+        // Redact even short restored tokens; avoiding secret disclosure is more
+        // important than preserving every character of helper diagnostics.
         message = message.replace(token, "<redacted>");
     }
+    message = message.replace(['\r', '\n'], " ");
     if message.len() > MAX_COMMAND_STDERR_LEN {
         let boundary = (0..=MAX_COMMAND_STDERR_LEN)
             .rev()
@@ -286,13 +298,78 @@ fn sanitize_command_stderr(stderr: &[u8], token: &str) -> SanitizedMessage {
     }
 }
 
+fn wait_for_git_command(
+    child: &mut Child,
+    command_name: &str,
+    token: &str,
+) -> CliResult<(ExitStatus, Vec<u8>)> {
+    wait_for_git_command_timeout(child, command_name, token, GIT_COMMAND_TIMEOUT)
+}
+
+fn wait_for_git_command_timeout(
+    child: &mut Child,
+    command_name: &str,
+    token: &str,
+    timeout: Duration,
+) -> CliResult<(ExitStatus, Vec<u8>)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|source| CliError::Io {
+            context: format!("failed to wait for {command_name}"),
+            source,
+        })? {
+            let stderr = read_child_stderr(child, command_name)?;
+            return Ok((status, stderr));
+        }
+
+        if Instant::now() >= deadline {
+            child.kill().map_err(|source| CliError::Io {
+                context: format!("failed to stop timed-out {command_name}"),
+                source,
+            })?;
+            let _ = child.wait();
+            let stderr = read_child_stderr(child, command_name)?;
+            return Err(CliError::ExternalCommand {
+                command: command_name.to_owned(),
+                status: format!("timed out after {} seconds", timeout.as_secs()),
+                stderr: sanitize_command_stderr(&stderr, token),
+            });
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_child_stderr(child: &mut Child, command_name: &str) -> CliResult<Vec<u8>> {
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr)
+            .map_err(|source| CliError::Io {
+                context: format!("failed to read stderr from {command_name}"),
+                source,
+            })?;
+    }
+    Ok(stderr)
+}
+
+fn command_status_text(status: ExitStatus) -> String {
+    status
+        .code()
+        .map_or_else(|| status.to_string(), |code| code.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::Path,
+        process::{Command, Stdio},
+        time::Duration,
+    };
 
     use super::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, MAX_COMMAND_STDERR_LEN,
-        sanitize_command_stderr,
+        sanitize_command_stderr, wait_for_git_command_timeout,
     };
     use crate::{CliError, LfsSessionToken};
 
@@ -324,6 +401,8 @@ mod tests {
             "file:///tmp/repo.git/info/lfs",
             "https://",
             "https://lfs.example.com/repo.git/info/lfs#fragment",
+            "https://user:pass@lfs.example.com/repo.git/info/lfs",
+            "https://lfs.example.com/repo.git/info/lfs?token=secret",
         ] {
             let error = GitCredentialApproval::new(invalid, token()).unwrap_err();
             assert!(matches!(error, CliError::InvalidArguments { .. }));
@@ -421,6 +500,67 @@ exit 42
         assert!(matches!(error, CliError::ExternalCommand { .. }));
         assert!(display.contains("git credential approve failed"));
         assert!(display.contains("<redacted>"));
+        assert!(!display.contains("local-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approve_failure_normalizes_multiline_command_stderr() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let fake_git = write_fake_git(
+            temp.path(),
+            r#"#!/bin/sh
+if [ "$1" = "config" ]; then
+  exit 0
+fi
+printf 'first line\nsecond local-lfs-token line\n' >&2
+exit 42
+"#,
+        );
+        let approval = GitCredentialApproval::new(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            token(),
+        )
+        .expect("approval should parse");
+
+        let error = approval
+            .approve_with_git_program(&fake_git)
+            .expect_err("fake git should fail");
+        let display = error.to_string();
+
+        assert!(display.contains("first line second <redacted> line"));
+        assert!(!display.contains('\n'));
+        assert!(!display.contains("local-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approve_failure_times_out_hung_git_helpers() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let fake_git = write_fake_git(
+            temp.path(),
+            r#"#!/bin/sh
+echo "waiting with local-lfs-token" >&2
+sleep 5
+"#,
+        );
+        let mut child = Command::new(&fake_git)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fake git should start");
+
+        let error = wait_for_git_command_timeout(
+            &mut child,
+            "fake git",
+            "local-lfs-token",
+            Duration::from_millis(100),
+        )
+        .expect_err("fake git should time out");
+        let display = error.to_string();
+
+        assert!(display.contains("fake git failed with status timed out"));
         assert!(!display.contains("local-lfs-token"));
     }
 
