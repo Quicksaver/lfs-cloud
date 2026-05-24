@@ -24,8 +24,8 @@ pub use logging::{
     tracing_filter,
 };
 pub use providers::{
-    RepositoryAuthorization, RepositoryHandle, RepositoryIdentity, RepositoryProvider,
-    RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
+    ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,
+    RepositoryProvider, RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
 };
 
 /// Returns the placeholder message shown by the scaffold CLI.

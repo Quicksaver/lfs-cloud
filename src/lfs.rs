@@ -85,6 +85,20 @@ pub enum LfsObjectError {
         /// Unsupported pointer line.
         line: String,
     },
+
+    /// The pointer extension key used a reserved name or invalid character.
+    #[error("invalid LFS pointer extension key: {key}")]
+    PointerInvalidExtensionKey {
+        /// Extension key that could not be safely rendered in a pointer file.
+        key: String,
+    },
+
+    /// The pointer extension value contained a line break.
+    #[error("invalid LFS pointer extension value for {key}: values cannot contain line breaks")]
+    PointerInvalidExtensionValue {
+        /// Extension key associated with the invalid value.
+        key: String,
+    },
 }
 
 /// A validated SHA-256 Git LFS object identifier without the `sha256:` prefix.
@@ -246,8 +260,8 @@ impl LfsObject {
 pub struct LfsPointer {
     /// Pointer version URL.
     pub version: &'static str,
-    /// Extension records keyed by pointer extension name.
-    pub extensions: BTreeMap<String, LfsOid>,
+    /// Extension and unknown records keyed by pointer key.
+    extensions: BTreeMap<String, String>,
     /// Object referenced by the pointer file.
     pub object: LfsObject,
 }
@@ -261,6 +275,32 @@ impl LfsPointer {
             extensions: BTreeMap::new(),
             object,
         }
+    }
+
+    /// Returns extension and unknown pointer records preserved from the pointer file.
+    #[must_use]
+    pub fn extensions(&self) -> &BTreeMap<String, String> {
+        &self.extensions
+    }
+
+    /// Inserts an extension or unknown pointer record.
+    ///
+    /// The `version`, `oid`, and `size` keys are owned by the core pointer
+    /// fields. Extension keys must use Git LFS pointer key characters so the
+    /// pointer can be rendered back into its canonical sorted form.
+    pub fn insert_extension(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), LfsObjectError> {
+        let key = key.into();
+        let value = value.into();
+
+        validate_extension_key(&key)?;
+        validate_extension_value(&key, &value)?;
+
+        self.extensions.insert(key, value);
+        Ok(())
     }
 
     /// Parses a Git LFS pointer file.
@@ -333,8 +373,9 @@ impl LfsPointer {
                     })?;
                     size = Some(LfsObjectSize::new(parsed_size));
                 }
-                extension_key if extension_key.starts_with("ext-") => {
-                    extensions.insert(extension_key.to_owned(), Self::parse_pointer_oid(value)?);
+                extension_key if is_valid_extension_key(extension_key) => {
+                    validate_extension_value(extension_key, value)?;
+                    extensions.insert(extension_key.to_owned(), value.to_owned());
                 }
                 _ => {
                     return Err(LfsObjectError::PointerUnexpectedLine {
@@ -358,16 +399,14 @@ impl LfsPointer {
     #[must_use]
     pub fn to_pointer_file(&self) -> String {
         let mut pointer = format!("version {}\n", self.version);
+        let mut fields = self.extensions.clone();
 
-        for (key, oid) in &self.extensions {
-            pointer.push_str(&format!("{key} {}\n", oid.as_pointer_oid()));
+        fields.insert("oid".to_owned(), self.object.oid.as_pointer_oid());
+        fields.insert("size".to_owned(), self.object.size.to_string());
+
+        for (key, value) in fields {
+            pointer.push_str(&format!("{key} {value}\n"));
         }
-
-        pointer.push_str(&format!(
-            "oid {}\nsize {}\n",
-            self.object.oid.as_pointer_oid(),
-            self.object.size
-        ));
         pointer
     }
 
@@ -379,6 +418,33 @@ impl LfsPointer {
         })?;
 
         LfsOid::from_sha256_hex(oid_hex)
+    }
+}
+
+fn validate_extension_key(key: &str) -> Result<(), LfsObjectError> {
+    if is_valid_extension_key(key) {
+        Ok(())
+    } else {
+        Err(LfsObjectError::PointerInvalidExtensionKey {
+            key: key.to_owned(),
+        })
+    }
+}
+
+fn is_valid_extension_key(key: &str) -> bool {
+    !matches!(key, "" | "version" | "oid" | "size")
+        && key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
+}
+
+fn validate_extension_value(key: &str, value: &str) -> Result<(), LfsObjectError> {
+    if value.contains('\r') || value.contains('\n') {
+        Err(LfsObjectError::PointerInvalidExtensionValue {
+            key: key.to_owned(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -497,8 +563,11 @@ pub struct LfsBatchAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     /// Expiration lifetime in seconds, if available.
+    ///
+    /// The Git LFS batch API allows negative values to represent an already
+    /// expired action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_in: Option<u64>,
+    pub expires_in: Option<i64>,
 }
 
 impl LfsBatchAction {
@@ -605,14 +674,24 @@ mod tests {
 
         assert_eq!(pointer.object.oid.as_hex(), OID);
         assert_eq!(
-            pointer
-                .extensions
-                .get("ext-0-foo")
-                .map(LfsOid::as_pointer_oid),
-            Some(
-                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                    .to_owned()
-            )
+            pointer.extensions().get("ext-0-foo").map(String::as_str),
+            Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(pointer.to_pointer_file(), contents);
+    }
+
+    #[test]
+    fn pointer_preserves_unknown_extension_values_as_strings() {
+        let contents = "version https://git-lfs.github.com/spec/v1\n\
+             metadata arbitrary extension value\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             size 42\n";
+
+        let pointer = LfsPointer::parse(contents).expect("extended pointer should parse");
+
+        assert_eq!(
+            pointer.extensions().get("metadata").map(String::as_str),
+            Some("arbitrary extension value")
         );
         assert_eq!(pointer.to_pointer_file(), contents);
     }
@@ -649,6 +728,25 @@ mod tests {
     }
 
     #[test]
+    fn pointer_rejects_invalid_version_and_size() {
+        let invalid_version = "version https://example.com/spec/v1\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             size 42\n";
+        let invalid_size = "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             size not-a-number\n";
+
+        assert!(matches!(
+            LfsPointer::parse(invalid_version),
+            Err(LfsObjectError::PointerInvalidVersion { .. })
+        ));
+        assert!(matches!(
+            LfsPointer::parse(invalid_size),
+            Err(LfsObjectError::PointerInvalidSize { .. })
+        ));
+    }
+
+    #[test]
     fn pointer_rejects_out_of_order_and_duplicate_keys() {
         let oid_before_version = "oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
              version https://git-lfs.github.com/spec/v1\n\
@@ -669,6 +767,50 @@ mod tests {
     }
 
     #[test]
+    fn pointer_renders_extension_keys_in_canonical_order() {
+        let object = LfsObject::new(LfsOid::from_str(OID).unwrap(), LfsObjectSize::new(42));
+        let mut pointer = LfsPointer::new(object);
+
+        pointer
+            .insert_extension("zz", "after size")
+            .expect("extension key should be valid");
+        pointer
+            .insert_extension("aa", "before oid")
+            .expect("extension key should be valid");
+
+        assert_eq!(
+            pointer.to_pointer_file(),
+            "version https://git-lfs.github.com/spec/v1\n\
+             aa before oid\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             size 42\n\
+             zz after size\n"
+        );
+    }
+
+    #[test]
+    fn pointer_rejects_invalid_extension_keys() {
+        let object = LfsObject::new(LfsOid::from_str(OID).unwrap(), LfsObjectSize::new(42));
+        let mut pointer = LfsPointer::new(object);
+
+        assert!(matches!(
+            pointer.insert_extension(
+                "oid",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            Err(LfsObjectError::PointerInvalidExtensionKey { .. })
+        ));
+        assert!(matches!(
+            pointer.insert_extension("Invalid", "value"),
+            Err(LfsObjectError::PointerInvalidExtensionKey { .. })
+        ));
+        assert!(matches!(
+            pointer.insert_extension("ext-test", "bad\nvalue"),
+            Err(LfsObjectError::PointerInvalidExtensionValue { .. })
+        ));
+    }
+
+    #[test]
     fn batch_object_response_separates_actions_from_errors() {
         let object = LfsObject::new(LfsOid::from_str(OID).unwrap(), LfsObjectSize::new(42));
         let response = LfsBatchObjectResponse::with_error(
@@ -680,5 +822,14 @@ mod tests {
         assert_eq!(response.size, object.size);
         assert!(response.actions.is_empty());
         assert_eq!(response.error.as_ref().map(|error| error.code), Some(404));
+    }
+
+    #[test]
+    fn batch_action_allows_already_expired_lifetime() {
+        let mut action = super::LfsBatchAction::new("https://lfs.example.com/object");
+
+        action.expires_in = Some(-1);
+
+        assert_eq!(action.expires_in, Some(-1));
     }
 }

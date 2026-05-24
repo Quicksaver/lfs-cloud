@@ -4,9 +4,15 @@
 //! the storage provider, but the LFS protocol layer should depend on these
 //! traits rather than concrete provider implementations.
 
-use std::{future::Future, path::Path};
+use std::{future::Future, path::Path, pin::Pin};
 
 use crate::{LfsObject, RepositoryPermission, RepositoryProviderResult, StorageResult};
+
+/// Boxed asynchronous provider operation.
+///
+/// Provider traits use this alias so callers can store configured providers as
+/// trait objects while implementations can still perform network I/O.
+pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Configured repository address resolved from an LFS route or CLI context.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,7 +123,7 @@ pub trait RepositoryProvider {
     fn repository_identity<'a>(
         &'a self,
         repository: &'a RepositoryHandle,
-    ) -> impl Future<Output = RepositoryProviderResult<RepositoryIdentity>> + Send + 'a;
+    ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryIdentity>>;
 
     /// Checks whether a user has the permission required by an LFS operation.
     fn check_permission<'a>(
@@ -125,7 +131,7 @@ pub trait RepositoryProvider {
         repository: &'a RepositoryIdentity,
         user: &'a RepositoryUser,
         required: RepositoryPermission,
-    ) -> impl Future<Output = RepositoryProviderResult<RepositoryAuthorization>> + Send + 'a;
+    ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryAuthorization>>;
 }
 
 /// Storage metadata for an object that exists in a backend provider.
@@ -181,27 +187,33 @@ pub trait StorageProvider {
     fn object_exists<'a>(
         &'a self,
         object: &'a LfsObject,
-    ) -> impl Future<Output = StorageResult<bool>> + Send + 'a;
+    ) -> ProviderFuture<'a, StorageResult<bool>>;
 
     /// Uploads an already-staged and verified object file to this backend.
+    ///
+    /// Providers should treat the [`LfsObject`] size as part of the validation
+    /// contract: stored bytes must match both the OID and the expected size.
     fn upload_object<'a>(
         &'a self,
         object: &'a LfsObject,
         source: &'a Path,
-    ) -> impl Future<Output = StorageResult<StoredObject>> + Send + 'a;
+    ) -> ProviderFuture<'a, StorageResult<StoredObject>>;
 
     /// Downloads an object from this backend into the provided destination path.
+    ///
+    /// Providers should report a missing object or integrity failure when the
+    /// stored object does not match the requested OID and size.
     fn download_object<'a>(
         &'a self,
         object: &'a LfsObject,
         destination: &'a Path,
-    ) -> impl Future<Output = StorageResult<StoredObject>> + Send + 'a;
+    ) -> ProviderFuture<'a, StorageResult<StoredObject>>;
 
     /// Deletes an object or marks it for later cleanup when deletion is unavailable.
     fn delete_or_mark_object<'a>(
         &'a self,
         object: &'a LfsObject,
-    ) -> impl Future<Output = StorageResult<StorageDeleteOutcome>> + Send + 'a;
+    ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>>;
 }
 
 #[cfg(test)]
@@ -209,12 +221,12 @@ mod tests {
     use std::{collections::BTreeSet, path::Path, str::FromStr, sync::Mutex};
 
     use super::{
-        RepositoryAuthorization, RepositoryHandle, RepositoryIdentity, RepositoryProvider,
-        RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
+        ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,
+        RepositoryProvider, RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
     };
     use crate::{
         LfsObject, LfsObjectSize, LfsOid, RepositoryPermission, RepositoryProviderError,
-        RepositoryProviderResult, StorageResult,
+        RepositoryProviderResult, StorageError, StorageResult,
     };
 
     const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -232,14 +244,13 @@ mod tests {
         fn repository_identity<'a>(
             &'a self,
             repository: &'a RepositoryHandle,
-        ) -> impl Future<Output = RepositoryProviderResult<RepositoryIdentity>> + Send + 'a
-        {
-            async move {
+        ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryIdentity>> {
+            Box::pin(async move {
                 Ok(RepositoryIdentity::from_handle(
                     repository,
                     Some("repo-123".to_owned()),
                 ))
-            }
+            })
         }
 
         fn check_permission<'a>(
@@ -247,9 +258,8 @@ mod tests {
             repository: &'a RepositoryIdentity,
             user: &'a RepositoryUser,
             required: RepositoryPermission,
-        ) -> impl Future<Output = RepositoryProviderResult<RepositoryAuthorization>> + Send + 'a
-        {
-            async move {
+        ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryAuthorization>> {
+            Box::pin(async move {
                 if self.granted == required || self.granted == RepositoryPermission::Admin {
                     Ok(RepositoryAuthorization {
                         user: user.clone(),
@@ -265,7 +275,7 @@ mod tests {
                         required,
                     })
                 }
-            }
+            })
         }
     }
 
@@ -282,22 +292,22 @@ mod tests {
         fn object_exists<'a>(
             &'a self,
             object: &'a LfsObject,
-        ) -> impl Future<Output = StorageResult<bool>> + Send + 'a {
-            async move {
+        ) -> ProviderFuture<'a, StorageResult<bool>> {
+            Box::pin(async move {
                 Ok(self
                     .objects
                     .lock()
                     .expect("fake storage lock should not poison")
                     .contains(object))
-            }
+            })
         }
 
         fn upload_object<'a>(
             &'a self,
             object: &'a LfsObject,
             _source: &'a Path,
-        ) -> impl Future<Output = StorageResult<StoredObject>> + Send + 'a {
-            async move {
+        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+            Box::pin(async move {
                 self.objects
                     .lock()
                     .expect("fake storage lock should not poison")
@@ -308,35 +318,48 @@ mod tests {
                     object.clone(),
                     format!("drive-file-{}", object.oid),
                 ))
-            }
+            })
         }
 
         fn download_object<'a>(
             &'a self,
             object: &'a LfsObject,
             _destination: &'a Path,
-        ) -> impl Future<Output = StorageResult<StoredObject>> + Send + 'a {
-            async move {
+        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+            Box::pin(async move {
+                if !self
+                    .objects
+                    .lock()
+                    .expect("fake storage lock should not poison")
+                    .contains(object)
+                {
+                    return Err(StorageError::ObjectNotFound {
+                        provider: self.provider_id.clone(),
+                        oid: object.oid.as_hex().to_owned(),
+                        size: object.size.bytes(),
+                    });
+                }
+
                 Ok(StoredObject::new(
                     self.provider_id.clone(),
                     object.clone(),
                     format!("drive-file-{}", object.oid),
                 ))
-            }
+            })
         }
 
         fn delete_or_mark_object<'a>(
             &'a self,
             object: &'a LfsObject,
-        ) -> impl Future<Output = StorageResult<StorageDeleteOutcome>> + Send + 'a {
-            async move {
+        ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
+            Box::pin(async move {
                 self.objects
                     .lock()
                     .expect("fake storage lock should not poison")
                     .remove(object);
 
                 Ok(StorageDeleteOutcome::Deleted)
-            }
+            })
         }
     }
 
@@ -353,6 +376,7 @@ mod tests {
             provider_id: "github-main".to_owned(),
             granted: RepositoryPermission::Write,
         };
+        let provider: Box<dyn RepositoryProvider> = Box::new(provider);
         let handle = RepositoryHandle::new("github-main", "github.com", "owner", "repo");
         let user = RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned()));
 
@@ -403,6 +427,7 @@ mod tests {
             provider_id: "drive-user-a".to_owned(),
             objects: Mutex::new(BTreeSet::new()),
         };
+        let provider: Box<dyn StorageProvider> = Box::new(provider);
         let object = lfs_object();
         let path = Path::new("/tmp/lfs-cloud-test-object");
 
@@ -433,5 +458,29 @@ mod tests {
 
         assert_eq!(deletion, StorageDeleteOutcome::Deleted);
         assert!(!provider.object_exists(&object).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fake_storage_download_reports_missing_objects() {
+        let provider = FakeStorageProvider {
+            provider_id: "drive-user-a".to_owned(),
+            objects: Mutex::new(BTreeSet::new()),
+        };
+        let object = lfs_object();
+        let path = Path::new("/tmp/lfs-cloud-test-object");
+
+        let error = provider
+            .download_object(&object, path)
+            .await
+            .expect_err("missing object download should fail");
+
+        assert!(matches!(
+            error,
+            StorageError::ObjectNotFound {
+                provider,
+                size: 42,
+                ..
+            } if provider == "drive-user-a"
+        ));
     }
 }
