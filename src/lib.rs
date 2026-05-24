@@ -10,6 +10,7 @@ pub mod github_auth;
 pub mod google_drive;
 pub mod lfs;
 pub mod logging;
+pub mod metadata;
 pub mod providers;
 pub mod server_config;
 pub mod sessions;
@@ -47,13 +48,15 @@ pub use logging::{
     DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, init_tracing,
     tracing_filter,
 };
+pub use metadata::{METADATA_SCHEMA_VERSION, MetadataDatabase};
 pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,
     RepositoryProvider, RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
 };
 pub use server_config::{
-    DEFAULT_CONFIG_PATH, GitHubProviderConfig, GoogleDriveStorageConfig, RepositoryMapping,
-    RepositoryProviderConfig, ServerConfig, ServerSettings, StorageProviderConfig,
+    DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
+    GoogleDriveStorageConfig, RepositoryMapping, RepositoryProviderConfig, ServerConfig,
+    ServerSettings, StorageProviderConfig,
 };
 pub use sessions::{
     DEFAULT_LFS_SESSION_TTL, IssuedLfsSession, LfsSessionMetadata, LfsSessionToken,

@@ -1114,20 +1114,13 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 3 Google Drive storage is complete. Server-side Google
-> Drive credential references can now load flat OAuth credential JSON from
-> environment-backed secret references, refresh tokens can be exchanged for
-> bearer access tokens, and configured Drive root folders can be validated with
-> a non-mutating metadata probe. Repository-scoped object keys now define a
-> deterministic Drive inspection path and Drive `files.list` lookups verify
-> object identity with private app properties plus binary size. Staged upload
-> files are verified locally by SHA-256 and size before Drive resumable upload
-> sessions are opened. The MVP Drive scope is `drive.file`, with root folders
-> required to be app-created or explicitly app-accessible.
-> Download streaming now resolves Drive file IDs through the verified
-> repository/OID/size lookup path before proxying `alt=media` bytes through an
-> HTTP response, and Drive provider failures are classified into auth, quota,
-> not-found, conflict, and retryable categories.
+> **Status**: Phase 4 metadata setup is underway. The SQLite dependency is
+> present, `server.metadata_path` now resolves to a safe config-relative default
+> of `.lfs-cloud/metadata.sqlite3`, and `MetadataDatabase` opens server-owned
+> SQLite state with foreign-key enforcement and idempotent schema migrations.
+> The initial schema creates repository mapping, storage provider, object,
+> session, and transfer-attempt tables so later object metadata work can add
+> typed lookup and insert/update APIs without revisiting database bootstrap.
 
 ### Progress Summary
 
@@ -1137,13 +1130,13 @@ Defer:
 | 1. Server Config                         | 8           | 8      | 0         |
 | 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
-| 4. Metadata DB                           | 8           | 0      | 8         |
+| 4. Metadata DB                           | 8           | 4      | 4         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **38** | **61**    |
+| **Total**                                | **99**      | **42** | **57**    |
 
 ### Legend
 
@@ -1235,10 +1228,10 @@ Defer:
 
 #### Epic 4.1: SQLite Setup
 
-- [ ] [T] Add SQLite dependency and connection management.
-- [ ] [T] Add migration runner for local DB schema.
-- [ ] [T] Create tables for repository mappings, storage providers, objects, sessions, and transfer attempts.
-- [ ] [T] Add DB path resolution from config with safe defaults.
+- [x] [T] Add SQLite dependency and connection management.
+- [x] [T] Add migration runner for local DB schema.
+- [x] [T] Create tables for repository mappings, storage providers, objects, sessions, and transfer attempts.
+- [x] [T] Add DB path resolution from config with safe defaults.
 
 #### Epic 4.2: Object Metadata
 

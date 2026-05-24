@@ -214,6 +214,46 @@ pub enum ServerError {
         message: String,
     },
 
+    /// The server could not create the metadata database directory.
+    #[error("failed to create metadata database directory {}: {source}", path.display())]
+    MetadataDirectoryCreate {
+        /// Directory path that should contain the SQLite metadata database.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The server could not open the SQLite metadata database.
+    #[error("failed to open metadata database {}: {source}", path.display())]
+    MetadataOpen {
+        /// SQLite database path that was being opened.
+        path: PathBuf,
+        /// Underlying SQLite failure.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// The server could not configure the SQLite metadata connection.
+    #[error("failed to configure metadata database {}: {source}", path.display())]
+    MetadataConfigure {
+        /// SQLite database path that was being configured.
+        path: PathBuf,
+        /// Underlying SQLite failure.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// The server could not apply metadata database migrations.
+    #[error("failed to migrate metadata database {}: {source}", path.display())]
+    MetadataMigration {
+        /// SQLite database path that was being migrated.
+        path: PathBuf,
+        /// Underlying SQLite failure.
+        #[source]
+        source: rusqlite::Error,
+    },
+
     /// No configured repository mapping matches an incoming LFS route.
     #[error("no configured repository route matches {path}")]
     RouteNotConfigured {

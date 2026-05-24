@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use config::{Config, File, FileFormat};
@@ -18,6 +18,10 @@ use crate::{ServerError, ServerResult};
 
 /// Default server config path used when no explicit path is supplied.
 pub const DEFAULT_CONFIG_PATH: &str = "lfs-cloud.yml";
+/// Default metadata state directory relative to the config file.
+pub const DEFAULT_METADATA_DIR: &str = ".lfs-cloud";
+/// Default SQLite metadata database filename.
+pub const DEFAULT_METADATA_DB_FILE: &str = "metadata.sqlite3";
 
 const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const DEFAULT_BIND_PORT: u16 = 8080;
@@ -76,9 +80,14 @@ impl ServerConfig {
             source,
         })?;
 
-        Self::load_from_str_with_env(&contents, path.display().to_string(), |name| {
-            std::env::var(name).ok()
-        })
+        let metadata_base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+        Self::load_from_str_with_env_and_base_dir(
+            &contents,
+            path.display().to_string(),
+            metadata_base_dir,
+            |name| std::env::var(name).ok(),
+        )
     }
 
     /// Parses config from a YAML string.
@@ -100,6 +109,15 @@ impl ServerConfig {
         path: impl Into<String>,
         env: impl FnMut(&str) -> Option<String>,
     ) -> ServerResult<Self> {
+        Self::load_from_str_with_env_and_base_dir(contents, path, Path::new("."), env)
+    }
+
+    fn load_from_str_with_env_and_base_dir(
+        contents: &str,
+        path: impl Into<String>,
+        metadata_base_dir: &Path,
+        env: impl FnMut(&str) -> Option<String>,
+    ) -> ServerResult<Self> {
         let path = path.into();
         let config = Config::builder()
             .add_source(File::from_str(contents, FileFormat::Yaml))
@@ -112,14 +130,15 @@ impl ServerConfig {
             .try_deserialize::<RawServerConfig>()
             .map_err(|source| ServerError::ConfigParse { path, source })?;
 
-        ServerConfig::from_raw(raw, env)
+        ServerConfig::from_raw(raw, env, metadata_base_dir)
     }
 
     fn from_raw(
         raw: RawServerConfig,
         mut env: impl FnMut(&str) -> Option<String>,
+        metadata_base_dir: &Path,
     ) -> ServerResult<Self> {
-        let server = ServerSettings::from_raw(raw.server, &mut env)?;
+        let server = ServerSettings::from_raw(raw.server, &mut env, metadata_base_dir)?;
         let repository_providers = raw
             .repository_providers
             .into_iter()
@@ -213,16 +232,20 @@ pub struct ServerSettings {
     pub port: u16,
     /// Public base URL used when constructing Git LFS action URLs.
     pub public_url: String,
+    /// Local SQLite database path for server-owned metadata.
+    pub metadata_path: PathBuf,
 }
 
 impl ServerSettings {
     fn from_raw(
         raw: RawServerSettings,
         env: &mut impl FnMut(&str) -> Option<String>,
+        metadata_base_dir: &Path,
     ) -> ServerResult<Self> {
         let host = resolve_required(raw.host, "server.host", env)?;
         let public_url = resolve_required(raw.public_url, "server.public_url", env)?;
         validate_http_url(&public_url, "server.public_url", false)?;
+        let metadata_path = resolve_metadata_path(raw.metadata_path, metadata_base_dir, env)?;
 
         if raw.port == 0 {
             return invalid_config("server.port", "must be greater than zero");
@@ -232,6 +255,7 @@ impl ServerSettings {
             host,
             port: raw.port,
             public_url,
+            metadata_path,
         })
     }
 }
@@ -479,6 +503,8 @@ struct RawServerSettings {
     port: u16,
     #[serde(default)]
     public_url: Option<String>,
+    #[serde(default)]
+    metadata_path: Option<String>,
 }
 
 impl Default for RawServerSettings {
@@ -487,6 +513,7 @@ impl Default for RawServerSettings {
             host: default_bind_host(),
             port: default_bind_port(),
             public_url: None,
+            metadata_path: None,
         }
     }
 }
@@ -568,6 +595,36 @@ fn resolve_http_url(
     let value = resolve_required(value, &path, env)?;
     validate_http_url(&value, &path, false)?;
     Ok(value)
+}
+
+fn resolve_metadata_path(
+    value: Option<String>,
+    metadata_base_dir: &Path,
+    env: &mut impl FnMut(&str) -> Option<String>,
+) -> ServerResult<PathBuf> {
+    let path = match value.filter(|value| !value.trim().is_empty()) {
+        Some(value) => {
+            let value = interpolate_env(&value, "server.metadata_path", env)?;
+            if value.trim().is_empty() {
+                return invalid_config("server.metadata_path", "is required when provided");
+            }
+            PathBuf::from(value)
+        }
+        None => PathBuf::from(DEFAULT_METADATA_DIR).join(DEFAULT_METADATA_DB_FILE),
+    };
+
+    if path.as_os_str().is_empty() {
+        return invalid_config("server.metadata_path", "must not be empty");
+    }
+
+    if path.is_absolute()
+        || metadata_base_dir.as_os_str().is_empty()
+        || metadata_base_dir == Path::new(".")
+    {
+        Ok(path)
+    } else {
+        Ok(metadata_base_dir.join(path))
+    }
 }
 
 fn resolve_optional(
@@ -734,11 +791,12 @@ fn invalid_config_error(path: impl Into<String>, message: impl Into<String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
 
     use super::{
-        GitHubProviderConfig, GoogleDriveStorageConfig, RepositoryProviderConfig, ServerConfig,
-        ServerError, StorageProviderConfig,
+        DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
+        GoogleDriveStorageConfig, RepositoryProviderConfig, ServerConfig, ServerError,
+        StorageProviderConfig,
     };
 
     fn valid_yaml() -> &'static str {
@@ -795,6 +853,10 @@ repositories:
         assert_eq!(config.server.port, 8081);
         assert_eq!(config.server.public_url, "http://127.0.0.1:8081");
         assert_eq!(
+            config.server.metadata_path,
+            PathBuf::from(DEFAULT_METADATA_DIR).join(DEFAULT_METADATA_DB_FILE)
+        );
+        assert_eq!(
             config.repositories[0].route_path(),
             "/github.com/owner/repo.git/info/lfs"
         );
@@ -850,6 +912,13 @@ storage_providers:
         let config = ServerConfig::load_from_path(&config_path).expect("config should load");
 
         assert_eq!(config.server.public_url, "http://127.0.0.1:8080");
+        assert_eq!(
+            config.server.metadata_path,
+            directory
+                .path()
+                .join(DEFAULT_METADATA_DIR)
+                .join(DEFAULT_METADATA_DB_FILE)
+        );
     }
 
     #[test]
@@ -871,6 +940,83 @@ server:
 
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8080);
+    }
+
+    #[test]
+    fn explicit_relative_metadata_path_resolves_from_config_directory() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = directory.path().join("config").join("lfs-cloud.yml");
+        fs::create_dir_all(
+            config_path
+                .parent()
+                .expect("config path should have parent"),
+        )
+        .expect("config directory should be created");
+        fs::write(
+            &config_path,
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+  metadata_path: state/metadata.sqlite3
+"#,
+        )
+        .expect("config fixture should be written");
+
+        let config = ServerConfig::load_from_path(&config_path).expect("config should load");
+
+        assert_eq!(
+            config.server.metadata_path,
+            directory
+                .path()
+                .join("config")
+                .join("state")
+                .join("metadata.sqlite3")
+        );
+    }
+
+    #[test]
+    fn explicit_absolute_metadata_path_is_preserved() {
+        let path = tempfile::tempdir()
+            .expect("tempdir should be created")
+            .path()
+            .join("metadata.sqlite3");
+        let config = ServerConfig::load_from_str_with_env(
+            &format!(
+                r#"
+server:
+  public_url: http://127.0.0.1:8080
+  metadata_path: {}
+"#,
+                path.display()
+            ),
+            "<test>",
+            test_env,
+        )
+        .expect("config should load");
+
+        assert_eq!(config.server.metadata_path, path);
+    }
+
+    #[test]
+    fn metadata_path_supports_environment_references() {
+        let config = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+  metadata_path: ${METADATA_PATH}
+"#,
+            "<test>",
+            |name| match name {
+                "METADATA_PATH" => Some("state/metadata.sqlite3".to_owned()),
+                _ => test_env(name),
+            },
+        )
+        .expect("config should load");
+
+        assert_eq!(
+            config.server.metadata_path,
+            PathBuf::from("state").join("metadata.sqlite3")
+        );
     }
 
     #[test]

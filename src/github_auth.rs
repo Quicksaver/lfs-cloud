@@ -376,6 +376,10 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
             ServerError::ConfigRead { .. }
             | ServerError::ConfigParse { .. }
             | ServerError::InvalidConfiguration { .. }
+            | ServerError::MetadataDirectoryCreate { .. }
+            | ServerError::MetadataOpen { .. }
+            | ServerError::MetadataConfigure { .. }
+            | ServerError::MetadataMigration { .. }
             | ServerError::RouteNotConfigured { .. }
             | ServerError::Internal { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
