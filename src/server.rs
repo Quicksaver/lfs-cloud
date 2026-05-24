@@ -12,6 +12,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -48,6 +49,8 @@ use crate::{
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
 const GIT_LFS_JSON_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 const MAX_UPLOAD_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MIN_UPLOAD_STAGING_FREE_BYTES: u64 = 64 * 1024 * 1024;
+const UPLOAD_STAGING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const BATCH_STORAGE_LOOKUP_CONCURRENCY: usize = 16;
 
 /// Runtime options supplied by `lfs-cloud serve`.
@@ -854,6 +857,9 @@ async fn handle_lfs_upload_request(
             );
         }
     };
+    if expected_size > MAX_UPLOAD_OBJECT_BYTES {
+        return upload_payload_too_large_response();
+    }
 
     let declared_size = request
         .headers()
@@ -926,6 +932,12 @@ async fn handle_lfs_upload_request(
         Err(UploadStagingError::PayloadTooLarge) => {
             return upload_payload_too_large_response();
         }
+        Err(UploadStagingError::InsufficientTempSpace { .. }) => {
+            return upload_temp_space_exhausted_response();
+        }
+        Err(UploadStagingError::TimedOut) => {
+            return upload_staging_timeout_response();
+        }
         Err(error) => {
             let error = error.into_storage_error();
             tracing::debug!(
@@ -979,13 +991,6 @@ fn transfer_request_expected_size(request: &Request, action: &str) -> ServerResu
                 .map_err(|_| ServerError::InvalidRequest {
                     message: format!("invalid {action} size query value {value:?}"),
                 })?;
-            if action == "upload" && size > MAX_UPLOAD_OBJECT_BYTES {
-                return Err(ServerError::InvalidRequest {
-                    message: format!(
-                        "{action} action size {size} exceeds the maximum supported object size"
-                    ),
-                });
-            }
 
             return Ok(size);
         }
@@ -1000,6 +1005,20 @@ fn upload_payload_too_large_response() -> Response {
     git_lfs_json_error_response(
         StatusCode::PAYLOAD_TOO_LARGE,
         "Git LFS upload object exceeds the configured request size limit",
+    )
+}
+
+fn upload_temp_space_exhausted_response() -> Response {
+    git_lfs_json_error_response(
+        StatusCode::INSUFFICIENT_STORAGE,
+        "Git LFS upload staging directory does not have enough free space",
+    )
+}
+
+fn upload_staging_timeout_response() -> Response {
+    git_lfs_json_error_response(
+        StatusCode::REQUEST_TIMEOUT,
+        "Git LFS upload request timed out while reading the object body",
     )
 }
 
@@ -1033,6 +1052,41 @@ async fn stage_upload_request_body_with_limit(
     request: Request,
     max_upload_bytes: u64,
 ) -> Result<StagedUpload, UploadStagingError> {
+    stage_upload_request_body_with_guardrails(
+        expected_oid,
+        expected_size,
+        request,
+        UploadStagingGuardrails {
+            max_upload_bytes,
+            ..UploadStagingGuardrails::default()
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UploadStagingGuardrails {
+    max_upload_bytes: u64,
+    min_free_bytes: u64,
+    idle_timeout: Duration,
+}
+
+impl Default for UploadStagingGuardrails {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: MAX_UPLOAD_OBJECT_BYTES,
+            min_free_bytes: MIN_UPLOAD_STAGING_FREE_BYTES,
+            idle_timeout: UPLOAD_STAGING_IDLE_TIMEOUT,
+        }
+    }
+}
+
+async fn stage_upload_request_body_with_guardrails(
+    expected_oid: &LfsOid,
+    expected_size: Option<u64>,
+    request: Request,
+    guardrails: UploadStagingGuardrails,
+) -> Result<StagedUpload, UploadStagingError> {
     let temp_file = tempfile::Builder::new()
         .prefix("lfs-cloud-upload-")
         .tempfile()
@@ -1040,6 +1094,11 @@ async fn stage_upload_request_body_with_limit(
             provider: "lfs-cloud".to_owned(),
             message: format!("upload staging file could not be created: {source}"),
         })?;
+    if let Some(expected_size) = expected_size {
+        let staging_dir = temp_file.path().parent().unwrap_or_else(|| Path::new("."));
+        ensure_temp_space_for_upload(staging_dir, expected_size, guardrails.min_free_bytes)?;
+    }
+
     let std_file = temp_file
         .reopen()
         .map_err(|source| StorageError::StagedFileRead {
@@ -1052,7 +1111,13 @@ async fn stage_upload_request_body_with_limit(
     let mut hasher = Sha256::new();
     let mut actual_size = 0_u64;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let Some(chunk) = tokio::time::timeout(guardrails.idle_timeout, stream.next())
+            .await
+            .map_err(|_| UploadStagingError::TimedOut)?
+        else {
+            break;
+        };
         let chunk = chunk.map_err(|source| StorageError::Retryable {
             provider: "lfs-cloud".to_owned(),
             message: format!("upload request body could not be read: {source}"),
@@ -1060,7 +1125,7 @@ async fn stage_upload_request_body_with_limit(
         let next_size = actual_size
             .checked_add(chunk.len() as u64)
             .ok_or(UploadStagingError::PayloadTooLarge)?;
-        if next_size > max_upload_bytes {
+        if next_size > guardrails.max_upload_bytes {
             return Err(UploadStagingError::PayloadTooLarge);
         }
         hasher.update(&chunk);
@@ -1106,9 +1171,48 @@ async fn stage_upload_request_body_with_limit(
     Ok(StagedUpload { temp_file })
 }
 
+fn ensure_temp_space_for_upload(
+    staging_dir: &Path,
+    expected_size: u64,
+    min_free_bytes: u64,
+) -> Result<(), UploadStagingError> {
+    let available =
+        fs4::available_space(staging_dir).map_err(|source| StorageError::Retryable {
+            provider: "lfs-cloud".to_owned(),
+            message: format!(
+                "upload staging directory free space could not be inspected: {source}"
+            ),
+        })?;
+
+    ensure_temp_space_for_upload_with_available_space(expected_size, min_free_bytes, available)
+}
+
+fn ensure_temp_space_for_upload_with_available_space(
+    expected_size: u64,
+    min_free_bytes: u64,
+    available_space: u64,
+) -> Result<(), UploadStagingError> {
+    let required_space = expected_size
+        .checked_add(min_free_bytes)
+        .ok_or(UploadStagingError::PayloadTooLarge)?;
+    if available_space < required_space {
+        return Err(UploadStagingError::InsufficientTempSpace {
+            required_space,
+            available_space,
+        });
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 enum UploadStagingError {
     PayloadTooLarge,
+    InsufficientTempSpace {
+        required_space: u64,
+        available_space: u64,
+    },
+    TimedOut,
     Storage(StorageError),
 }
 
@@ -1118,6 +1222,19 @@ impl UploadStagingError {
             Self::PayloadTooLarge => StorageError::QuotaExceeded {
                 provider: "lfs-cloud".to_owned(),
                 message: "upload object exceeded request size limit".to_owned(),
+            },
+            Self::InsufficientTempSpace {
+                required_space,
+                available_space,
+            } => StorageError::QuotaExceeded {
+                provider: "lfs-cloud".to_owned(),
+                message: format!(
+                    "upload staging directory has {available_space} bytes available but requires {required_space} bytes"
+                ),
+            },
+            Self::TimedOut => StorageError::Retryable {
+                provider: "lfs-cloud".to_owned(),
+                message: "upload request body timed out while reading".to_owned(),
             },
             Self::Storage(error) => error,
         }
@@ -1835,7 +1952,7 @@ mod tests {
 
     use axum::{
         Json, Router,
-        body::{Body, to_bytes},
+        body::{Body, Bytes, to_bytes},
         extract::Path,
         http::{
             HeaderMap, HeaderValue, Method, Request, StatusCode,
@@ -1850,13 +1967,15 @@ mod tests {
     use super::{
         BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsBatchAuthorizer, LfsDownloadResponse,
         LfsObjectTransferStore, LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord,
-        MAX_UPLOAD_OBJECT_BYTES, ServerBind, advertised_server_urls, authenticate_lfs_session,
+        MAX_UPLOAD_OBJECT_BYTES, ServerBind, UploadStagingGuardrails, advertised_server_urls,
+        authenticate_lfs_session, ensure_temp_space_for_upload_with_available_space,
         lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
         render_server_startup_message, server_router_with_sessions, stage_upload_request_body,
-        stage_upload_request_body_with_limit,
+        stage_upload_request_body_with_guardrails, stage_upload_request_body_with_limit,
     };
     use base64::Engine as _;
+    use futures_util::stream;
     use sha2::{Digest, Sha256};
 
     use crate::{
@@ -3080,6 +3199,38 @@ repositories:
     }
 
     #[tokio::test]
+    async fn upload_endpoint_rejects_oversized_action_size_before_staging() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let transfer_store = RecordingTransferStore::missing();
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+        );
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::PUT,
+                &format!(
+                    "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size={}",
+                    MAX_UPLOAD_OBJECT_BYTES + 1
+                ),
+                Some(&format!("Bearer {token}")),
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Git LFS upload object exceeds the configured request size limit",
+        )
+        .await;
+        assert!(transfer_store.uploads().is_empty());
+    }
+
+    #[tokio::test]
     async fn staged_upload_uses_declared_content_length_in_integrity_errors() {
         let body = "declared size should be preserved";
         let request = Request::builder()
@@ -3137,6 +3288,59 @@ repositories:
         };
 
         assert!(matches!(error, super::UploadStagingError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn temp_space_guardrail_requires_expected_size_plus_headroom() {
+        ensure_temp_space_for_upload_with_available_space(10, 5, 15)
+            .expect("exact expected size plus headroom should be accepted");
+
+        let error = ensure_temp_space_for_upload_with_available_space(10, 5, 14)
+            .expect_err("insufficient temp space should be rejected");
+        assert!(matches!(
+            error,
+            super::UploadStagingError::InsufficientTempSpace {
+                required_space: 15,
+                available_space: 14
+            }
+        ));
+
+        let overflow = ensure_temp_space_for_upload_with_available_space(u64::MAX, 1, u64::MAX)
+            .expect_err("overflowing required space should be rejected");
+        assert!(matches!(
+            overflow,
+            super::UploadStagingError::PayloadTooLarge
+        ));
+    }
+
+    #[tokio::test]
+    async fn staged_upload_aborts_when_body_stream_stalls() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .body(Body::from_stream(stream::pending::<
+                Result<Bytes, std::io::Error>,
+            >()))
+            .expect("test request should build");
+
+        let error = match stage_upload_request_body_with_guardrails(
+            &LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("test oid should parse"),
+            None,
+            request,
+            UploadStagingGuardrails {
+                max_upload_bytes: MAX_UPLOAD_OBJECT_BYTES,
+                min_free_bytes: 0,
+                idle_timeout: Duration::from_millis(1),
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("stalled upload body should fail staging"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, super::UploadStagingError::TimedOut));
     }
 
     #[tokio::test]
