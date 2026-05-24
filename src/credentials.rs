@@ -9,6 +9,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
 };
@@ -22,7 +23,11 @@ pub const DEFAULT_GIT_CREDENTIAL_USERNAME: &str = "lfs-cloud";
 
 const MAX_CREDENTIAL_FIELD_LEN: usize = 2048;
 const MAX_COMMAND_STDERR_LEN: usize = 4096;
+const MAX_RETAINED_COMMAND_STDERR_LEN: usize = MAX_COMMAND_STDERR_LEN + MAX_CREDENTIAL_FIELD_LEN;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const STDERR_DRAIN_AFTER_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
+const STDERR_DRAIN_AFTER_KILL_TIMEOUT: Duration = Duration::from_millis(100);
+const STDERR_EVENTS_PER_WAIT_POLL: usize = 64;
 
 /// Credential-helper payload for approving one configured LFS URL.
 #[derive(Clone, Eq, PartialEq)]
@@ -121,7 +126,8 @@ impl GitCredentialApproval {
         let credential_scope = credential_host_scope(&self.lfs_url);
         let config_key = format!("credential.{credential_scope}.useHttpPath");
         let command_name = format!("git config --global {config_key} true");
-        let mut child = Command::new(git_program)
+        let mut command = git_command(git_program);
+        let mut child = command
             .args(["config", "--global", &config_key, "true"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -147,7 +153,8 @@ impl GitCredentialApproval {
 
     fn approve_with_configured_git(&self, git_program: &Path) -> CliResult<()> {
         let command_name = "git credential approve";
-        let mut child = Command::new(git_program)
+        let mut command = git_command(git_program);
+        let mut child = command
             .args(["credential", "approve"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -313,22 +320,34 @@ fn wait_for_git_command_timeout(
     timeout: Duration,
 ) -> CliResult<(ExitStatus, Vec<u8>)> {
     let deadline = Instant::now() + timeout;
+    let mut stderr = Vec::new();
+    let mut stderr_reader = child.stderr.take().map(StderrReader::new);
+
     loop {
+        drain_available_stderr(&mut stderr_reader, &mut stderr, command_name)?;
+
         if let Some(status) = child.try_wait().map_err(|source| CliError::Io {
             context: format!("failed to wait for {command_name}"),
             source,
         })? {
-            let stderr = read_child_stderr(child, command_name)?;
+            drain_stderr_until(
+                &mut stderr_reader,
+                &mut stderr,
+                command_name,
+                STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
+            )?;
             return Ok((status, stderr));
         }
 
         if Instant::now() >= deadline {
-            child.kill().map_err(|source| CliError::Io {
-                context: format!("failed to stop timed-out {command_name}"),
-                source,
-            })?;
+            stop_timed_out_child(child, command_name)?;
             let _ = child.wait();
-            let stderr = read_child_stderr(child, command_name)?;
+            drain_stderr_until(
+                &mut stderr_reader,
+                &mut stderr,
+                command_name,
+                STDERR_DRAIN_AFTER_KILL_TIMEOUT,
+            )?;
             return Err(CliError::ExternalCommand {
                 command: command_name.to_owned(),
                 status: format!("timed out after {} seconds", timeout.as_secs()),
@@ -340,16 +359,253 @@ fn wait_for_git_command_timeout(
     }
 }
 
-fn read_child_stderr(child: &mut Child, command_name: &str) -> CliResult<Vec<u8>> {
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_end(&mut stderr)
-            .map_err(|source| CliError::Io {
+fn git_command(git_program: &Path) -> Command {
+    Command::new(git_program)
+}
+
+fn stop_timed_out_child(child: &mut Child, command_name: &str) -> CliResult<()> {
+    stop_timed_out_child_process_tree(child);
+
+    if child
+        .try_wait()
+        .map_err(|source| CliError::Io {
+            context: format!("failed to wait for timed-out {command_name}"),
+            source,
+        })?
+        .is_none()
+    {
+        child.kill().map_err(|source| CliError::Io {
+            context: format!("failed to stop timed-out {command_name}"),
+            source,
+        })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_timed_out_child_process_tree(child: &Child) {
+    let descendants = collect_descendant_pids(child.id());
+    for pid in descendants.iter().rev() {
+        signal_process("TERM", *pid);
+    }
+    thread::sleep(Duration::from_millis(50));
+    for pid in descendants.iter().rev() {
+        signal_process("KILL", *pid);
+    }
+}
+
+#[cfg(unix)]
+fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    let mut descendants = Vec::new();
+    let mut pending = child_pids(root_pid);
+
+    while let Some(pid) = pending.pop() {
+        descendants.push(pid);
+        pending.extend(child_pids(pid));
+    }
+
+    descendants
+}
+
+#[cfg(target_os = "linux")]
+fn child_pids(parent_pid: u32) -> Vec<u32> {
+    let children_path = format!("/proc/{parent_pid}/task/{parent_pid}/children");
+    let Ok(children) = std::fs::read_to_string(children_path) else {
+        return Vec::new();
+    };
+
+    children
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn child_pids(parent_pid: u32) -> Vec<u32> {
+    let Ok(output) = Command::new("pgrep")
+        .args(["-P", &parent_pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+#[cfg(unix)]
+fn signal_process(signal: &str, pid: u32) {
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(windows)]
+fn stop_timed_out_child_process_tree(child: &Child) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stop_timed_out_child_process_tree(_child: &Child) {}
+
+struct StderrReader {
+    receiver: Receiver<StderrEvent>,
+    _reader_thread: thread::JoinHandle<()>,
+    closed: bool,
+}
+
+impl StderrReader {
+    fn new(mut pipe: std::process::ChildStderr) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(STDERR_EVENTS_PER_WAIT_POLL);
+        let reader_thread = thread::spawn(move || {
+            let mut buffer = [0; 8192];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = sender.send(StderrEvent::Closed);
+                        break;
+                    }
+                    Ok(count) => {
+                        if sender
+                            .send(StderrEvent::Data(buffer[..count].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(source) => {
+                        let _ = sender.send(StderrEvent::Error(source));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            receiver,
+            _reader_thread: reader_thread,
+            closed: false,
+        }
+    }
+}
+
+enum StderrEvent {
+    Data(Vec<u8>),
+    Error(std::io::Error),
+    Closed,
+}
+
+fn drain_available_stderr(
+    reader: &mut Option<StderrReader>,
+    stderr: &mut Vec<u8>,
+    command_name: &str,
+) -> CliResult<()> {
+    let Some(reader) = reader else {
+        return Ok(());
+    };
+
+    drain_available_stderr_reader(reader, stderr, command_name)
+}
+
+fn drain_available_stderr_reader(
+    reader: &mut StderrReader,
+    stderr: &mut Vec<u8>,
+    command_name: &str,
+) -> CliResult<()> {
+    for _ in 0..STDERR_EVENTS_PER_WAIT_POLL {
+        if reader.closed {
+            break;
+        }
+
+        match reader.receiver.try_recv() {
+            Ok(event) => handle_stderr_event(event, reader, stderr, command_name)?,
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                reader.closed = true;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn drain_stderr_until(
+    reader: &mut Option<StderrReader>,
+    stderr: &mut Vec<u8>,
+    command_name: &str,
+    timeout: Duration,
+) -> CliResult<()> {
+    let Some(reader) = reader else {
+        return Ok(());
+    };
+
+    let deadline = Instant::now() + timeout;
+    while !reader.closed {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match reader.receiver.recv_timeout(remaining) {
+            Ok(event) => handle_stderr_event(event, reader, stderr, command_name)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                reader.closed = true;
+            }
+        }
+    }
+
+    drain_available_stderr_reader(reader, stderr, command_name)
+}
+
+fn handle_stderr_event(
+    event: StderrEvent,
+    reader: &mut StderrReader,
+    stderr: &mut Vec<u8>,
+    command_name: &str,
+) -> CliResult<()> {
+    match event {
+        StderrEvent::Data(data) => retain_stderr_data(stderr, &data),
+        StderrEvent::Closed => {
+            reader.closed = true;
+        }
+        StderrEvent::Error(source) => {
+            reader.closed = true;
+            return Err(CliError::Io {
                 context: format!("failed to read stderr from {command_name}"),
                 source,
-            })?;
+            });
+        }
     }
-    Ok(stderr)
+
+    Ok(())
+}
+
+fn retain_stderr_data(stderr: &mut Vec<u8>, data: &[u8]) {
+    let retained = stderr.len();
+    if retained >= MAX_RETAINED_COMMAND_STDERR_LEN {
+        return;
+    }
+
+    let remaining = MAX_RETAINED_COMMAND_STDERR_LEN - retained;
+    stderr.extend_from_slice(&data[..remaining.min(data.len())]);
 }
 
 fn command_status_text(status: ExitStatus) -> String {
@@ -364,12 +620,14 @@ mod tests {
         fs,
         path::Path,
         process::{Command, Stdio},
-        time::Duration,
+        thread,
+        time::{Duration, Instant},
     };
 
     use super::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, MAX_COMMAND_STDERR_LEN,
-        sanitize_command_stderr, wait_for_git_command_timeout,
+        MAX_RETAINED_COMMAND_STDERR_LEN, git_command, retain_stderr_data, sanitize_command_stderr,
+        wait_for_git_command_timeout,
     };
     use crate::{CliError, LfsSessionToken};
 
@@ -566,6 +824,144 @@ sleep 5
 
     #[test]
     #[cfg(unix)]
+    fn command_wait_drains_large_stderr_while_process_runs() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let fake_git = write_fake_git(
+            temp.path(),
+            r#"#!/bin/sh
+i=0
+while [ "$i" -lt 20000 ]; do
+  printf 'large stderr line %s\n' "$i" >&2
+  i=$((i + 1))
+done
+exit 42
+"#,
+        );
+        let mut child = Command::new(&fake_git)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fake git should start");
+
+        let (status, stderr) =
+            wait_for_git_command_timeout(&mut child, "fake git", "", Duration::from_secs(5))
+                .expect("large stderr should not deadlock or time out");
+
+        assert_eq!(status.code(), Some(42));
+        assert_eq!(stderr.len(), MAX_RETAINED_COMMAND_STDERR_LEN);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_timeout_does_not_block_on_descendant_stderr() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let fake_git = write_fake_git(
+            temp.path(),
+            r#"#!/bin/sh
+(sleep 2) &
+echo "waiting with local-lfs-token" >&2
+wait
+"#,
+        );
+        let mut command = git_command(&fake_git);
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fake git should start");
+
+        let started = Instant::now();
+        let error = wait_for_git_command_timeout(
+            &mut child,
+            "fake git",
+            "local-lfs-token",
+            Duration::from_millis(100),
+        )
+        .expect_err("fake git should time out");
+        let display = error.to_string();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(display.contains("fake git failed with status timed out"));
+        assert!(!display.contains("local-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_timeout_stops_descendant_helpers() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let marker_path = temp.path().join("descendant-survived");
+        let fake_git = write_fake_git(
+            temp.path(),
+            &format!(
+                r#"#!/bin/sh
+(
+  sleep 0.5
+  touch '{}'
+) &
+echo "waiting with local-lfs-token" >&2
+wait
+"#,
+                marker_path.display()
+            ),
+        );
+        let mut command = git_command(&fake_git);
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fake git should start");
+
+        wait_for_git_command_timeout(
+            &mut child,
+            "fake git",
+            "local-lfs-token",
+            Duration::from_millis(100),
+        )
+        .expect_err("fake git should time out");
+        thread::sleep(Duration::from_millis(700));
+
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_timeout_is_checked_while_stderr_stays_noisy() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let fake_git = write_fake_git(
+            temp.path(),
+            r#"#!/bin/sh
+while :; do
+  printf 'still noisy with local-lfs-token\n' >&2
+done
+"#,
+        );
+        let mut child = Command::new(&fake_git)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fake git should start");
+
+        let started = Instant::now();
+        let error = wait_for_git_command_timeout(
+            &mut child,
+            "fake git",
+            "local-lfs-token",
+            Duration::from_millis(100),
+        )
+        .expect_err("fake git should time out");
+        let display = error.to_string();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(display.contains("fake git failed with status timed out"));
+        assert!(!display.contains("local-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn approve_failure_reports_config_errors_without_running_approve() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let approve_path = temp.path().join("approve.txt");
@@ -614,6 +1010,33 @@ exit 0
         assert!(sanitized.as_str().len() <= MAX_COMMAND_STDERR_LEN + "...".len());
         assert!(!sanitized.as_str().contains("split"));
         assert!(!sanitized.as_str().contains("split-token-secret"));
+    }
+
+    #[test]
+    fn retained_command_stderr_is_capped_before_sanitizing() {
+        let mut stderr = Vec::new();
+        retain_stderr_data(
+            &mut stderr,
+            &vec![b'x'; MAX_RETAINED_COMMAND_STDERR_LEN * 2],
+        );
+
+        assert_eq!(stderr.len(), MAX_RETAINED_COMMAND_STDERR_LEN);
+    }
+
+    #[test]
+    fn retained_command_stderr_keeps_token_boundary_before_sanitizing() {
+        let token = "split-token-secret";
+        let mut stderr = Vec::new();
+        let prefix = "x".repeat(MAX_COMMAND_STDERR_LEN - 5);
+        let noisy_tail = "y".repeat(MAX_RETAINED_COMMAND_STDERR_LEN * 2);
+        let diagnostic = format!("{prefix}{token}{noisy_tail}");
+
+        retain_stderr_data(&mut stderr, diagnostic.as_bytes());
+        let sanitized = sanitize_command_stderr(&stderr, token);
+
+        assert!(sanitized.as_str().len() <= MAX_COMMAND_STDERR_LEN + "...".len());
+        assert!(!sanitized.as_str().contains("split"));
+        assert!(!sanitized.as_str().contains(token));
     }
 
     #[test]
