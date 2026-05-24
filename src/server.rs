@@ -30,6 +30,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
+use url::form_urlencoded;
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
@@ -267,11 +268,11 @@ trait LfsBatchAuthorizer: Send + Sync {
 }
 
 trait LfsObjectTransferStore: Send + Sync {
-    fn object_exists<'a>(
+    fn lookup_object<'a>(
         &'a self,
         repository: &'a RepositoryMapping,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<bool>>;
+    ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>>;
 
     fn upload_object<'a>(
         &'a self,
@@ -280,16 +281,24 @@ trait LfsObjectTransferStore: Send + Sync {
         source: &'a Path,
         created_by: &'a RepositoryUser,
     ) -> ProviderFuture<'a, ServerResult<StoredObject>>;
+
+    fn record_verified_object<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        object: &'a LfsObject,
+        backend_id: &'a str,
+        created_by: &'a RepositoryUser,
+    ) -> ProviderFuture<'a, ServerResult<()>>;
 }
 
 struct PendingLfsObjectTransferStore;
 
 impl LfsObjectTransferStore for PendingLfsObjectTransferStore {
-    fn object_exists<'a>(
+    fn lookup_object<'a>(
         &'a self,
         _repository: &'a RepositoryMapping,
         _object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<bool>> {
+    ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
         Box::pin(async {
             Err(ServerError::Storage {
                 source: StorageError::Unsupported {
@@ -306,6 +315,22 @@ impl LfsObjectTransferStore for PendingLfsObjectTransferStore {
         _source: &'a Path,
         _created_by: &'a RepositoryUser,
     ) -> ProviderFuture<'a, ServerResult<StoredObject>> {
+        Box::pin(async {
+            Err(ServerError::Storage {
+                source: StorageError::Unsupported {
+                    provider_type: "storage transfer handling is not configured".to_owned(),
+                },
+            })
+        })
+    }
+
+    fn record_verified_object<'a>(
+        &'a self,
+        _repository: &'a RepositoryMapping,
+        _object: &'a LfsObject,
+        _backend_id: &'a str,
+        _created_by: &'a RepositoryUser,
+    ) -> ProviderFuture<'a, ServerResult<()>> {
         Box::pin(async {
             Err(ServerError::Storage {
                 source: StorageError::Unsupported {
@@ -360,14 +385,14 @@ impl GoogleDriveTransferStore {
 }
 
 impl LfsObjectTransferStore for GoogleDriveTransferStore {
-    fn object_exists<'a>(
+    fn lookup_object<'a>(
         &'a self,
         repository: &'a RepositoryMapping,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<bool>> {
+    ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
         Box::pin(async move {
             let store = self.object_store_for_repository(repository).await?;
-            store.object_exists(object).await.map_err(ServerError::from)
+            store.lookup_object(object).await.map_err(ServerError::from)
         })
     }
 
@@ -381,14 +406,28 @@ impl LfsObjectTransferStore for GoogleDriveTransferStore {
         Box::pin(async move {
             let store = self.object_store_for_repository(repository).await?;
             let stored_object = store.upload_object(object, source).await?;
+            self.record_verified_object(repository, object, &stored_object.backend_id, created_by)
+                .await?;
+            Ok(stored_object)
+        })
+    }
+
+    fn record_verified_object<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        object: &'a LfsObject,
+        backend_id: &'a str,
+        created_by: &'a RepositoryUser,
+    ) -> ProviderFuture<'a, ServerResult<()>> {
+        Box::pin(async move {
             self.metadata_database.record_verified_object(
                 &repository.id,
                 &repository.storage_provider,
                 object,
-                &stored_object.backend_id,
+                backend_id,
                 created_by,
             )?;
-            Ok(stored_object)
+            Ok(())
         })
     }
 }
@@ -678,6 +717,22 @@ async fn handle_lfs_upload_request(
         return git_lfs_authorization_error_response(error);
     }
 
+    let expected_size = match upload_request_expected_size(&request) {
+        Ok(size) => size,
+        Err(error) => {
+            tracing::debug!(
+                repo_id = repository.id.as_str(),
+                oid = oid.as_hex(),
+                %error,
+                "Git LFS upload transfer missing or invalid object size"
+            );
+            return git_lfs_json_error_response(
+                StatusCode::BAD_REQUEST,
+                "Git LFS upload action did not include a valid size query parameter",
+            );
+        }
+    };
+
     let declared_size = request
         .headers()
         .get(CONTENT_LENGTH)
@@ -691,8 +746,60 @@ async fn handle_lfs_upload_request(
 
     let upload_lock = state.upload_lock_for(&repository, &oid);
     let _upload_lock_guard = upload_lock.lock().await;
+    let object = LfsObject::new(oid.clone(), LfsObjectSize::new(expected_size));
+    let created_by = RepositoryUser::new(
+        session.metadata().provider_id.clone(),
+        session.metadata().login.clone(),
+        session.metadata().stable_id.clone(),
+    );
 
-    let staged_upload = match stage_upload_request_body(&oid, declared_size, request).await {
+    match state
+        .transfer_store
+        .lookup_object(&repository, &object)
+        .await
+    {
+        Ok(Some(stored_object)) => {
+            tracing::debug!(
+                repo_id = repository.id.as_str(),
+                storage_provider = stored_object.provider_id.as_str(),
+                backend_id = stored_object.backend_id.as_str(),
+                oid = object.oid.as_hex(),
+                size = object.size.bytes(),
+                "Git LFS upload transfer found an existing object"
+            );
+            if let Err(error) = state
+                .transfer_store
+                .record_verified_object(
+                    &repository,
+                    &object,
+                    &stored_object.backend_id,
+                    &created_by,
+                )
+                .await
+            {
+                tracing::debug!(
+                    repo_id = repository.id.as_str(),
+                    oid = object.oid.as_hex(),
+                    %error,
+                    "Git LFS upload transfer metadata repair failed"
+                );
+                return git_lfs_storage_error_response(error);
+            }
+            return StatusCode::OK.into_response();
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(
+                repo_id = repository.id.as_str(),
+                oid = object.oid.as_hex(),
+                %error,
+                "Git LFS upload transfer existence check failed"
+            );
+            return git_lfs_storage_error_response(error);
+        }
+    }
+
+    let staged_upload = match stage_upload_request_body(&oid, Some(expected_size), request).await {
         Ok(staged_upload) => staged_upload,
         Err(UploadStagingError::PayloadTooLarge) => {
             return upload_payload_too_large_response();
@@ -708,39 +815,6 @@ async fn handle_lfs_upload_request(
             return git_lfs_storage_error_response(ServerError::from(error));
         }
     };
-    let object = LfsObject::new(oid, LfsObjectSize::new(staged_upload.size_bytes));
-    let created_by = RepositoryUser::new(
-        session.metadata().provider_id.clone(),
-        session.metadata().login.clone(),
-        session.metadata().stable_id.clone(),
-    );
-
-    match state
-        .transfer_store
-        .object_exists(&repository, &object)
-        .await
-    {
-        Ok(true) => {
-            tracing::debug!(
-                repo_id = repository.id.as_str(),
-                storage_provider = repository.storage_provider.as_str(),
-                oid = object.oid.as_hex(),
-                size = object.size.bytes(),
-                "Git LFS upload transfer found an existing object"
-            );
-            return StatusCode::OK.into_response();
-        }
-        Ok(false) => {}
-        Err(error) => {
-            tracing::debug!(
-                repo_id = repository.id.as_str(),
-                oid = object.oid.as_hex(),
-                %error,
-                "Git LFS upload transfer existence check failed"
-            );
-            return git_lfs_storage_error_response(error);
-        }
-    }
 
     match state
         .transfer_store
@@ -769,6 +843,30 @@ async fn handle_lfs_upload_request(
     }
 }
 
+fn upload_request_expected_size(request: &Request) -> ServerResult<u64> {
+    let Some(query) = request.uri().query() else {
+        return Err(ServerError::InvalidRequest {
+            message: "upload action missing size query parameter".to_owned(),
+        });
+    };
+
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key == "size" {
+            let size = value
+                .parse::<u64>()
+                .map_err(|_| ServerError::InvalidRequest {
+                    message: format!("invalid upload size query value {value:?}"),
+                })?;
+
+            return Ok(size);
+        }
+    }
+
+    Err(ServerError::InvalidRequest {
+        message: "upload action missing size query parameter".to_owned(),
+    })
+}
+
 fn upload_payload_too_large_response() -> Response {
     git_lfs_json_error_response(
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -778,7 +876,6 @@ fn upload_payload_too_large_response() -> Response {
 
 struct StagedUpload {
     temp_file: tempfile::NamedTempFile,
-    size_bytes: u64,
 }
 
 impl StagedUpload {
@@ -855,6 +952,18 @@ async fn stage_upload_request_body_with_limit(
     drop(file);
 
     let actual_oid = format!("{:x}", hasher.finalize());
+    if let Some(expected_size) = expected_size
+        && expected_size != actual_size
+    {
+        return Err(StorageError::IntegrityMismatch {
+            expected_oid: expected_oid.as_hex().to_owned(),
+            expected_size,
+            actual_oid,
+            actual_size,
+        }
+        .into());
+    }
+
     if actual_oid != expected_oid.as_hex() {
         return Err(StorageError::IntegrityMismatch {
             expected_oid: expected_oid.as_hex().to_owned(),
@@ -865,10 +974,7 @@ async fn stage_upload_request_body_with_limit(
         .into());
     }
 
-    Ok(StagedUpload {
-        temp_file,
-        size_bytes: actual_size,
-    })
+    Ok(StagedUpload { temp_file })
 }
 
 #[derive(Debug)]
@@ -984,11 +1090,11 @@ async fn upload_batch_response_with_storage_lookup(
     for object in request.objects {
         match state
             .transfer_store
-            .object_exists(repository, &object)
+            .lookup_object(repository, &object)
             .await
         {
-            Ok(true) => objects.push(LfsBatchUploadObject::present(object)),
-            Ok(false) => objects.push(LfsBatchUploadObject::needed(object)),
+            Ok(Some(_)) => objects.push(LfsBatchUploadObject::present(object)),
+            Ok(None) => objects.push(LfsBatchUploadObject::needed(object)),
             Err(error) => objects.push(LfsBatchUploadObject::error(
                 object,
                 lfs_batch_object_error_from_server_error(&error),
@@ -1587,7 +1693,7 @@ mod tests {
 
     use crate::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, LfsBatchOperation,
-        LfsBatchResponse, LfsObject, LfsOid, LocalLfsSessionStore, ProviderFuture,
+        LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LocalLfsSessionStore, ProviderFuture,
         RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
         ServerConfig, ServerError, ServerResult, StoredObject,
     };
@@ -1717,8 +1823,9 @@ repositories:
 
     #[derive(Clone, Default)]
     struct RecordingTransferStore {
-        existing: Arc<std::sync::atomic::AtomicBool>,
+        lookup_object: Arc<Mutex<Option<StoredObject>>>,
         uploads: Arc<Mutex<Vec<RecordedUpload>>>,
+        verified: Arc<Mutex<Vec<RecordedVerification>>>,
         upload_started: Option<Arc<Notify>>,
         upload_release: Option<Arc<Barrier>>,
     }
@@ -1730,8 +1837,29 @@ repositories:
 
         fn existing() -> Self {
             Self {
-                existing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                lookup_object: Arc::new(Mutex::new(Some(StoredObject::new(
+                    "drive-user-a",
+                    LfsObject::new(
+                        LfsOid::new(
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        )
+                        .expect("test oid should parse"),
+                        LfsObjectSize::new(42),
+                    ),
+                    "drive-file-existing",
+                )))),
                 uploads: Arc::new(Mutex::new(Vec::new())),
+                verified: Arc::new(Mutex::new(Vec::new())),
+                upload_started: None,
+                upload_release: None,
+            }
+        }
+
+        fn existing_object(stored_object: StoredObject) -> Self {
+            Self {
+                lookup_object: Arc::new(Mutex::new(Some(stored_object))),
+                uploads: Arc::new(Mutex::new(Vec::new())),
+                verified: Arc::new(Mutex::new(Vec::new())),
                 upload_started: None,
                 upload_release: None,
             }
@@ -1739,8 +1867,9 @@ repositories:
 
         fn blocking_missing(upload_started: Arc<Notify>, upload_release: Arc<Barrier>) -> Self {
             Self {
-                existing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                lookup_object: Arc::new(Mutex::new(None)),
                 uploads: Arc::new(Mutex::new(Vec::new())),
+                verified: Arc::new(Mutex::new(Vec::new())),
                 upload_started: Some(upload_started),
                 upload_release: Some(upload_release),
             }
@@ -1750,6 +1879,13 @@ repositories:
             self.uploads
                 .lock()
                 .expect("upload records should not be poisoned")
+                .clone()
+        }
+
+        fn verified_records(&self) -> Vec<RecordedVerification> {
+            self.verified
+                .lock()
+                .expect("verification records should not be poisoned")
                 .clone()
         }
     }
@@ -1762,13 +1898,29 @@ repositories:
         created_by: RepositoryUser,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedVerification {
+        repo_id: String,
+        object: LfsObject,
+        backend_id: String,
+        created_by: RepositoryUser,
+    }
+
     impl LfsObjectTransferStore for RecordingTransferStore {
-        fn object_exists<'a>(
+        fn lookup_object<'a>(
             &'a self,
             _repository: &'a RepositoryMapping,
-            _object: &'a LfsObject,
-        ) -> ProviderFuture<'a, ServerResult<bool>> {
-            Box::pin(async move { Ok(self.existing.load(std::sync::atomic::Ordering::SeqCst)) })
+            object: &'a LfsObject,
+        ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
+            Box::pin(async move {
+                let lookup_object = self
+                    .lookup_object
+                    .lock()
+                    .expect("lookup records should not be poisoned")
+                    .clone();
+
+                Ok(lookup_object.filter(|stored_object| stored_object.object == *object))
+            })
         }
 
         fn upload_object<'a>(
@@ -1785,8 +1937,6 @@ repositories:
                 if let Some(upload_release) = &self.upload_release {
                     upload_release.wait().await;
                 }
-                self.existing
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let bytes = std::fs::read(source).map_err(|source| ServerError::Internal {
                     message: format!("test upload file could not be read: {source}"),
                 })?;
@@ -1800,11 +1950,39 @@ repositories:
                         created_by: created_by.clone(),
                     });
 
-                Ok(StoredObject::new(
+                let stored_object = StoredObject::new(
                     repository.storage_provider.clone(),
                     object.clone(),
                     "drive-file-uploaded",
-                ))
+                );
+                self.lookup_object
+                    .lock()
+                    .expect("lookup records should not be poisoned")
+                    .replace(stored_object.clone());
+
+                Ok(stored_object)
+            })
+        }
+
+        fn record_verified_object<'a>(
+            &'a self,
+            repository: &'a RepositoryMapping,
+            object: &'a LfsObject,
+            backend_id: &'a str,
+            created_by: &'a RepositoryUser,
+        ) -> ProviderFuture<'a, ServerResult<()>> {
+            Box::pin(async move {
+                self.verified
+                    .lock()
+                    .expect("verification records should not be poisoned")
+                    .push(RecordedVerification {
+                        repo_id: repository.id.clone(),
+                        object: object.clone(),
+                        backend_id: backend_id.to_owned(),
+                        created_by: created_by.clone(),
+                    });
+
+                Ok(())
             })
         }
     }
@@ -2159,7 +2337,7 @@ repositories:
                 .get("upload")
                 .map(|action| action.href.as_str()),
             Some(
-                "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=42"
             )
         );
     }
@@ -2207,7 +2385,10 @@ repositories:
         );
         let body = b"hello from lfs cloud";
         let oid = format!("{:x}", Sha256::digest(body));
-        let path = format!("/github.com/owner/repo.git/info/lfs/objects/{oid}");
+        let path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{oid}?size={}",
+            body.len()
+        );
 
         let response = router
             .oneshot(lfs_request_with_method_and_body(
@@ -2242,9 +2423,44 @@ repositories:
         let response = router
             .oneshot(lfs_request_with_method_and_body(
                 Method::PUT,
-                "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=25",
                 Some(&format!("Bearer {token}")),
                 "not the requested object",
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "uploaded Git LFS object did not match the requested SHA-256",
+        )
+        .await;
+        assert!(transfer_store.uploads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_rejects_bytes_that_do_not_match_batch_size() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let transfer_store = RecordingTransferStore::missing();
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+        );
+        let body = b"hello from lfs cloud";
+        let oid = format!("{:x}", Sha256::digest(body));
+        let path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{oid}?size={}",
+            body.len() + 1
+        );
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::PUT,
+                &path,
+                Some(&format!("Bearer {token}")),
+                body.to_vec(),
             ))
             .await
             .expect("router should respond");
@@ -2272,7 +2488,7 @@ repositories:
             .oneshot(
                 Request::builder()
                     .method(Method::PUT)
-                    .uri("/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .uri("/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=42")
                     .header(AUTHORIZATION, format!("Bearer {token}"))
                     .header(CONTENT_LENGTH, (MAX_UPLOAD_OBJECT_BYTES + 1).to_string())
                     .body(Body::from("small body"))
@@ -2295,7 +2511,7 @@ repositories:
         let body = "declared size should be preserved";
         let request = Request::builder()
             .method(Method::PUT)
-            .uri("/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .uri("/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=33")
             .header(CONTENT_LENGTH, "1234")
             .body(Body::from(body))
             .expect("test request should build");
@@ -2361,7 +2577,10 @@ repositories:
         );
         let body = b"blocked upload body";
         let oid = format!("{:x}", Sha256::digest(body));
-        let path = format!("/github.com/owner/repo.git/info/lfs/objects/{oid}");
+        let path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{oid}?size={}",
+            body.len()
+        );
 
         let response = router
             .oneshot(lfs_request_with_method_and_body(
@@ -2398,7 +2617,10 @@ repositories:
         );
         let body = b"hello from lfs cloud";
         let oid = format!("{:x}", Sha256::digest(body));
-        let path = format!("/github.com/owner/repo.git/info/lfs/objects/{oid}");
+        let path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{oid}?size={}",
+            body.len()
+        );
         let upload_started_wait = upload_started.notified();
 
         let first_router = router.clone();
@@ -2441,6 +2663,47 @@ repositories:
         assert_eq!(first_response.status(), StatusCode::OK);
         assert_eq!(second_response.status(), StatusCode::OK);
         assert_eq!(transfer_store.uploads().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_repairs_metadata_for_existing_backend_objects() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let body = b"hello from lfs cloud";
+        let oid = format!("{:x}", Sha256::digest(body));
+        let object = LfsObject::new(
+            LfsOid::new(&oid).expect("test oid should parse"),
+            LfsObjectSize::new(body.len() as u64),
+        );
+        let transfer_store = RecordingTransferStore::existing_object(StoredObject::new(
+            "drive-user-a",
+            object.clone(),
+            "drive-file-existing",
+        ));
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+        );
+        let path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{oid}?size={}",
+            body.len()
+        );
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::PUT,
+                &path,
+                Some(&format!("Bearer {token}")),
+                body.to_vec(),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(transfer_store.uploads().is_empty());
+        let verified_records = transfer_store.verified_records();
+        assert_eq!(verified_records.len(), 1);
+        assert_eq!(verified_records[0].backend_id, "drive-file-existing");
     }
 
     #[tokio::test]

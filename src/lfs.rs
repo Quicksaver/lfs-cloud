@@ -837,7 +837,7 @@ impl LfsBatchUploadObject {
                 let mut actions = BTreeMap::new();
                 actions.insert(
                     "upload".to_owned(),
-                    LfsBatchAction::new(lfs_object_action_url(
+                    LfsBatchAction::new(lfs_upload_object_action_url(
                         public_url,
                         repository_lfs_path,
                         &object,
@@ -868,6 +868,20 @@ fn lfs_object_action_url(
         public_url.trim_end_matches('/'),
         repository_lfs_path.trim_matches('/'),
         object.oid.as_hex()
+    )
+}
+
+fn lfs_upload_object_action_url(
+    public_url: &str,
+    repository_lfs_path: &str,
+    object: &LfsObject,
+) -> String {
+    format!(
+        "{}/{}/objects/{}?size={}",
+        public_url.trim_end_matches('/'),
+        repository_lfs_path.trim_matches('/'),
+        object.oid.as_hex(),
+        object.size.bytes()
     )
 }
 
@@ -1309,8 +1323,9 @@ mod tests {
         assert_eq!(needed_response.size, needed.size);
         assert_eq!(needed_response.authenticated, Some(true));
         let expected_href = format!(
-            "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/{}",
-            needed.oid.as_hex()
+            "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/{}?size={}",
+            needed.oid.as_hex(),
+            needed.size.bytes()
         );
         assert_eq!(
             needed_response
