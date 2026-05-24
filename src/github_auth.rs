@@ -10,6 +10,7 @@ use oauth2::{
     AuthUrl, ClientId, CsrfToken, RedirectUrl, Scope, basic::BasicClient,
     url::ParseError as UrlParseError,
 };
+use serde::Deserialize;
 use url::Url;
 
 use crate::{GitHubProviderConfig, ServerError, ServerResult};
@@ -19,6 +20,12 @@ use crate::{GitHubProviderConfig, ServerError, ServerResult};
 /// This browser-facing OAuth URL is intentionally not derived from
 /// [`GitHubProviderConfig::api_url`], which is the REST API base URL.
 pub const GITHUB_OAUTH_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
+
+/// Callback route path GitHub redirects to after browser OAuth login.
+///
+/// The full redirect URL is formed by combining the configured server public
+/// URL with this path.
+pub const GITHUB_OAUTH_CALLBACK_PATH: &str = "/auth/github/callback";
 
 /// Default GitHub OAuth scopes for the initial login URL.
 ///
@@ -142,6 +149,36 @@ impl fmt::Debug for GitHubOAuthAuthorization {
 pub struct GitHubOAuthState(String);
 
 impl GitHubOAuthState {
+    /// Restores a previously persisted OAuth CSRF state secret.
+    ///
+    /// The callback validator compares this value with the `state` query
+    /// parameter before allowing token exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the state is blank or padded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::GitHubOAuthState;
+    ///
+    /// let state = GitHubOAuthState::from_secret("csrf-state")?;
+    ///
+    /// assert_eq!(state.as_str(), "csrf-state");
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
+    pub fn from_secret(secret: impl Into<String>) -> ServerResult<Self> {
+        let secret = secret.into();
+        if secret.trim().is_empty() || secret != secret.trim() {
+            return Err(ServerError::InvalidRequest {
+                message: "github oauth state must not be blank or padded".to_owned(),
+            });
+        }
+
+        Ok(Self(secret))
+    }
+
     /// Returns the state value that must match the OAuth callback.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -158,6 +195,153 @@ impl fmt::Debug for GitHubOAuthState {
 impl From<CsrfToken> for GitHubOAuthState {
     fn from(value: CsrfToken) -> Self {
         Self(value.secret().clone())
+    }
+}
+
+/// Authorization code returned by the GitHub OAuth callback.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitHubOAuthCode(String);
+
+impl GitHubOAuthCode {
+    /// Returns the raw OAuth code to pass to token exchange.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GitHubOAuthCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GitHubOAuthCode(<redacted>)")
+    }
+}
+
+/// Query parameters accepted by the GitHub OAuth callback route.
+///
+/// GitHub returns either `code` and `state` for a successful authorization, or
+/// `error` fields when the user or provider denies the login attempt.
+#[derive(Clone, Deserialize, Eq, PartialEq)]
+pub struct GitHubOAuthCallbackQuery {
+    /// OAuth authorization code returned by GitHub.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// CSRF state returned by GitHub.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// OAuth error code returned by GitHub, such as `access_denied`.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Optional human-readable GitHub OAuth error description.
+    #[serde(default)]
+    pub error_description: Option<String>,
+    /// Optional GitHub documentation URL for the OAuth error.
+    #[serde(default)]
+    pub error_uri: Option<String>,
+}
+
+impl GitHubOAuthCallbackQuery {
+    /// Creates a successful callback query from an authorization code and state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::GitHubOAuthCallbackQuery;
+    ///
+    /// let query = GitHubOAuthCallbackQuery::authorization_code("code", "state");
+    ///
+    /// assert_eq!(query.code.as_deref(), Some("code"));
+    /// ```
+    #[must_use]
+    pub fn authorization_code(code: impl Into<String>, state: impl Into<String>) -> Self {
+        Self {
+            code: Some(code.into()),
+            state: Some(state.into()),
+            error: None,
+            error_description: None,
+            error_uri: None,
+        }
+    }
+}
+
+impl fmt::Debug for GitHubOAuthCallbackQuery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubOAuthCallbackQuery")
+            .field("code", &self.code.as_ref().map(|_| "<redacted>"))
+            .field("state", &self.state.as_ref().map(|_| "<redacted>"))
+            .field("error", &self.error)
+            .field("error_description", &self.error_description)
+            .field("error_uri", &self.error_uri)
+            .finish()
+    }
+}
+
+/// Validated GitHub OAuth callback ready for code-to-token exchange.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubOAuthCallback {
+    /// Authorization code returned by GitHub.
+    pub code: GitHubOAuthCode,
+    /// CSRF state that matched the stored authorization attempt.
+    pub state: GitHubOAuthState,
+}
+
+impl GitHubOAuthCallback {
+    /// Validates a GitHub OAuth callback query against the expected CSRF state.
+    ///
+    /// The returned callback contains the authorization code only after the
+    /// state matches. Callers should then exchange the code for a GitHub token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when GitHub reports an OAuth error, required
+    /// callback fields are missing or blank, or the CSRF state does not match.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::{
+    ///     GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthState,
+    /// };
+    ///
+    /// let expected_state = GitHubOAuthState::from_secret("csrf-state")?;
+    /// let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "csrf-state");
+    ///
+    /// let callback = GitHubOAuthCallback::validate(query, &expected_state)?;
+    ///
+    /// assert_eq!(callback.code.as_str(), "oauth-code");
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
+    pub fn validate(
+        query: GitHubOAuthCallbackQuery,
+        expected_state: &GitHubOAuthState,
+    ) -> ServerResult<Self> {
+        if let Some(error) = query.error {
+            let error = required_callback_param(Some(error), "error")?;
+            let description = query
+                .error_description
+                .as_deref()
+                .map(sanitize_callback_value)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default();
+
+            return Err(ServerError::Unauthorized {
+                reason: format!("github oauth callback failed with {error}{description}"),
+            });
+        }
+
+        let code = required_callback_param(query.code, "code")?;
+        let state = required_callback_param(query.state, "state")?;
+        if state != expected_state.as_str() {
+            return Err(ServerError::Unauthorized {
+                reason: "github oauth csrf state mismatch".to_owned(),
+            });
+        }
+
+        Ok(Self {
+            code: GitHubOAuthCode(code),
+            state: GitHubOAuthState(state),
+        })
     }
 }
 
@@ -203,6 +387,37 @@ fn invalid_oauth_url(path: &str, source: UrlParseError) -> ServerError {
     }
 }
 
+fn required_callback_param(value: Option<String>, name: &str) -> ServerResult<String> {
+    let value = value.ok_or_else(|| ServerError::InvalidRequest {
+        message: format!("github oauth callback {name} is required"),
+    })?;
+    if value.trim().is_empty() || value != value.trim() {
+        return Err(ServerError::InvalidRequest {
+            message: format!("github oauth callback {name} must not be blank or padded"),
+        });
+    }
+
+    Ok(value)
+}
+
+fn sanitize_callback_value(value: &str) -> String {
+    const MAX_LEN: usize = 200;
+
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(MAX_LEN)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -210,10 +425,11 @@ mod tests {
     use oauth2::CsrfToken;
 
     use super::{
-        DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GitHubOAuthAuthorization,
+        DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
+        GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthState,
         github_oauth_authorization_url,
     };
-    use crate::GitHubProviderConfig;
+    use crate::{GitHubProviderConfig, ServerError};
 
     const REDIRECT_URL: &str = "http://127.0.0.1:8080/auth/github/callback";
 
@@ -367,6 +583,107 @@ mod tests {
 
         assert!(rendered.contains("GitHubOAuthAuthorization"));
         assert!(!rendered.contains("csrf-state"));
+    }
+
+    #[test]
+    fn callback_path_matches_authorization_redirect_examples() {
+        assert_eq!(GITHUB_OAUTH_CALLBACK_PATH, "/auth/github/callback");
+        assert!(REDIRECT_URL.ends_with(GITHUB_OAUTH_CALLBACK_PATH));
+    }
+
+    #[test]
+    fn callback_validation_accepts_matching_state_and_code() {
+        let expected_state =
+            GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
+        let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "csrf-state");
+
+        let callback =
+            GitHubOAuthCallback::validate(query, &expected_state).expect("callback should match");
+
+        assert_eq!(callback.code.as_str(), "oauth-code");
+        assert_eq!(callback.state.as_str(), "csrf-state");
+    }
+
+    #[test]
+    fn callback_validation_rejects_state_mismatch_without_echoing_values() {
+        let expected_state =
+            GitHubOAuthState::from_secret("expected-state").expect("state should be valid");
+        let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "returned-state");
+
+        let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+
+        assert!(matches!(error, ServerError::Unauthorized { .. }));
+        let rendered = error.to_string();
+        assert!(rendered.contains("csrf state mismatch"));
+        assert!(!rendered.contains("expected-state"));
+        assert!(!rendered.contains("returned-state"));
+        assert!(!rendered.contains("oauth-code"));
+    }
+
+    #[test]
+    fn callback_validation_rejects_missing_or_blank_required_fields() {
+        let expected_state =
+            GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
+
+        for query in [
+            GitHubOAuthCallbackQuery {
+                code: None,
+                state: Some("csrf-state".to_owned()),
+                error: None,
+                error_description: None,
+                error_uri: None,
+            },
+            GitHubOAuthCallbackQuery::authorization_code("  ", "csrf-state"),
+            GitHubOAuthCallbackQuery {
+                code: Some("oauth-code".to_owned()),
+                state: None,
+                error: None,
+                error_description: None,
+                error_uri: None,
+            },
+            GitHubOAuthCallbackQuery::authorization_code("oauth-code", "  "),
+        ] {
+            let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+            assert!(matches!(error, ServerError::InvalidRequest { .. }));
+        }
+    }
+
+    #[test]
+    fn callback_validation_converts_github_error_to_unauthorized() {
+        let expected_state =
+            GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
+        let query = GitHubOAuthCallbackQuery {
+            code: None,
+            state: Some("csrf-state".to_owned()),
+            error: Some("access_denied".to_owned()),
+            error_description: Some("User denied\naccess".to_owned()),
+            error_uri: Some("https://docs.github.com".to_owned()),
+        };
+
+        let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+
+        assert!(matches!(error, ServerError::Unauthorized { .. }));
+        let rendered = error.to_string();
+        assert!(rendered.contains("access_denied"));
+        assert!(rendered.contains("User denied access"));
+    }
+
+    #[test]
+    fn callback_debug_output_redacts_code_and_state() {
+        let expected_state =
+            GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
+        let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "csrf-state");
+
+        let callback =
+            GitHubOAuthCallback::validate(query.clone(), &expected_state).expect("valid callback");
+
+        let query_debug = format!("{query:?}");
+        let callback_debug = format!("{callback:?}");
+
+        assert!(!query_debug.contains("oauth-code"));
+        assert!(!query_debug.contains("csrf-state"));
+        assert!(!callback_debug.contains("oauth-code"));
+        assert!(!callback_debug.contains("csrf-state"));
     }
 
     fn query_pairs(authorization: &GitHubOAuthAuthorization) -> BTreeMap<String, String> {

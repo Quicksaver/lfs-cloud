@@ -184,6 +184,6 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, typed config loading/validation, GitHub OAuth authorization URL construction, and a minimal Rust binary scaffold. The actual CLI/server behavior has not been implemented yet.
+This repository currently contains planning documents, project configuration, typed config loading/validation, GitHub OAuth authorization URL construction and callback state validation, and a minimal Rust binary scaffold. The actual CLI/server behavior has not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.

@@ -17,7 +17,8 @@ pub use error::{
     SanitizedMessage, ServerError, ServerResult, StorageError, StorageResult,
 };
 pub use github_auth::{
-    DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GitHubOAuthAuthorization,
+    DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
+    GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthCode,
     GitHubOAuthState, github_oauth_authorization_url,
 };
 pub use lfs::{

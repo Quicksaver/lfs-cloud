@@ -1091,8 +1091,8 @@ Defer:
 ### Current Sprint
 
 > **Status**: Phase 2 GitHub authentication has started with OAuth
-> authorization URL generation and CSRF state creation. OAuth callback
-> validation and token exchange are the next implementation areas.
+> authorization URL generation, CSRF state creation, and callback state
+> validation. Token exchange is the next implementation area.
 
 ### Progress Summary
 
@@ -1100,7 +1100,7 @@ Defer:
 | ---------------------------------------- | ----------- | ------ | --------- |
 | 0. Foundations                           | 8           | 8      | 0         |
 | 1. Server Config                         | 8           | 8      | 0         |
-| 2. GitHub Auth                           | 12          | 1      | 11        |
+| 2. GitHub Auth                           | 12          | 2      | 10        |
 | 3. Google Drive Storage                  | 9           | 0      | 9         |
 | 4. Metadata DB                           | 8           | 0      | 8         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
@@ -1108,7 +1108,7 @@ Defer:
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **98**      | **17** | **81**    |
+| **Total**                                | **98**      | **18** | **80**    |
 
 ### Legend
 
@@ -1160,7 +1160,7 @@ Defer:
 #### Epic 2.1: OAuth Login
 
 - [x] [T] Implement GitHub OAuth authorization URL generation with CSRF state.
-- [ ] [T] Implement OAuth callback route and state validation.
+- [x] [T] Implement OAuth callback route and state validation.
 - [ ] [T] Implement GitHub OAuth code-to-token exchange.
 - [ ] [T] Fetch authenticated GitHub user identity with the OAuth token.
 - [ ] [T] Store local `lfs-cloud` session/token metadata without exposing the GitHub token to Git LFS.

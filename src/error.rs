@@ -192,6 +192,13 @@ pub enum ServerError {
         path: String,
     },
 
+    /// An incoming server request was malformed or missing required fields.
+    #[error("invalid request: {message}")]
+    InvalidRequest {
+        /// Human-readable request validation failure.
+        message: String,
+    },
+
     /// A request was authenticated incorrectly or lacked required access.
     #[error("unauthorized request: {reason}")]
     Unauthorized {
