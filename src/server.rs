@@ -155,15 +155,22 @@ fn github_oauth_router(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
 ) -> ServerResult<Option<Router>> {
-    let Some(provider) = config
+    let github_providers = config
         .repository_providers
         .values()
-        .map(|provider| match provider {
-            RepositoryProviderConfig::GitHub(provider) => provider,
+        .filter_map(|provider| match provider {
+            RepositoryProviderConfig::GitHub(provider) => Some(provider),
         })
-        .next()
-    else {
-        return Ok(None);
+        .collect::<Vec<_>>();
+
+    let provider = match github_providers.as_slice() {
+        [] => return Ok(None),
+        [provider] => provider,
+        _ => {
+            return Err(ServerError::InvalidConfiguration {
+                message: "multiple GitHub repository providers are not yet supported by the OAuth callback router".to_owned(),
+            });
+        }
     };
     let redirect_url = format!(
         "{}{}",
@@ -171,7 +178,7 @@ fn github_oauth_router(
         GITHUB_OAUTH_CALLBACK_PATH
     );
     let route_state = GitHubOAuthCallbackRouteState::with_clients_and_session_store(
-        provider.clone(),
+        (*provider).clone(),
         GitHubOAuthStateRegistry::new(),
         redirect_url,
         crate::GitHubOAuthTokenExchanger::new()?,
@@ -872,6 +879,44 @@ repositories:
             .expect("router should respond");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn server_router_rejects_multiple_github_oauth_providers() {
+        let config = ServerConfig::load_from_str(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: test-client-a
+    oauth_client_secret: test-secret-a
+  github-secondary:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: test-client-b
+    oauth_client_secret: test-secret-b
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials_ref: google-drive-user-a
+    root_folder_id: root
+repositories:
+  - id: github-main:owner/repo
+    repo_provider: github-main
+    host: github.com
+    owner: owner
+    name: repo
+    storage_provider: drive-user-a
+"#,
+        )
+        .expect("test config should load");
+
+        let error = server_router_with_sessions(config, LocalLfsSessionStore::new())
+            .expect_err("router should reject ambiguous GitHub providers");
+        assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
     }
 
     fn issued_session_token(ttl: Duration) -> (LocalLfsSessionStore, String) {
