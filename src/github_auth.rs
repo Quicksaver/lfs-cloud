@@ -762,7 +762,13 @@ impl GitHubOAuthStateRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_oauth_states(&mut states, now);
-        states.remove(state.as_str()).is_some()
+        let mut consumed = false;
+        states.retain(|registered_state, _| {
+            let matches = constant_time_str_eq(state.as_str(), registered_state);
+            consumed |= matches;
+            !matches
+        });
+        consumed
     }
 
     fn len(&self) -> usize {
@@ -2293,6 +2299,29 @@ mod tests {
         }
 
         assert_eq!(registry.len(), MAX_PENDING_GITHUB_OAUTH_STATES);
+    }
+
+    #[test]
+    fn state_registry_consumes_only_exact_constant_time_match() {
+        let registry = GitHubOAuthStateRegistry::new();
+        registry.register(
+            GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse"),
+        );
+        registry.register(
+            GitHubOAuthState::from_secret("csrf-state-beta").expect("state should parse"),
+        );
+
+        assert!(!registry.consume(
+            &GitHubOAuthState::from_secret("csrf-state-alphb").expect("state should parse")
+        ));
+        assert_eq!(registry.len(), 2);
+        assert!(registry.consume(
+            &GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse")
+        ));
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.consume(
+            &GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse")
+        ));
     }
 
     #[test]
