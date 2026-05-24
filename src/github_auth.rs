@@ -349,7 +349,11 @@ async fn github_oauth_callback_route(
         .fetch_authenticated_user(&state.provider, &token.access_token)
         .await?;
     let scopes = token.scopes;
-    let session = state.session_store.issue_session(&user, scopes.clone())?;
+    let session = state.session_store.issue_session_with_github_token(
+        &user,
+        scopes.clone(),
+        token.access_token,
+    )?;
     let response = GitHubOAuthCallbackRouteResponse::new(&state.provider, user, scopes, session);
 
     Ok(Json(response))

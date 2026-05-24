@@ -14,7 +14,7 @@ use std::{
 use oauth2::CsrfToken;
 use sha2::{Digest, Sha256};
 
-use crate::{RepositoryUser, ServerError, ServerResult};
+use crate::{GitHubOAuthAccessToken, RepositoryUser, ServerError, ServerResult};
 
 /// Default lifetime for an issued local LFS Cloud session token.
 pub const DEFAULT_LFS_SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -99,6 +99,55 @@ pub struct LfsSessionMetadata {
     pub expires_at: SystemTime,
 }
 
+/// Private server-side state associated with a local LFS session.
+///
+/// Git LFS clients receive only [`LfsSessionToken`]. The optional GitHub token
+/// is retained server-side so batch requests can re-check repository
+/// permissions without handing the upstream token to Git.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct LfsSessionRecord {
+    /// Non-secret metadata for the local LFS session.
+    metadata: LfsSessionMetadata,
+    github_access_token: Option<GitHubOAuthAccessToken>,
+}
+
+impl LfsSessionRecord {
+    fn new(
+        metadata: LfsSessionMetadata,
+        github_access_token: Option<GitHubOAuthAccessToken>,
+    ) -> Self {
+        Self {
+            metadata,
+            github_access_token,
+        }
+    }
+
+    /// Returns the non-secret metadata for this local LFS session.
+    #[must_use]
+    pub(crate) fn metadata(&self) -> &LfsSessionMetadata {
+        &self.metadata
+    }
+
+    /// Returns the private GitHub OAuth token kept server-side for permission checks.
+    #[must_use]
+    pub(crate) fn github_access_token(&self) -> Option<&GitHubOAuthAccessToken> {
+        self.github_access_token.as_ref()
+    }
+}
+
+impl fmt::Debug for LfsSessionRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LfsSessionRecord")
+            .field("metadata", &self.metadata)
+            .field(
+                "github_access_token",
+                &self.github_access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 impl LfsSessionMetadata {
     fn new(
         user: &RepositoryUser,
@@ -156,7 +205,7 @@ impl fmt::Debug for IssuedLfsSession {
 /// LFS receives only [`LfsSessionToken`], never the GitHub OAuth token.
 #[derive(Clone, Default)]
 pub struct LocalLfsSessionStore {
-    sessions: Arc<Mutex<BTreeMap<LfsSessionTokenKey, LfsSessionMetadata>>>,
+    sessions: Arc<Mutex<BTreeMap<LfsSessionTokenKey, LfsSessionRecord>>>,
 }
 
 impl LocalLfsSessionStore {
@@ -176,7 +225,30 @@ impl LocalLfsSessionStore {
         user: &RepositoryUser,
         granted_scopes: impl IntoIterator<Item = impl Into<String>>,
     ) -> ServerResult<IssuedLfsSession> {
-        self.issue_session_with_ttl(user, granted_scopes, DEFAULT_LFS_SESSION_TTL)
+        self.issue_session_record(user, granted_scopes, DEFAULT_LFS_SESSION_TTL, None)
+    }
+
+    /// Issues a local LFS session that retains a GitHub token server-side.
+    ///
+    /// The returned local token is still the only secret intended for Git LFS
+    /// and Git credential-helper storage. The GitHub token remains private
+    /// process state used for repository permission checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the default lifetime cannot be represented.
+    pub fn issue_session_with_github_token(
+        &self,
+        user: &RepositoryUser,
+        granted_scopes: impl IntoIterator<Item = impl Into<String>>,
+        github_access_token: GitHubOAuthAccessToken,
+    ) -> ServerResult<IssuedLfsSession> {
+        self.issue_session_record(
+            user,
+            granted_scopes,
+            DEFAULT_LFS_SESSION_TTL,
+            Some(github_access_token),
+        )
     }
 
     /// Issues a new local LFS session using an explicit token lifetime.
@@ -191,6 +263,16 @@ impl LocalLfsSessionStore {
         granted_scopes: impl IntoIterator<Item = impl Into<String>>,
         ttl: Duration,
     ) -> ServerResult<IssuedLfsSession> {
+        self.issue_session_record(user, granted_scopes, ttl, None)
+    }
+
+    fn issue_session_record(
+        &self,
+        user: &RepositoryUser,
+        granted_scopes: impl IntoIterator<Item = impl Into<String>>,
+        ttl: Duration,
+        github_access_token: Option<GitHubOAuthAccessToken>,
+    ) -> ServerResult<IssuedLfsSession> {
         if ttl.is_zero() {
             return Err(ServerError::InvalidRequest {
                 message: "lfs session ttl must be greater than zero".to_owned(),
@@ -204,6 +286,7 @@ impl LocalLfsSessionStore {
                 message: "lfs session expiration timestamp overflowed".to_owned(),
             })?;
         let metadata = LfsSessionMetadata::new(user, granted_scopes, issued_at, expires_at);
+        let record = LfsSessionRecord::new(metadata, github_access_token);
 
         let mut sessions = self
             .sessions
@@ -223,8 +306,11 @@ impl LocalLfsSessionStore {
                 evict_session_expiring_soonest(&mut sessions);
             }
 
-            sessions.insert(token_key, metadata.clone());
-            return Ok(IssuedLfsSession { token, metadata });
+            sessions.insert(token_key, record.clone());
+            return Ok(IssuedLfsSession {
+                token,
+                metadata: record.metadata,
+            });
         }
 
         Err(ServerError::Internal {
@@ -235,6 +321,12 @@ impl LocalLfsSessionStore {
     /// Returns non-secret metadata for a valid, unexpired token.
     #[must_use]
     pub fn verify(&self, token: &LfsSessionToken) -> Option<LfsSessionMetadata> {
+        self.verify_record(token).map(|record| record.metadata)
+    }
+
+    /// Returns private server-side state for a valid, unexpired token.
+    #[must_use]
+    pub(crate) fn verify_record(&self, token: &LfsSessionToken) -> Option<LfsSessionRecord> {
         let now = SystemTime::now();
         let mut sessions = self
             .sessions
@@ -321,16 +413,16 @@ impl LfsSessionTokenKey {
 }
 
 fn prune_expired_sessions(
-    sessions: &mut BTreeMap<LfsSessionTokenKey, LfsSessionMetadata>,
+    sessions: &mut BTreeMap<LfsSessionTokenKey, LfsSessionRecord>,
     now: SystemTime,
 ) {
-    sessions.retain(|_, metadata| metadata.expires_at > now);
+    sessions.retain(|_, record| record.metadata.expires_at > now);
 }
 
-fn evict_session_expiring_soonest(sessions: &mut BTreeMap<LfsSessionTokenKey, LfsSessionMetadata>) {
+fn evict_session_expiring_soonest(sessions: &mut BTreeMap<LfsSessionTokenKey, LfsSessionRecord>) {
     if let Some(token) = sessions
         .iter()
-        .min_by_key(|(_, metadata)| metadata.expires_at)
+        .min_by_key(|(_, record)| record.metadata.expires_at)
         .map(|(token, _)| *token)
     {
         sessions.remove(&token);
@@ -348,7 +440,7 @@ mod tests {
     use std::{thread, time::Duration};
 
     use super::{LfsSessionToken, LocalLfsSessionStore, MAX_LFS_SESSION_TOKEN_LEN};
-    use crate::{RepositoryUser, ServerError};
+    use crate::{GitHubOAuthAccessToken, RepositoryUser, ServerError};
 
     fn user() -> RepositoryUser {
         RepositoryUser::new("github-main", "octocat", Some("42".to_owned()))
@@ -397,6 +489,29 @@ mod tests {
         assert!(metadata.expires_at > metadata.issued_at);
         assert_eq!(metadata, issued.metadata);
         assert!(!format!("{issued:?}").contains(issued.token.as_str()));
+    }
+
+    #[test]
+    fn session_store_keeps_github_token_private_for_server_side_authorization() {
+        let store = LocalLfsSessionStore::new();
+        let github_token =
+            GitHubOAuthAccessToken::from_secret("gho_authorization").expect("token should parse");
+        let issued = store
+            .issue_session_with_github_token(&user(), ["read:user", "repo"], github_token)
+            .expect("session should be issued");
+        let record = store
+            .verify_record(&issued.token)
+            .expect("session record should verify");
+
+        assert_eq!(record.metadata().login, "octocat");
+        assert_eq!(
+            record
+                .github_access_token()
+                .expect("github token should be retained")
+                .as_str(),
+            "gho_authorization"
+        );
+        assert!(!format!("{record:?}").contains("gho_authorization"));
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! tasks.
 
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::PathBuf,
     sync::Arc,
@@ -28,11 +29,13 @@ use serde::Serialize;
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
-    GitHubOAuthStateRegistry, LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError,
-    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsOid,
-    LfsSessionMetadata, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, RepositoryMapping,
-    RepositoryProviderConfig, ServerConfig, ServerError, ServerResult,
-    github_oauth_callback_router, github_oauth_login_router, parse_lfs_batch_request_json,
+    GitHubOAuthStateRegistry, GitHubProviderConfig, GitHubRepositoryPermissionClient,
+    LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation,
+    LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsOid, LfsSessionToken,
+    LocalLfsSessionStore, MetadataDatabase, ProviderFuture, RepositoryIdentity, RepositoryMapping,
+    RepositoryPermission, RepositoryProviderConfig, RepositoryProviderError, RepositoryUser,
+    ServerConfig, ServerError, ServerResult, github_oauth_callback_router,
+    github_oauth_login_router, parse_lfs_batch_request_json, sessions::LfsSessionRecord,
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
@@ -151,7 +154,19 @@ pub fn lfs_server_router_with_sessions(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
 ) -> Router {
-    let state = Arc::new(LfsServerState::new(config, session_store));
+    lfs_server_router_with_sessions_and_authorizer(
+        config.clone(),
+        session_store,
+        Arc::new(GitHubBatchAuthorizer::new(&config)),
+    )
+}
+
+fn lfs_server_router_with_sessions_and_authorizer(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+    authorizer: Arc<dyn LfsBatchAuthorizer>,
+) -> Router {
+    let state = Arc::new(LfsServerState::new(config, session_store, authorizer));
 
     Router::new().fallback(handle_lfs_request).with_state(state)
 }
@@ -197,19 +212,113 @@ fn github_oauth_router(
     ))
 }
 
+trait LfsBatchAuthorizer: Send + Sync {
+    fn authorize<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        session: &'a LfsSessionRecord,
+        operation: LfsBatchOperation,
+    ) -> ProviderFuture<'a, ServerResult<()>>;
+}
+
 #[derive(Clone, Debug)]
+struct GitHubBatchAuthorizer {
+    providers: BTreeMap<String, GitHubProviderConfig>,
+}
+
+impl GitHubBatchAuthorizer {
+    fn new(config: &ServerConfig) -> Self {
+        let providers = config
+            .repository_providers
+            .iter()
+            .map(|(id, provider)| match provider {
+                RepositoryProviderConfig::GitHub(provider) => (id.clone(), provider.clone()),
+            })
+            .collect();
+
+        Self { providers }
+    }
+}
+
+impl LfsBatchAuthorizer for GitHubBatchAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        session: &'a LfsSessionRecord,
+        operation: LfsBatchOperation,
+    ) -> ProviderFuture<'a, ServerResult<()>> {
+        Box::pin(async move {
+            let required = permission_required_for_batch_operation(operation);
+            let provider = self
+                .providers
+                .get(&repository.repo_provider)
+                .ok_or_else(|| ServerError::InvalidConfiguration {
+                    message: format!(
+                        "repository {} references unknown provider {}",
+                        repository.id, repository.repo_provider
+                    ),
+                })?;
+            let token =
+                session
+                    .github_access_token()
+                    .ok_or_else(|| ServerError::RepositoryProvider {
+                        source: RepositoryProviderError::AuthenticationRequired {
+                            provider: repository.repo_provider.clone(),
+                        },
+                    })?;
+
+            if session.metadata().provider_id != repository.repo_provider {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::PermissionDenied {
+                        provider: repository.repo_provider.clone(),
+                        owner: repository.owner.clone(),
+                        repo: repository.name.clone(),
+                        required,
+                    },
+                });
+            }
+
+            let identity = RepositoryIdentity {
+                provider_id: repository.repo_provider.clone(),
+                stable_id: None,
+                host: repository.host.clone(),
+                owner: repository.owner.clone(),
+                name: repository.name.clone(),
+            };
+            let user = RepositoryUser::new(
+                session.metadata().provider_id.clone(),
+                session.metadata().login.clone(),
+                session.metadata().stable_id.clone(),
+            );
+
+            GitHubRepositoryPermissionClient::new()?
+                .check_permission(provider, token, &identity, &user, required)
+                .await?;
+
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
 struct LfsServerState {
     routes: LfsRouteResolver,
     session_store: LocalLfsSessionStore,
     public_url: String,
+    authorizer: Arc<dyn LfsBatchAuthorizer>,
 }
 
 impl LfsServerState {
-    fn new(config: ServerConfig, session_store: LocalLfsSessionStore) -> Self {
+    fn new(
+        config: ServerConfig,
+        session_store: LocalLfsSessionStore,
+        authorizer: Arc<dyn LfsBatchAuthorizer>,
+    ) -> Self {
         Self {
             routes: LfsRouteResolver::new(&config),
             session_store,
             public_url: config.server.public_url,
+            authorizer,
         }
     }
 }
@@ -225,8 +334,7 @@ async fn handle_lfs_request(
     match state.routes.resolve_path(uri.path()) {
         Ok(route) => match authenticate_lfs_session(&headers, &state.session_store) {
             Ok(session) => {
-                handle_authenticated_lfs_request(route, session, method, request, &state.public_url)
-                    .await
+                handle_authenticated_lfs_request(route, session, method, request, &state).await
             }
             Err(error @ ServerError::Unauthorized { .. }) => {
                 tracing::debug!(path = uri.path(), %error, "LFS route request was not authenticated");
@@ -263,14 +371,14 @@ async fn handle_lfs_request(
 
 async fn handle_authenticated_lfs_request(
     route: ResolvedLfsRoute,
-    session: LfsSessionMetadata,
+    session: LfsSessionRecord,
     method: Method,
     request: Request,
-    public_url: &str,
+    state: &LfsServerState,
 ) -> Response {
     match route.endpoint {
         LfsRouteEndpoint::Batch => {
-            handle_lfs_batch_request(route.repository, session, method, request, public_url).await
+            handle_lfs_batch_request(route.repository, session, method, request, state).await
         }
         LfsRouteEndpoint::Info | LfsRouteEndpoint::Object { .. } => (
             StatusCode::NOT_IMPLEMENTED,
@@ -282,10 +390,10 @@ async fn handle_authenticated_lfs_request(
 
 async fn handle_lfs_batch_request(
     repository: RepositoryMapping,
-    session: LfsSessionMetadata,
+    session: LfsSessionRecord,
     method: Method,
     request: Request,
-    public_url: &str,
+    state: &LfsServerState,
 ) -> Response {
     if method != Method::POST {
         return (
@@ -300,12 +408,12 @@ async fn handle_lfs_batch_request(
             Ok(batch_request) => {
                 tracing::debug!(
                     repo_id = repository.id.as_str(),
-                    provider_id = session.provider_id.as_str(),
+                    provider_id = session.metadata().provider_id.as_str(),
                     operation = ?batch_request.operation,
                     object_count = batch_request.objects.len(),
                     "parsed Git LFS batch request"
                 );
-                handle_parsed_lfs_batch_request(repository, public_url, batch_request)
+                handle_parsed_lfs_batch_request(repository, session, state, batch_request).await
             }
             Err(error) => {
                 tracing::debug!(repo_id = repository.id.as_str(), %error, "invalid Git LFS batch request");
@@ -323,11 +431,26 @@ async fn handle_lfs_batch_request(
     }
 }
 
-fn handle_parsed_lfs_batch_request(
+async fn handle_parsed_lfs_batch_request(
     repository: RepositoryMapping,
-    public_url: &str,
+    session: LfsSessionRecord,
+    state: &LfsServerState,
     request: LfsBatchRequest,
 ) -> Response {
+    if let Err(error) = state
+        .authorizer
+        .authorize(&repository, &session, request.operation)
+        .await
+    {
+        tracing::debug!(
+            repo_id = repository.id.as_str(),
+            operation = ?request.operation,
+            %error,
+            "Git LFS batch authorization failed"
+        );
+        return git_lfs_authorization_error_response(error);
+    }
+
     if !request.transfers.is_empty()
         && !request
             .transfers
@@ -342,11 +465,18 @@ fn handle_parsed_lfs_batch_request(
 
     match request.operation {
         LfsBatchOperation::Download => git_lfs_json_response(
-            download_batch_response_pending_storage_lookup(public_url, &repository, request),
+            download_batch_response_pending_storage_lookup(&state.public_url, &repository, request),
         ),
         LfsBatchOperation::Upload => git_lfs_json_response(
-            upload_batch_response_pending_storage_lookup(public_url, &repository, request),
+            upload_batch_response_pending_storage_lookup(&state.public_url, &repository, request),
         ),
+    }
+}
+
+fn permission_required_for_batch_operation(operation: LfsBatchOperation) -> RepositoryPermission {
+    match operation {
+        LfsBatchOperation::Download => RepositoryPermission::Read,
+        LfsBatchOperation::Upload => RepositoryPermission::Write,
     }
 }
 
@@ -410,6 +540,45 @@ fn git_lfs_json_error_response(status: StatusCode, message: impl Into<String>) -
         .into_response()
 }
 
+fn git_lfs_authorization_error_response(error: ServerError) -> Response {
+    let (status, message) = match error {
+        ServerError::RepositoryProvider {
+            source: RepositoryProviderError::AuthenticationRequired { .. },
+        } => (
+            StatusCode::UNAUTHORIZED,
+            "repository provider authentication is required for this Git LFS operation",
+        ),
+        ServerError::RepositoryProvider {
+            source:
+                RepositoryProviderError::PermissionDenied { .. }
+                | RepositoryProviderError::SsoRequired { .. },
+        } => (
+            StatusCode::FORBIDDEN,
+            "repository provider denied this Git LFS operation",
+        ),
+        ServerError::RepositoryProvider {
+            source: RepositoryProviderError::RepositoryNotFound { .. },
+        } => (
+            StatusCode::NOT_FOUND,
+            "repository provider could not find this repository",
+        ),
+        ServerError::InvalidRequest { .. } => (
+            StatusCode::BAD_REQUEST,
+            "repository authorization request was invalid",
+        ),
+        ServerError::RepositoryProvider { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "repository provider authorization failed",
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Git LFS authorization failed",
+        ),
+    };
+
+    git_lfs_json_error_response(status, message)
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct LfsBatchErrorResponse {
     message: String,
@@ -418,11 +587,11 @@ struct LfsBatchErrorResponse {
 fn authenticate_lfs_session(
     headers: &HeaderMap,
     session_store: &LocalLfsSessionStore,
-) -> ServerResult<LfsSessionMetadata> {
+) -> ServerResult<LfsSessionRecord> {
     let token = lfs_session_token_from_authorization_header(headers)?;
 
     session_store
-        .verify(&token)
+        .verify_record(&token)
         .ok_or_else(|| unauthorized("invalid or expired lfs session token"))
 }
 
@@ -794,27 +963,37 @@ fn detect_lan_ipv4() -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use axum::{
+        Json, Router,
         body::{Body, to_bytes},
+        extract::Path,
         http::{
             HeaderMap, HeaderValue, Method, Request, StatusCode,
             header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
         },
+        routing::get,
     };
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsRouteEndpoint, LfsRouteResolver, ServerBind,
-        advertised_server_urls, authenticate_lfs_session, lfs_server_router_with_sessions,
-        render_server_startup_message, server_router_with_sessions,
+        BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsBatchAuthorizer, LfsRouteEndpoint,
+        LfsRouteResolver, LfsSessionRecord, ServerBind, advertised_server_urls,
+        authenticate_lfs_session, lfs_server_router_with_sessions,
+        lfs_server_router_with_sessions_and_authorizer, render_server_startup_message,
+        server_router_with_sessions,
     };
     use base64::Engine as _;
 
     use crate::{
-        DEFAULT_GIT_CREDENTIAL_USERNAME, LfsBatchResponse, LocalLfsSessionStore, RepositoryUser,
-        ServerConfig, ServerError,
+        DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, LfsBatchOperation,
+        LfsBatchResponse, LocalLfsSessionStore, ProviderFuture, RepositoryMapping,
+        RepositoryPermission, RepositoryProviderError, RepositoryUser, ServerConfig, ServerError,
+        ServerResult,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -850,14 +1029,18 @@ mod tests {
     }"#;
 
     fn test_config() -> ServerConfig {
-        ServerConfig::load_from_str(
+        test_config_with_github_api_url("https://api.github.com")
+    }
+
+    fn test_config_with_github_api_url(api_url: &str) -> ServerConfig {
+        ServerConfig::load_from_str(&format!(
             r#"
 server:
   public_url: http://127.0.0.1:8080
 repository_providers:
   github-main:
     type: github
-    api_url: https://api.github.com
+    api_url: {api_url}
     oauth_client_id: test-client
     oauth_client_secret: test-secret
 storage_providers:
@@ -873,8 +1056,74 @@ repositories:
     name: repo
     storage_provider: drive-user-a
 "#,
-        )
+        ))
         .expect("test config should load")
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingBatchAuthorizer {
+        required: Arc<Mutex<Vec<RepositoryPermission>>>,
+        deny: bool,
+    }
+
+    impl RecordingBatchAuthorizer {
+        fn allow() -> Self {
+            Self::default()
+        }
+
+        fn deny() -> Self {
+            Self {
+                required: Arc::new(Mutex::new(Vec::new())),
+                deny: true,
+            }
+        }
+
+        fn required_permissions(&self) -> Vec<RepositoryPermission> {
+            self.required
+                .lock()
+                .expect("authorization records should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl LfsBatchAuthorizer for RecordingBatchAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            repository: &'a RepositoryMapping,
+            _session: &'a LfsSessionRecord,
+            operation: LfsBatchOperation,
+        ) -> ProviderFuture<'a, ServerResult<()>> {
+            Box::pin(async move {
+                let required = match operation {
+                    LfsBatchOperation::Download => RepositoryPermission::Read,
+                    LfsBatchOperation::Upload => RepositoryPermission::Write,
+                };
+                self.required
+                    .lock()
+                    .expect("authorization records should not be poisoned")
+                    .push(required);
+
+                if self.deny {
+                    return Err(ServerError::RepositoryProvider {
+                        source: RepositoryProviderError::PermissionDenied {
+                            provider: repository.repo_provider.clone(),
+                            owner: repository.owner.clone(),
+                            repo: repository.name.clone(),
+                            required,
+                        },
+                    });
+                }
+
+                Ok(())
+            })
+        }
+    }
+
+    fn test_router_with_authorizer(
+        store: LocalLfsSessionStore,
+        authorizer: RecordingBatchAuthorizer,
+    ) -> Router {
+        lfs_server_router_with_sessions_and_authorizer(test_config(), store, Arc::new(authorizer))
     }
 
     #[test]
@@ -982,9 +1231,9 @@ repositories:
         let basic_session = authenticate_lfs_session(&basic_headers, &store)
             .expect("basic credential token should authenticate");
 
-        assert_eq!(bearer_session.login, "octocat");
-        assert_eq!(basic_session.login, "octocat");
-        assert_eq!(basic_session.provider_id, "github-main");
+        assert_eq!(bearer_session.metadata().login, "octocat");
+        assert_eq!(basic_session.metadata().login, "octocat");
+        assert_eq!(basic_session.metadata().provider_id, "github-main");
     }
 
     #[test]
@@ -1069,7 +1318,7 @@ repositories:
     #[tokio::test]
     async fn authenticated_batch_route_parses_valid_batch_requests() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
-        let router = lfs_server_router_with_sessions(test_config(), store);
+        let router = test_router_with_authorizer(store, RecordingBatchAuthorizer::allow());
 
         let response = router
             .oneshot(lfs_request_with_method_and_body(
@@ -1112,7 +1361,7 @@ repositories:
     #[tokio::test]
     async fn authenticated_batch_route_rejects_unsupported_transfers() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
-        let router = lfs_server_router_with_sessions(test_config(), store);
+        let router = test_router_with_authorizer(store, RecordingBatchAuthorizer::allow());
 
         let response = router
             .oneshot(lfs_request_with_method_and_body(
@@ -1147,7 +1396,7 @@ repositories:
     #[tokio::test]
     async fn authenticated_upload_batch_route_returns_object_level_pending_errors() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
-        let router = lfs_server_router_with_sessions(test_config(), store);
+        let router = test_router_with_authorizer(store, RecordingBatchAuthorizer::allow());
 
         let response = router
             .oneshot(lfs_request_with_method_and_body(
@@ -1184,6 +1433,110 @@ repositories:
             Some(501)
         );
         assert!(body.objects[0].actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_route_authorizes_download_as_read_and_upload_as_write() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let authorizer = RecordingBatchAuthorizer::allow();
+        let router = test_router_with_authorizer(store, authorizer.clone());
+
+        for body in [VALID_BATCH_REQUEST, VALID_UPLOAD_BATCH_REQUEST] {
+            let response = router
+                .clone()
+                .oneshot(lfs_request_with_method_and_body(
+                    Method::POST,
+                    "/github.com/owner/repo.git/info/lfs/objects/batch",
+                    Some(&format!("Bearer {token}")),
+                    body,
+                ))
+                .await
+                .expect("router should respond");
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            authorizer.required_permissions(),
+            vec![RepositoryPermission::Read, RepositoryPermission::Write]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_route_rejects_repository_permission_denials() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let authorizer = RecordingBatchAuthorizer::deny();
+        let router = test_router_with_authorizer(store, authorizer.clone());
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                VALID_UPLOAD_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.git-lfs+json")
+        );
+        assert_eq!(
+            authorizer.required_permissions(),
+            vec![RepositoryPermission::Write]
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("response should be JSON");
+
+        assert_eq!(
+            body.get("message").and_then(|value| value.as_str()),
+            Some("repository provider denied this Git LFS operation")
+        );
+    }
+
+    #[tokio::test]
+    async fn default_batch_authorizer_checks_github_permissions() {
+        let github_api_url = start_permission_server("read").await;
+        let config = test_config_with_github_api_url(&github_api_url);
+        let store = LocalLfsSessionStore::new();
+        let user = RepositoryUser::new("github-main", "octocat", Some("42".to_owned()));
+        let github_token =
+            GitHubOAuthAccessToken::from_secret("gho_authorization").expect("token should parse");
+        let issued = store
+            .issue_session_with_github_token(&user, ["read:user", "repo"], github_token)
+            .expect("session should be issued");
+        let router = lfs_server_router_with_sessions(config, store);
+
+        let download = router
+            .clone()
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {}", issued.token.as_str())),
+                VALID_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+        let upload = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {}", issued.token.as_str())),
+                VALID_UPLOAD_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(upload.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1330,6 +1683,31 @@ repositories:
             .expect("session token should be issued");
 
         (store, issued.token.as_str().to_owned())
+    }
+
+    async fn start_permission_server(permission: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("permission server should bind");
+        let address = listener
+            .local_addr()
+            .expect("permission server address should be available");
+        let router = Router::new().route(
+            "/repos/{owner}/{repo}/collaborators/{username}/permission",
+            get(
+                move |Path((_owner, _repo, _username)): Path<(String, String, String)>| async move {
+                    Json(serde_json::json!({ "permission": permission }))
+                },
+            ),
+        );
+
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("permission server should run");
+        });
+
+        format!("http://{address}")
     }
 
     fn authorization_headers(value: &str) -> HeaderMap {

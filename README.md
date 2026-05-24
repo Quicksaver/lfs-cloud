@@ -9,10 +9,11 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > routes, requiring a local LFS Cloud session token before parsing authenticated
 > requests.
 > Git LFS batch request parsing plus download and upload batch response
-> generation are implemented. Batch responses currently return Git LFS
-> object-level errors until storage availability lookup and transfer handling
-> are wired. Upload/download transfer handling and the other commands below are
-> still planned product behavior.
+> generation are implemented, with GitHub read/write authorization enforced per
+> batch operation. Batch responses currently return Git LFS object-level errors
+> until storage availability lookup and transfer handling are wired.
+> Upload/download transfer handling and the other commands below are still
+> planned product behavior.
 
 ## Why
 
@@ -214,6 +215,6 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, parses authenticated Git LFS batch requests, and generates download and upload batch responses with per-object errors until storage availability lookup and transfer handling are wired. Transfer endpoints and most CLI behavior have not been implemented yet.
+This repository currently contains planning documents, project configuration, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, and generates download and upload batch responses with per-object errors until storage availability lookup and transfer handling are wired. Transfer endpoints and most CLI behavior have not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
