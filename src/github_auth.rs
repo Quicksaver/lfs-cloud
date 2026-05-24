@@ -80,6 +80,31 @@ impl GitHubOAuthCallbackRouteState {
     /// `expected_state` must be the CSRF value generated for the matching
     /// authorization URL, and `redirect_url` must match the OAuth app callback.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::{
+    ///     GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubProviderConfig,
+    /// };
+    ///
+    /// let provider = GitHubProviderConfig {
+    ///     id: "github-main".to_owned(),
+    ///     api_url: "https://api.github.com".to_owned(),
+    ///     oauth_client_id: "client-id".to_owned(),
+    ///     oauth_client_secret: "client-secret".to_owned(),
+    /// };
+    /// let expected_state = GitHubOAuthState::from_secret("csrf-state")?;
+    ///
+    /// let route_state = GitHubOAuthCallbackRouteState::new(
+    ///     provider,
+    ///     expected_state,
+    ///     "https://lfs.example.com/auth/github/callback",
+    /// )?;
+    ///
+    /// assert!(format!("{route_state:?}").contains("GitHubOAuthCallbackRouteState"));
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`ServerError`] when default HTTP clients cannot be created or
@@ -102,6 +127,36 @@ impl GitHubOAuthCallbackRouteState {
     ///
     /// This constructor is useful for tests and for server code that shares
     /// tuned HTTP clients across provider components.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::{
+    ///     GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubOAuthTokenExchanger,
+    ///     GitHubProviderConfig, GitHubUserClient,
+    /// };
+    ///
+    /// let provider = GitHubProviderConfig {
+    ///     id: "github-main".to_owned(),
+    ///     api_url: "https://api.github.com".to_owned(),
+    ///     oauth_client_id: "client-id".to_owned(),
+    ///     oauth_client_secret: "client-secret".to_owned(),
+    /// };
+    /// let expected_state = GitHubOAuthState::from_secret("csrf-state")?;
+    /// let token_exchanger = GitHubOAuthTokenExchanger::new()?;
+    /// let user_client = GitHubUserClient::new()?;
+    ///
+    /// let route_state = GitHubOAuthCallbackRouteState::with_clients(
+    ///     provider,
+    ///     expected_state,
+    ///     "https://lfs.example.com/auth/github/callback",
+    ///     token_exchanger,
+    ///     user_client,
+    /// )?;
+    ///
+    /// assert!(format!("{route_state:?}").contains("GitHubOAuthCallbackRouteState"));
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
     ///
     /// # Errors
     ///
