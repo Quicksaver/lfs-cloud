@@ -161,6 +161,42 @@ impl From<CsrfToken> for GitHubOAuthState {
     }
 }
 
+/// Creates a GitHub OAuth authorization URL using default LFS Cloud scopes.
+///
+/// This is a compatibility wrapper for callers that used the original free
+/// function API. New code may call [`GitHubOAuthAuthorization::new`] directly.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] when the configured redirect URL is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use lfs_cloud::{GitHubProviderConfig, github_oauth_authorization_url};
+///
+/// let provider = GitHubProviderConfig {
+///     id: "github-main".to_owned(),
+///     api_url: "https://api.github.com".to_owned(),
+///     oauth_client_id: "client-id".to_owned(),
+///     oauth_client_secret: "client-secret".to_owned(),
+/// };
+///
+/// let authorization = github_oauth_authorization_url(
+///     &provider,
+///     "http://127.0.0.1:8080/auth/github/callback",
+/// )?;
+///
+/// assert_eq!(authorization.authorization_url.host_str(), Some("github.com"));
+/// # Ok::<(), lfs_cloud::ServerError>(())
+/// ```
+pub fn github_oauth_authorization_url(
+    provider: &GitHubProviderConfig,
+    redirect_url: impl Into<String>,
+) -> ServerResult<GitHubOAuthAuthorization> {
+    GitHubOAuthAuthorization::new(provider, redirect_url)
+}
+
 fn invalid_oauth_url(path: &str, source: UrlParseError) -> ServerError {
     ServerError::InvalidConfiguration {
         message: format!("{path} must be a valid absolute URL: {source}"),
@@ -175,6 +211,7 @@ mod tests {
 
     use super::{
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GitHubOAuthAuthorization,
+        github_oauth_authorization_url,
     };
     use crate::GitHubProviderConfig;
 
@@ -244,6 +281,21 @@ mod tests {
             .expect("second authorization URL should build");
 
         assert_ne!(first.csrf_state, second.csrf_state);
+    }
+
+    #[test]
+    fn free_function_oauth_helper_remains_available() {
+        let authorization = github_oauth_authorization_url(&provider_config(), REDIRECT_URL)
+            .expect("authorization URL should build");
+
+        assert_eq!(
+            authorization.authorization_url.host_str(),
+            Some("github.com")
+        );
+        assert_eq!(
+            query_pairs(&authorization).get("scope").map(String::as_str),
+            Some("read:user")
+        );
     }
 
     #[test]

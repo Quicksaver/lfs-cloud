@@ -18,7 +18,7 @@ pub use error::{
 };
 pub use github_auth::{
     DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GitHubOAuthAuthorization,
-    GitHubOAuthState,
+    GitHubOAuthState, github_oauth_authorization_url,
 };
 pub use lfs::{
     LFS_POINTER_VERSION, LfsBatchAction, LfsBatchObjectError, LfsBatchObjectResponse,
