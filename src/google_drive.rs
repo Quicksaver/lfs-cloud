@@ -32,7 +32,6 @@ use crate::{
 const GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_OBJECT_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
-const GOOGLE_DRIVE_OBJECT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_";
 const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
 const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
@@ -826,7 +825,11 @@ impl GoogleDriveObjectStore {
                         "Google Drive resumable upload response did not include Location",
                     ),
                 })?;
-            validate_drive_resumable_upload_session_url(&self.storage, session_url)?
+            validate_drive_resumable_upload_session_url(
+                &self.storage,
+                &self.api_base_url,
+                session_url,
+            )?
         } else {
             let response_body = read_google_response_body(initiate_response)
                 .await
@@ -1182,10 +1185,24 @@ fn default_google_drive_object_metadata_http_client() -> StorageResult<Client> {
 }
 
 fn default_google_drive_object_upload_http_client() -> StorageResult<Client> {
-    default_google_drive_http_client_from(
-        &DEFAULT_GOOGLE_DRIVE_OBJECT_UPLOAD_HTTP_CLIENT,
-        GOOGLE_DRIVE_OBJECT_UPLOAD_TIMEOUT,
-    )
+    if let Some(client) = DEFAULT_GOOGLE_DRIVE_OBJECT_UPLOAD_HTTP_CLIENT.get() {
+        return Ok(client.clone());
+    }
+
+    let client = Client::builder()
+        .build()
+        .map_err(|source| StorageError::Retryable {
+            provider: "google_drive".to_owned(),
+            message: format!("failed to initialize Google Drive upload HTTP client: {source}"),
+        })?;
+
+    match DEFAULT_GOOGLE_DRIVE_OBJECT_UPLOAD_HTTP_CLIENT.set(client.clone()) {
+        Ok(()) => Ok(client),
+        Err(client) => Ok(DEFAULT_GOOGLE_DRIVE_OBJECT_UPLOAD_HTTP_CLIENT
+            .get()
+            .cloned()
+            .unwrap_or(client)),
+    }
 }
 
 fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
@@ -1375,6 +1392,7 @@ fn drive_resumable_upload_url(mut api_base_url: Url) -> StorageResult<Url> {
 
 fn validate_drive_resumable_upload_session_url(
     storage: &GoogleDriveStorageConfig,
+    api_base_url: &Url,
     value: &str,
 ) -> StorageResult<Url> {
     let url = Url::parse(value).map_err(|_| StorageError::Upstream {
@@ -1418,8 +1436,23 @@ fn validate_drive_resumable_upload_session_url(
             ),
         });
     }
+    if !url_origins_match(&url, api_base_url) {
+        return Err(StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: None,
+            message: SanitizedMessage::new(
+                "Google Drive resumable upload session URL must match the configured Drive API origin",
+            ),
+        });
+    }
 
     Ok(url)
+}
+
+fn url_origins_match(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 fn drive_upload_metadata(root_folder_id: &str, key: &GoogleDriveObjectKey) -> serde_json::Value {
@@ -2409,6 +2442,7 @@ mod tests {
         let storage = storage_config("google-drive-user-a");
         let error = super::validate_drive_resumable_upload_session_url(
             &storage,
+            &url::Url::parse("https://www.googleapis.com").expect("API base should parse"),
             "http://drive.example.com/upload/session-1?upload_id=123",
         )
         .expect_err("non-loopback HTTP session URL should fail");
@@ -2419,6 +2453,7 @@ mod tests {
 
         let url = super::validate_drive_resumable_upload_session_url(
             &storage,
+            &url::Url::parse("http://localhost").expect("API base should parse"),
             "http://localhost/upload/session-1?upload_id=123",
         )
         .expect("loopback HTTP session URL should be accepted for local testing");
@@ -2426,6 +2461,33 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://localhost/upload/session-1?upload_id=123"
+        );
+    }
+
+    #[test]
+    fn drive_resumable_upload_session_url_must_match_api_origin() {
+        let storage = storage_config("google-drive-user-a");
+        let error = super::validate_drive_resumable_upload_session_url(
+            &storage,
+            &url::Url::parse("https://www.googleapis.com").expect("API base should parse"),
+            "https://attacker.example/upload/session-1?upload_id=123",
+        )
+        .expect_err("cross-origin session URL should fail before forwarding auth");
+
+        assert!(error.to_string().contains(
+            "Google Drive resumable upload session URL must match the configured Drive API origin"
+        ));
+
+        let url = super::validate_drive_resumable_upload_session_url(
+            &storage,
+            &url::Url::parse("https://www.googleapis.com/drive/v3").expect("API base should parse"),
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=123",
+        )
+        .expect("same-origin session URL should be accepted");
+
+        assert_eq!(
+            url.as_str(),
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=123"
         );
     }
 
@@ -3076,6 +3138,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_store_rejects_cross_origin_upload_session_before_put() {
+        let staged_bytes = b"0123456789abcdef0123456789abcdef0123456789";
+        let object = lfs_object_for_bytes(staged_bytes);
+        let server = DriveUploadServer::start_with_session_url(
+            "https://attacker.example/upload_session/session-1",
+            drive_object_json(
+                "drive-file-unused",
+                object.oid.as_hex(),
+                object.size.bytes(),
+            ),
+        )
+        .await;
+        let staged_file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(staged_file.path(), staged_bytes).expect("staged file should be written");
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let error = store
+            .upload_object(&object, staged_file.path())
+            .await
+            .expect_err("cross-origin session URL should fail before upload PUT");
+
+        assert!(matches!(
+            error,
+            StorageError::Upstream {
+                ref provider,
+                status: None,
+                ref message,
+            } if provider == "drive-user-a"
+                && message.as_str()
+                    == "Google Drive resumable upload session URL must match the configured Drive API origin"
+        ));
+        assert_eq!(server.initiate_requests().len(), 1);
+        assert!(server.upload_requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn object_store_rejects_staged_file_mismatch_before_drive_upload() {
         let server =
             DriveUploadServer::start(drive_object_list_json("drive-file-unused", OBJECT_OID, 42))
@@ -3693,9 +3798,29 @@ mod tests {
             Self::start_with_upload_response(StatusCode::CREATED, upload_body).await
         }
 
+        async fn start_with_session_url(
+            session_url: impl Into<String>,
+            upload_body: impl Into<String>,
+        ) -> Self {
+            Self::start_with_upload_response_and_session_url(
+                StatusCode::CREATED,
+                upload_body,
+                Some(session_url.into()),
+            )
+            .await
+        }
+
         async fn start_with_upload_response(
             upload_status: StatusCode,
             upload_body: impl Into<String>,
+        ) -> Self {
+            Self::start_with_upload_response_and_session_url(upload_status, upload_body, None).await
+        }
+
+        async fn start_with_upload_response_and_session_url(
+            upload_status: StatusCode,
+            upload_body: impl Into<String>,
+            session_url: Option<String>,
         ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -3704,7 +3829,8 @@ mod tests {
                 .local_addr()
                 .expect("test Drive upload server address should be available");
             let state = Arc::new(DriveUploadServerState {
-                session_url: format!("http://{address}/upload_session/session-1"),
+                session_url: session_url
+                    .unwrap_or_else(|| format!("http://{address}/upload_session/session-1")),
                 initiate_status: StatusCode::OK,
                 initiate_body: String::new(),
                 upload_status,
