@@ -16,7 +16,7 @@ use std::{
 use axum::{
     Router,
     body::Bytes,
-    extract::{OriginalUri, State},
+    extract::{FromRequest, OriginalUri, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{AUTHORIZATION, WWW_AUTHENTICATE},
@@ -212,13 +212,14 @@ impl LfsServerState {
 async fn handle_lfs_request(
     State(state): State<Arc<LfsServerState>>,
     OriginalUri(uri): OriginalUri,
-    method: Method,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request,
 ) -> Response {
+    let method = request.method().clone();
+    let headers = request.headers().clone();
+
     match state.routes.resolve_path(uri.path()) {
         Ok(route) => match authenticate_lfs_session(&headers, &state.session_store) {
-            Ok(session) => handle_authenticated_lfs_request(route, session, method, body),
+            Ok(session) => handle_authenticated_lfs_request(route, session, method, request).await,
             Err(error @ ServerError::Unauthorized { .. }) => {
                 tracing::debug!(path = uri.path(), %error, "LFS route request was not authenticated");
                 authentication_required_response()
@@ -252,15 +253,15 @@ async fn handle_lfs_request(
     }
 }
 
-fn handle_authenticated_lfs_request(
+async fn handle_authenticated_lfs_request(
     route: ResolvedLfsRoute,
     session: LfsSessionMetadata,
     method: Method,
-    body: Bytes,
+    request: Request,
 ) -> Response {
     match route.endpoint {
         LfsRouteEndpoint::Batch => {
-            handle_lfs_batch_request(route.repository, session, method, body)
+            handle_lfs_batch_request(route.repository, session, method, request).await
         }
         LfsRouteEndpoint::Info | LfsRouteEndpoint::Object { .. } => (
             StatusCode::NOT_IMPLEMENTED,
@@ -270,11 +271,11 @@ fn handle_authenticated_lfs_request(
     }
 }
 
-fn handle_lfs_batch_request(
+async fn handle_lfs_batch_request(
     repository: RepositoryMapping,
     session: LfsSessionMetadata,
     method: Method,
-    body: Bytes,
+    request: Request,
 ) -> Response {
     if method != Method::POST {
         return (
@@ -284,23 +285,33 @@ fn handle_lfs_batch_request(
             .into_response();
     }
 
-    match parse_lfs_batch_request_json(&body) {
-        Ok(request) => {
+    match Bytes::from_request(request, &()).await {
+        Ok(body) => match parse_lfs_batch_request_json(&body) {
+            Ok(request) => {
+                tracing::debug!(
+                    repo_id = repository.id.as_str(),
+                    provider_id = session.provider_id.as_str(),
+                    operation = ?request.operation,
+                    object_count = request.objects.len(),
+                    "parsed Git LFS batch request"
+                );
+                (
+                    StatusCode::NOT_IMPLEMENTED,
+                    "Git LFS batch request parsed; response generation is not implemented yet.\n",
+                )
+                    .into_response()
+            }
+            Err(error) => {
+                tracing::debug!(repo_id = repository.id.as_str(), %error, "invalid Git LFS batch request");
+                (StatusCode::BAD_REQUEST, "Invalid Git LFS batch request.\n").into_response()
+            }
+        },
+        Err(error) => {
             tracing::debug!(
                 repo_id = repository.id.as_str(),
-                provider_id = session.provider_id.as_str(),
-                operation = ?request.operation,
-                object_count = request.objects.len(),
-                "parsed Git LFS batch request"
+                %error,
+                "failed to read Git LFS batch request body"
             );
-            (
-                StatusCode::NOT_IMPLEMENTED,
-                "Git LFS batch request parsed; response generation is not implemented yet.\n",
-            )
-                .into_response()
-        }
-        Err(error) => {
-            tracing::debug!(repo_id = repository.id.as_str(), %error, "invalid Git LFS batch request");
             (StatusCode::BAD_REQUEST, "Invalid Git LFS batch request.\n").into_response()
         }
     }
@@ -987,6 +998,25 @@ repositories:
 
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_route_requires_auth_before_buffering_body() {
+        let (store, _token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions(test_config(), store);
+        let large_body = "x".repeat(2 * 1024 * 1024 + 1);
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                None,
+                large_body,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
