@@ -785,7 +785,7 @@ async fn handle_lfs_download_request(
                 %error,
                 "Git LFS download transfer storage read failed"
             );
-            git_lfs_storage_error_response(error)
+            git_lfs_download_storage_error_response(error)
         }
     }
 }
@@ -1357,6 +1357,22 @@ fn git_lfs_storage_error_response(error: ServerError) -> Response {
     };
 
     git_lfs_json_error_response(status, message)
+}
+
+fn git_lfs_download_storage_error_response(error: ServerError) -> Response {
+    if matches!(
+        &error,
+        ServerError::Storage {
+            source: StorageError::IntegrityMismatch { .. },
+        }
+    ) {
+        return git_lfs_json_error_response(
+            StatusCode::BAD_GATEWAY,
+            "Git LFS storage returned an object that failed integrity validation",
+        );
+    }
+
+    git_lfs_storage_error_response(error)
 }
 
 fn lfs_batch_object_error_from_server_error(error: &ServerError) -> LfsBatchObjectError {
@@ -1939,6 +1955,7 @@ repositories:
     struct RecordingTransferStore {
         lookup_object: Arc<Mutex<Option<StoredObject>>>,
         download_body: Arc<Mutex<Option<Vec<u8>>>>,
+        download_integrity_mismatch: bool,
         downloads: Arc<Mutex<Vec<RecordedDownload>>>,
         uploads: Arc<Mutex<Vec<RecordedUpload>>>,
         verified: Arc<Mutex<Vec<RecordedVerification>>>,
@@ -1965,6 +1982,7 @@ repositories:
                     "drive-file-existing",
                 )))),
                 download_body: Arc::new(Mutex::new(Some(vec![0; 42]))),
+                download_integrity_mismatch: false,
                 downloads: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(Vec::new())),
                 verified: Arc::new(Mutex::new(Vec::new())),
@@ -1977,6 +1995,7 @@ repositories:
             Self {
                 lookup_object: Arc::new(Mutex::new(Some(stored_object))),
                 download_body: Arc::new(Mutex::new(None)),
+                download_integrity_mismatch: false,
                 downloads: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(Vec::new())),
                 verified: Arc::new(Mutex::new(Vec::new())),
@@ -1989,6 +2008,7 @@ repositories:
             Self {
                 lookup_object: Arc::new(Mutex::new(None)),
                 download_body: Arc::new(Mutex::new(None)),
+                download_integrity_mismatch: false,
                 downloads: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(Vec::new())),
                 verified: Arc::new(Mutex::new(Vec::new())),
@@ -2001,6 +2021,20 @@ repositories:
             Self {
                 lookup_object: Arc::new(Mutex::new(Some(stored_object))),
                 download_body: Arc::new(Mutex::new(Some(body))),
+                download_integrity_mismatch: false,
+                downloads: Arc::new(Mutex::new(Vec::new())),
+                uploads: Arc::new(Mutex::new(Vec::new())),
+                verified: Arc::new(Mutex::new(Vec::new())),
+                upload_started: None,
+                upload_release: None,
+            }
+        }
+
+        fn existing_object_with_download_integrity_mismatch(stored_object: StoredObject) -> Self {
+            Self {
+                lookup_object: Arc::new(Mutex::new(Some(stored_object))),
+                download_body: Arc::new(Mutex::new(None)),
+                download_integrity_mismatch: true,
                 downloads: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(Vec::new())),
                 verified: Arc::new(Mutex::new(Vec::new())),
@@ -2126,6 +2160,18 @@ repositories:
                         },
                     });
                 };
+                if self.download_integrity_mismatch {
+                    return Err(ServerError::Storage {
+                        source: crate::StorageError::IntegrityMismatch {
+                            expected_oid: object.oid.as_hex().to_owned(),
+                            expected_size: object.size.bytes(),
+                            actual_oid:
+                                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                    .to_owned(),
+                            actual_size: object.size.bytes(),
+                        },
+                    });
+                }
                 let body = self
                     .download_body
                     .lock()
@@ -2701,6 +2747,42 @@ repositories:
         assert_eq!(downloads.len(), 1);
         assert_eq!(downloads[0].repo_id, "github-main:owner/repo");
         assert_eq!(downloads[0].object, object);
+    }
+
+    #[tokio::test]
+    async fn download_endpoint_reports_storage_integrity_failures_as_backend_errors() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let object = LfsObject::new(
+            LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("test oid should parse"),
+            LfsObjectSize::new(42),
+        );
+        let transfer_store =
+            RecordingTransferStore::existing_object_with_download_integrity_mismatch(
+                StoredObject::new("drive-user-a", object, "drive-file-existing"),
+            );
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store,
+        );
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::GET,
+                "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=42",
+                Some(&format!("Bearer {token}")),
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::BAD_GATEWAY,
+            "Git LFS storage returned an object that failed integrity validation",
+        )
+        .await;
     }
 
     #[tokio::test]
