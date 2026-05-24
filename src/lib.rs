@@ -43,8 +43,8 @@ pub use google_drive::{
 };
 pub use lfs::{
     LFS_POINTER_VERSION, LfsBatchAction, LfsBatchObjectError, LfsBatchObjectResponse,
-    LfsBatchOperation, LfsBatchRef, LfsBatchRequest, LfsBatchResponse, LfsObject, LfsObjectError,
-    LfsObjectSize, LfsOid, LfsPointer,
+    LfsBatchOperation, LfsBatchRef, LfsBatchRequest, LfsBatchRequestParseError, LfsBatchResponse,
+    LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
 };
 pub use logging::{
     DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, init_tracing,

@@ -1118,8 +1118,8 @@ Defer:
 > loads validated server config, applies `--host`/`--port` overrides, opens
 > server-owned metadata storage, binds an Axum listener, reports local and
 > best-effort LAN URLs, resolves configured repository LFS paths, and requires
-> a valid local LFS Cloud session token before later batch, upload, and
-> download handlers run.
+> a valid local LFS Cloud session token before parsing Git LFS batch requests.
+> Batch response generation, upload, and download handlers remain planned.
 
 ### Progress Summary
 
@@ -1130,12 +1130,12 @@ Defer:
 | 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
-| 5. LFS Server Protocol                   | 12          | 4      | 8         |
+| 5. LFS Server Protocol                   | 12          | 5      | 7         |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **50** | **49**    |
+| **Total**                                | **99**      | **51** | **48**    |
 
 ### Legend
 
@@ -1250,7 +1250,7 @@ Defer:
 
 #### Epic 5.2: Batch API
 
-- [ ] [T] Implement Git LFS batch request parsing.
+- [x] [T] Implement Git LFS batch request parsing.
 - [ ] [T] Implement batch download response generation with object-level errors.
 - [ ] [T] Implement batch upload response generation with object-level errors.
 - [ ] [T] Enforce GitHub read/write authorization per batch operation.

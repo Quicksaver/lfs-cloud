@@ -516,6 +516,59 @@ pub struct LfsBatchRequest {
     pub objects: Vec<LfsObject>,
 }
 
+/// Error returned when a Git LFS batch request body cannot be parsed.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum LfsBatchRequestParseError {
+    /// The request body was not valid Git LFS batch JSON.
+    #[error("invalid Git LFS batch request JSON: {source}")]
+    Json {
+        /// Underlying JSON or typed deserialization failure.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Parses a Git LFS batch API request body.
+///
+/// The Git LFS batch endpoint accepts JSON whose `operation` is `download` or
+/// `upload`, whose objects carry SHA-256 OIDs and exact sizes, and whose
+/// optional `ref` field is preserved for later authorization decisions.
+///
+/// # Errors
+///
+/// Returns [`LfsBatchRequestParseError`] when the body is not valid JSON or
+/// does not match the typed Git LFS batch request shape.
+///
+/// # Examples
+///
+/// ```
+/// use lfs_cloud::{LfsBatchOperation, parse_lfs_batch_request_json};
+///
+/// let request = parse_lfs_batch_request_json(
+///     br#"{
+///       "operation": "download",
+///       "transfers": ["basic"],
+///       "objects": [
+///         {
+///           "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+///           "size": 42
+///         }
+///       ]
+///     }"#,
+/// )?;
+///
+/// assert_eq!(request.operation, LfsBatchOperation::Download);
+/// assert_eq!(request.objects[0].size.bytes(), 42);
+/// # Ok::<(), lfs_cloud::LfsBatchRequestParseError>(())
+/// ```
+pub fn parse_lfs_batch_request_json(
+    body: impl AsRef<[u8]>,
+) -> Result<LfsBatchRequest, LfsBatchRequestParseError> {
+    serde_json::from_slice(body.as_ref())
+        .map_err(|source| LfsBatchRequestParseError::Json { source })
+}
+
 /// Git LFS batch response payload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LfsBatchResponse {
@@ -630,8 +683,8 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        LfsBatchObjectError, LfsBatchObjectResponse, LfsObject, LfsObjectError, LfsObjectSize,
-        LfsOid, LfsPointer,
+        LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation, LfsObject, LfsObjectError,
+        LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
     };
 
     const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -926,6 +979,62 @@ mod tests {
         assert_eq!(response.size, object.size);
         assert!(response.actions.is_empty());
         assert_eq!(response.error.as_ref().map(|error| error.code), Some(404));
+    }
+
+    #[test]
+    fn batch_request_json_parses_operation_objects_transfers_and_ref() {
+        let request = parse_lfs_batch_request_json(
+            br#"{
+                "operation": "download",
+                "transfers": ["basic"],
+                "ref": { "name": "refs/heads/main" },
+                "objects": [
+                    {
+                        "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "size": 42
+                    }
+                ]
+            }"#,
+        )
+        .expect("valid batch request should parse");
+
+        assert_eq!(request.operation, LfsBatchOperation::Download);
+        assert_eq!(request.transfers, ["basic"]);
+        assert_eq!(
+            request
+                .ref_context
+                .as_ref()
+                .map(|ref_context| ref_context.name.as_str()),
+            Some("refs/heads/main")
+        );
+        assert_eq!(request.objects.len(), 1);
+        assert_eq!(request.objects[0].oid.as_hex(), OID);
+        assert_eq!(request.objects[0].size.bytes(), 42);
+    }
+
+    #[test]
+    fn batch_request_json_rejects_invalid_shape_and_objects() {
+        let unsupported_operation = br#"{
+            "operation": "lock",
+            "objects": [
+                {
+                    "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 42
+                }
+            ]
+        }"#;
+        let invalid_object = br#"{
+            "operation": "upload",
+            "objects": [
+                {
+                    "oid": "not-a-sha",
+                    "size": 42
+                }
+            ]
+        }"#;
+
+        assert!(parse_lfs_batch_request_json(unsupported_operation).is_err());
+        assert!(parse_lfs_batch_request_json(invalid_object).is_err());
     }
 
     #[test]
