@@ -13,7 +13,9 @@ pub mod providers;
 pub mod server_config;
 pub mod sessions;
 
-pub use credentials::{DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval};
+pub use credentials::{
+    DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredential, GitCredentialApproval, GitCredentialLookup,
+};
 pub use error::{
     CliError, CliResult, ErrorCategory, LfsCloudError, LfsCloudResult, MigrationError,
     MigrationResult, RepositoryPermission, RepositoryProviderError, RepositoryProviderResult,
