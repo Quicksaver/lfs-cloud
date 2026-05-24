@@ -339,7 +339,7 @@ impl StorageProviderConfig {
                 id,
                 credential_ref: resolve_required(
                     raw.credential_ref,
-                    format!("{base_path}.credential_ref"),
+                    format!("{base_path}.credentials_ref"),
                     env,
                 )?,
                 root_folder_id: resolve_required(
@@ -492,7 +492,7 @@ struct RawRepositoryProviderConfig {
 struct RawStorageProviderConfig {
     #[serde(default, rename = "type")]
     provider_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "credentials_ref", alias = "credential_ref")]
     credential_ref: Option<String>,
     #[serde(default)]
     root_folder_id: Option<String>,
@@ -534,7 +534,12 @@ fn resolve_required(
     let value = value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid_config_error(&path, "is required"))?;
-    interpolate_env(&value, &path, env)
+    let value = interpolate_env(&value, &path, env)?;
+    if value.trim().is_empty() {
+        return invalid_config(path, "is required");
+    }
+
+    Ok(value)
 }
 
 fn resolve_optional(
@@ -631,7 +636,7 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: ${DRIVE_CREDENTIAL_REF}
+    credentials_ref: ${DRIVE_CREDENTIAL_REF}
     root_folder_id: drive-root-folder
     display_name: Main Drive
 
@@ -752,6 +757,42 @@ server:
             &error,
             "repository_providers.github-main.oauth_client_id references unset environment variable GITHUB_CLIENT_ID",
         );
+    }
+
+    #[test]
+    fn required_environment_references_must_not_resolve_to_empty_strings() {
+        let error =
+            ServerConfig::load_from_str_with_env(valid_yaml(), "<test>", |name| match name {
+                "GITHUB_CLIENT_ID" => Some("client-id".to_owned()),
+                "GITHUB_CLIENT_SECRET" => Some("client-secret".to_owned()),
+                "DRIVE_CREDENTIAL_REF" => Some(String::new()),
+                _ => None,
+            })
+            .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "storage_providers.drive-user-a.credentials_ref is required",
+        );
+    }
+
+    #[test]
+    fn accepts_legacy_singular_storage_credential_ref_key() {
+        let config = load_with_test_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credential_ref: drive-credential
+    root_folder_id: drive-root
+"#,
+        );
+
+        let StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig { credential_ref, .. }) =
+            &config.storage_providers["drive-user-a"];
+        assert_eq!(credential_ref, "drive-credential");
     }
 
     #[test]
