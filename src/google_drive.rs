@@ -676,7 +676,7 @@ impl GoogleDriveObjectStore {
         GoogleDriveObjectKey::new(&self.repo_namespace, object.clone())
     }
 
-    /// Checks whether a matching object is visible to the configured Drive app.
+    /// Checks whether the object exists under the configured Drive root.
     ///
     /// # Errors
     ///
@@ -1181,17 +1181,22 @@ fn drive_object_lookup_url(
         .append_pair("corpora", "user")
         .append_pair("includeItemsFromAllDrives", "true")
         .append_pair("supportsAllDrives", "true")
-        .append_pair("q", &drive_object_lookup_query(key, expected_properties));
+        .append_pair(
+            "q",
+            &drive_object_lookup_query(root_folder_id, key, expected_properties),
+        );
 
     Ok(api_base_url)
 }
 
 fn drive_object_lookup_query(
+    root_folder_id: &str,
     key: &GoogleDriveObjectKey,
     expected_properties: &GoogleDriveObjectProperties,
 ) -> String {
     let mut query = format!(
-        "trashed = false and name = '{}'",
+        "'{}' in parents and trashed = false and name = '{}'",
+        escape_drive_query_string(root_folder_id),
         escape_drive_query_string(&key.file_name())
     );
 
@@ -1974,6 +1979,7 @@ mod tests {
         assert_eq!(query["corpora"], "user");
         assert_eq!(query["includeItemsFromAllDrives"], "true");
         assert_eq!(query["supportsAllDrives"], "true");
+        assert!(query["q"].contains("'drive-root' in parents"));
         assert!(query["q"].contains("trashed = false"));
         assert!(query["q"].contains(&format!("name = 'sha256-{OBJECT_OID}-42.lfs'")));
         assert!(query["q"].contains(
@@ -2288,6 +2294,7 @@ mod tests {
         assert_eq!(query["corpora"], "user");
         assert_eq!(query["includeItemsFromAllDrives"], "true");
         assert_eq!(query["supportsAllDrives"], "true");
+        assert!(query["q"].contains("'drive-root' in parents"));
         assert!(query["q"].contains(
             "appProperties has { key='lfsCloudRepoNamespace' and value='github.com/owner/repo' }"
         ));
