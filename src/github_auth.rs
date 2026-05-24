@@ -23,9 +23,10 @@ use crate::{
 };
 
 const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
+const MAX_GITHUB_ERROR_BODY_LEN: usize = 16 * 1024;
 const GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_USER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
-const GITHUB_OAUTH_USER_AGENT: &str = concat!("lfs-cloud/", env!("CARGO_PKG_VERSION"));
+const GITHUB_USER_AGENT: &str = concat!("lfs-cloud/", env!("CARGO_PKG_VERSION"));
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 
 static DEFAULT_GITHUB_OAUTH_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
@@ -188,10 +189,16 @@ impl GitHubUserClient {
                 });
             }
 
-            let body = response
-                .text()
+            let body = read_github_error_body(response)
                 .await
                 .map_err(|source| github_user_request_error(provider, Some(status), source))?;
+            if status == StatusCode::FORBIDDEN && github_forbidden_body_indicates_auth(&body) {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: provider.id.clone(),
+                    },
+                });
+            }
 
             return Err(github_user_status_error(provider, status, &body, token));
         }
@@ -742,7 +749,9 @@ impl GitHubUserResponse {
             .login
             .ok_or_else(|| malformed_github_user_response_error(provider, "missing login"))?;
         let login = validate_sensitive_oauth_value(login, "github authenticated user login")
-            .map_err(|_| malformed_github_user_response_error(provider, "invalid login"))?;
+            .map_err(|error| {
+                malformed_github_user_response_error(provider, &format!("invalid login: {error}"))
+            })?;
 
         Ok(RepositoryUser::new(
             provider.id.clone(),
@@ -755,6 +764,8 @@ impl GitHubUserResponse {
 #[derive(Debug, Deserialize)]
 struct GitHubApiErrorResponse {
     message: Option<String>,
+    #[serde(default)]
+    errors: Vec<serde_json::Value>,
 }
 
 impl GitHubOAuthTokenResponse {
@@ -924,6 +935,23 @@ fn github_user_status_error(
     repository_provider_upstream_error(provider, Some(status.as_u16()), &message)
 }
 
+async fn read_github_error_body(mut response: reqwest::Response) -> Result<String, reqwest::Error> {
+    let mut body = Vec::new();
+    while body.len() < MAX_GITHUB_ERROR_BODY_LEN {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        let remaining = MAX_GITHUB_ERROR_BODY_LEN - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 fn malformed_github_user_response_error(
     provider: &GitHubProviderConfig,
     message: &str,
@@ -1025,14 +1053,14 @@ fn default_github_api_http_client() -> ServerResult<Client> {
 fn build_github_oauth_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
         .timeout(GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT)
-        .user_agent(GITHUB_OAUTH_USER_AGENT)
+        .user_agent(GITHUB_USER_AGENT)
         .build()
 }
 
 fn build_github_api_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
         .timeout(GITHUB_USER_FETCH_TIMEOUT)
-        .user_agent(GITHUB_OAUTH_USER_AGENT)
+        .user_agent(GITHUB_USER_AGENT)
         .build()
 }
 
@@ -1128,14 +1156,78 @@ fn sanitize_oauth_diagnostic_value(value: &str) -> String {
 fn github_api_error_message(body: &str, token: &GitHubOAuthAccessToken) -> Option<String> {
     serde_json::from_str::<GitHubApiErrorResponse>(body)
         .ok()
-        .and_then(|error| error.message)
+        .and_then(github_api_error_diagnostic)
         .map(|message| redact_oauth_secret(&message, token))
-        .map(|message| sanitize_oauth_diagnostic_value(&message))
-        .filter(|message| !message.is_empty())
+        .filter(|message| !message.trim().is_empty())
 }
 
 fn redact_oauth_secret(message: &str, token: &GitHubOAuthAccessToken) -> String {
+    if token.as_str().is_empty() {
+        return message.to_owned();
+    }
+
     message.replace(token.as_str(), "<redacted>")
+}
+
+fn github_api_error_diagnostic(error: GitHubApiErrorResponse) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(message) = error.message.filter(|message| !message.trim().is_empty()) {
+        parts.push(message);
+    }
+    parts.extend(
+        error
+            .errors
+            .iter()
+            .filter_map(github_api_error_detail)
+            .take(3),
+    );
+
+    (!parts.is_empty()).then(|| parts.join(": "))
+}
+
+fn github_api_error_detail(error: &serde_json::Value) -> Option<String> {
+    if let Some(message) = error.as_str().filter(|message| !message.trim().is_empty()) {
+        return Some(message.to_owned());
+    }
+
+    let object = error.as_object()?;
+    if let Some(message) = object
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+    {
+        return Some(message.to_owned());
+    }
+
+    let mut detail = Vec::new();
+    for key in ["resource", "field", "code"] {
+        if let Some(value) = object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            detail.push(value);
+        }
+    }
+
+    (!detail.is_empty()).then(|| detail.join("."))
+}
+
+fn github_forbidden_body_indicates_auth(body: &str) -> bool {
+    let Some(message) = serde_json::from_str::<GitHubApiErrorResponse>(body)
+        .ok()
+        .and_then(github_api_error_diagnostic)
+    else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+
+    message.contains("scope")
+        || message.contains("resource not accessible")
+        || message.contains("bad credentials")
+        || message.contains("requires authentication")
+        || message.contains("personal access token")
+        || message.contains("oauth")
 }
 
 #[cfg(test)]
@@ -1573,6 +1665,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_client_maps_forbidden_scope_failure_to_authentication_required() {
+        let (api_url, _user_server) = user_server(
+            StatusCode::FORBIDDEN,
+            r#"{"message":"Resource not accessible by personal access token"}"#,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_secret").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("forbidden scope failure should fail as authentication");
+        let rendered = error.to_string();
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::AuthenticationRequired { .. }
+            }
+        ));
+        assert!(!rendered.contains("gho_secret"));
+    }
+
+    #[tokio::test]
+    async fn user_client_includes_github_error_details_in_upstream_message() {
+        let (api_url, _user_server) = user_server(
+            StatusCode::BAD_GATEWAY,
+            r#"{"message":"Validation failed","errors":[{"resource":"User","field":"login","code":"invalid"}]}"#,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_secret").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("upstream user lookup should fail");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("Validation failed"));
+        assert!(rendered.contains("User.login.invalid"));
+    }
+
+    #[tokio::test]
+    async fn user_client_caps_large_upstream_error_body() {
+        let large_body = "x".repeat(super::MAX_GITHUB_ERROR_BODY_LEN * 2);
+        let (api_url, _user_server) = user_server(StatusCode::BAD_GATEWAY, large_body).await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_secret").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("upstream user lookup should fail");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("github authenticated user request failed"));
+        assert!(rendered.len() < 512);
+    }
+
+    #[tokio::test]
     async fn user_client_redacts_long_token_before_truncating_upstream_error_message() {
         let token_secret = format!("gho_{}", "a".repeat(240));
         let body = format!(r#"{{"message":"echo {token_secret}"}}"#);
@@ -1592,6 +1749,25 @@ mod tests {
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains(&token_secret));
         assert!(!rendered.contains(&token_secret[..200]));
+    }
+
+    #[tokio::test]
+    async fn user_client_reports_invalid_login_validation_reason() {
+        let (api_url, _user_server) =
+            user_server(StatusCode::OK, r#"{"login":" bad-login","id":583231}"#).await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("invalid login should fail");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("invalid login"));
+        assert!(rendered.contains("must not be blank or padded"));
+        assert!(!rendered.contains("gho_token"));
     }
 
     #[tokio::test]
