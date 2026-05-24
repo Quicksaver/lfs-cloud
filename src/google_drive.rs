@@ -4,13 +4,23 @@
 //! configuration references and exchanges refresh tokens for short-lived
 //! access tokens. It does not expose Drive credentials to Git LFS clients.
 
-use std::{collections::BTreeMap, fmt, net::IpAddr, sync::OnceLock, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    fs::File,
+    io::{BufReader, Read},
+    net::IpAddr,
+    path::Path,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use reqwest::{
-    Client, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue},
+    Body, Client, StatusCode,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION},
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
@@ -20,11 +30,11 @@ use crate::{
 
 const GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
-const GOOGLE_DRIVE_OBJECT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_";
 const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
 const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
 const GOOGLE_DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
+const GOOGLE_DRIVE_OBJECT_CONTENT_TYPE: &str = "application/octet-stream";
 const GOOGLE_DRIVE_OBJECT_VERSION: &str = "1";
 const GOOGLE_DRIVE_OBJECT_VERSION_PROPERTY: &str = "lfsCloudVersion";
 const GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY: &str = "lfsCloudRepoNamespace";
@@ -33,7 +43,7 @@ const GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY: &str = "lfsCloudSize";
 
 static DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
-static DEFAULT_GOOGLE_DRIVE_OBJECT_LOOKUP_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static DEFAULT_GOOGLE_DRIVE_OBJECT_STORE_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
 /// Google OAuth token endpoint used by Drive refresh-token exchange.
 pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -629,7 +639,7 @@ impl GoogleDriveObjectStore {
             storage,
             repo_namespace,
             token,
-            default_google_drive_object_lookup_http_client()?,
+            default_google_drive_object_store_http_client()?,
             GOOGLE_DRIVE_API_BASE_URL,
         )
     }
@@ -733,6 +743,110 @@ impl GoogleDriveObjectStore {
             &expected_properties,
             status,
             &response_body,
+        )
+    }
+
+    /// Uploads a staged and locally verified object file through Drive resumable upload.
+    ///
+    /// The staged file is read before any Drive request so its SHA-256 and
+    /// byte count can be checked against the LFS pointer metadata. The current
+    /// implementation sends the resumable upload content in one request after
+    /// session initiation; if Drive reports an interrupted session, callers get
+    /// a retryable storage error and may retry the whole upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the staged file cannot be read, its bytes
+    /// do not match the requested object identity, Drive cannot create a
+    /// resumable session, or the upload completion response is malformed.
+    pub async fn upload_object(
+        &self,
+        object: &LfsObject,
+        source: impl AsRef<Path>,
+    ) -> StorageResult<StoredObject> {
+        let source = source.as_ref();
+        verify_staged_upload_file(&self.storage, object, source)?;
+
+        let key = self.object_key(object)?;
+        let expected_properties = key.expected_app_properties();
+        let metadata = drive_upload_metadata(&self.storage.root_folder_id, &key);
+        let initiate_response = self
+            .client
+            .post(drive_resumable_upload_url(self.api_base_url.clone())?)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                AUTHORIZATION,
+                self.token.authorization_header_value(&self.storage.id)?,
+            )
+            .header("X-Upload-Content-Type", GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
+            .header("X-Upload-Content-Length", object.size.bytes().to_string())
+            .json(&metadata)
+            .send()
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        let initiate_status = initiate_response.status();
+        let session_url = if initiate_status.is_success() {
+            initiate_response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| StorageError::Upstream {
+                    provider: self.storage.id.clone(),
+                    status: Some(initiate_status.as_u16()),
+                    message: SanitizedMessage::new(
+                        "Google Drive resumable upload response did not include Location",
+                    ),
+                })?
+                .to_owned()
+        } else {
+            let response_body = read_google_response_body(initiate_response)
+                .await
+                .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+            return Err(parse_drive_upload_error(
+                &self.storage,
+                &self.token,
+                object,
+                initiate_status,
+                &response_body,
+            ));
+        };
+
+        let file = tokio::fs::File::open(source)
+            .await
+            .map_err(|error| staged_file_read_error(&self.storage, source, error))?;
+        let upload_response = self
+            .client
+            .put(session_url)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
+            .header(CONTENT_LENGTH, object.size.bytes().to_string())
+            .body(Body::from(file))
+            .send()
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        let upload_status = upload_response.status();
+        let upload_body = read_google_response_body(upload_response)
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+
+        if !matches!(upload_status, StatusCode::OK | StatusCode::CREATED) {
+            return Err(parse_drive_upload_error(
+                &self.storage,
+                &self.token,
+                object,
+                upload_status,
+                &upload_body,
+            ));
+        }
+
+        parse_drive_upload_success(
+            &self.storage,
+            &key,
+            &expected_properties,
+            upload_status,
+            &upload_body,
         )
     }
 }
@@ -1029,11 +1143,25 @@ fn default_google_drive_root_validation_http_client() -> StorageResult<Client> {
     )
 }
 
-fn default_google_drive_object_lookup_http_client() -> StorageResult<Client> {
-    default_google_drive_http_client_from(
-        &DEFAULT_GOOGLE_DRIVE_OBJECT_LOOKUP_HTTP_CLIENT,
-        GOOGLE_DRIVE_OBJECT_LOOKUP_TIMEOUT,
-    )
+fn default_google_drive_object_store_http_client() -> StorageResult<Client> {
+    if let Some(client) = DEFAULT_GOOGLE_DRIVE_OBJECT_STORE_HTTP_CLIENT.get() {
+        return Ok(client.clone());
+    }
+
+    let client = Client::builder()
+        .build()
+        .map_err(|source| StorageError::Retryable {
+            provider: "google_drive".to_owned(),
+            message: format!("failed to initialize Google Drive object HTTP client: {source}"),
+        })?;
+
+    match DEFAULT_GOOGLE_DRIVE_OBJECT_STORE_HTTP_CLIENT.set(client.clone()) {
+        Ok(()) => Ok(client),
+        Err(client) => Ok(DEFAULT_GOOGLE_DRIVE_OBJECT_STORE_HTTP_CLIENT
+            .get()
+            .cloned()
+            .unwrap_or(client)),
+    }
 }
 
 fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
@@ -1187,6 +1315,53 @@ fn drive_object_lookup_url(
         );
 
     Ok(api_base_url)
+}
+
+fn drive_resumable_upload_url(mut api_base_url: Url) -> StorageResult<Url> {
+    let base_path_already_targets_drive_api =
+        drive_api_base_path_already_targets_drive_api(&api_base_url);
+
+    {
+        let mut segments =
+            api_base_url
+                .path_segments_mut()
+                .map_err(|_| StorageError::Upstream {
+                    provider: "google_drive".to_owned(),
+                    status: None,
+                    message: SanitizedMessage::new(
+                        "Google Drive API base URL cannot be used for path construction",
+                    ),
+                })?;
+        segments.pop_if_empty();
+        if base_path_already_targets_drive_api {
+            segments.pop();
+            segments.pop();
+        }
+        segments.extend(["upload", "drive", "v3", "files"]);
+    }
+
+    api_base_url
+        .query_pairs_mut()
+        .append_pair("uploadType", "resumable")
+        .append_pair("fields", "id,name,size,appProperties")
+        .append_pair("supportsAllDrives", "true");
+
+    Ok(api_base_url)
+}
+
+fn drive_upload_metadata(root_folder_id: &str, key: &GoogleDriveObjectKey) -> serde_json::Value {
+    let app_properties = key
+        .expected_app_properties()
+        .pairs()
+        .into_iter()
+        .map(|(property, value)| (property, value.to_owned()))
+        .collect::<BTreeMap<_, _>>();
+
+    serde_json::json!({
+        "name": key.file_name(),
+        "parents": [root_folder_id],
+        "appProperties": app_properties,
+    })
 }
 
 fn drive_object_lookup_query(
@@ -1514,6 +1689,74 @@ fn verify_drive_object_file(
     ))
 }
 
+fn verify_staged_upload_file(
+    storage: &GoogleDriveStorageConfig,
+    object: &LfsObject,
+    source: &Path,
+) -> StorageResult<()> {
+    let file =
+        File::open(source).map_err(|error| staged_file_read_error(storage, source, error))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut actual_size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|error| staged_file_read_error(storage, source, error))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+        actual_size += bytes_read as u64;
+    }
+
+    let actual_oid = format!("{:x}", hasher.finalize());
+    if actual_oid != object.oid.as_hex() || actual_size != object.size.bytes() {
+        return Err(StorageError::IntegrityMismatch {
+            expected_oid: object.oid.as_hex().to_owned(),
+            expected_size: object.size.bytes(),
+            actual_oid,
+            actual_size,
+        });
+    }
+
+    Ok(())
+}
+
+fn staged_file_read_error(
+    storage: &GoogleDriveStorageConfig,
+    path: &Path,
+    source: std::io::Error,
+) -> StorageError {
+    StorageError::StagedFileRead {
+        provider: storage.id.clone(),
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn parse_drive_upload_success(
+    storage: &GoogleDriveStorageConfig,
+    key: &GoogleDriveObjectKey,
+    expected_properties: &GoogleDriveObjectProperties,
+    status: StatusCode,
+    body: &str,
+) -> StorageResult<StoredObject> {
+    let file = serde_json::from_str::<GoogleDriveObjectFile>(body).map_err(|_| {
+        StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive upload completion response was invalid JSON",
+            ),
+        }
+    })?;
+
+    verify_drive_object_file(storage, key, expected_properties, status, file)
+}
+
 fn parse_drive_object_lookup_error(
     storage: &GoogleDriveStorageConfig,
     token: &GoogleDriveAccessToken,
@@ -1542,6 +1785,63 @@ fn parse_drive_object_lookup_error(
         };
     }
     if status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || diagnostic.reasons.iter().any(|reason| {
+            matches!(
+                reason.as_str(),
+                "rateLimitExceeded" | "userRateLimitExceeded"
+            )
+        })
+    {
+        return StorageError::Retryable {
+            provider: storage.id.clone(),
+            message: diagnostic.message,
+        };
+    }
+
+    StorageError::Upstream {
+        provider: storage.id.clone(),
+        status: Some(status.as_u16()),
+        message: SanitizedMessage::new(diagnostic.message),
+    }
+}
+
+fn parse_drive_upload_error(
+    storage: &GoogleDriveStorageConfig,
+    token: &GoogleDriveAccessToken,
+    object: &LfsObject,
+    status: StatusCode,
+    body: &str,
+) -> StorageError {
+    let diagnostic = drive_error_message(token, body);
+    if status == StatusCode::UNAUTHORIZED
+        || diagnostic
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason.as_str(), "authError" | "insufficientPermissions"))
+    {
+        return StorageError::AuthenticationRequired {
+            provider: storage.id.clone(),
+        };
+    }
+    if status == StatusCode::CONFLICT {
+        return StorageError::Conflict {
+            provider: storage.id.clone(),
+            oid: object.oid.as_hex().to_owned(),
+        };
+    }
+    if diagnostic
+        .reasons
+        .iter()
+        .any(|reason| matches!(reason.as_str(), "quotaExceeded" | "storageQuotaExceeded"))
+    {
+        return StorageError::QuotaExceeded {
+            provider: storage.id.clone(),
+            message: diagnostic.message,
+        };
+    }
+    if status == StatusCode::NOT_FOUND
+        || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
         || diagnostic.reasons.iter().any(|reason| {
             matches!(
@@ -1764,13 +2064,14 @@ mod tests {
         body::Bytes,
         extract::{Path, State},
         http::{
-            HeaderMap, Uri,
-            header::{AUTHORIZATION, CONTENT_TYPE},
+            HeaderMap, HeaderValue, Uri,
+            header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
         },
         response::{IntoResponse, Response},
-        routing::{get, post},
+        routing::{get, post, put},
     };
     use reqwest::StatusCode;
+    use sha2::{Digest, Sha256};
 
     use super::{
         GOOGLE_OAUTH_TOKEN_URL, GoogleDriveCredential, GoogleDriveCredentialLoader,
@@ -2505,6 +2806,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_store_uploads_staged_file_with_resumable_session() {
+        let staged_bytes = b"0123456789abcdef0123456789abcdef0123456789";
+        let object = lfs_object_for_bytes(staged_bytes);
+        let server = DriveUploadServer::start(drive_object_json(
+            "drive-file-uploaded",
+            object.oid.as_hex(),
+            object.size.bytes(),
+        ))
+        .await;
+        let staged_file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(staged_file.path(), staged_bytes).expect("staged file should be written");
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let uploaded = store
+            .upload_object(&object, staged_file.path())
+            .await
+            .expect("resumable upload should succeed");
+
+        assert_eq!(uploaded.provider_id, "drive-user-a");
+        assert_eq!(uploaded.object, object);
+        assert_eq!(uploaded.backend_id, "drive-file-uploaded");
+
+        let initiate_requests = server.initiate_requests();
+        assert_eq!(initiate_requests.len(), 1);
+        assert_eq!(
+            initiate_requests[0].headers.get(AUTHORIZATION).unwrap(),
+            "Bearer access-token"
+        );
+        assert_eq!(
+            initiate_requests[0].headers.get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            initiate_requests[0]
+                .headers
+                .get("x-upload-content-type")
+                .unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            initiate_requests[0]
+                .headers
+                .get("x-upload-content-length")
+                .unwrap(),
+            &object.size.bytes().to_string()
+        );
+        let query = form_pairs(&initiate_requests[0].query);
+        assert_eq!(query["uploadType"], "resumable");
+        assert_eq!(query["supportsAllDrives"], "true");
+        assert_eq!(query["fields"], "id,name,size,appProperties");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&initiate_requests[0].body).expect("metadata should be JSON");
+        assert_eq!(
+            metadata["name"],
+            format!("sha256-{}-{}.lfs", object.oid.as_hex(), object.size.bytes())
+        );
+        assert_eq!(metadata["parents"], serde_json::json!(["drive-root"]));
+        assert_eq!(
+            metadata["appProperties"]["lfsCloudRepoNamespace"],
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            metadata["appProperties"]["lfsCloudOid"],
+            object.oid.as_hex()
+        );
+        assert_eq!(
+            metadata["appProperties"]["lfsCloudSize"],
+            object.size.bytes().to_string()
+        );
+
+        let upload_requests = server.upload_requests();
+        assert_eq!(upload_requests.len(), 1);
+        assert_eq!(upload_requests[0].session_id, "session-1");
+        assert_eq!(
+            upload_requests[0].headers.get(CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            upload_requests[0].headers.get(CONTENT_LENGTH).unwrap(),
+            &object.size.bytes().to_string()
+        );
+        assert_eq!(upload_requests[0].body, staged_bytes);
+    }
+
+    #[tokio::test]
+    async fn object_store_rejects_staged_file_mismatch_before_drive_upload() {
+        let server =
+            DriveUploadServer::start(drive_object_list_json("drive-file-unused", OBJECT_OID, 42))
+                .await;
+        let staged_file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(staged_file.path(), [b'x'; 42]).expect("staged file should be written");
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let error = store
+            .upload_object(&lfs_object(), staged_file.path())
+            .await
+            .expect_err("hash mismatch should fail before Drive upload starts");
+
+        assert!(matches!(
+            error,
+            StorageError::IntegrityMismatch {
+                ref expected_oid,
+                expected_size: 42,
+                actual_size: 42,
+                ..
+            } if expected_oid == OBJECT_OID
+        ));
+        assert!(server.initiate_requests().is_empty());
+        assert!(server.upload_requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn root_validator_confirms_app_accessible_writable_folder() {
         let server = DriveMetadataServer::start(StatusCode::OK, drive_folder_json()).await;
         let validator = GoogleDriveRootValidator::with_client_and_api_base_url(
@@ -2774,6 +3201,15 @@ mod tests {
         LfsObject::new(
             LfsOid::from_str(OBJECT_OID).expect("test OID should parse"),
             LfsObjectSize::new(42),
+        )
+    }
+
+    fn lfs_object_for_bytes(bytes: &[u8]) -> LfsObject {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        LfsObject::new(
+            LfsOid::from_str(&format!("{:x}", hasher.finalize())).expect("test OID should parse"),
+            LfsObjectSize::new(bytes.len() as u64),
         )
     }
 
@@ -3064,6 +3500,156 @@ mod tests {
             state.status,
             [(CONTENT_TYPE, "application/json")],
             state.body.clone(),
+        )
+            .into_response()
+    }
+
+    struct DriveUploadServer {
+        base_url: String,
+        state: Arc<DriveUploadServerState>,
+        server_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl DriveUploadServer {
+        async fn start(upload_body: impl Into<String>) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test Drive upload server should bind");
+            let address = listener
+                .local_addr()
+                .expect("test Drive upload server address should be available");
+            let state = Arc::new(DriveUploadServerState {
+                session_url: format!("http://{address}/upload_session/session-1"),
+                initiate_status: StatusCode::OK,
+                initiate_body: String::new(),
+                upload_status: StatusCode::CREATED,
+                upload_body: upload_body.into(),
+                initiate_requests: Mutex::new(Vec::new()),
+                upload_requests: Mutex::new(Vec::new()),
+            });
+            let app = Router::new()
+                .route(
+                    "/upload/drive/v3/files",
+                    post(drive_upload_initiate_handler),
+                )
+                .route(
+                    "/upload_session/{session_id}",
+                    put(drive_upload_session_handler),
+                )
+                .with_state(state.clone());
+            let server_task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("test Drive upload server should run");
+            });
+
+            Self {
+                base_url: format!("http://{address}"),
+                state,
+                server_task,
+            }
+        }
+
+        fn initiate_requests(&self) -> Vec<CapturedDriveUploadInitiateRequest> {
+            self.state
+                .initiate_requests
+                .lock()
+                .expect("test Drive upload initiate requests lock should not poison")
+                .clone()
+        }
+
+        fn upload_requests(&self) -> Vec<CapturedDriveUploadRequest> {
+            self.state
+                .upload_requests
+                .lock()
+                .expect("test Drive upload requests lock should not poison")
+                .clone()
+        }
+    }
+
+    impl Drop for DriveUploadServer {
+        fn drop(&mut self) {
+            self.server_task.abort();
+        }
+    }
+
+    struct DriveUploadServerState {
+        session_url: String,
+        initiate_status: StatusCode,
+        initiate_body: String,
+        upload_status: StatusCode,
+        upload_body: String,
+        initiate_requests: Mutex<Vec<CapturedDriveUploadInitiateRequest>>,
+        upload_requests: Mutex<Vec<CapturedDriveUploadRequest>>,
+    }
+
+    #[derive(Clone)]
+    struct CapturedDriveUploadInitiateRequest {
+        headers: HeaderMap,
+        query: String,
+        body: String,
+    }
+
+    #[derive(Clone)]
+    struct CapturedDriveUploadRequest {
+        session_id: String,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    async fn drive_upload_initiate_handler(
+        State(state): State<Arc<DriveUploadServerState>>,
+        headers: HeaderMap,
+        uri: Uri,
+        body: Bytes,
+    ) -> Response {
+        state
+            .initiate_requests
+            .lock()
+            .expect("test Drive upload initiate requests lock should not poison")
+            .push(CapturedDriveUploadInitiateRequest {
+                headers,
+                query: uri.query().unwrap_or_default().to_owned(),
+                body: String::from_utf8(body.to_vec())
+                    .expect("initiate metadata body should be UTF-8"),
+            });
+
+        let mut response = (
+            state.initiate_status,
+            [(CONTENT_TYPE, "application/json")],
+            state.initiate_body.clone(),
+        )
+            .into_response();
+        if state.initiate_status.is_success() {
+            response.headers_mut().insert(
+                LOCATION,
+                HeaderValue::from_str(&state.session_url)
+                    .expect("session URL should be a valid header"),
+            );
+        }
+        response
+    }
+
+    async fn drive_upload_session_handler(
+        Path(session_id): Path<String>,
+        State(state): State<Arc<DriveUploadServerState>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        state
+            .upload_requests
+            .lock()
+            .expect("test Drive upload requests lock should not poison")
+            .push(CapturedDriveUploadRequest {
+                session_id,
+                headers,
+                body: body.to_vec(),
+            });
+
+        (
+            state.upload_status,
+            [(CONTENT_TYPE, "application/json")],
+            state.upload_body.clone(),
         )
             .into_response()
     }

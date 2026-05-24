@@ -432,6 +432,18 @@ pub enum StorageError {
         actual_size: u64,
     },
 
+    /// A staged upload file could not be opened or read before provider upload.
+    #[error("{provider} staged upload file {} could not be read: {source}", path.display())]
+    StagedFileRead {
+        /// Configured storage provider ID.
+        provider: String,
+        /// Local staged file path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The operation failed in a way that may succeed if retried later.
     #[error("{provider} retryable storage failure: {message}")]
     Retryable {

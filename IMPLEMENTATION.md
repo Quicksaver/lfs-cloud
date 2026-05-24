@@ -1120,9 +1120,10 @@ Defer:
 > bearer access tokens, and configured Drive root folders can be validated with
 > a non-mutating metadata probe. Repository-scoped object keys now define a
 > deterministic Drive inspection path and Drive `files.list` lookups verify
-> object identity with private app properties plus binary size. The MVP Drive
-> scope is `drive.file`, with root folders required to be app-created or
-> explicitly app-accessible.
+> object identity with private app properties plus binary size. Staged upload
+> files are verified locally by SHA-256 and size before Drive resumable upload
+> sessions are opened. The MVP Drive scope is `drive.file`, with root folders
+> required to be app-created or explicitly app-accessible.
 
 ### Progress Summary
 
@@ -1131,14 +1132,14 @@ Defer:
 | 0. Foundations                           | 8           | 8      | 0         |
 | 1. Server Config                         | 8           | 8      | 0         |
 | 2. GitHub Auth                           | 13          | 13     | 0         |
-| 3. Google Drive Storage                  | 9           | 6      | 3         |
+| 3. Google Drive Storage                  | 9           | 7      | 2         |
 | 4. Metadata DB                           | 8           | 0      | 8         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **35** | **64**    |
+| **Total**                                | **99**      | **36** | **63**    |
 
 ### Legend
 
@@ -1222,7 +1223,7 @@ Defer:
 
 - [x] [T] Define Drive object naming/path convention under the configured root folder.
 - [x] [T] Implement object existence lookup by repo namespace, OID, and size.
-- [ ] [M] Implement resumable upload from staged temp file.
+- [x] [M] Implement resumable upload from staged temp file. Manual verification: with a real app-accessible Drive root folder and `drive.file` credential, upload a staged file whose SHA-256 and size match an `LfsObject`, then confirm Drive contains `sha256-<oid>-<size>.lfs` under the configured root with matching private app properties and binary size.
 - [ ] [M] Implement download streaming from Drive to HTTP response.
 - [ ] [T] Implement provider error classification for auth, quota, not found, conflict, and retryable failures.
 
