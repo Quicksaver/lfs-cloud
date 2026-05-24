@@ -200,12 +200,7 @@ impl GitHubOAuthTokenExchanger {
                     token_exchange_upstream_error(provider, Some(status.as_u16()), source)
                 })?;
 
-            return Err(ServerError::Unauthorized {
-                reason: format!(
-                    "github oauth token exchange failed: {}",
-                    error.to_sanitized_reason()
-                ),
-            });
+            return Err(oauth_token_exchange_error(error));
         }
 
         let response = response
@@ -214,6 +209,9 @@ impl GitHubOAuthTokenExchanger {
             .map_err(|source| {
                 token_exchange_upstream_error(provider, Some(status.as_u16()), source)
             })?;
+        if let Some(error) = response.oauth_error() {
+            return Err(oauth_token_exchange_error(error));
+        }
 
         GitHubOAuthToken::try_from_response(provider, response)
     }
@@ -596,6 +594,19 @@ struct GitHubOAuthTokenResponse {
     access_token: Option<String>,
     token_type: Option<String>,
     scope: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+impl GitHubOAuthTokenResponse {
+    fn oauth_error(&self) -> Option<GitHubOAuthTokenErrorResponse> {
+        let error = GitHubOAuthTokenErrorResponse {
+            error: self.error.clone(),
+            error_description: self.error_description.clone(),
+        };
+
+        error.has_diagnostic().then_some(error)
+    }
 }
 
 impl GitHubOAuthToken {
@@ -627,6 +638,18 @@ struct GitHubOAuthTokenErrorResponse {
 }
 
 impl GitHubOAuthTokenErrorResponse {
+    fn has_diagnostic(&self) -> bool {
+        self.error
+            .as_deref()
+            .map(sanitize_oauth_diagnostic_value)
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .error_description
+                .as_deref()
+                .map(sanitize_oauth_diagnostic_value)
+                .is_some_and(|value| !value.is_empty())
+    }
+
     fn to_sanitized_reason(&self) -> String {
         let error = self
             .error
@@ -673,6 +696,15 @@ fn malformed_token_response_error(provider: &GitHubProviderConfig, message: &str
         None,
         &format!("malformed github oauth token response: {message}"),
     )
+}
+
+fn oauth_token_exchange_error(error: GitHubOAuthTokenErrorResponse) -> ServerError {
+    ServerError::Unauthorized {
+        reason: format!(
+            "github oauth token exchange failed: {}",
+            error.to_sanitized_reason()
+        ),
+    }
 }
 
 fn repository_provider_upstream_error(
@@ -989,6 +1021,28 @@ mod tests {
         assert!(!rendered.contains("client-secret"));
         assert!(!rendered.contains("oauth-code"));
         assert!(!rendered.contains("csrf-state"));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_maps_successful_github_oauth_error_body() {
+        let (token_url, _token_server) = token_server(
+            StatusCode::OK,
+            r#"{"error":"bad_verification_code","error_description":"The code passed is incorrect or expired."}"#,
+        )
+        .await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let error = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect_err("GitHub OAuth denial should fail");
+        let rendered = error.to_string();
+
+        assert!(matches!(error, ServerError::Unauthorized { .. }));
+        assert!(rendered.contains("bad_verification_code"));
+        assert!(!rendered.contains("oauth-code"));
     }
 
     #[tokio::test]
