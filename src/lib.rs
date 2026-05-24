@@ -1,9 +1,9 @@
-//! Core library scaffold for LFS Cloud.
+//! Core library for LFS Cloud.
 //!
-//! The production CLI and server behavior is still planned. This library exists
-//! so the package has a stable target for documentation, tests, and future
-//! shared implementation.
+//! The root package keeps shared CLI, server, provider, storage, metadata, and
+//! protocol code in one library target so the binary target can stay small.
 
+pub mod cli;
 pub mod credentials;
 pub mod error;
 pub mod github_auth;
@@ -16,6 +16,7 @@ pub mod server;
 pub mod server_config;
 pub mod sessions;
 
+pub use cli::run_from_env;
 pub use credentials::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredential, GitCredentialApproval, GitCredentialLookup,
     git_credential_helper_fallback_instructions,
@@ -74,16 +75,16 @@ pub use sessions::{
     LocalLfsSessionStore,
 };
 
-/// Returns the placeholder message shown by the scaffold CLI.
+/// Returns the fallback message used by callers that want a static CLI hint.
 ///
 /// # Examples
 ///
 /// ```
-/// assert!(lfs_cloud::scaffold_message().contains("not implemented yet"));
+/// assert!(lfs_cloud::scaffold_message().contains("--help"));
 /// ```
 #[must_use]
 pub fn scaffold_message() -> &'static str {
-    "lfs-cloud scaffold: CLI and server commands are not implemented yet."
+    "Run `lfs-cloud --help` to see available commands."
 }
 
 #[cfg(test)]
@@ -91,7 +92,7 @@ mod tests {
     use super::scaffold_message;
 
     #[test]
-    fn scaffold_message_mentions_unimplemented_commands() {
-        assert!(scaffold_message().contains("not implemented yet"));
+    fn scaffold_message_points_to_cli_help() {
+        assert!(scaffold_message().contains("--help"));
     }
 }

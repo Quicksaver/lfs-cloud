@@ -1114,7 +1114,7 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 5 server protocol work has started. `lfs-cloud serve`
+> **Status**: Phase 6 CLI command work has started. `lfs-cloud serve`
 > loads validated server config, applies `--host`/`--port` overrides, opens
 > server-owned metadata storage, binds an Axum listener, reports local and
 > best-effort LAN URLs, resolves configured repository LFS paths, and requires
@@ -1131,6 +1131,9 @@ Defer:
 > error payloads with matching HTTP statuses. Upload staging now rejects object
 > sizes over the configured server cap, checks local temp-directory capacity
 > before writing, and times out idle client body reads.
+> The binary now uses a testable `clap` root command with shared `--config`
+> and `--log-level` flags, initializes tracing from CLI or `RUST_LOG`, and
+> dispatches `serve` through the server runtime.
 
 ### Progress Summary
 
@@ -1142,11 +1145,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 0      | 13        |
+| 6. CLI Commands                          | 13          | 3      | 10        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **58** | **41**    |
+| **Total**                                | **99**      | **61** | **38**    |
 
 ### Legend
 
@@ -1277,9 +1280,9 @@ Defer:
 
 #### Epic 6.1: CLI Skeleton
 
-- [ ] [T] Implement `clap` root command and shared global flags.
-- [ ] [T] Implement config-path and log-level handling.
-- [ ] [T] Implement `lfs-cloud serve` command wiring to server runtime.
+- [x] [T] Implement `clap` root command and shared global flags.
+- [x] [T] Implement config-path and log-level handling.
+- [x] [T] Implement `lfs-cloud serve` command wiring to server runtime.
 
 #### Epic 6.2: Login And Init
 
