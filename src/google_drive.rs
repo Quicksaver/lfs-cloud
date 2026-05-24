@@ -1162,6 +1162,8 @@ fn drive_object_lookup_url(
         )
         .append_pair("pageSize", "2")
         .append_pair("spaces", "drive")
+        .append_pair("corpora", "user")
+        .append_pair("includeItemsFromAllDrives", "true")
         .append_pair("supportsAllDrives", "true")
         .append_pair("q", &drive_object_lookup_query(root_folder_id, key));
 
@@ -1945,6 +1947,8 @@ mod tests {
         );
         assert_eq!(query["pageSize"], "2");
         assert_eq!(query["spaces"], "drive");
+        assert_eq!(query["corpora"], "user");
+        assert_eq!(query["includeItemsFromAllDrives"], "true");
         assert_eq!(query["supportsAllDrives"], "true");
         assert!(query["q"].contains("'drive-root' in parents"));
         assert!(query["q"].contains("trashed = false"));
@@ -2234,6 +2238,9 @@ mod tests {
             "Bearer access-token"
         );
         let query = form_pairs(&requests[0].query);
+        assert_eq!(query["corpora"], "user");
+        assert_eq!(query["includeItemsFromAllDrives"], "true");
+        assert_eq!(query["supportsAllDrives"], "true");
         assert!(query["q"].contains("'drive-root' in parents"));
         assert!(query["q"].contains(
             "appProperties has { key='lfsCloudRepoNamespace' and value='github.com/owner/repo' }"
