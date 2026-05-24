@@ -271,6 +271,34 @@ pub enum ServerError {
         path: PathBuf,
     },
 
+    /// The server could not bind its configured listener.
+    #[error("failed to bind server listener on {host}:{port}: {source}")]
+    Bind {
+        /// Listener host or interface.
+        host: String,
+        /// Listener TCP port.
+        port: u16,
+        /// Underlying socket failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The server could not inspect the listener's actual local address.
+    #[error("failed to inspect server listener address: {source}")]
+    LocalAddress {
+        /// Underlying socket failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The HTTP server stopped because the Axum runtime returned an error.
+    #[error("server runtime failed: {source}")]
+    Serve {
+        /// Underlying server runtime failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// No configured repository mapping matches an incoming LFS route.
     #[error("no configured repository route matches {path}")]
     RouteNotConfigured {

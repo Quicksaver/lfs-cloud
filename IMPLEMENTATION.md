@@ -1114,13 +1114,11 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 4 metadata setup is complete. `server.metadata_path`
-> resolves to a safe config-relative default of `.lfs-cloud/metadata.sqlite3`,
-> and `MetadataDatabase` opens server-owned SQLite state with foreign-key
-> enforcement, idempotent schema migrations, typed object lookup, and verified
-> object upsert APIs that repair stale backend IDs without creating duplicate
-> object rows. Phase 5 can now wire these metadata operations into LFS server
-> routes.
+> **Status**: Phase 5 server protocol work has started. `lfs-cloud serve`
+> loads validated server config, applies `--host`/`--port` overrides, opens
+> server-owned metadata storage, binds an Axum listener, reports local and
+> best-effort LAN URLs, and resolves configured repository LFS paths before the
+> later auth, batch, upload, and download handlers are attached.
 
 ### Progress Summary
 
@@ -1131,12 +1129,12 @@ Defer:
 | 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
-| 5. LFS Server Protocol                   | 12          | 0      | 12        |
+| 5. LFS Server Protocol                   | 12          | 3      | 9         |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **46** | **53**    |
+| **Total**                                | **99**      | **49** | **50**    |
 
 ### Legend
 
@@ -1244,9 +1242,9 @@ Defer:
 
 #### Epic 5.1: HTTP Server
 
-- [ ] [T] Implement `lfs-cloud serve --host --port --config`.
-- [ ] [M] Print localhost and LAN URLs when serving.
-- [ ] [T] Implement route parsing for configured repo LFS endpoints.
+- [x] [T] Implement `lfs-cloud serve --host --port --config`.
+- [x] [M] Print localhost and LAN URLs when serving. Manual verification: run `cargo run -- serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080` with a valid local config and confirm the startup output contains both `local:` and `network:` lines.
+- [x] [T] Implement route parsing for configured repo LFS endpoints.
 - [ ] [T] Add auth middleware for `lfs-cloud` LFS tokens.
 
 #### Epic 5.2: Batch API

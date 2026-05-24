@@ -382,6 +382,9 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
             | ServerError::MetadataMigration { .. }
             | ServerError::MetadataOperation { .. }
             | ServerError::MetadataConnectionPoisoned { .. }
+            | ServerError::Bind { .. }
+            | ServerError::LocalAddress { .. }
+            | ServerError::Serve { .. }
             | ServerError::RouteNotConfigured { .. }
             | ServerError::Internal { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,

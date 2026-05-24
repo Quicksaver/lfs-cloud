@@ -12,6 +12,7 @@ pub mod lfs;
 pub mod logging;
 pub mod metadata;
 pub mod providers;
+pub mod server;
 pub mod server_config;
 pub mod sessions;
 
@@ -55,6 +56,10 @@ pub use metadata::{
 pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,
     RepositoryProvider, RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
+};
+pub use server::{
+    AdvertisedServerUrls, LfsRouteEndpoint, LfsRouteResolver, ResolvedLfsRoute, ServeOptions,
+    advertised_server_urls, lfs_server_router, render_server_startup_message, serve,
 };
 pub use server_config::{
     DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,

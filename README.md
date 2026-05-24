@@ -4,7 +4,10 @@ LFS Cloud is a planned Git LFS-compatible server and CLI for storing large Git-t
 
 The initial goal is to keep normal Git version control on GitHub, while routing Git LFS objects through an `lfs-cloud` server to Google Drive storage you control.
 
-> Status: design and scaffold stage. A minimal Rust binary package exists, but the commands below describe intended product behavior and are not implemented yet.
+> Status: design and scaffold stage. A minimal `serve` command can load config,
+> bind an HTTP listener, print reachable URLs, and resolve configured LFS
+> routes, but Git LFS protocol handling and the other commands below are still
+> planned product behavior.
 
 ## Why
 
@@ -206,6 +209,6 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, and a minimal Rust binary scaffold. The actual CLI/server behavior has not been implemented yet.
+This repository currently contains planning documents, project configuration, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, reports local/LAN URLs, and resolves configured LFS repository routes. Full Git LFS batch, upload, download, auth middleware, and most CLI behavior have not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
