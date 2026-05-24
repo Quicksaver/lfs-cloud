@@ -289,8 +289,9 @@ impl GitCredentialApproval {
     ///
     /// # Errors
     ///
-    /// Returns [`CliError`] when `git` cannot be started, stdin cannot be
-    /// written, or the credential helper exits unsuccessfully.
+    /// Returns [`CliError`] when Git has no configured credential helper, `git`
+    /// cannot be started, stdin cannot be written, or the credential helper
+    /// exits unsuccessfully.
     pub fn approve(&self) -> CliResult<()> {
         self.approve_with_git_program(Path::new("git"))
     }
@@ -302,11 +303,59 @@ impl GitCredentialApproval {
     ///
     /// # Errors
     ///
-    /// Returns [`CliError`] when the process cannot be started, stdin cannot be
-    /// written, or the helper exits unsuccessfully.
+    /// Returns [`CliError`] when Git has no configured credential helper, the
+    /// process cannot be started, stdin cannot be written, or the helper exits
+    /// unsuccessfully.
     pub fn approve_with_git_program(&self, git_program: impl AsRef<Path>) -> CliResult<()> {
+        self.ensure_credential_helper_configured(git_program.as_ref())?;
         self.persist_path_aware_lookup(git_program.as_ref())?;
         self.approve_with_configured_git(git_program.as_ref())
+    }
+
+    fn ensure_credential_helper_configured(&self, git_program: &Path) -> CliResult<()> {
+        let command_name = "git config --get-all credential.helper";
+        let mut command = git_command(git_program);
+        let mut child = command
+            .args(["config", "--get-all", "credential.helper"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| CliError::Io {
+                context: format!("failed to start {command_name}"),
+                source,
+            })?;
+
+        let (status, stdout, stderr) = wait_for_git_command_output(
+            &mut child,
+            command_name,
+            self.token.as_str(),
+            GIT_COMMAND_TIMEOUT,
+        )?;
+
+        if status.success() {
+            return if git_config_output_has_helper(&stdout)? {
+                Ok(())
+            } else {
+                Err(missing_credential_helper_error(
+                    &self.lfs_url,
+                    &self.username,
+                ))
+            };
+        }
+
+        if status.code() == Some(1) && stdout.is_empty() && stderr.is_empty() {
+            return Err(missing_credential_helper_error(
+                &self.lfs_url,
+                &self.username,
+            ));
+        }
+
+        Err(CliError::ExternalCommand {
+            command: command_name.to_owned(),
+            status: command_status_text(status),
+            stderr: sanitize_command_stderr(&stderr, self.token.as_str()),
+        })
     }
 
     fn persist_path_aware_lookup(&self, git_program: &Path) -> CliResult<()> {
@@ -389,6 +438,71 @@ impl GitCredentialApproval {
             self.token.as_str()
         )
     }
+}
+
+/// Builds recovery instructions for systems without a Git credential helper.
+///
+/// The returned text is suitable for CLI error output because it contains only
+/// the configured LFS URL and static setup commands. It never asks users to
+/// paste GitHub OAuth tokens or personal access tokens into Git LFS.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when `lfs_url` is not an absolute HTTP(S) URL accepted
+/// by LFS Cloud credential storage.
+///
+/// # Examples
+///
+/// ```
+/// use lfs_cloud::git_credential_helper_fallback_instructions;
+///
+/// let instructions = git_credential_helper_fallback_instructions(
+///     "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+/// )?;
+///
+/// assert!(instructions.contains("credential.helper"));
+/// # Ok::<(), lfs_cloud::CliError>(())
+/// ```
+pub fn git_credential_helper_fallback_instructions(lfs_url: impl AsRef<str>) -> CliResult<String> {
+    let lfs_url = validate_lfs_credential_url(lfs_url.as_ref())?;
+    Ok(credential_helper_fallback_instructions(
+        &lfs_url,
+        DEFAULT_GIT_CREDENTIAL_USERNAME,
+    ))
+}
+
+fn missing_credential_helper_error(lfs_url: &Url, username: &str) -> CliError {
+    CliError::GitCredentialHelperNotConfigured {
+        lfs_url: lfs_url.as_str().to_owned(),
+        instructions: SanitizedMessage::new(credential_helper_fallback_instructions(
+            lfs_url, username,
+        )),
+    }
+}
+
+fn credential_helper_fallback_instructions(lfs_url: &Url, username: &str) -> String {
+    format!(
+        "Configure a Git credential helper, then retry the lfs-cloud login or init command.\n\
+         Recommended persistent helpers:\n\
+           macOS:   git config --global credential.helper osxkeychain\n\
+           Windows: git config --global credential.helper manager\n\
+           Linux:   git config --global credential.helper libsecret\n\
+         Temporary local fallback:\n\
+           git config --global credential.helper 'cache --timeout=3600'\n\
+         Last-resort plaintext fallback:\n\
+           git config --global credential.helper store\n\
+         After a helper is configured, lfs-cloud will store username '{username}' for {lfs_url}.\n\
+         Do not store a GitHub OAuth token or personal access token here; Git LFS should receive only the local lfs-cloud session token."
+    )
+}
+
+fn git_config_output_has_helper(stdout: &[u8]) -> CliResult<bool> {
+    let output = std::str::from_utf8(stdout).map_err(|_| CliError::ExternalCommandOutput {
+        command: "git config --get-all credential.helper".to_owned(),
+        message: SanitizedMessage::new("git config returned non-UTF-8 credential helper output"),
+    })?;
+
+    Ok(output.lines().any(|line| !line.trim().is_empty()))
 }
 
 fn credential_host_scope(url: &Url) -> String {
@@ -1068,7 +1182,8 @@ mod tests {
     use super::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, GitCredentialLookup,
         MAX_COMMAND_STDERR_LEN, MAX_CREDENTIAL_FIELD_LEN, MAX_CREDENTIAL_OUTPUT_LEN,
-        MAX_RETAINED_COMMAND_STDERR_LEN, git_command, parse_git_credential_fill_output,
+        MAX_RETAINED_COMMAND_STDERR_LEN, git_command, git_config_output_has_helper,
+        git_credential_helper_fallback_instructions, parse_git_credential_fill_output,
         retain_stderr_data, retain_stdout_data, sanitize_command_stderr,
         wait_for_git_command_timeout,
     };
@@ -1121,6 +1236,33 @@ mod tests {
             .unwrap_err();
             assert!(matches!(error, CliError::InvalidArguments { .. }));
         }
+    }
+
+    #[test]
+    fn credential_helper_fallback_instructions_avoid_repository_host_tokens() {
+        let instructions = git_credential_helper_fallback_instructions(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+        )
+        .expect("instructions should be generated");
+
+        assert!(instructions.contains("git config --global credential.helper osxkeychain"));
+        assert!(instructions.contains("git config --global credential.helper manager"));
+        assert!(instructions.contains("git config --global credential.helper libsecret"));
+        assert!(instructions.contains("GitHub OAuth token"));
+        assert!(instructions.contains("personal access token"));
+        assert!(instructions.contains("local lfs-cloud session token"));
+    }
+
+    #[test]
+    fn credential_helper_config_output_accepts_non_empty_helpers_only() {
+        assert!(
+            git_config_output_has_helper(b"osxkeychain\n").expect("helper output should parse")
+        );
+        assert!(!git_config_output_has_helper(b"\n  \n").expect("blank output should parse"));
+        assert!(matches!(
+            git_config_output_has_helper(b"helper\xff").unwrap_err(),
+            CliError::ExternalCommandOutput { .. }
+        ));
     }
 
     #[test]
@@ -1333,6 +1475,14 @@ exit 1
             temp.path(),
             &format!(
                 r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+  if [ "$3" != "credential.helper" ]; then
+    echo "unexpected helper check args: $*" >&2
+    exit 64
+  fi
+  printf '%s\n' 'store'
+  exit 0
+fi
 if [ "$1" = "config" ]; then
   if [ "$2" != "--global" ] ||
      [ "$3" != "credential.https://lfs.example.com/.useHttpPath" ] ||
@@ -1375,11 +1525,57 @@ cat > '{}'
 
     #[test]
     #[cfg(unix)]
+    fn approve_requires_configured_credential_helper_before_storing_token() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let approve_path = temp.path().join("approve.txt");
+        let fake_git = write_fake_git(
+            temp.path(),
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+  exit 1
+fi
+if [ "$1" = "credential" ] && [ "$2" = "approve" ]; then
+  touch '{}'
+fi
+exit 0
+"#,
+                approve_path.display()
+            ),
+        );
+        let approval = GitCredentialApproval::new(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            token(),
+        )
+        .expect("approval should parse");
+
+        let error = approval
+            .approve_with_git_program(&fake_git)
+            .expect_err("missing helper should be reported before approve");
+        let display = error.to_string();
+
+        assert!(matches!(
+            error,
+            CliError::GitCredentialHelperNotConfigured { .. }
+        ));
+        assert!(display.contains("credential.helper osxkeychain"));
+        assert!(display.contains("credential.helper 'cache --timeout=3600'"));
+        assert!(display.contains("Do not store a GitHub OAuth token"));
+        assert!(!display.contains("local-lfs-token"));
+        assert!(!approve_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn approve_failure_redacts_token_from_command_error() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let fake_git = write_fake_git(
             temp.path(),
             r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+  printf '%s\n' 'store'
+  exit 0
+fi
 if [ "$1" = "config" ]; then
   exit 0
 fi
@@ -1411,6 +1607,10 @@ exit 42
         let fake_git = write_fake_git(
             temp.path(),
             r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+  printf '%s\n' 'store'
+  exit 0
+fi
 if [ "$1" = "config" ]; then
   exit 0
 fi
@@ -1612,6 +1812,10 @@ done
             temp.path(),
             &format!(
                 r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+  printf '%s\n' 'store'
+  exit 0
+fi
 if [ "$1" = "config" ]; then
   echo "config rejected local-lfs-token" >&2
   exit 43

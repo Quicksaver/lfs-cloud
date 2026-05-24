@@ -1098,7 +1098,8 @@ Defer:
 > repository permission checks now map collaborator base permissions into the
 > internal read/write/admin authorization model. Local LFS Cloud tokens can now
 > be approved into and looked up from Git's credential helper for the
-> configured, path-scoped LFS URL.
+> configured, path-scoped LFS URL, with clear fallback instructions when Git has
+> no credential helper configured.
 
 ### Progress Summary
 
@@ -1106,7 +1107,7 @@ Defer:
 | ---------------------------------------- | ----------- | ------ | --------- |
 | 0. Foundations                           | 8           | 8      | 0         |
 | 1. Server Config                         | 8           | 8      | 0         |
-| 2. GitHub Auth                           | 13          | 12     | 1         |
+| 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 0      | 9         |
 | 4. Metadata DB                           | 8           | 0      | 8         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
@@ -1114,7 +1115,7 @@ Defer:
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **28** | **71**    |
+| **Total**                                | **99**      | **29** | **70**    |
 
 ### Legend
 
@@ -1176,7 +1177,7 @@ Defer:
 
 - [x] [M] Implement `git credential approve` integration for the configured LFS URL. Manual verification: `scripts/manual/verify-git-credential-approve.sh`.
 - [x] [T] Implement credential lookup/verification for the local CLI.
-- [ ] [M] Add clear fallback instructions if no Git credential helper is configured.
+- [x] [M] Add clear fallback instructions if no Git credential helper is configured. Manual verification: `scripts/manual/verify-git-credential-helper-fallback.sh`.
 
 #### Epic 2.3: Repository Permission Checks
 

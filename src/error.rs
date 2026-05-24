@@ -161,6 +161,15 @@ pub enum CliError {
         /// Sanitized explanation of the invalid output.
         message: SanitizedMessage,
     },
+
+    /// Git has no credential helper configured for storing local LFS tokens.
+    #[error("no Git credential helper is configured for {lfs_url}\n{instructions}")]
+    GitCredentialHelperNotConfigured {
+        /// LFS URL whose local credential could not be stored persistently.
+        lfs_url: String,
+        /// User-facing recovery instructions that do not contain secrets.
+        instructions: SanitizedMessage,
+    },
 }
 
 impl CliError {
