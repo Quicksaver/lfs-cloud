@@ -313,10 +313,18 @@ impl GitCredentialApproval {
     }
 
     fn ensure_credential_helper_configured(&self, git_program: &Path) -> CliResult<()> {
-        let command_name = "git config --get-all credential.helper";
+        let command_name = format!(
+            "git config --get-urlmatch credential.helper {}",
+            self.lfs_url
+        );
         let mut command = git_command(git_program);
         let mut child = command
-            .args(["config", "--get-all", "credential.helper"])
+            .args([
+                "config",
+                "--get-urlmatch",
+                "credential.helper",
+                self.lfs_url.as_str(),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -328,7 +336,7 @@ impl GitCredentialApproval {
 
         let (status, stdout, stderr) = wait_for_git_command_output(
             &mut child,
-            command_name,
+            &command_name,
             self.token.as_str(),
             GIT_COMMAND_TIMEOUT,
         )?;
@@ -352,7 +360,7 @@ impl GitCredentialApproval {
         }
 
         Err(CliError::ExternalCommand {
-            command: command_name.to_owned(),
+            command: command_name,
             status: command_status_text(status),
             stderr: sanitize_command_stderr(&stderr, self.token.as_str()),
         })
@@ -498,7 +506,7 @@ fn credential_helper_fallback_instructions(lfs_url: &Url, username: &str) -> Str
 
 fn git_config_output_has_helper(stdout: &[u8]) -> CliResult<bool> {
     let output = std::str::from_utf8(stdout).map_err(|_| CliError::ExternalCommandOutput {
-        command: "git config --get-all credential.helper".to_owned(),
+        command: "git config --get-urlmatch credential.helper <lfs-url>".to_owned(),
         message: SanitizedMessage::new("git config returned non-UTF-8 credential helper output"),
     })?;
 
@@ -1475,8 +1483,9 @@ exit 1
             temp.path(),
             &format!(
                 r#"#!/bin/sh
-if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
-  if [ "$3" != "credential.helper" ]; then
+if [ "$1" = "config" ] && [ "$2" = "--get-urlmatch" ]; then
+  if [ "$3" != "credential.helper" ] ||
+     [ "$4" != "https://lfs.example.com/github.com/owner/repo.git/info/lfs" ]; then
     echo "unexpected helper check args: $*" >&2
     exit 64
   fi
@@ -1532,7 +1541,7 @@ cat > '{}'
             temp.path(),
             &format!(
                 r#"#!/bin/sh
-if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+if [ "$1" = "config" ] && [ "$2" = "--get-urlmatch" ]; then
   exit 1
 fi
 if [ "$1" = "credential" ] && [ "$2" = "approve" ]; then
@@ -1567,12 +1576,53 @@ exit 0
 
     #[test]
     #[cfg(unix)]
+    fn approve_accepts_url_matched_credential_helper_before_storing_token() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let approve_path = temp.path().join("approve.txt");
+        let fake_git = write_fake_git(
+            temp.path(),
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "--get-urlmatch" ]; then
+  if [ "$3" != "credential.helper" ] ||
+     [ "$4" != "https://lfs.example.com/github.com/owner/repo.git/info/lfs" ]; then
+    echo "unexpected helper check args: $*" >&2
+    exit 64
+  fi
+  printf '%s\n' 'store'
+  exit 0
+fi
+if [ "$1" = "config" ]; then
+  exit 0
+fi
+if [ "$1" = "credential" ] && [ "$2" = "approve" ]; then
+  touch '{}'
+fi
+"#,
+                approve_path.display()
+            ),
+        );
+        let approval = GitCredentialApproval::new(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            token(),
+        )
+        .expect("approval should parse");
+
+        approval
+            .approve_with_git_program(&fake_git)
+            .expect("URL-matched helper should allow approval");
+
+        assert!(approve_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn approve_failure_redacts_token_from_command_error() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let fake_git = write_fake_git(
             temp.path(),
             r#"#!/bin/sh
-if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+if [ "$1" = "config" ] && [ "$2" = "--get-urlmatch" ]; then
   printf '%s\n' 'store'
   exit 0
 fi
@@ -1607,7 +1657,7 @@ exit 42
         let fake_git = write_fake_git(
             temp.path(),
             r#"#!/bin/sh
-if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+if [ "$1" = "config" ] && [ "$2" = "--get-urlmatch" ]; then
   printf '%s\n' 'store'
   exit 0
 fi
@@ -1812,7 +1862,7 @@ done
             temp.path(),
             &format!(
                 r#"#!/bin/sh
-if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
+if [ "$1" = "config" ] && [ "$2" = "--get-urlmatch" ]; then
   printf '%s\n' 'store'
   exit 0
 fi
