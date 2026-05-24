@@ -4,7 +4,7 @@
 //! configuration references and exchanges refresh tokens for short-lived
 //! access tokens. It does not expose Drive credentials to Git LFS clients.
 
-use std::{fmt, net::IpAddr, sync::OnceLock, time::Duration};
+use std::{collections::BTreeMap, fmt, net::IpAddr, sync::OnceLock, time::Duration};
 
 use reqwest::{
     Client, StatusCode,
@@ -13,17 +13,27 @@ use reqwest::{
 use serde::Deserialize;
 use url::Url;
 
-use crate::{GoogleDriveStorageConfig, SanitizedMessage, StorageError, StorageResult};
+use crate::{
+    GoogleDriveStorageConfig, LfsObject, SanitizedMessage, StorageError, StorageResult,
+    StoredObject,
+};
 
 const GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
+const GOOGLE_DRIVE_OBJECT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_";
 const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
 const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
 const GOOGLE_DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
+const GOOGLE_DRIVE_OBJECT_VERSION: &str = "1";
+const GOOGLE_DRIVE_OBJECT_VERSION_PROPERTY: &str = "lfsCloudVersion";
+const GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY: &str = "lfsCloudRepoNamespace";
+const GOOGLE_DRIVE_OBJECT_OID_PROPERTY: &str = "lfsCloudOid";
+const GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY: &str = "lfsCloudSize";
 
 static DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static DEFAULT_GOOGLE_DRIVE_OBJECT_LOOKUP_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
 /// Google OAuth token endpoint used by Drive refresh-token exchange.
 pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -501,6 +511,230 @@ impl fmt::Debug for GoogleDriveRootValidator {
     }
 }
 
+/// Deterministic Google Drive address metadata for one LFS object.
+///
+/// The display path is an inspection and cleanup convention under the
+/// configured Drive root. Lookups still verify private Drive app properties so
+/// the later SQLite metadata database can remain the ownership source of truth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoogleDriveObjectKey {
+    repo_namespace: String,
+    object: LfsObject,
+}
+
+impl GoogleDriveObjectKey {
+    /// Creates Drive object-addressing metadata for a repository-scoped object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the repository namespace is blank or
+    /// contains control characters that cannot be rendered safely.
+    pub fn new(repo_namespace: impl AsRef<str>, object: LfsObject) -> StorageResult<Self> {
+        Ok(Self {
+            repo_namespace: validate_repo_namespace(repo_namespace.as_ref())?,
+            object,
+        })
+    }
+
+    /// Returns the repository namespace associated with this object.
+    #[must_use]
+    pub fn repo_namespace(&self) -> &str {
+        &self.repo_namespace
+    }
+
+    /// Returns the provider-independent object identity.
+    #[must_use]
+    pub fn object(&self) -> &LfsObject {
+        &self.object
+    }
+
+    /// Returns the deterministic Drive file name for this LFS object.
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        format!(
+            "sha256-{}-{}.lfs",
+            self.object.oid.as_hex(),
+            self.object.size.bytes()
+        )
+    }
+
+    /// Returns the human-readable object path below the configured Drive root.
+    ///
+    /// Google Drive addresses files by ID, not POSIX paths. This value is a
+    /// deterministic convention for upload placement and operator inspection.
+    #[must_use]
+    pub fn display_path(&self) -> String {
+        let oid = self.object.oid.as_hex();
+        format!(
+            "objects/{}/sha256/{}/{}/{}",
+            percent_encode_drive_path_segment(&self.repo_namespace),
+            &oid[..2],
+            &oid[2..4],
+            self.file_name()
+        )
+    }
+
+    fn expected_app_properties(&self) -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
+            (
+                GOOGLE_DRIVE_OBJECT_VERSION_PROPERTY,
+                GOOGLE_DRIVE_OBJECT_VERSION.to_owned(),
+            ),
+            (
+                GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY,
+                self.repo_namespace.clone(),
+            ),
+            (
+                GOOGLE_DRIVE_OBJECT_OID_PROPERTY,
+                self.object.oid.as_hex().to_owned(),
+            ),
+            (
+                GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY,
+                self.object.size.bytes().to_string(),
+            ),
+        ])
+    }
+}
+
+/// Looks up repository-scoped LFS objects in Google Drive.
+#[derive(Clone)]
+pub struct GoogleDriveObjectStore {
+    storage: GoogleDriveStorageConfig,
+    repo_namespace: String,
+    token: GoogleDriveAccessToken,
+    client: Client,
+    api_base_url: Url,
+}
+
+impl GoogleDriveObjectStore {
+    /// Creates an object store using the default Drive API client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the HTTP client or repository namespace
+    /// cannot be initialized.
+    pub fn new(
+        storage: GoogleDriveStorageConfig,
+        repo_namespace: impl AsRef<str>,
+        token: GoogleDriveAccessToken,
+    ) -> StorageResult<Self> {
+        Self::with_client_and_api_base_url(
+            storage,
+            repo_namespace,
+            token,
+            default_google_drive_object_lookup_http_client()?,
+            GOOGLE_DRIVE_API_BASE_URL,
+        )
+    }
+
+    /// Creates an object store with an explicit HTTP client and API base URL.
+    ///
+    /// This is primarily useful for tests that replace Google Drive with a
+    /// local HTTP server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the repository namespace or API base URL is
+    /// not safe to use.
+    pub fn with_client_and_api_base_url(
+        storage: GoogleDriveStorageConfig,
+        repo_namespace: impl AsRef<str>,
+        token: GoogleDriveAccessToken,
+        client: Client,
+        api_base_url: impl AsRef<str>,
+    ) -> StorageResult<Self> {
+        Ok(Self {
+            storage,
+            repo_namespace: validate_repo_namespace(repo_namespace.as_ref())?,
+            token,
+            client,
+            api_base_url: validate_drive_api_base_url(api_base_url.as_ref())?,
+        })
+    }
+
+    /// Returns this store's configured storage-provider ID.
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        &self.storage.id
+    }
+
+    /// Creates a deterministic Drive object key for the configured repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the repository namespace cannot be rendered
+    /// safely. This should only happen if the store was constructed with
+    /// invalid state.
+    pub fn object_key(&self, object: &LfsObject) -> StorageResult<GoogleDriveObjectKey> {
+        GoogleDriveObjectKey::new(&self.repo_namespace, object.clone())
+    }
+
+    /// Checks whether the object exists under the configured Drive root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] for backend authentication failures, retryable
+    /// Drive failures, malformed Drive responses, or conflicting duplicate
+    /// files for the same repository/OID/size tuple.
+    pub async fn object_exists(&self, object: &LfsObject) -> StorageResult<bool> {
+        Ok(self.lookup_object(object).await?.is_some())
+    }
+
+    /// Returns verified backend metadata for an existing Drive object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] for backend authentication failures, retryable
+    /// Drive failures, malformed Drive responses, or conflicting duplicate
+    /// files for the same repository/OID/size tuple.
+    pub async fn lookup_object(&self, object: &LfsObject) -> StorageResult<Option<StoredObject>> {
+        let key = self.object_key(object)?;
+        let response = self
+            .client
+            .get(drive_object_lookup_url(
+                self.api_base_url.clone(),
+                &self.storage.root_folder_id,
+                &key,
+            )?)
+            .header(ACCEPT, "application/json")
+            .header(
+                AUTHORIZATION,
+                self.token.authorization_header_value(&self.storage.id)?,
+            )
+            .send()
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        let status = response.status();
+        let response_body = read_google_response_body(response)
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+
+        if !status.is_success() {
+            return Err(parse_drive_object_lookup_error(
+                &self.storage,
+                &self.token,
+                status,
+                &response_body,
+            ));
+        }
+
+        parse_drive_object_lookup_success(&self.storage, &key, status, &response_body)
+    }
+}
+
+impl fmt::Debug for GoogleDriveObjectStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoogleDriveObjectStore")
+            .field("storage", &self.storage)
+            .field("repo_namespace", &self.repo_namespace)
+            .field("token", &"<redacted>")
+            .field("client", &"<redacted>")
+            .field("api_base_url", &self.api_base_url)
+            .finish()
+    }
+}
+
 #[derive(Deserialize)]
 struct RawGoogleDriveCredential {
     #[serde(default)]
@@ -548,6 +782,27 @@ struct GoogleDriveFileMetadata {
 #[serde(rename_all = "camelCase")]
 struct GoogleDriveFileCapabilities {
     can_add_children: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleDriveFileList {
+    #[serde(default)]
+    files: Vec<GoogleDriveObjectFile>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+    #[serde(default)]
+    incomplete_search: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleDriveObjectFile {
+    id: Option<String>,
+    name: Option<String>,
+    size: Option<String>,
+    #[serde(default)]
+    app_properties: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -759,6 +1014,13 @@ fn default_google_drive_root_validation_http_client() -> StorageResult<Client> {
     )
 }
 
+fn default_google_drive_object_lookup_http_client() -> StorageResult<Client> {
+    default_google_drive_http_client_from(
+        &DEFAULT_GOOGLE_DRIVE_OBJECT_LOOKUP_HTTP_CLIENT,
+        GOOGLE_DRIVE_OBJECT_LOOKUP_TIMEOUT,
+    )
+}
+
 fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
     let url = Url::parse(value).map_err(|_| StorageError::Upstream {
         provider: "google_drive".to_owned(),
@@ -805,6 +1067,18 @@ fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
     Ok(url)
 }
 
+fn drive_api_base_path_already_targets_drive_api(api_base_url: &Url) -> bool {
+    api_base_url
+        .path_segments()
+        .map(|segments| {
+            let segments = segments
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>();
+            segments.ends_with(&["drive", "v3"])
+        })
+        .unwrap_or(false)
+}
+
 fn drive_file_metadata_url(mut api_base_url: Url, root_folder_id: &str) -> StorageResult<Url> {
     if root_folder_id.trim().is_empty() {
         return Err(StorageError::Upstream {
@@ -814,15 +1088,8 @@ fn drive_file_metadata_url(mut api_base_url: Url, root_folder_id: &str) -> Stora
         });
     }
 
-    let base_path_already_targets_drive_api = api_base_url
-        .path_segments()
-        .map(|segments| {
-            let segments = segments
-                .filter(|segment| !segment.is_empty())
-                .collect::<Vec<_>>();
-            segments.ends_with(&["drive", "v3"])
-        })
-        .unwrap_or(false);
+    let base_path_already_targets_drive_api =
+        drive_api_base_path_already_targets_drive_api(&api_base_url);
 
     {
         let mut segments =
@@ -851,6 +1118,133 @@ fn drive_file_metadata_url(mut api_base_url: Url, root_folder_id: &str) -> Stora
         .append_pair("supportsAllDrives", "true");
 
     Ok(api_base_url)
+}
+
+fn drive_object_lookup_url(
+    mut api_base_url: Url,
+    root_folder_id: &str,
+    key: &GoogleDriveObjectKey,
+) -> StorageResult<Url> {
+    if root_folder_id.trim().is_empty() {
+        return Err(StorageError::Upstream {
+            provider: "google_drive".to_owned(),
+            status: None,
+            message: SanitizedMessage::new("Google Drive root_folder_id must not be blank"),
+        });
+    }
+
+    let base_path_already_targets_drive_api =
+        drive_api_base_path_already_targets_drive_api(&api_base_url);
+    {
+        let mut segments =
+            api_base_url
+                .path_segments_mut()
+                .map_err(|_| StorageError::Upstream {
+                    provider: "google_drive".to_owned(),
+                    status: None,
+                    message: SanitizedMessage::new(
+                        "Google Drive API base URL cannot be used for path construction",
+                    ),
+                })?;
+        segments.pop_if_empty();
+        if base_path_already_targets_drive_api {
+            segments.push("files");
+        } else {
+            segments.extend(["drive", "v3", "files"]);
+        }
+    }
+
+    api_base_url
+        .query_pairs_mut()
+        .append_pair(
+            "fields",
+            "files(id,name,size,appProperties),nextPageToken,incompleteSearch",
+        )
+        .append_pair("pageSize", "2")
+        .append_pair("spaces", "drive")
+        .append_pair("supportsAllDrives", "true")
+        .append_pair("q", &drive_object_lookup_query(root_folder_id, key));
+
+    Ok(api_base_url)
+}
+
+fn drive_object_lookup_query(root_folder_id: &str, key: &GoogleDriveObjectKey) -> String {
+    let mut query = format!(
+        "'{}' in parents and trashed = false and name = '{}'",
+        escape_drive_query_string(root_folder_id),
+        escape_drive_query_string(&key.file_name())
+    );
+
+    for (property, value) in key.expected_app_properties() {
+        query.push_str(&format!(
+            " and appProperties has {{ key='{}' and value='{}' }}",
+            escape_drive_query_string(property),
+            escape_drive_query_string(&value)
+        ));
+    }
+
+    query
+}
+
+fn validate_repo_namespace(value: &str) -> StorageResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::Upstream {
+            provider: "google_drive".to_owned(),
+            status: None,
+            message: SanitizedMessage::new("repository namespace must not be blank"),
+        });
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(StorageError::Upstream {
+            provider: "google_drive".to_owned(),
+            status: None,
+            message: SanitizedMessage::new(
+                "repository namespace must not contain control characters",
+            ),
+        });
+    }
+
+    Ok(trimmed.to_owned())
+}
+
+fn percent_encode_drive_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(hex_digit(byte >> 4));
+                encoded.push(hex_digit(byte & 0x0f));
+            }
+        }
+    }
+    encoded
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + value - 10) as char,
+        _ => unreachable!("hex digit nibble should be in range"),
+    }
+}
+
+fn escape_drive_query_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\'' | '\\' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn parse_drive_root_success(
@@ -966,6 +1360,145 @@ fn parse_drive_root_error(
                 "Google Drive root_folder_id {:?} was not found or is not accessible",
                 storage.root_folder_id
             )),
+        };
+    }
+    if diagnostic
+        .reasons
+        .iter()
+        .any(|reason| matches!(reason.as_str(), "quotaExceeded" | "storageQuotaExceeded"))
+    {
+        return StorageError::QuotaExceeded {
+            provider: storage.id.clone(),
+            message: diagnostic.message,
+        };
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || diagnostic.reasons.iter().any(|reason| {
+            matches!(
+                reason.as_str(),
+                "rateLimitExceeded" | "userRateLimitExceeded"
+            )
+        })
+    {
+        return StorageError::Retryable {
+            provider: storage.id.clone(),
+            message: diagnostic.message,
+        };
+    }
+
+    StorageError::Upstream {
+        provider: storage.id.clone(),
+        status: Some(status.as_u16()),
+        message: SanitizedMessage::new(diagnostic.message),
+    }
+}
+
+fn parse_drive_object_lookup_success(
+    storage: &GoogleDriveStorageConfig,
+    key: &GoogleDriveObjectKey,
+    status: StatusCode,
+    body: &str,
+) -> StorageResult<Option<StoredObject>> {
+    let response =
+        serde_json::from_str::<GoogleDriveFileList>(body).map_err(|_| StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new("Google Drive object lookup response was invalid JSON"),
+        })?;
+    if response.incomplete_search {
+        return Err(StorageError::Retryable {
+            provider: storage.id.clone(),
+            message: "Google Drive object lookup returned incomplete search results".to_owned(),
+        });
+    }
+    if response.next_page_token.is_some() || response.files.len() > 1 {
+        return Err(StorageError::Conflict {
+            provider: storage.id.clone(),
+            oid: key.object.oid.as_hex().to_owned(),
+        });
+    }
+
+    let Some(file) = response.files.into_iter().next() else {
+        return Ok(None);
+    };
+    verify_drive_object_file(storage, key, status, file).map(Some)
+}
+
+fn verify_drive_object_file(
+    storage: &GoogleDriveStorageConfig,
+    key: &GoogleDriveObjectKey,
+    status: StatusCode,
+    file: GoogleDriveObjectFile,
+) -> StorageResult<StoredObject> {
+    let id = file
+        .id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive object lookup response did not include id",
+            ),
+        })?;
+    if file.name.as_deref() != Some(&key.file_name()) {
+        return Err(StorageError::Conflict {
+            provider: storage.id.clone(),
+            oid: key.object.oid.as_hex().to_owned(),
+        });
+    }
+    for (property, expected) in key.expected_app_properties() {
+        if file.app_properties.get(property) != Some(&expected) {
+            return Err(StorageError::Conflict {
+                provider: storage.id.clone(),
+                oid: key.object.oid.as_hex().to_owned(),
+            });
+        }
+    }
+    let actual_size = file
+        .size
+        .as_deref()
+        .ok_or_else(|| StorageError::Conflict {
+            provider: storage.id.clone(),
+            oid: key.object.oid.as_hex().to_owned(),
+        })?
+        .parse::<u64>()
+        .map_err(|_| StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new("Google Drive object lookup response size was invalid"),
+        })?;
+    if actual_size != key.object.size.bytes() {
+        return Err(StorageError::IntegrityMismatch {
+            expected_oid: key.object.oid.as_hex().to_owned(),
+            expected_size: key.object.size.bytes(),
+            actual_oid: key.object.oid.as_hex().to_owned(),
+            actual_size,
+        });
+    }
+
+    Ok(StoredObject::new(
+        storage.id.clone(),
+        key.object.clone(),
+        id,
+    ))
+}
+
+fn parse_drive_object_lookup_error(
+    storage: &GoogleDriveStorageConfig,
+    token: &GoogleDriveAccessToken,
+    status: StatusCode,
+    body: &str,
+) -> StorageError {
+    let diagnostic = drive_error_message(token, body);
+    if status == StatusCode::UNAUTHORIZED
+        || diagnostic
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason.as_str(), "authError" | "insufficientPermissions"))
+    {
+        return StorageError::AuthenticationRequired {
+            provider: storage.id.clone(),
         };
     }
     if diagnostic
@@ -1192,6 +1725,7 @@ async fn read_google_response_body(
 mod tests {
     use std::{
         collections::BTreeMap,
+        str::FromStr,
         sync::{Arc, Mutex},
     };
 
@@ -1210,9 +1744,12 @@ mod tests {
 
     use super::{
         GOOGLE_OAUTH_TOKEN_URL, GoogleDriveCredential, GoogleDriveCredentialLoader,
-        GoogleDriveRootValidator, GoogleDriveTokenRefresher,
+        GoogleDriveObjectKey, GoogleDriveObjectStore, GoogleDriveRootValidator,
+        GoogleDriveTokenRefresher,
     };
-    use crate::{GoogleDriveStorageConfig, StorageError};
+    use crate::{GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, StorageError};
+
+    const OBJECT_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn loader_resolves_bare_credential_refs_to_server_side_env_secret_json() {
@@ -1371,6 +1908,54 @@ mod tests {
         .expect("metadata URL should build");
 
         assert_eq!(url.path(), "/proxy/drive/v3/files/drive-root");
+    }
+
+    #[test]
+    fn drive_object_key_defines_stable_display_path_and_file_name() {
+        let key = GoogleDriveObjectKey::new("github.com/Owner Repo/repo.git", lfs_object())
+            .expect("object key should build");
+
+        assert_eq!(key.repo_namespace(), "github.com/Owner Repo/repo.git");
+        assert_eq!(key.object(), &lfs_object());
+        assert_eq!(key.file_name(), format!("sha256-{OBJECT_OID}-42.lfs"));
+        assert_eq!(
+            key.display_path(),
+            format!(
+                "objects/github.com%2FOwner%20Repo%2Frepo.git/sha256/aa/aa/sha256-{OBJECT_OID}-42.lfs"
+            )
+        );
+    }
+
+    #[test]
+    fn drive_object_lookup_url_searches_root_with_private_app_properties() {
+        let key = GoogleDriveObjectKey::new("github.com/owner/repo", lfs_object())
+            .expect("key should build");
+        let url = super::drive_object_lookup_url(
+            url::Url::parse("http://localhost/proxy/drive/v3").expect("base URL should parse"),
+            "drive-root",
+            &key,
+        )
+        .expect("lookup URL should build");
+
+        assert_eq!(url.path(), "/proxy/drive/v3/files");
+        let query = form_pairs(url.query().expect("lookup URL should include query"));
+        assert_eq!(
+            query["fields"],
+            "files(id,name,size,appProperties),nextPageToken,incompleteSearch"
+        );
+        assert_eq!(query["pageSize"], "2");
+        assert_eq!(query["spaces"], "drive");
+        assert_eq!(query["supportsAllDrives"], "true");
+        assert!(query["q"].contains("'drive-root' in parents"));
+        assert!(query["q"].contains("trashed = false"));
+        assert!(query["q"].contains(&format!("name = 'sha256-{OBJECT_OID}-42.lfs'")));
+        assert!(query["q"].contains(
+            "appProperties has { key='lfsCloudRepoNamespace' and value='github.com/owner/repo' }"
+        ));
+        assert!(query["q"].contains(&format!(
+            "appProperties has {{ key='lfsCloudOid' and value='{OBJECT_OID}' }}"
+        )));
+        assert!(query["q"].contains("appProperties has { key='lfsCloudSize' and value='42' }"));
     }
 
     #[test]
@@ -1607,6 +2192,195 @@ mod tests {
                 provider,
                 message,
             } if provider == "drive-user-a" && message.contains("try later")
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_store_finds_verified_object_by_repo_oid_and_size() {
+        let server = DriveFilesListServer::start(
+            StatusCode::OK,
+            drive_object_list_json("drive-file-123", OBJECT_OID, 42),
+        )
+        .await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let found = store
+            .lookup_object(&lfs_object())
+            .await
+            .expect("object lookup should succeed")
+            .expect("object should exist");
+
+        assert_eq!(found.provider_id, "drive-user-a");
+        assert_eq!(found.object, lfs_object());
+        assert_eq!(found.backend_id, "drive-file-123");
+        assert!(
+            store
+                .object_exists(&lfs_object())
+                .await
+                .expect("exists should succeed")
+        );
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers.get(AUTHORIZATION).unwrap(),
+            "Bearer access-token"
+        );
+        let query = form_pairs(&requests[0].query);
+        assert!(query["q"].contains("'drive-root' in parents"));
+        assert!(query["q"].contains(
+            "appProperties has { key='lfsCloudRepoNamespace' and value='github.com/owner/repo' }"
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_store_reports_missing_object_as_false() {
+        let server = DriveFilesListServer::start(StatusCode::OK, r#"{"files":[]}"#).await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        assert!(
+            !store
+                .object_exists(&lfs_object())
+                .await
+                .expect("missing object lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_rejects_duplicate_drive_matches() {
+        let server = DriveFilesListServer::start(
+            StatusCode::OK,
+            format!(
+                r#"{{
+                    "files":[
+                        {},
+                        {}
+                    ]
+                }}"#,
+                drive_object_json("drive-file-a", OBJECT_OID, 42),
+                drive_object_json("drive-file-b", OBJECT_OID, 42)
+            ),
+        )
+        .await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let error = store
+            .lookup_object(&lfs_object())
+            .await
+            .expect_err("duplicate Drive matches should conflict");
+
+        assert!(matches!(
+            error,
+            StorageError::Conflict {
+                ref provider,
+                ref oid,
+            } if provider == "drive-user-a" && oid == OBJECT_OID
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_store_verifies_drive_binary_size() {
+        let server = DriveFilesListServer::start(
+            StatusCode::OK,
+            drive_object_list_json("drive-file-123", OBJECT_OID, 41),
+        )
+        .await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let error = store
+            .lookup_object(&lfs_object())
+            .await
+            .expect_err("wrong Drive binary size should fail integrity");
+
+        assert!(matches!(
+            error,
+            StorageError::IntegrityMismatch {
+                expected_size: 42,
+                actual_size: 41,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_store_maps_auth_and_rate_limit_failures() {
+        let auth_server = DriveFilesListServer::start(
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"missing scope access-token","errors":[{"reason":"insufficientPermissions"}]}}"#,
+        )
+        .await;
+        let auth_store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &auth_server.base_url,
+        )
+        .expect("object store should build");
+
+        let auth_error = auth_store
+            .object_exists(&lfs_object())
+            .await
+            .expect_err("insufficient scope should fail");
+        assert!(matches!(
+            auth_error,
+            StorageError::AuthenticationRequired { ref provider } if provider == "drive-user-a"
+        ));
+
+        let rate_limit_server = DriveFilesListServer::start(
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"try later access-token","errors":[{"reason":"rateLimitExceeded"}]}}"#,
+        )
+        .await;
+        let rate_limit_store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &rate_limit_server.base_url,
+        )
+        .expect("object store should build");
+
+        let rate_limit_error = rate_limit_store
+            .object_exists(&lfs_object())
+            .await
+            .expect_err("rate limit should fail");
+        assert!(matches!(
+            rate_limit_error,
+            StorageError::Retryable {
+                provider,
+                message,
+            } if provider == "drive-user-a"
+                && message.contains("try later")
+                && !message.contains("access-token")
         ));
     }
 
@@ -1876,6 +2650,13 @@ mod tests {
         }
     }
 
+    fn lfs_object() -> LfsObject {
+        LfsObject::new(
+            LfsOid::from_str(OBJECT_OID).expect("test OID should parse"),
+            LfsObjectSize::new(42),
+        )
+    }
+
     fn drive_folder_json() -> &'static str {
         r#"{
             "id":"drive-root",
@@ -1884,6 +2665,110 @@ mod tests {
             "trashed":false,
             "capabilities":{"canAddChildren":true}
         }"#
+    }
+
+    fn drive_object_list_json(file_id: &str, oid: &str, size: u64) -> String {
+        format!(r#"{{"files":[{}]}}"#, drive_object_json(file_id, oid, size))
+    }
+
+    fn drive_object_json(file_id: &str, oid: &str, size: u64) -> String {
+        format!(
+            r#"{{
+                "id":"{file_id}",
+                "name":"sha256-{oid}-42.lfs",
+                "size":"{size}",
+                "appProperties":{{
+                    "lfsCloudVersion":"1",
+                    "lfsCloudRepoNamespace":"github.com/owner/repo",
+                    "lfsCloudOid":"{oid}",
+                    "lfsCloudSize":"42"
+                }}
+            }}"#
+        )
+    }
+
+    struct DriveFilesListServer {
+        base_url: String,
+        state: Arc<DriveFilesListServerState>,
+        server_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl DriveFilesListServer {
+        async fn start(status: StatusCode, body: impl Into<String>) -> Self {
+            let state = Arc::new(DriveFilesListServerState {
+                status,
+                body: body.into(),
+                requests: Mutex::new(Vec::new()),
+            });
+            let app = Router::new()
+                .route("/drive/v3/files", get(drive_files_list_handler))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test Drive files-list server should bind");
+            let address = listener
+                .local_addr()
+                .expect("test Drive files-list server address should be available");
+            let server_task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("test Drive files-list server should run");
+            });
+
+            Self {
+                base_url: format!("http://{address}"),
+                state,
+                server_task,
+            }
+        }
+
+        fn requests(&self) -> Vec<CapturedDriveFilesListRequest> {
+            self.state
+                .requests
+                .lock()
+                .expect("test Drive files-list requests lock should not poison")
+                .clone()
+        }
+    }
+
+    impl Drop for DriveFilesListServer {
+        fn drop(&mut self) {
+            self.server_task.abort();
+        }
+    }
+
+    struct DriveFilesListServerState {
+        status: StatusCode,
+        body: String,
+        requests: Mutex<Vec<CapturedDriveFilesListRequest>>,
+    }
+
+    #[derive(Clone)]
+    struct CapturedDriveFilesListRequest {
+        headers: HeaderMap,
+        query: String,
+    }
+
+    async fn drive_files_list_handler(
+        State(state): State<Arc<DriveFilesListServerState>>,
+        headers: HeaderMap,
+        uri: Uri,
+    ) -> Response {
+        state
+            .requests
+            .lock()
+            .expect("test Drive files-list requests lock should not poison")
+            .push(CapturedDriveFilesListRequest {
+                headers,
+                query: uri.query().unwrap_or_default().to_owned(),
+            });
+
+        (
+            state.status,
+            [(CONTENT_TYPE, "application/json")],
+            state.body.clone(),
+        )
+            .into_response()
     }
 
     fn form_pairs(body: &str) -> BTreeMap<String, String> {

@@ -35,7 +35,8 @@ pub use github_auth::{
 pub use google_drive::{
     GOOGLE_DRIVE_API_BASE_URL, GOOGLE_DRIVE_FILE_SCOPE, GOOGLE_OAUTH_TOKEN_URL,
     GoogleDriveAccessToken, GoogleDriveCredential, GoogleDriveCredentialLoader,
-    GoogleDriveRootFolder, GoogleDriveRootValidator, GoogleDriveTokenRefresher,
+    GoogleDriveObjectKey, GoogleDriveObjectStore, GoogleDriveRootFolder, GoogleDriveRootValidator,
+    GoogleDriveTokenRefresher,
 };
 pub use lfs::{
     LFS_POINTER_VERSION, LfsBatchAction, LfsBatchObjectError, LfsBatchObjectResponse,

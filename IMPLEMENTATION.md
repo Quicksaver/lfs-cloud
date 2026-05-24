@@ -956,6 +956,19 @@ current validator confirms that the ID resolves to a live Drive folder and that
 the credential can add child objects there. Resumable upload and download
 implementation tasks remain responsible for transfer-level verification.
 
+Drive object placement uses deterministic repository-scoped keys below the
+configured root folder:
+
+```text
+objects/<percent-encoded-repo-namespace>/sha256/<first-2>/<next-2>/sha256-<oid>-<size>.lfs
+```
+
+Google Drive file IDs remain the backend address. The display path is for
+operator inspection and cleanup, while lookup verifies private Drive
+`appProperties` for the object-key version, repository namespace, SHA-256 OID,
+and byte size. The binary `size` returned by Drive must also match the LFS
+pointer size before an object is accepted.
+
 Use Google Drive resumable uploads for large object writes. The first implementation may stage uploads to a local temp file so it can verify SHA-256 and size before uploading to Drive.
 
 ### Transfer Mode
@@ -1105,8 +1118,11 @@ Defer:
 > Drive credential references can now load flat OAuth credential JSON from
 > environment-backed secret references, refresh tokens can be exchanged for
 > bearer access tokens, and configured Drive root folders can be validated with
-> a non-mutating metadata probe. The MVP Drive scope is `drive.file`, with
-> root folders required to be app-created or explicitly app-accessible.
+> a non-mutating metadata probe. Repository-scoped object keys now define a
+> deterministic Drive inspection path and Drive `files.list` lookups verify
+> object identity with private app properties plus binary size. The MVP Drive
+> scope is `drive.file`, with root folders required to be app-created or
+> explicitly app-accessible.
 
 ### Progress Summary
 
@@ -1115,14 +1131,14 @@ Defer:
 | 0. Foundations                           | 8           | 8      | 0         |
 | 1. Server Config                         | 8           | 8      | 0         |
 | 2. GitHub Auth                           | 13          | 13     | 0         |
-| 3. Google Drive Storage                  | 9           | 4      | 5         |
+| 3. Google Drive Storage                  | 9           | 6      | 3         |
 | 4. Metadata DB                           | 8           | 0      | 8         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **33** | **66**    |
+| **Total**                                | **99**      | **35** | **64**    |
 
 ### Legend
 
@@ -1204,8 +1220,8 @@ Defer:
 
 #### Epic 3.2: Object Storage Operations
 
-- [ ] [T] Define Drive object naming/path convention under the configured root folder.
-- [ ] [T] Implement object existence lookup by repo namespace, OID, and size.
+- [x] [T] Define Drive object naming/path convention under the configured root folder.
+- [x] [T] Implement object existence lookup by repo namespace, OID, and size.
 - [ ] [M] Implement resumable upload from staged temp file.
 - [ ] [M] Implement download streaming from Drive to HTTP response.
 - [ ] [T] Implement provider error classification for auth, quota, not found, conflict, and retryable failures.
