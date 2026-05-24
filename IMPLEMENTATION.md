@@ -1123,10 +1123,12 @@ Defer:
 > authorization. Upload batches check configured storage availability and return
 > upload actions for missing objects, while authenticated object `PUT` uploads
 > stage bytes to a temp file, verify SHA-256 and size, write to Google Drive,
-> and record verified metadata. Download batches still return Git LFS JSON with
-> per-object errors until download transfer handling is wired. LFS route,
-> authentication, method, body-size, parse, authorization, and upload-integrity
-> failures now use Git LFS JSON error payloads with matching HTTP statuses.
+> and record verified metadata. Download batches check configured storage
+> availability and return download actions for existing objects, while
+> authenticated object `GET` downloads stream verified Google Drive bytes
+> through `lfs-cloud`. LFS route, authentication, method, body-size, parse,
+> authorization, upload-integrity, and storage failures now use Git LFS JSON
+> error payloads with matching HTTP statuses.
 
 ### Progress Summary
 
@@ -1137,12 +1139,12 @@ Defer:
 | 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
-| 5. LFS Server Protocol                   | 12          | 10     | 2         |
+| 5. LFS Server Protocol                   | 12          | 11     | 1         |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **56** | **43**    |
+| **Total**                                | **99**      | **57** | **42**    |
 
 ### Legend
 
@@ -1265,7 +1267,7 @@ Defer:
 #### Epic 5.3: Transfer Endpoints
 
 - [x] [M] Implement upload endpoint with temp-file staging, SHA-256 hashing, and size verification. Manual verification: with a valid GitHub OAuth-backed local LFS session and a real app-accessible Drive `drive.file` credential, request an upload batch for a missing object, confirm the response includes an `upload` action, `PUT` matching bytes to that action URL, then confirm the HTTP response is success, Drive contains the expected `sha256-<oid>-<size>.lfs` object, and metadata has a verified row for the configured repository/storage/OID/size.
-- [ ] [M] Implement download endpoint streaming bytes from Google Drive through `lfs-cloud`.
+- [x] [M] Implement download endpoint streaming bytes from Google Drive through `lfs-cloud`. Manual verification: with a valid GitHub OAuth-backed local LFS session and a real app-accessible Drive `drive.file` credential, request a download batch for an existing object, confirm the response includes a `download` action, `GET` that action URL, then confirm the HTTP response streams bytes whose length and SHA-256 match the requested LFS object without exposing a Drive URL to the client.
 - [x] [T] Return Git LFS-compatible error payloads and HTTP status codes.
 - [ ] [T] Add request size, temp-space, and timeout guardrails with clear errors.
 

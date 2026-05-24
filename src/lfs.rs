@@ -864,10 +864,11 @@ fn lfs_object_action_url(
     object: &LfsObject,
 ) -> String {
     format!(
-        "{}/{}/objects/{}",
+        "{}/{}/objects/{}?size={}",
         public_url.trim_end_matches('/'),
         repository_lfs_path.trim_matches('/'),
-        object.oid.as_hex()
+        object.oid.as_hex(),
+        object.size.bytes()
     )
 }
 
@@ -1268,8 +1269,9 @@ mod tests {
         assert_eq!(available_response.size, available.size);
         assert_eq!(available_response.authenticated, Some(true));
         let expected_href = format!(
-            "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/{}",
-            available.oid.as_hex()
+            "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/{}?size={}",
+            available.oid.as_hex(),
+            available.size.bytes()
         );
         assert_eq!(
             available_response

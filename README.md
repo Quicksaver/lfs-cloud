@@ -13,11 +13,12 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > batch operation. Upload batches now check configured storage availability,
 > advertise upload actions for missing objects, and accept authenticated object
 > `PUT` uploads through temp-file staging, SHA-256 verification, Google Drive
-> storage, and metadata recording. Download batches still return Git LFS
-> object-level errors until download transfer handling is wired. LFS route,
-> authentication, method, body-size, parse, authorization, and upload-integrity
-> failures return Git LFS JSON error payloads with matching HTTP statuses.
-> Download transfer handling and the other commands below are still planned
+> storage, and metadata recording. Download batches check configured storage
+> availability, advertise download actions for existing objects, and stream
+> authenticated object `GET` downloads from Google Drive through `lfs-cloud`.
+> LFS route, authentication, method, body-size, parse, authorization,
+> upload-integrity, and storage failures return Git LFS JSON error payloads
+> with matching HTTP statuses. The other commands below are still planned
 > product behavior.
 
 ## Why
