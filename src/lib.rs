@@ -42,9 +42,10 @@ pub use google_drive::{
     GoogleDriveRootFolder, GoogleDriveRootValidator, GoogleDriveTokenRefresher,
 };
 pub use lfs::{
-    LFS_POINTER_VERSION, LfsBatchAction, LfsBatchObjectError, LfsBatchObjectResponse,
-    LfsBatchOperation, LfsBatchRef, LfsBatchRequest, LfsBatchRequestParseError, LfsBatchResponse,
-    LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
+    LFS_BASIC_TRANSFER, LFS_POINTER_VERSION, LfsBatchAction, LfsBatchDownloadObject,
+    LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation, LfsBatchRef, LfsBatchRequest,
+    LfsBatchRequestParseError, LfsBatchResponse, LfsObject, LfsObjectError, LfsObjectSize, LfsOid,
+    LfsPointer, parse_lfs_batch_request_json,
 };
 pub use logging::{
     DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, init_tracing,

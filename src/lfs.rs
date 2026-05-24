@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 /// Git LFS pointer file version supported by this package.
 pub const LFS_POINTER_VERSION: &str = "https://git-lfs.github.com/spec/v1";
+/// Git LFS batch transfer adapter supported by the MVP server.
+pub const LFS_BASIC_TRANSFER: &str = "basic";
 
 const SHA256_PREFIX: &str = "sha256:";
 const SHA256_HEX_LENGTH: usize = 64;
@@ -578,6 +580,55 @@ pub struct LfsBatchResponse {
     pub objects: Vec<LfsBatchObjectResponse>,
 }
 
+impl LfsBatchResponse {
+    /// Creates a Git LFS download batch response using the basic transfer adapter.
+    ///
+    /// Available objects receive a `download` action under the configured
+    /// repository LFS route. Missing and unavailable objects receive
+    /// object-level errors so one bad object does not fail the whole batch.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::str::FromStr;
+    ///
+    /// use lfs_cloud::{
+    ///     LfsBatchDownloadObject, LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid,
+    /// };
+    ///
+    /// let object = LfsObject::new(
+    ///     LfsOid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?,
+    ///     LfsObjectSize::new(42),
+    /// );
+    /// let response = LfsBatchResponse::download(
+    ///     "http://127.0.0.1:8080",
+    ///     "/github.com/owner/repo.git/info/lfs",
+    ///     [LfsBatchDownloadObject::available(object)],
+    /// );
+    ///
+    /// assert!(response.objects[0].actions.contains_key("download"));
+    /// # Ok::<(), lfs_cloud::LfsObjectError>(())
+    /// ```
+    #[must_use]
+    pub fn download(
+        public_url: impl AsRef<str>,
+        repository_lfs_path: impl AsRef<str>,
+        objects: impl IntoIterator<Item = LfsBatchDownloadObject>,
+    ) -> Self {
+        let public_url = public_url.as_ref();
+        let repository_lfs_path = repository_lfs_path.as_ref();
+        let objects = objects
+            .into_iter()
+            .map(|object| object.into_response(public_url, repository_lfs_path))
+            .collect();
+
+        Self {
+            transfer: LFS_BASIC_TRANSFER.to_owned(),
+            objects,
+        }
+    }
+}
+
 /// Per-object result in a Git LFS batch response.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LfsBatchObjectResponse {
@@ -624,6 +675,84 @@ impl LfsBatchObjectResponse {
             error: Some(error),
         }
     }
+}
+
+/// Download availability for one object in a Git LFS batch response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LfsBatchDownloadObject {
+    /// The server can offer a download action for this object.
+    Available {
+        /// Object whose bytes can be downloaded.
+        object: LfsObject,
+    },
+    /// The object is not present for this repository/storage mapping.
+    Missing {
+        /// Object requested by the client.
+        object: LfsObject,
+    },
+    /// The object could not be offered because of a classified object-level failure.
+    Error {
+        /// Object requested by the client.
+        object: LfsObject,
+        /// Safe error payload returned for this object.
+        error: LfsBatchObjectError,
+    },
+}
+
+impl LfsBatchDownloadObject {
+    /// Marks an object as available for download.
+    #[must_use]
+    pub fn available(object: LfsObject) -> Self {
+        Self::Available { object }
+    }
+
+    /// Marks an object as missing for this repository/storage mapping.
+    #[must_use]
+    pub fn missing(object: LfsObject) -> Self {
+        Self::Missing { object }
+    }
+
+    /// Marks an object with a specific object-level error.
+    #[must_use]
+    pub fn error(object: LfsObject, error: LfsBatchObjectError) -> Self {
+        Self::Error { object, error }
+    }
+
+    fn into_response(self, public_url: &str, repository_lfs_path: &str) -> LfsBatchObjectResponse {
+        match self {
+            Self::Available { object } => {
+                let mut actions = BTreeMap::new();
+                actions.insert(
+                    "download".to_owned(),
+                    LfsBatchAction::new(lfs_object_action_url(
+                        public_url,
+                        repository_lfs_path,
+                        &object,
+                    )),
+                );
+
+                LfsBatchObjectResponse::with_actions(&object, true, actions)
+            }
+            Self::Missing { object } => LfsBatchObjectResponse::with_error(
+                &object,
+                LfsBatchObjectError::new(404, "object not found"),
+            ),
+            Self::Error { object, error } => LfsBatchObjectResponse::with_error(&object, error),
+        }
+    }
+}
+
+fn lfs_object_action_url(
+    public_url: &str,
+    repository_lfs_path: &str,
+    object: &LfsObject,
+) -> String {
+    format!(
+        "{}/{}/objects/{}",
+        public_url.trim_end_matches('/'),
+        repository_lfs_path.trim_matches('/'),
+        object.oid.as_hex()
+    )
 }
 
 /// HTTP action advertised to a Git LFS client.
@@ -683,8 +812,9 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation, LfsObject, LfsObjectError,
-        LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
+        LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation,
+        LfsBatchResponse, LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer,
+        parse_lfs_batch_request_json,
     };
 
     const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -982,6 +1112,61 @@ mod tests {
     }
 
     #[test]
+    fn download_batch_response_generates_actions_and_object_errors() {
+        let available = lfs_object('a', 42);
+        let missing = lfs_object('b', 64);
+        let unavailable = lfs_object('c', 128);
+
+        let response = LfsBatchResponse::download(
+            "http://127.0.0.1:8080/",
+            "/github.com/owner/repo.git/info/lfs",
+            [
+                LfsBatchDownloadObject::available(available.clone()),
+                LfsBatchDownloadObject::missing(missing),
+                LfsBatchDownloadObject::error(
+                    unavailable,
+                    LfsBatchObjectError::new(503, "storage temporarily unavailable"),
+                ),
+            ],
+        );
+
+        assert_eq!(response.transfer, "basic");
+        assert_eq!(response.objects.len(), 3);
+
+        let available_response = &response.objects[0];
+        assert_eq!(available_response.oid, available.oid);
+        assert_eq!(available_response.size, available.size);
+        assert_eq!(available_response.authenticated, Some(true));
+        let expected_href = format!(
+            "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/{}",
+            available.oid.as_hex()
+        );
+        assert_eq!(
+            available_response
+                .actions
+                .get("download")
+                .map(|action| action.href.as_str()),
+            Some(expected_href.as_str())
+        );
+        assert_eq!(available_response.error, None);
+
+        let missing_error = response.objects[1]
+            .error
+            .as_ref()
+            .expect("missing object should have an object-level error");
+        assert_eq!(missing_error.code, 404);
+        assert_eq!(missing_error.message, "object not found");
+        assert!(response.objects[1].actions.is_empty());
+
+        let unavailable_error = response.objects[2]
+            .error
+            .as_ref()
+            .expect("unavailable object should preserve object-level error");
+        assert_eq!(unavailable_error.code, 503);
+        assert_eq!(unavailable_error.message, "storage temporarily unavailable");
+    }
+
+    #[test]
     fn batch_request_json_parses_operation_objects_transfers_and_ref() {
         let request = parse_lfs_batch_request_json(
             br#"{
@@ -1044,5 +1229,12 @@ mod tests {
         action.expires_in = Some(-1);
 
         assert_eq!(action.expires_in, Some(-1));
+    }
+
+    fn lfs_object(hex_byte: char, size: u64) -> LfsObject {
+        LfsObject::new(
+            LfsOid::from_str(&hex_byte.to_string().repeat(64)).unwrap(),
+            LfsObjectSize::new(size),
+        )
     }
 }

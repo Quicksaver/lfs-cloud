@@ -14,12 +14,12 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     body::Bytes,
     extract::{FromRequest, OriginalUri, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
     },
     response::{IntoResponse, Response},
 };
@@ -27,13 +27,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
-    GitHubOAuthStateRegistry, LfsOid, LfsSessionMetadata, LfsSessionToken, LocalLfsSessionStore,
-    MetadataDatabase, RepositoryMapping, RepositoryProviderConfig, ServerConfig, ServerError,
-    ServerResult, github_oauth_callback_router, github_oauth_login_router,
-    parse_lfs_batch_request_json,
+    GitHubOAuthStateRegistry, LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation,
+    LfsBatchRequest, LfsBatchResponse, LfsOid, LfsSessionMetadata, LfsSessionToken,
+    LocalLfsSessionStore, MetadataDatabase, RepositoryMapping, RepositoryProviderConfig,
+    ServerConfig, ServerError, ServerResult, github_oauth_callback_router,
+    github_oauth_login_router, parse_lfs_batch_request_json,
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
+const GIT_LFS_JSON_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 
 /// Runtime options supplied by `lfs-cloud serve`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,10 +62,10 @@ impl ServeOptions {
 
 /// Starts the configured LFS Cloud HTTP server and runs until shutdown.
 ///
-/// The server currently resolves configured LFS routes and returns
-/// `401 Unauthorized` for unauthenticated matched endpoints or
-/// `501 Not Implemented` after a valid local LFS session token is accepted.
-/// Batch and transfer behavior are implemented by later protocol tasks.
+/// The server currently resolves configured LFS routes, requires local LFS
+/// session authentication, and can render download batch responses with
+/// object-level unavailable errors. Upload batch responses and transfer
+/// endpoints are implemented by later protocol tasks.
 ///
 /// # Errors
 ///
@@ -198,6 +200,7 @@ fn github_oauth_router(
 struct LfsServerState {
     routes: LfsRouteResolver,
     session_store: LocalLfsSessionStore,
+    public_url: String,
 }
 
 impl LfsServerState {
@@ -205,6 +208,7 @@ impl LfsServerState {
         Self {
             routes: LfsRouteResolver::new(&config),
             session_store,
+            public_url: config.server.public_url,
         }
     }
 }
@@ -219,7 +223,10 @@ async fn handle_lfs_request(
 
     match state.routes.resolve_path(uri.path()) {
         Ok(route) => match authenticate_lfs_session(&headers, &state.session_store) {
-            Ok(session) => handle_authenticated_lfs_request(route, session, method, request).await,
+            Ok(session) => {
+                handle_authenticated_lfs_request(route, session, method, request, &state.public_url)
+                    .await
+            }
             Err(error @ ServerError::Unauthorized { .. }) => {
                 tracing::debug!(path = uri.path(), %error, "LFS route request was not authenticated");
                 authentication_required_response()
@@ -258,10 +265,11 @@ async fn handle_authenticated_lfs_request(
     session: LfsSessionMetadata,
     method: Method,
     request: Request,
+    public_url: &str,
 ) -> Response {
     match route.endpoint {
         LfsRouteEndpoint::Batch => {
-            handle_lfs_batch_request(route.repository, session, method, request).await
+            handle_lfs_batch_request(route.repository, session, method, request, public_url).await
         }
         LfsRouteEndpoint::Info | LfsRouteEndpoint::Object { .. } => (
             StatusCode::NOT_IMPLEMENTED,
@@ -276,6 +284,7 @@ async fn handle_lfs_batch_request(
     session: LfsSessionMetadata,
     method: Method,
     request: Request,
+    public_url: &str,
 ) -> Response {
     if method != Method::POST {
         return (
@@ -287,19 +296,15 @@ async fn handle_lfs_batch_request(
 
     match Bytes::from_request(request, &()).await {
         Ok(body) => match parse_lfs_batch_request_json(&body) {
-            Ok(request) => {
+            Ok(batch_request) => {
                 tracing::debug!(
                     repo_id = repository.id.as_str(),
                     provider_id = session.provider_id.as_str(),
-                    operation = ?request.operation,
-                    object_count = request.objects.len(),
+                    operation = ?batch_request.operation,
+                    object_count = batch_request.objects.len(),
                     "parsed Git LFS batch request"
                 );
-                (
-                    StatusCode::NOT_IMPLEMENTED,
-                    "Git LFS batch request parsed; response generation is not implemented yet.\n",
-                )
-                    .into_response()
+                handle_parsed_lfs_batch_request(repository, public_url, batch_request)
             }
             Err(error) => {
                 tracing::debug!(repo_id = repository.id.as_str(), %error, "invalid Git LFS batch request");
@@ -315,6 +320,52 @@ async fn handle_lfs_batch_request(
             error.into_response()
         }
     }
+}
+
+fn handle_parsed_lfs_batch_request(
+    repository: RepositoryMapping,
+    public_url: &str,
+    request: LfsBatchRequest,
+) -> Response {
+    match request.operation {
+        LfsBatchOperation::Download => git_lfs_json_response(
+            download_batch_response_pending_storage_lookup(public_url, &repository, request),
+        ),
+        LfsBatchOperation::Upload => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Git LFS upload batch response generation is not implemented yet.\n",
+        )
+            .into_response(),
+    }
+}
+
+fn download_batch_response_pending_storage_lookup(
+    public_url: &str,
+    repository: &RepositoryMapping,
+    request: LfsBatchRequest,
+) -> LfsBatchResponse {
+    LfsBatchResponse::download(
+        public_url,
+        repository.route_path(),
+        request.objects.into_iter().map(|object| {
+            LfsBatchDownloadObject::error(
+                object,
+                LfsBatchObjectError::new(
+                    501,
+                    "download object availability lookup is not implemented yet",
+                ),
+            )
+        }),
+    )
+}
+
+fn git_lfs_json_response(response: LfsBatchResponse) -> Response {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, GIT_LFS_JSON_CONTENT_TYPE)],
+        Json(response),
+    )
+        .into_response()
 }
 
 fn authenticate_lfs_session(
@@ -715,14 +766,24 @@ mod tests {
     use base64::Engine as _;
 
     use crate::{
-        DEFAULT_GIT_CREDENTIAL_USERNAME, LocalLfsSessionStore, RepositoryUser, ServerConfig,
-        ServerError,
+        DEFAULT_GIT_CREDENTIAL_USERNAME, LfsBatchResponse, LocalLfsSessionStore, RepositoryUser,
+        ServerConfig, ServerError,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
         "operation": "download",
         "transfers": ["basic"],
         "ref": { "name": "refs/heads/main" },
+        "objects": [
+            {
+                "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "size": 42
+            }
+        ]
+    }"#;
+    const VALID_UPLOAD_BATCH_REQUEST: &str = r#"{
+        "operation": "upload",
+        "transfers": ["basic"],
         "objects": [
             {
                 "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -963,12 +1024,50 @@ repositories:
             .await
             .expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.git-lfs+json")
+        );
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("response body should collect");
-        let body = std::str::from_utf8(&body).expect("response should be UTF-8");
-        assert!(body.contains("batch request parsed"));
+        let body: LfsBatchResponse =
+            serde_json::from_slice(&body).expect("response should be Git LFS batch JSON");
+
+        assert_eq!(body.transfer, "basic");
+        assert_eq!(body.objects.len(), 1);
+        assert_eq!(
+            body.objects[0].oid.as_hex(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(body.objects[0].size.bytes(), 42);
+        assert_eq!(
+            body.objects[0].error.as_ref().map(|error| error.code),
+            Some(501)
+        );
+        assert!(body.objects[0].actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_upload_batch_response_generation_is_still_planned() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions(test_config(), store);
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                VALID_UPLOAD_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
