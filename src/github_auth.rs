@@ -4,6 +4,8 @@
 //! the start of the GitHub login flow. Later callback and token-exchange code
 //! should validate the returned CSRF state before accepting an OAuth code.
 
+use std::fmt;
+
 use oauth2::{
     AuthUrl, ClientId, CsrfToken, RedirectUrl, Scope, basic::BasicClient,
     url::ParseError as UrlParseError,
@@ -13,6 +15,9 @@ use url::Url;
 use crate::{GitHubProviderConfig, ServerError, ServerResult};
 
 /// GitHub's OAuth authorization endpoint for the initial GitHub.com provider.
+///
+/// This browser-facing OAuth URL is intentionally not derived from
+/// [`GitHubProviderConfig::api_url`], which is the REST API base URL.
 pub const GITHUB_OAUTH_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 
 /// Default GitHub OAuth scopes for the initial login URL.
@@ -22,7 +27,7 @@ pub const GITHUB_OAUTH_AUTHORIZE_URL: &str = "https://github.com/login/oauth/aut
 pub const DEFAULT_GITHUB_OAUTH_SCOPES: &[&str] = &["read:user"];
 
 /// Browser URL plus CSRF state for a GitHub OAuth authorization attempt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct GitHubOAuthAuthorization {
     /// URL the user should open in a browser to start GitHub OAuth login.
     pub authorization_url: Url,
@@ -40,7 +45,7 @@ impl GitHubOAuthAuthorization {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{GitHubProviderConfig, github_oauth_authorization_url};
+    /// use lfs_cloud::{GitHubOAuthAuthorization, GitHubProviderConfig};
     ///
     /// let provider = GitHubProviderConfig {
     ///     id: "github-main".to_owned(),
@@ -49,7 +54,7 @@ impl GitHubOAuthAuthorization {
     ///     oauth_client_secret: "client-secret".to_owned(),
     /// };
     ///
-    /// let authorization = github_oauth_authorization_url(
+    /// let authorization = GitHubOAuthAuthorization::new(
     ///     &provider,
     ///     "http://127.0.0.1:8080/auth/github/callback",
     /// )?;
@@ -76,34 +81,43 @@ impl GitHubOAuthAuthorization {
     /// # Errors
     ///
     /// Returns [`ServerError`] when the configured redirect URL is invalid.
-    pub fn with_scopes<'a>(
+    pub fn with_scopes<S>(
         provider: &GitHubProviderConfig,
         redirect_url: impl Into<String>,
-        scopes: impl IntoIterator<Item = &'a str>,
-    ) -> ServerResult<Self> {
+        scopes: impl IntoIterator<Item = S>,
+    ) -> ServerResult<Self>
+    where
+        S: AsRef<str>,
+    {
         Self::with_state(provider, redirect_url, scopes, CsrfToken::new_random)
     }
 
-    fn with_state<'a>(
+    fn with_state<S>(
         provider: &GitHubProviderConfig,
         redirect_url: impl Into<String>,
-        scopes: impl IntoIterator<Item = &'a str>,
+        scopes: impl IntoIterator<Item = S>,
         state_fn: impl FnOnce() -> CsrfToken,
-    ) -> ServerResult<Self> {
+    ) -> ServerResult<Self>
+    where
+        S: AsRef<str>,
+    {
         let redirect_url = RedirectUrl::new(redirect_url.into())
             .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
-        let client =
-            BasicClient::new(ClientId::new(provider.oauth_client_id.clone()))
-                .set_auth_uri(AuthUrl::new(GITHUB_OAUTH_AUTHORIZE_URL.to_owned()).expect(
-                    "static GitHub OAuth authorization endpoint must be a valid absolute URL",
-                ))
-                .set_redirect_uri(redirect_url);
-        let request = scopes
-            .into_iter()
-            .filter(|scope| !scope.trim().is_empty())
-            .fold(client.authorize_url(state_fn), |request, scope| {
-                request.add_scope(Scope::new(scope.to_owned()))
-            });
+        let auth_url = AuthUrl::new(GITHUB_OAUTH_AUTHORIZE_URL.to_owned())
+            .map_err(|source| invalid_oauth_url("github oauth authorization endpoint", source))?;
+        let client = BasicClient::new(ClientId::new(provider.oauth_client_id.clone()))
+            .set_auth_uri(auth_url)
+            .set_redirect_uri(redirect_url);
+        let mut request = client.authorize_url(state_fn);
+        for scope in scopes {
+            let scope = scope.as_ref().trim();
+            if scope.is_empty() {
+                return Err(ServerError::InvalidConfiguration {
+                    message: "github oauth scope must not be blank".to_owned(),
+                });
+            }
+            request = request.add_scope(Scope::new(scope.to_owned()));
+        }
         let (authorization_url, csrf_state) = request.url();
 
         Ok(Self {
@@ -113,8 +127,18 @@ impl GitHubOAuthAuthorization {
     }
 }
 
+impl fmt::Debug for GitHubOAuthAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubOAuthAuthorization")
+            .field("authorization_url", &"<redacted OAuth authorization URL>")
+            .field("csrf_state", &self.csrf_state)
+            .finish()
+    }
+}
+
 /// CSRF state generated for a GitHub OAuth authorization attempt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct GitHubOAuthState(String);
 
 impl GitHubOAuthState {
@@ -125,22 +149,16 @@ impl GitHubOAuthState {
     }
 }
 
+impl fmt::Debug for GitHubOAuthState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GitHubOAuthState(<redacted>)")
+    }
+}
+
 impl From<CsrfToken> for GitHubOAuthState {
     fn from(value: CsrfToken) -> Self {
         Self(value.secret().clone())
     }
-}
-
-/// Creates a GitHub OAuth authorization URL using default LFS Cloud scopes.
-///
-/// # Errors
-///
-/// Returns [`ServerError`] when the configured redirect URL is invalid.
-pub fn github_oauth_authorization_url(
-    provider: &GitHubProviderConfig,
-    redirect_url: impl Into<String>,
-) -> ServerResult<GitHubOAuthAuthorization> {
-    GitHubOAuthAuthorization::new(provider, redirect_url)
 }
 
 fn invalid_oauth_url(path: &str, source: UrlParseError) -> ServerError {
@@ -157,7 +175,6 @@ mod tests {
 
     use super::{
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GitHubOAuthAuthorization,
-        github_oauth_authorization_url,
     };
     use crate::GitHubProviderConfig;
 
@@ -182,16 +199,33 @@ mod tests {
         )
         .expect("authorization URL should build");
 
+        assert_eq!(authorization.authorization_url.scheme(), "https");
         assert_eq!(
-            authorization.authorization_url.as_str(),
-            "https://github.com/login/oauth/authorize?response_type=code&client_id=client-id&state=csrf-state&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fauth%2Fgithub%2Fcallback&scope=read%3Auser"
+            authorization.authorization_url.host_str(),
+            Some("github.com")
         );
+        assert_eq!(
+            authorization.authorization_url.path(),
+            "/login/oauth/authorize"
+        );
+        let query = query_pairs(&authorization);
+        assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("client-id")
+        );
+        assert_eq!(
+            query.get("redirect_uri").map(String::as_str),
+            Some(REDIRECT_URL)
+        );
+        assert_eq!(query.get("scope").map(String::as_str), Some("read:user"));
+        assert_eq!(query.get("state").map(String::as_str), Some("csrf-state"));
         assert_eq!(authorization.csrf_state.as_str(), "csrf-state");
     }
 
     #[test]
     fn csrf_state_matches_url_query_parameter() {
-        let authorization = github_oauth_authorization_url(&provider_config(), REDIRECT_URL)
+        let authorization = GitHubOAuthAuthorization::new(&provider_config(), REDIRECT_URL)
             .expect("authorization URL should build");
         let query = query_pairs(&authorization);
 
@@ -204,9 +238,9 @@ mod tests {
 
     #[test]
     fn generated_csrf_states_are_fresh() {
-        let first = github_oauth_authorization_url(&provider_config(), REDIRECT_URL)
+        let first = GitHubOAuthAuthorization::new(&provider_config(), REDIRECT_URL)
             .expect("first authorization URL should build");
-        let second = github_oauth_authorization_url(&provider_config(), REDIRECT_URL)
+        let second = GitHubOAuthAuthorization::new(&provider_config(), REDIRECT_URL)
             .expect("second authorization URL should build");
 
         assert_ne!(first.csrf_state, second.csrf_state);
@@ -214,7 +248,7 @@ mod tests {
 
     #[test]
     fn authorization_url_does_not_expose_client_secret() {
-        let authorization = github_oauth_authorization_url(&provider_config(), REDIRECT_URL)
+        let authorization = GitHubOAuthAuthorization::new(&provider_config(), REDIRECT_URL)
             .expect("authorization URL should build");
         let rendered = authorization.authorization_url.as_str();
 
@@ -224,13 +258,12 @@ mod tests {
 
     #[test]
     fn custom_scopes_are_encoded_as_space_separated_github_scope() {
-        let authorization = GitHubOAuthAuthorization::with_state(
-            &provider_config(),
-            REDIRECT_URL,
-            ["read:user", "repo"],
-            || CsrfToken::new("csrf-state".to_owned()),
-        )
-        .expect("authorization URL should build");
+        let scopes = vec![" read:user ".to_owned(), "repo".to_owned()];
+        let authorization =
+            GitHubOAuthAuthorization::with_state(&provider_config(), REDIRECT_URL, scopes, || {
+                CsrfToken::new("csrf-state".to_owned())
+            })
+            .expect("authorization URL should build");
 
         assert_eq!(
             query_pairs(&authorization).get("scope").map(String::as_str),
@@ -239,8 +272,21 @@ mod tests {
     }
 
     #[test]
+    fn blank_custom_scopes_are_rejected() {
+        let error = GitHubOAuthAuthorization::with_state(
+            &provider_config(),
+            REDIRECT_URL,
+            ["read:user", "  "],
+            || CsrfToken::new("csrf-state".to_owned()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("github oauth scope"));
+    }
+
+    #[test]
     fn invalid_redirect_url_is_rejected() {
-        let error = github_oauth_authorization_url(&provider_config(), "not a url").unwrap_err();
+        let error = GitHubOAuthAuthorization::new(&provider_config(), "not a url").unwrap_err();
 
         assert!(error.to_string().contains("github oauth redirect_url"));
     }
@@ -253,6 +299,22 @@ mod tests {
                 .host_str(),
             Some("github.com")
         );
+    }
+
+    #[test]
+    fn debug_output_redacts_csrf_state() {
+        let authorization = GitHubOAuthAuthorization::with_state(
+            &provider_config(),
+            REDIRECT_URL,
+            ["read:user"],
+            || CsrfToken::new("csrf-state".to_owned()),
+        )
+        .expect("authorization URL should build");
+
+        let rendered = format!("{authorization:?}");
+
+        assert!(rendered.contains("GitHubOAuthAuthorization"));
+        assert!(!rendered.contains("csrf-state"));
     }
 
     fn query_pairs(authorization: &GitHubOAuthAuthorization) -> BTreeMap<String, String> {
