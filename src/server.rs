@@ -24,14 +24,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use serde::Serialize;
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
-    GitHubOAuthStateRegistry, LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation,
-    LfsBatchRequest, LfsBatchResponse, LfsOid, LfsSessionMetadata, LfsSessionToken,
-    LocalLfsSessionStore, MetadataDatabase, RepositoryMapping, RepositoryProviderConfig,
-    ServerConfig, ServerError, ServerResult, github_oauth_callback_router,
-    github_oauth_login_router, parse_lfs_batch_request_json,
+    GitHubOAuthStateRegistry, LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError,
+    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsOid, LfsSessionMetadata,
+    LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, RepositoryMapping,
+    RepositoryProviderConfig, ServerConfig, ServerError, ServerResult,
+    github_oauth_callback_router, github_oauth_login_router, parse_lfs_batch_request_json,
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
@@ -327,6 +328,18 @@ fn handle_parsed_lfs_batch_request(
     public_url: &str,
     request: LfsBatchRequest,
 ) -> Response {
+    if !request.transfers.is_empty()
+        && !request
+            .transfers
+            .iter()
+            .any(|transfer| transfer == LFS_BASIC_TRANSFER)
+    {
+        return git_lfs_json_error_response(
+            StatusCode::CONFLICT,
+            "unsupported Git LFS transfer requested; only basic is available",
+        );
+    }
+
     match request.operation {
         LfsBatchOperation::Download => git_lfs_json_response(
             download_batch_response_pending_storage_lookup(public_url, &repository, request),
@@ -366,6 +379,22 @@ fn git_lfs_json_response(response: LfsBatchResponse) -> Response {
         Json(response),
     )
         .into_response()
+}
+
+fn git_lfs_json_error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        [(CONTENT_TYPE, GIT_LFS_JSON_CONTENT_TYPE)],
+        Json(LfsBatchErrorResponse {
+            message: message.into(),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LfsBatchErrorResponse {
+    message: String,
 }
 
 fn authenticate_lfs_session(
@@ -791,6 +820,16 @@ mod tests {
             }
         ]
     }"#;
+    const UNSUPPORTED_TRANSFER_BATCH_REQUEST: &str = r#"{
+        "operation": "download",
+        "transfers": ["ssh"],
+        "objects": [
+            {
+                "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "size": 42
+            }
+        ]
+    }"#;
 
     fn test_config() -> ServerConfig {
         ServerConfig::load_from_str(
@@ -1050,6 +1089,41 @@ repositories:
             Some(501)
         );
         assert!(body.objects[0].actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_batch_route_rejects_unsupported_transfers() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions(test_config(), store);
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                UNSUPPORTED_TRANSFER_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.git-lfs+json")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("response should be JSON");
+
+        assert_eq!(
+            body.get("message").and_then(|value| value.as_str()),
+            Some("unsupported Git LFS transfer requested; only basic is available")
+        );
     }
 
     #[tokio::test]
