@@ -11,21 +11,25 @@ use oauth2::{
     url::ParseError as UrlParseError,
 };
 use reqwest::{
-    Client,
+    Client, StatusCode,
     header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
 use serde::Deserialize;
 use url::Url;
 
 use crate::{
-    GitHubProviderConfig, RepositoryProviderError, SanitizedMessage, ServerError, ServerResult,
+    GitHubProviderConfig, RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerError,
+    ServerResult,
 };
 
 const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
 const GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_USER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_OAUTH_USER_AGENT: &str = concat!("lfs-cloud/", env!("CARGO_PKG_VERSION"));
+const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 
 static DEFAULT_GITHUB_OAUTH_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+static DEFAULT_GITHUB_API_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 
 /// GitHub's OAuth authorization endpoint for the initial GitHub.com provider.
 ///
@@ -110,6 +114,94 @@ impl fmt::Debug for GitHubOAuthToken {
             .field("token_type", &self.token_type)
             .field("scopes", &self.scopes)
             .finish()
+    }
+}
+
+/// HTTP client for fetching the authenticated GitHub user identity.
+///
+/// This client uses the OAuth access token only for server-side GitHub API
+/// calls. The returned [`RepositoryUser`] is the identity that later session and
+/// permission-check code can store without exposing the GitHub token to Git LFS.
+#[derive(Clone, Debug)]
+pub struct GitHubUserClient {
+    client: Client,
+}
+
+impl GitHubUserClient {
+    /// Creates a GitHub user client with the default HTTP settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the default HTTP client cannot be built.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::GitHubUserClient;
+    ///
+    /// let client = GitHubUserClient::new()?;
+    ///
+    /// assert!(format!("{client:?}").contains("GitHubUserClient"));
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
+    pub fn new() -> ServerResult<Self> {
+        Ok(Self::with_client(default_github_api_http_client()?))
+    }
+
+    /// Creates a GitHub user client from an existing [`Client`].
+    ///
+    /// This is useful when server code shares one tuned provider HTTP client.
+    #[must_use]
+    pub fn with_client(client: Client) -> Self {
+        Self { client }
+    }
+
+    /// Fetches the authenticated GitHub user's identity with an OAuth token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the configured GitHub API URL is invalid,
+    /// the token is rejected, the request fails, or GitHub returns malformed
+    /// identity JSON.
+    pub async fn fetch_authenticated_user(
+        &self,
+        provider: &GitHubProviderConfig,
+        token: &GitHubOAuthAccessToken,
+    ) -> ServerResult<RepositoryUser> {
+        let endpoint = github_user_endpoint(provider)?;
+        let response = self
+            .client
+            .get(endpoint)
+            .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .map_err(|source| github_user_request_error(provider, None, source))?;
+        let status = response.status();
+
+        if !status.is_success() {
+            if status == StatusCode::UNAUTHORIZED {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: provider.id.clone(),
+                    },
+                });
+            }
+
+            let body = response
+                .text()
+                .await
+                .map_err(|source| github_user_request_error(provider, Some(status), source))?;
+
+            return Err(github_user_status_error(provider, status, &body, token));
+        }
+
+        let response = response
+            .json::<GitHubUserResponse>()
+            .await
+            .map_err(|source| github_user_request_error(provider, Some(status), source))?;
+
+        response.into_repository_user(provider)
     }
 }
 
@@ -612,6 +704,23 @@ pub async fn exchange_github_oauth_code(
         .await
 }
 
+/// Fetches the authenticated GitHub user using the default GitHub API client.
+///
+/// Server code that performs repeated provider calls should prefer holding a
+/// reusable [`GitHubUserClient`] so connection pooling remains warm.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] when the GitHub user lookup cannot complete.
+pub async fn fetch_authenticated_github_user(
+    provider: &GitHubProviderConfig,
+    token: &GitHubOAuthAccessToken,
+) -> ServerResult<RepositoryUser> {
+    GitHubUserClient::new()?
+        .fetch_authenticated_user(provider, token)
+        .await
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubOAuthTokenResponse {
     access_token: Option<String>,
@@ -619,6 +728,33 @@ struct GitHubOAuthTokenResponse {
     scope: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubUserResponse {
+    login: Option<String>,
+    id: Option<u64>,
+}
+
+impl GitHubUserResponse {
+    fn into_repository_user(self, provider: &GitHubProviderConfig) -> ServerResult<RepositoryUser> {
+        let login = self
+            .login
+            .ok_or_else(|| malformed_github_user_response_error(provider, "missing login"))?;
+        let login = validate_sensitive_oauth_value(login, "github authenticated user login")
+            .map_err(|_| malformed_github_user_response_error(provider, "invalid login"))?;
+
+        Ok(RepositoryUser::new(
+            provider.id.clone(),
+            login,
+            self.id.map(|id| id.to_string()),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubApiErrorResponse {
+    message: Option<String>,
 }
 
 impl GitHubOAuthTokenResponse {
@@ -756,6 +892,50 @@ fn token_exchange_upstream_error(
     repository_provider_upstream_error(provider, status, message)
 }
 
+fn github_user_request_error(
+    provider: &GitHubProviderConfig,
+    status: Option<StatusCode>,
+    source: reqwest::Error,
+) -> ServerError {
+    let message = if source.is_timeout() {
+        "github authenticated user request timed out"
+    } else if source.is_connect() {
+        "github api connection failed while fetching authenticated user"
+    } else if source.is_decode() {
+        "malformed github authenticated user response"
+    } else if source.is_body() {
+        "github authenticated user response body could not be read"
+    } else {
+        "github authenticated user request failed"
+    };
+
+    repository_provider_upstream_error(provider, status.map(|status| status.as_u16()), message)
+}
+
+fn github_user_status_error(
+    provider: &GitHubProviderConfig,
+    status: StatusCode,
+    body: &str,
+    token: &GitHubOAuthAccessToken,
+) -> ServerError {
+    let message = github_api_error_message(body)
+        .map(|message| redact_oauth_secret(&message, token))
+        .unwrap_or_else(|| "github authenticated user request failed".to_owned());
+
+    repository_provider_upstream_error(provider, Some(status.as_u16()), &message)
+}
+
+fn malformed_github_user_response_error(
+    provider: &GitHubProviderConfig,
+    message: &str,
+) -> ServerError {
+    repository_provider_upstream_error(
+        provider,
+        None,
+        &format!("malformed github authenticated user response: {message}"),
+    )
+}
+
 fn malformed_token_response_error(provider: &GitHubProviderConfig, message: &str) -> ServerError {
     repository_provider_upstream_error(
         provider,
@@ -808,6 +988,17 @@ fn invalid_oauth_url(path: &str, source: UrlParseError) -> ServerError {
     }
 }
 
+fn github_user_endpoint(provider: &GitHubProviderConfig) -> ServerResult<Url> {
+    let mut endpoint = Url::parse(&provider.api_url)
+        .map_err(|source| invalid_oauth_url("github api_url", source))?;
+    let base_path = endpoint.path().trim_end_matches('/');
+    endpoint.set_path(&format!("{base_path}/user"));
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+
+    Ok(endpoint)
+}
+
 fn default_github_oauth_http_client() -> ServerResult<Client> {
     match DEFAULT_GITHUB_OAUTH_HTTP_CLIENT.get_or_init(|| {
         build_github_oauth_http_client()
@@ -820,9 +1011,28 @@ fn default_github_oauth_http_client() -> ServerResult<Client> {
     }
 }
 
+fn default_github_api_http_client() -> ServerResult<Client> {
+    match DEFAULT_GITHUB_API_HTTP_CLIENT.get_or_init(|| {
+        build_github_api_http_client()
+            .map_err(|source| sanitize_oauth_diagnostic_value(&source.to_string()))
+    }) {
+        Ok(client) => Ok(client.clone()),
+        Err(message) => Err(ServerError::InvalidConfiguration {
+            message: format!("github api http client could not be built: {message}"),
+        }),
+    }
+}
+
 fn build_github_oauth_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
         .timeout(GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT)
+        .user_agent(GITHUB_OAUTH_USER_AGENT)
+        .build()
+}
+
+fn build_github_api_http_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .timeout(GITHUB_USER_FETCH_TIMEOUT)
         .user_agent(GITHUB_OAUTH_USER_AGENT)
         .build()
 }
@@ -916,6 +1126,18 @@ fn sanitize_oauth_diagnostic_value(value: &str) -> String {
     sanitized
 }
 
+fn github_api_error_message(body: &str) -> Option<String> {
+    serde_json::from_str::<GitHubApiErrorResponse>(body)
+        .ok()
+        .and_then(|error| error.message)
+        .map(|message| sanitize_oauth_diagnostic_value(&message))
+        .filter(|message| !message.is_empty())
+}
+
+fn redact_oauth_secret(message: &str, token: &GitHubOAuthAccessToken) -> String {
+    message.replace(token.as_str(), "<redacted>")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
@@ -923,20 +1145,21 @@ mod tests {
     use axum::{
         Router,
         extract::State,
-        http::{HeaderMap, StatusCode},
+        http::{HeaderMap, StatusCode, header::AUTHORIZATION},
         response::IntoResponse,
-        routing::post,
+        routing::{get, post},
     };
     use oauth2::CsrfToken;
     use tokio::sync::Mutex;
 
     use super::{
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
-        GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAuthorization, GitHubOAuthCallback,
-        GitHubOAuthCallbackQuery, GitHubOAuthState, GitHubOAuthTokenExchanger,
-        exchange_github_oauth_code, github_oauth_authorization_url,
+        GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization,
+        GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthState, GitHubOAuthTokenExchanger,
+        GitHubUserClient, exchange_github_oauth_code, fetch_authenticated_github_user,
+        github_oauth_authorization_url,
     };
-    use crate::{GitHubProviderConfig, ServerError};
+    use crate::{GitHubProviderConfig, RepositoryProviderError, ServerError};
 
     const REDIRECT_URL: &str = "http://127.0.0.1:8080/auth/github/callback";
 
@@ -946,6 +1169,13 @@ mod tests {
             api_url: "https://api.github.com".to_owned(),
             oauth_client_id: "client-id".to_owned(),
             oauth_client_secret: "client-secret".to_owned(),
+        }
+    }
+
+    fn provider_config_with_api_url(api_url: impl Into<String>) -> GitHubProviderConfig {
+        GitHubProviderConfig {
+            api_url: api_url.into(),
+            ..provider_config()
         }
     }
 
@@ -1245,6 +1475,120 @@ mod tests {
         assert!(!rendered.contains("gho_secret"));
     }
 
+    #[tokio::test]
+    async fn user_client_fetches_authenticated_github_identity() {
+        let (api_url, user_server) =
+            user_server(StatusCode::OK, r#"{"login":"octocat","id":583231}"#).await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let user = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect("user lookup should succeed");
+
+        assert_eq!(user.provider_id, "github-main");
+        assert_eq!(user.login, "octocat");
+        assert_eq!(user.stable_id.as_deref(), Some("583231"));
+        let requests = user_server.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.accept.as_deref(), Some(super::GITHUB_API_ACCEPT));
+        assert_eq!(request.authorization.as_deref(), Some("Bearer gho_token"));
+    }
+
+    #[tokio::test]
+    async fn user_client_preserves_github_api_base_path() {
+        let (api_url, user_server) =
+            user_server(StatusCode::OK, r#"{"login":"octocat","id":583231}"#).await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+
+        let user = fetch_authenticated_github_user(&provider, &token)
+            .await
+            .expect("wrapper user lookup should succeed");
+
+        assert_eq!(user.login, "octocat");
+        assert_eq!(user_server.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn user_client_rejects_invalid_api_url_before_network_io() {
+        let provider = provider_config_with_api_url("not a url");
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+
+        let error = fetch_authenticated_github_user(&provider, &token)
+            .await
+            .expect_err("invalid api_url should fail");
+
+        assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
+        assert!(error.to_string().contains("github api_url"));
+    }
+
+    #[tokio::test]
+    async fn user_client_maps_bad_token_to_authentication_required() {
+        let (api_url, _user_server) = user_server(
+            StatusCode::UNAUTHORIZED,
+            r#"{"message":"Bad credentials gho_secret"}"#,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_secret").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("unauthorized user lookup should fail");
+        let rendered = error.to_string();
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::AuthenticationRequired { .. }
+            }
+        ));
+        assert!(!rendered.contains("gho_secret"));
+    }
+
+    #[tokio::test]
+    async fn user_client_redacts_token_from_upstream_error_message() {
+        let (api_url, _user_server) =
+            user_server(StatusCode::BAD_GATEWAY, r#"{"message":"echo gho_secret"}"#).await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_secret").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("upstream user lookup should fail");
+        let rendered = error.to_string();
+
+        assert!(matches!(error, ServerError::RepositoryProvider { .. }));
+        assert!(rendered.contains("502"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("gho_secret"));
+    }
+
+    #[tokio::test]
+    async fn user_client_rejects_malformed_identity_response() {
+        let (api_url, _user_server) = user_server(StatusCode::OK, r#"{"id":583231}"#).await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("missing login should fail");
+
+        assert!(matches!(error, ServerError::RepositoryProvider { .. }));
+        assert!(error.to_string().contains("missing login"));
+        assert!(!error.to_string().contains("gho_token"));
+    }
+
     #[test]
     fn authorization_url_does_not_expose_client_secret() {
         let authorization = GitHubOAuthAuthorization::new(&provider_config(), REDIRECT_URL)
@@ -1508,6 +1852,19 @@ mod tests {
         body: BTreeMap<String, String>,
     }
 
+    #[derive(Debug, Default)]
+    struct UserServerState {
+        status: StatusCode,
+        body: &'static str,
+        requests: Mutex<Vec<CapturedUserRequest>>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CapturedUserRequest {
+        accept: Option<String>,
+        authorization: Option<String>,
+    }
+
     async fn token_server(
         status: StatusCode,
         body: &'static str,
@@ -1536,6 +1893,31 @@ mod tests {
         (format!("http://{address}/login/oauth/access_token"), state)
     }
 
+    async fn user_server(status: StatusCode, body: &'static str) -> (String, Arc<UserServerState>) {
+        let state = Arc::new(UserServerState {
+            status,
+            body,
+            requests: Mutex::new(Vec::new()),
+        });
+        let app = Router::new()
+            .route("/api/v3/user", get(capture_user_request))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock user server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock user server address should be available");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock user server should run");
+        });
+
+        (format!("http://{address}/api/v3"), state)
+    }
+
     async fn capture_token_request(
         State(state): State<Arc<TokenServerState>>,
         headers: HeaderMap,
@@ -1557,6 +1939,31 @@ mod tests {
             accept,
             content_type,
             body,
+        });
+
+        (
+            state.status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            state.body,
+        )
+    }
+
+    async fn capture_user_request(
+        State(state): State<Arc<UserServerState>>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let authorization = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+
+        state.requests.lock().await.push(CapturedUserRequest {
+            accept,
+            authorization,
         });
 
         (
