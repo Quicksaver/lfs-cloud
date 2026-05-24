@@ -29,8 +29,8 @@ use serde::Serialize;
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
     GitHubOAuthStateRegistry, LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError,
-    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsOid, LfsSessionMetadata,
-    LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, RepositoryMapping,
+    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsOid,
+    LfsSessionMetadata, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, RepositoryMapping,
     RepositoryProviderConfig, ServerConfig, ServerError, ServerResult,
     github_oauth_callback_router, github_oauth_login_router, parse_lfs_batch_request_json,
 };
@@ -64,9 +64,9 @@ impl ServeOptions {
 /// Starts the configured LFS Cloud HTTP server and runs until shutdown.
 ///
 /// The server currently resolves configured LFS routes, requires local LFS
-/// session authentication, and can render download batch responses with
-/// object-level unavailable errors. Upload batch responses and transfer
-/// endpoints are implemented by later protocol tasks.
+/// session authentication, and can render batch responses with object-level
+/// unavailable errors. Storage-backed batch actions and transfer endpoints are
+/// implemented by later protocol tasks.
 ///
 /// # Errors
 ///
@@ -344,11 +344,9 @@ fn handle_parsed_lfs_batch_request(
         LfsBatchOperation::Download => git_lfs_json_response(
             download_batch_response_pending_storage_lookup(public_url, &repository, request),
         ),
-        LfsBatchOperation::Upload => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Git LFS upload batch response generation is not implemented yet.\n",
-        )
-            .into_response(),
+        LfsBatchOperation::Upload => git_lfs_json_response(
+            upload_batch_response_pending_storage_lookup(public_url, &repository, request),
+        ),
     }
 }
 
@@ -366,6 +364,26 @@ fn download_batch_response_pending_storage_lookup(
                 LfsBatchObjectError::new(
                     501,
                     "download object availability lookup is not implemented yet",
+                ),
+            )
+        }),
+    )
+}
+
+fn upload_batch_response_pending_storage_lookup(
+    public_url: &str,
+    repository: &RepositoryMapping,
+    request: LfsBatchRequest,
+) -> LfsBatchResponse {
+    LfsBatchResponse::upload(
+        public_url,
+        repository.route_path(),
+        request.objects.into_iter().map(|object| {
+            LfsBatchUploadObject::error(
+                object,
+                LfsBatchObjectError::new(
+                    501,
+                    "upload object availability lookup is not implemented yet",
                 ),
             )
         }),
@@ -1127,7 +1145,7 @@ repositories:
     }
 
     #[tokio::test]
-    async fn authenticated_upload_batch_response_generation_is_still_planned() {
+    async fn authenticated_upload_batch_route_returns_object_level_pending_errors() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
         let router = lfs_server_router_with_sessions(test_config(), store);
 
@@ -1141,7 +1159,31 @@ repositories:
             .await
             .expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.git-lfs+json")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        let body: LfsBatchResponse =
+            serde_json::from_slice(&body).expect("response should be Git LFS batch JSON");
+
+        assert_eq!(body.transfer, "basic");
+        assert_eq!(body.objects.len(), 1);
+        assert_eq!(
+            body.objects[0].oid.as_hex(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            body.objects[0].error.as_ref().map(|error| error.code),
+            Some(501)
+        );
+        assert!(body.objects[0].actions.is_empty());
     }
 
     #[tokio::test]

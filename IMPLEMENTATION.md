@@ -1121,7 +1121,9 @@ Defer:
 > a valid local LFS Cloud session token before parsing Git LFS batch requests.
 > Download batch response generation now returns Git LFS JSON with per-object
 > errors until storage availability lookup is wired. Upload batch response
-> generation, upload, and download handlers remain planned.
+> generation now returns Git LFS JSON with per-object errors until upload
+> availability lookup and transfer handling are wired. Upload and download
+> handlers remain planned.
 
 ### Progress Summary
 
@@ -1132,12 +1134,12 @@ Defer:
 | 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
-| 5. LFS Server Protocol                   | 12          | 6      | 6         |
+| 5. LFS Server Protocol                   | 12          | 7      | 5         |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **52** | **47**    |
+| **Total**                                | **99**      | **53** | **46**    |
 
 ### Legend
 
@@ -1254,7 +1256,7 @@ Defer:
 
 - [x] [T] Implement Git LFS batch request parsing.
 - [x] [T] Implement batch download response generation with object-level errors.
-- [ ] [T] Implement batch upload response generation with object-level errors.
+- [x] [T] Implement batch upload response generation with object-level errors.
 - [ ] [T] Enforce GitHub read/write authorization per batch operation.
 
 #### Epic 5.3: Transfer Endpoints

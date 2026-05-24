@@ -627,6 +627,54 @@ impl LfsBatchResponse {
             objects,
         }
     }
+
+    /// Creates a Git LFS upload batch response using the basic transfer adapter.
+    ///
+    /// Objects that need bytes uploaded receive an `upload` action under the
+    /// configured repository LFS route. Objects that are already present are
+    /// returned without actions, and per-object storage or protocol failures
+    /// remain object-level errors instead of failing the entire batch.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::str::FromStr;
+    ///
+    /// use lfs_cloud::{
+    ///     LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid,
+    /// };
+    ///
+    /// let object = LfsObject::new(
+    ///     LfsOid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?,
+    ///     LfsObjectSize::new(42),
+    /// );
+    /// let response = LfsBatchResponse::upload(
+    ///     "http://127.0.0.1:8080",
+    ///     "/github.com/owner/repo.git/info/lfs",
+    ///     [LfsBatchUploadObject::needed(object)],
+    /// );
+    ///
+    /// assert!(response.objects[0].actions.contains_key("upload"));
+    /// # Ok::<(), lfs_cloud::LfsObjectError>(())
+    /// ```
+    #[must_use]
+    pub fn upload(
+        public_url: impl AsRef<str>,
+        repository_lfs_path: impl AsRef<str>,
+        objects: impl IntoIterator<Item = LfsBatchUploadObject>,
+    ) -> Self {
+        let public_url = public_url.as_ref();
+        let repository_lfs_path = repository_lfs_path.as_ref();
+        let objects = objects
+            .into_iter()
+            .map(|object| object.into_response(public_url, repository_lfs_path))
+            .collect();
+
+        Self {
+            transfer: LFS_BASIC_TRANSFER.to_owned(),
+            objects,
+        }
+    }
 }
 
 /// Per-object result in a Git LFS batch response.
@@ -742,6 +790,74 @@ impl LfsBatchDownloadObject {
     }
 }
 
+/// Upload availability for one object in a Git LFS batch response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LfsBatchUploadObject {
+    /// The server needs the client to upload this object's bytes.
+    Needed {
+        /// Object whose bytes should be uploaded.
+        object: LfsObject,
+    },
+    /// The object is already present for this repository/storage mapping.
+    Present {
+        /// Object requested by the client.
+        object: LfsObject,
+    },
+    /// The object could not be accepted because of a classified object-level failure.
+    Error {
+        /// Object requested by the client.
+        object: LfsObject,
+        /// Safe error payload returned for this object.
+        error: LfsBatchObjectError,
+    },
+}
+
+impl LfsBatchUploadObject {
+    /// Marks an object as needing upload bytes from the client.
+    #[must_use]
+    pub fn needed(object: LfsObject) -> Self {
+        Self::Needed { object }
+    }
+
+    /// Marks an object as already present in storage.
+    #[must_use]
+    pub fn present(object: LfsObject) -> Self {
+        Self::Present { object }
+    }
+
+    /// Marks an object with a specific object-level error.
+    #[must_use]
+    pub fn error(object: LfsObject, error: LfsBatchObjectError) -> Self {
+        Self::Error { object, error }
+    }
+
+    fn into_response(self, public_url: &str, repository_lfs_path: &str) -> LfsBatchObjectResponse {
+        match self {
+            Self::Needed { object } => {
+                let mut actions = BTreeMap::new();
+                actions.insert(
+                    "upload".to_owned(),
+                    LfsBatchAction::new(lfs_object_action_url(
+                        public_url,
+                        repository_lfs_path,
+                        &object,
+                    )),
+                );
+
+                LfsBatchObjectResponse::with_actions(&object, true, actions)
+            }
+            Self::Present { object } => LfsBatchObjectResponse {
+                oid: object.oid,
+                size: object.size,
+                authenticated: None,
+                actions: BTreeMap::new(),
+                error: None,
+            },
+            Self::Error { object, error } => LfsBatchObjectResponse::with_error(&object, error),
+        }
+    }
+}
+
 fn lfs_object_action_url(
     public_url: &str,
     repository_lfs_path: &str,
@@ -813,8 +929,8 @@ mod tests {
 
     use super::{
         LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation,
-        LfsBatchResponse, LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer,
-        parse_lfs_batch_request_json,
+        LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectError, LfsObjectSize, LfsOid,
+        LfsPointer, parse_lfs_batch_request_json,
     };
 
     const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1157,6 +1273,56 @@ mod tests {
         assert_eq!(missing_error.code, 404);
         assert_eq!(missing_error.message, "object not found");
         assert!(response.objects[1].actions.is_empty());
+
+        let unavailable_error = response.objects[2]
+            .error
+            .as_ref()
+            .expect("unavailable object should preserve object-level error");
+        assert_eq!(unavailable_error.code, 503);
+        assert_eq!(unavailable_error.message, "storage temporarily unavailable");
+    }
+
+    #[test]
+    fn upload_batch_response_generates_actions_and_object_errors() {
+        let needed = lfs_object('a', 42);
+        let present = lfs_object('b', 64);
+        let unavailable = lfs_object('c', 128);
+
+        let response = LfsBatchResponse::upload(
+            "http://127.0.0.1:8080/",
+            "/github.com/owner/repo.git/info/lfs",
+            [
+                LfsBatchUploadObject::needed(needed.clone()),
+                LfsBatchUploadObject::present(present),
+                LfsBatchUploadObject::error(
+                    unavailable,
+                    LfsBatchObjectError::new(503, "storage temporarily unavailable"),
+                ),
+            ],
+        );
+
+        assert_eq!(response.transfer, "basic");
+        assert_eq!(response.objects.len(), 3);
+
+        let needed_response = &response.objects[0];
+        assert_eq!(needed_response.oid, needed.oid);
+        assert_eq!(needed_response.size, needed.size);
+        assert_eq!(needed_response.authenticated, Some(true));
+        let expected_href = format!(
+            "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/{}",
+            needed.oid.as_hex()
+        );
+        assert_eq!(
+            needed_response
+                .actions
+                .get("upload")
+                .map(|action| action.href.as_str()),
+            Some(expected_href.as_str())
+        );
+        assert_eq!(needed_response.error, None);
+
+        assert!(response.objects[1].actions.is_empty());
+        assert_eq!(response.objects[1].error, None);
 
         let unavailable_error = response.objects[2]
             .error
