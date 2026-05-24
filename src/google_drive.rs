@@ -18,7 +18,8 @@ use crate::{GoogleDriveStorageConfig, SanitizedMessage, StorageError, StorageRes
 const GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_";
-const MAX_GOOGLE_OAUTH_ERROR_BODY_LEN: usize = 16 * 1024;
+const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
+const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
 const GOOGLE_DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 
 static DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -353,7 +354,7 @@ impl GoogleDriveTokenRefresher {
             .await
             .map_err(|source| refresh_transport_error(credential, source))?;
         let status = response.status();
-        let response_body = read_google_oauth_response_body(response)
+        let response_body = read_google_response_body(response)
             .await
             .map_err(|source| refresh_transport_error(credential, source))?;
 
@@ -384,6 +385,9 @@ pub struct GoogleDriveRootFolder {
     /// Operator-facing Google Drive folder name.
     pub name: String,
     /// Whether the Drive API reports that this credential can create children.
+    ///
+    /// Successful validation guarantees this is `true`; a false or missing API
+    /// value fails validation before returning this metadata.
     pub can_add_children: bool,
 }
 
@@ -470,7 +474,7 @@ impl GoogleDriveRootValidator {
             .await
             .map_err(|source| drive_transport_error(storage, token, source))?;
         let status = response.status();
-        let response_body = read_google_oauth_response_body(response)
+        let response_body = read_google_response_body(response)
             .await
             .map_err(|source| drive_transport_error(storage, token, source))?;
 
@@ -719,48 +723,40 @@ fn parse_token_success(
     })
 }
 
-fn default_google_drive_http_client() -> StorageResult<Client> {
-    if let Some(client) = DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT.get() {
+fn default_google_drive_http_client_from(
+    client_slot: &'static OnceLock<Client>,
+    timeout: Duration,
+) -> StorageResult<Client> {
+    if let Some(client) = client_slot.get() {
         return Ok(client.clone());
     }
 
     let client = Client::builder()
-        .timeout(GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|source| StorageError::Retryable {
             provider: "google_drive".to_owned(),
             message: format!("failed to initialize Google Drive HTTP client: {source}"),
         })?;
 
-    match DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT.set(client.clone()) {
+    match client_slot.set(client.clone()) {
         Ok(()) => Ok(client),
-        Err(client) => Ok(DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT
-            .get()
-            .cloned()
-            .unwrap_or(client)),
+        Err(client) => Ok(client_slot.get().cloned().unwrap_or(client)),
     }
 }
 
+fn default_google_drive_http_client() -> StorageResult<Client> {
+    default_google_drive_http_client_from(
+        &DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT,
+        GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT,
+    )
+}
+
 fn default_google_drive_root_validation_http_client() -> StorageResult<Client> {
-    if let Some(client) = DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT.get() {
-        return Ok(client.clone());
-    }
-
-    let client = Client::builder()
-        .timeout(GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT)
-        .build()
-        .map_err(|source| StorageError::Retryable {
-            provider: "google_drive".to_owned(),
-            message: format!("failed to initialize Google Drive HTTP client: {source}"),
-        })?;
-
-    match DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT.set(client.clone()) {
-        Ok(()) => Ok(client),
-        Err(client) => Ok(DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT
-            .get()
-            .cloned()
-            .unwrap_or(client)),
-    }
+    default_google_drive_http_client_from(
+        &DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT,
+        GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT,
+    )
 }
 
 fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
@@ -818,6 +814,16 @@ fn drive_file_metadata_url(mut api_base_url: Url, root_folder_id: &str) -> Stora
         });
     }
 
+    let base_path_already_targets_drive_api = api_base_url
+        .path_segments()
+        .map(|segments| {
+            let segments = segments
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>();
+            segments.ends_with(&["drive", "v3"])
+        })
+        .unwrap_or(false);
+
     {
         let mut segments =
             api_base_url
@@ -830,7 +836,11 @@ fn drive_file_metadata_url(mut api_base_url: Url, root_folder_id: &str) -> Stora
                     ),
                 })?;
         segments.pop_if_empty();
-        segments.extend(["drive", "v3", "files", root_folder_id]);
+        if base_path_already_targets_drive_api {
+            segments.extend(["files", root_folder_id]);
+        } else {
+            segments.extend(["drive", "v3", "files", root_folder_id]);
+        }
     }
     api_base_url
         .query_pairs_mut()
@@ -898,7 +908,18 @@ fn parse_drive_root_success(
             )),
         });
     }
-    if metadata.capabilities.can_add_children != Some(true) {
+    let can_add_children =
+        metadata
+            .capabilities
+            .can_add_children
+            .ok_or_else(|| StorageError::Upstream {
+                provider: storage.id.clone(),
+                status: Some(status.as_u16()),
+                message: SanitizedMessage::new(
+                    "Google Drive root folder response did not include capabilities.canAddChildren",
+                ),
+            })?;
+    if !can_add_children {
         return Err(StorageError::Upstream {
             provider: storage.id.clone(),
             status: Some(status.as_u16()),
@@ -916,7 +937,7 @@ fn parse_drive_root_success(
         provider_id: storage.id.clone(),
         id,
         name,
-        can_add_children: true,
+        can_add_children,
     })
 }
 
@@ -980,12 +1001,8 @@ fn parse_drive_root_error(
 }
 
 fn drive_error_message(token: &GoogleDriveAccessToken, body: &str) -> DriveDiagnostic {
-    let capped = body
-        .chars()
-        .take(MAX_GOOGLE_OAUTH_ERROR_BODY_LEN)
-        .collect::<String>();
-    if let Ok(error) = serde_json::from_str::<GoogleDriveErrorResponse>(&capped)
-        && let Some(error) = error.error
+    if let Ok(GoogleDriveErrorResponse { error: Some(error) }) =
+        serde_json::from_str::<GoogleDriveErrorResponse>(body)
     {
         let message = error
             .message
@@ -998,13 +1015,13 @@ fn drive_error_message(token: &GoogleDriveAccessToken, body: &str) -> DriveDiagn
             .filter(|reason| !reason.trim().is_empty())
             .collect();
         return DriveDiagnostic {
-            message: sanitize_drive_diagnostic(token, &message),
+            message: sanitize_drive_diagnostic(token, &cap_google_diagnostic(&message)),
             reasons,
         };
     }
 
     DriveDiagnostic {
-        message: sanitize_drive_diagnostic(token, &capped),
+        message: sanitize_drive_diagnostic(token, &cap_google_diagnostic(body)),
         reasons: Vec::new(),
     }
 }
@@ -1015,7 +1032,7 @@ struct DriveDiagnostic {
 }
 
 fn sanitize_drive_diagnostic(token: &GoogleDriveAccessToken, message: &str) -> String {
-    let sanitized = message.replace(token.as_str(), "[redacted]");
+    let sanitized = redact_secret_from_message(message, token.as_str());
     if sanitized.trim().is_empty() {
         "Google Drive request failed".to_owned()
     } else {
@@ -1070,11 +1087,7 @@ fn google_token_error_message(
     credential: &GoogleDriveCredential,
     body: &str,
 ) -> GoogleTokenDiagnostic {
-    let capped = body
-        .chars()
-        .take(MAX_GOOGLE_OAUTH_ERROR_BODY_LEN)
-        .collect::<String>();
-    if let Ok(error) = serde_json::from_str::<GoogleDriveTokenError>(&capped) {
+    if let Ok(error) = serde_json::from_str::<GoogleDriveTokenError>(body) {
         let code = error.error.filter(|value| !value.trim().is_empty());
         let message = error
             .error_description
@@ -1083,13 +1096,13 @@ fn google_token_error_message(
             .unwrap_or_else(|| "Google OAuth token refresh failed".to_owned());
         return GoogleTokenDiagnostic {
             code,
-            message: sanitize_google_diagnostic(credential, &message),
+            message: sanitize_google_diagnostic(credential, &cap_google_diagnostic(&message)),
         };
     }
 
     GoogleTokenDiagnostic {
         code: None,
-        message: sanitize_google_diagnostic(credential, &capped),
+        message: sanitize_google_diagnostic(credential, &cap_google_diagnostic(body)),
     }
 }
 
@@ -1105,9 +1118,7 @@ fn sanitize_google_diagnostic(credential: &GoogleDriveCredential, message: &str)
         &credential.client_secret,
         &credential.refresh_token,
     ] {
-        if !secret.is_empty() {
-            sanitized = sanitized.replace(secret, "[redacted]");
-        }
+        sanitized = redact_secret_from_message(&sanitized, secret);
     }
     if sanitized.trim().is_empty() {
         "Google OAuth token refresh failed".to_owned()
@@ -1131,15 +1142,42 @@ fn refresh_transport_error(
     }
 }
 
-async fn read_google_oauth_response_body(
+fn cap_google_diagnostic(message: &str) -> String {
+    message.chars().take(MAX_GOOGLE_ERROR_BODY_LEN).collect()
+}
+
+fn redact_secret_from_message(message: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return message.to_owned();
+    }
+
+    let mut sanitized = message.replace(secret, "[redacted]");
+    if secret.len() < MIN_REDACTED_SECRET_FRAGMENT_LEN {
+        return sanitized;
+    }
+
+    for prefix_length in (MIN_REDACTED_SECRET_FRAGMENT_LEN..secret.len()).rev() {
+        let Some(prefix) = secret.get(..prefix_length) else {
+            continue;
+        };
+        if sanitized.ends_with(prefix) {
+            let suffix_start = sanitized.len() - prefix.len();
+            sanitized.replace_range(suffix_start.., "[redacted]");
+            break;
+        }
+    }
+    sanitized
+}
+
+async fn read_google_response_body(
     mut response: reqwest::Response,
 ) -> Result<String, reqwest::Error> {
     let mut body = Vec::new();
-    while body.len() < MAX_GOOGLE_OAUTH_ERROR_BODY_LEN {
+    while body.len() < MAX_GOOGLE_ERROR_BODY_LEN {
         let Some(chunk) = response.chunk().await? else {
             break;
         };
-        let remaining = MAX_GOOGLE_OAUTH_ERROR_BODY_LEN - body.len();
+        let remaining = MAX_GOOGLE_ERROR_BODY_LEN - body.len();
         if chunk.len() > remaining {
             body.extend_from_slice(&chunk[..remaining]);
             break;
@@ -1325,6 +1363,17 @@ mod tests {
     }
 
     #[test]
+    fn drive_file_metadata_url_does_not_duplicate_existing_drive_api_path() {
+        let url = super::drive_file_metadata_url(
+            url::Url::parse("http://localhost/proxy/drive/v3").expect("base URL should parse"),
+            "drive-root",
+        )
+        .expect("metadata URL should build");
+
+        assert_eq!(url.path(), "/proxy/drive/v3/files/drive-root");
+    }
+
+    #[test]
     fn credential_json_rejects_token_uri_query_and_fragment() {
         for token_uri in [
             "https://oauth2.googleapis.com/token?client_secret=client-secret",
@@ -1504,7 +1553,7 @@ mod tests {
     async fn refresher_caps_large_upstream_error_body_before_diagnostics() {
         let large_body = format!(
             "{}after-limit client-secret refresh-token",
-            "x".repeat(super::MAX_GOOGLE_OAUTH_ERROR_BODY_LEN)
+            "x".repeat(super::MAX_GOOGLE_ERROR_BODY_LEN)
         );
         let server = TokenServer::start(StatusCode::BAD_GATEWAY, large_body).await;
         let credential = credential_with_token_url(&server.url);
@@ -1521,11 +1570,20 @@ mod tests {
                 provider,
                 message,
             } if provider == "drive-user-a"
-                && message.len() == super::MAX_GOOGLE_OAUTH_ERROR_BODY_LEN
+                && message.len() == super::MAX_GOOGLE_ERROR_BODY_LEN
                 && !message.contains("after-limit")
                 && !message.contains("client-secret")
                 && !message.contains("refresh-token")
         ));
+    }
+
+    #[test]
+    fn drive_diagnostics_redact_token_fragments_at_truncation_boundary() {
+        let body = format!("{}access", "x".repeat(super::MAX_GOOGLE_ERROR_BODY_LEN - 6));
+        let diagnostic = super::drive_error_message(&access_token(), &body);
+
+        assert!(!diagnostic.message.contains("access"));
+        assert!(diagnostic.message.ends_with("[redacted]"));
     }
 
     #[tokio::test]
@@ -1584,6 +1642,25 @@ mod tests {
             "id,name,mimeType,trashed,capabilities(canAddChildren)"
         );
         assert_eq!(query["supportsAllDrives"], "true");
+    }
+
+    #[tokio::test]
+    async fn root_validator_uses_existing_drive_api_base_path_once() {
+        let server = DriveMetadataServer::start(StatusCode::OK, drive_folder_json()).await;
+        let validator = GoogleDriveRootValidator::with_client_and_api_base_url(
+            reqwest::Client::new(),
+            format!("{}/drive/v3", server.base_url),
+        )
+        .expect("validator should build");
+
+        validator
+            .validate_root_folder(&storage_config("google-drive-user-a"), &access_token())
+            .await
+            .expect("root folder should validate through Drive API base path");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].file_id, "drive-root");
     }
 
     #[tokio::test]
@@ -1652,6 +1729,31 @@ mod tests {
             } if provider == "drive-user-a"
         ));
         assert!(error.to_string().contains("cannot accept child objects"));
+    }
+
+    #[tokio::test]
+    async fn root_validator_reports_missing_child_write_capability() {
+        let server = DriveMetadataServer::start(
+            StatusCode::OK,
+            r#"{
+                "id":"drive-root",
+                "name":"Unexpected Shape",
+                "mimeType":"application/vnd.google-apps.folder"
+            }"#,
+        )
+        .await;
+        let validator = GoogleDriveRootValidator::with_client_and_api_base_url(
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("validator should build");
+
+        let error = validator
+            .validate_root_folder(&storage_config("google-drive-user-a"), &access_token())
+            .await
+            .expect_err("missing canAddChildren should fail");
+
+        assert!(error.to_string().contains("capabilities.canAddChildren"));
     }
 
     #[tokio::test]
@@ -1790,10 +1892,10 @@ mod tests {
             .collect()
     }
 
-    #[derive(Clone)]
     struct TokenServer {
         url: String,
         state: Arc<TokenServerState>,
+        server_task: tokio::task::JoinHandle<()>,
     }
 
     impl TokenServer {
@@ -1812,7 +1914,7 @@ mod tests {
             let address = listener
                 .local_addr()
                 .expect("test token server address should be available");
-            tokio::spawn(async move {
+            let server_task = tokio::spawn(async move {
                 axum::serve(listener, app)
                     .await
                     .expect("test token server should run");
@@ -1821,6 +1923,7 @@ mod tests {
             Self {
                 url: format!("http://{address}/token"),
                 state,
+                server_task,
             }
         }
 
@@ -1830,6 +1933,12 @@ mod tests {
                 .lock()
                 .expect("test token requests lock should not poison")
                 .clone()
+        }
+    }
+
+    impl Drop for TokenServer {
+        fn drop(&mut self) {
+            self.server_task.abort();
         }
     }
 
@@ -1867,10 +1976,10 @@ mod tests {
             .into_response()
     }
 
-    #[derive(Clone)]
     struct DriveMetadataServer {
         base_url: String,
         state: Arc<DriveMetadataServerState>,
+        server_task: tokio::task::JoinHandle<()>,
     }
 
     impl DriveMetadataServer {
@@ -1889,7 +1998,7 @@ mod tests {
             let address = listener
                 .local_addr()
                 .expect("test Drive metadata server address should be available");
-            tokio::spawn(async move {
+            let server_task = tokio::spawn(async move {
                 axum::serve(listener, app)
                     .await
                     .expect("test Drive metadata server should run");
@@ -1898,6 +2007,7 @@ mod tests {
             Self {
                 base_url: format!("http://{address}"),
                 state,
+                server_task,
             }
         }
 
@@ -1907,6 +2017,12 @@ mod tests {
                 .lock()
                 .expect("test Drive metadata requests lock should not poison")
                 .clone()
+        }
+    }
+
+    impl Drop for DriveMetadataServer {
+        fn drop(&mut self) {
+            self.server_task.abort();
         }
     }
 
