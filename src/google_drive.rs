@@ -11,16 +11,12 @@ use std::{
     io::{BufReader, Read, Seek, SeekFrom},
     net::IpAddr,
     path::Path,
-    pin::Pin,
     sync::OnceLock,
     time::Duration,
 };
 
-use axum::{
-    body::{Body as AxumBody, Bytes},
-    response::Response as AxumResponse,
-};
-use futures_util::{Stream, StreamExt, stream};
+use axum::{body::Body as AxumBody, response::Response as AxumResponse};
+use futures_util::StreamExt;
 use reqwest::{
     Body as ReqwestBody, Client, StatusCode,
     header::{
@@ -29,6 +25,7 @@ use reqwest::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use url::Url;
 
@@ -625,16 +622,6 @@ impl GoogleDriveObjectProperties {
     }
 }
 
-struct GoogleDriveDownloadValidationState {
-    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    storage: GoogleDriveStorageConfig,
-    token: GoogleDriveAccessToken,
-    expected_oid: String,
-    expected_size: u64,
-    actual_size: u64,
-    hasher: Sha256,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DriveUploadPhase {
     Initiate,
@@ -643,10 +630,11 @@ enum DriveUploadPhase {
 
 /// A verified Google Drive object download exposed as an HTTP response body.
 ///
-/// The response streams bytes from Drive through `lfs-cloud`. It intentionally
-/// does not expose Drive file IDs, URLs, or credentials to Git LFS clients.
-/// The current scaffold uses Axum as its HTTP server boundary; this wrapper can
-/// move behind a server crate boundary when the package is split.
+/// The response streams locally staged bytes after the Drive media response has
+/// been checked against the requested LFS object hash and size. It intentionally
+/// does not expose Drive file IDs, URLs, or credentials to Git LFS clients. The
+/// current scaffold uses Axum as its HTTP server boundary; this wrapper can move
+/// behind a server crate boundary when the package is split.
 pub struct GoogleDriveDownloadResponse {
     stored_object: StoredObject,
     response: AxumResponse,
@@ -985,6 +973,7 @@ impl GoogleDriveObjectStore {
                 AUTHORIZATION,
                 self.token.authorization_header_value(&self.storage.id)?,
             )
+            .header(ACCEPT_ENCODING, "identity")
             .send()
             .await
             .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
@@ -1023,16 +1012,20 @@ impl GoogleDriveObjectStore {
             });
         }
 
+        let verified_file = verify_drive_download_response_to_tempfile(
+            &self.storage,
+            &self.token,
+            object,
+            download_response,
+        )
+        .await?;
+        let response_body =
+            AxumBody::from_stream(ReaderStream::new(tokio::fs::File::from_std(verified_file)));
         let response = AxumResponse::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
             .header(CONTENT_LENGTH, object.size.bytes().to_string())
-            .body(AxumBody::from_stream(validating_drive_download_stream(
-                download_response,
-                self.storage.clone(),
-                self.token.clone(),
-                object,
-            )))
+            .body(response_body)
             .map_err(|source| StorageError::Upstream {
                 provider: self.storage.id.clone(),
                 status: None,
@@ -1048,44 +1041,62 @@ impl GoogleDriveObjectStore {
     }
 }
 
-fn validating_drive_download_stream(
-    download_response: reqwest::Response,
-    storage: GoogleDriveStorageConfig,
-    token: GoogleDriveAccessToken,
+async fn verify_drive_download_response_to_tempfile(
+    storage: &GoogleDriveStorageConfig,
+    token: &GoogleDriveAccessToken,
     object: &LfsObject,
-) -> impl Stream<Item = StorageResult<Bytes>> + Send + 'static {
-    let state = GoogleDriveDownloadValidationState {
-        stream: Box::pin(download_response.bytes_stream()),
-        storage,
-        token,
-        expected_oid: object.oid.as_hex().to_owned(),
-        expected_size: object.size.bytes(),
-        actual_size: 0,
-        hasher: Sha256::new(),
-    };
+    download_response: reqwest::Response,
+) -> StorageResult<File> {
+    let provider = storage.id.clone();
+    let temp_file = tempfile::tempfile().map_err(|source| StorageError::Retryable {
+        provider: provider.clone(),
+        message: format!("Drive download staging file could not be created: {source}"),
+    })?;
+    let mut temp_file = tokio::fs::File::from_std(temp_file);
+    let mut stream = download_response.bytes_stream();
+    let mut hasher = Sha256::new();
+    let mut actual_size = 0_u64;
 
-    stream::try_unfold(state, |mut state| async move {
-        let Some(chunk) = state.stream.next().await else {
-            let actual_oid = format!("{:x}", state.hasher.finalize());
-            if actual_oid != state.expected_oid || state.actual_size != state.expected_size {
-                return Err(StorageError::IntegrityMismatch {
-                    expected_oid: state.expected_oid,
-                    expected_size: state.expected_size,
-                    actual_oid,
-                    actual_size: state.actual_size,
-                });
-            }
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|source| drive_transport_error(storage, token, source))?;
+        hasher.update(&chunk);
+        actual_size += chunk.len() as u64;
+        temp_file
+            .write_all(&chunk)
+            .await
+            .map_err(|source| drive_download_staging_file_error(storage, source))?;
+    }
 
-            return Ok(None);
-        };
+    let actual_oid = format!("{:x}", hasher.finalize());
+    if actual_oid != object.oid.as_hex() || actual_size != object.size.bytes() {
+        return Err(StorageError::IntegrityMismatch {
+            expected_oid: object.oid.as_hex().to_owned(),
+            expected_size: object.size.bytes(),
+            actual_oid,
+            actual_size,
+        });
+    }
 
-        let chunk =
-            chunk.map_err(|source| drive_transport_error(&state.storage, &state.token, source))?;
-        state.hasher.update(&chunk);
-        state.actual_size += chunk.len() as u64;
+    temp_file
+        .flush()
+        .await
+        .map_err(|source| drive_download_staging_file_error(storage, source))?;
+    temp_file
+        .seek(SeekFrom::Start(0))
+        .await
+        .map_err(|source| drive_download_staging_file_error(storage, source))?;
 
-        Ok(Some((chunk, state)))
-    })
+    Ok(temp_file.into_std().await)
+}
+
+fn drive_download_staging_file_error(
+    storage: &GoogleDriveStorageConfig,
+    source: std::io::Error,
+) -> StorageError {
+    StorageError::Retryable {
+        provider: storage.id.clone(),
+        message: format!("Drive download staging file could not be written: {source}"),
+    }
 }
 
 impl fmt::Debug for GoogleDriveObjectStore {
@@ -1628,16 +1639,6 @@ fn drive_media_download_url(mut api_base_url: Url, file_id: &str) -> StorageResu
             message: SanitizedMessage::new("Google Drive file ID must not be blank"),
         });
     }
-    if !is_valid_drive_file_id(file_id) {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive file ID must contain only ASCII letters, digits, hyphens, or underscores",
-            ),
-        });
-    }
-
     let base_path_already_targets_drive_api =
         drive_api_base_path_already_targets_drive_api(&api_base_url);
 
@@ -1665,12 +1666,6 @@ fn drive_media_download_url(mut api_base_url: Url, file_id: &str) -> StorageResu
         .append_pair("supportsAllDrives", "true");
 
     Ok(api_base_url)
-}
-
-fn is_valid_drive_file_id(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn validate_drive_resumable_upload_session_url(
@@ -2472,7 +2467,7 @@ mod tests {
         extract::{Path, State},
         http::{
             HeaderMap, HeaderValue, Uri,
-            header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
+            header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
         },
         response::{IntoResponse, Response},
         routing::{get, post, put},
@@ -2729,17 +2724,31 @@ mod tests {
     }
 
     #[test]
-    fn drive_media_download_url_rejects_unsafe_file_ids() {
-        let error = super::drive_media_download_url(
+    fn drive_media_download_url_encodes_opaque_file_ids_as_one_segment() {
+        let url = super::drive_media_download_url(
             url::Url::parse("http://localhost/proxy/drive/v3").expect("base URL should parse"),
             "drive-file-123/../../other",
         )
-        .expect_err("path-like file IDs should fail before URL construction");
+        .expect("opaque file IDs should be path-encoded");
+
+        assert_eq!(
+            url.path(),
+            "/proxy/drive/v3/files/drive-file-123%2F..%2F..%2Fother"
+        );
+    }
+
+    #[test]
+    fn drive_media_download_url_rejects_blank_file_ids() {
+        let error = super::drive_media_download_url(
+            url::Url::parse("http://localhost/proxy/drive/v3").expect("base URL should parse"),
+            " \t",
+        )
+        .expect_err("blank file IDs should fail before URL construction");
 
         assert!(matches!(
             error,
             StorageError::Upstream { ref message, .. }
-                if message.as_str().contains("Google Drive file ID must contain only")
+                if message.as_str().contains("Google Drive file ID must not be blank")
         ));
     }
 
@@ -3624,6 +3633,10 @@ mod tests {
             download_requests[0].headers.get(AUTHORIZATION).unwrap(),
             "Bearer access-token"
         );
+        assert_eq!(
+            download_requests[0].headers.get(ACCEPT_ENCODING).unwrap(),
+            "identity"
+        );
         let query = form_pairs(&download_requests[0].query);
         assert_eq!(query["alt"], "media");
         assert_eq!(query["supportsAllDrives"], "true");
@@ -3777,14 +3790,10 @@ mod tests {
         )
         .expect("object store should build");
 
-        let download = store
+        let error = store
             .download_object_response(&lfs_object())
             .await
-            .expect("metadata and content length match before streaming");
-
-        let error = to_bytes(download.into_response().into_body(), usize::MAX)
-            .await
-            .expect_err("body stream should reject hash mismatch");
+            .expect_err("hash mismatch should fail before proxying");
         assert!(error.to_string().contains("integrity mismatch"));
     }
 
@@ -3806,14 +3815,17 @@ mod tests {
         )
         .expect("object store should build");
 
-        let error = store
-            .download_object_response(&lfs_object())
-            .await
-            .expect_err("truncated upstream response should fail before proxying");
+        let error = match store.download_object_response(&lfs_object()).await {
+            Ok(download) => to_bytes(download.into_response().into_body(), usize::MAX)
+                .await
+                .expect_err("body stream should reject truncated response")
+                .to_string(),
+            Err(error) => error.to_string(),
+        };
         assert!(
-            error.to_string().contains("integrity mismatch")
-                || error.to_string().contains("error decoding response body")
-                || error.to_string().contains("Google Drive request failed")
+            error.contains("integrity mismatch")
+                || error.contains("error decoding response body")
+                || error.contains("Google Drive request failed")
         );
     }
 
