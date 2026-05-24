@@ -10,10 +10,16 @@ use oauth2::{
     AuthUrl, ClientId, CsrfToken, RedirectUrl, Scope, basic::BasicClient,
     url::ParseError as UrlParseError,
 };
+use reqwest::{
+    Client,
+    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
+};
 use serde::Deserialize;
 use url::Url;
 
-use crate::{GitHubProviderConfig, ServerError, ServerResult};
+use crate::{
+    GitHubProviderConfig, RepositoryProviderError, SanitizedMessage, ServerError, ServerResult,
+};
 
 const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
 
@@ -22,6 +28,13 @@ const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
 /// This browser-facing OAuth URL is intentionally not derived from
 /// [`GitHubProviderConfig::api_url`], which is the REST API base URL.
 pub const GITHUB_OAUTH_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
+
+/// GitHub's OAuth token endpoint for authorization-code exchange.
+///
+/// Like the authorization URL, this browser OAuth endpoint is intentionally not
+/// derived from [`GitHubProviderConfig::api_url`], which is the REST API base
+/// URL used after authentication.
+pub const GITHUB_OAUTH_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 
 /// Callback route path GitHub redirects to after browser OAuth login.
 ///
@@ -34,6 +47,177 @@ pub const GITHUB_OAUTH_CALLBACK_PATH: &str = "/auth/github/callback";
 /// `read:user` lets the server identify the authenticated GitHub account
 /// without putting the broader repository scope decision into this URL helper.
 pub const DEFAULT_GITHUB_OAUTH_SCOPES: &[&str] = &["read:user"];
+
+/// GitHub OAuth access token returned after exchanging an authorization code.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitHubOAuthAccessToken(String);
+
+impl GitHubOAuthAccessToken {
+    /// Restores an OAuth access token secret returned by GitHub.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the token is blank, padded, too long, or
+    /// contains whitespace/control characters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::GitHubOAuthAccessToken;
+    ///
+    /// let token = GitHubOAuthAccessToken::from_secret("gho_example")?;
+    ///
+    /// assert_eq!(token.as_str(), "gho_example");
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
+    pub fn from_secret(secret: impl Into<String>) -> ServerResult<Self> {
+        validate_sensitive_oauth_value(secret.into(), "github oauth access token").map(Self)
+    }
+
+    /// Returns the raw access token for GitHub API requests.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GitHubOAuthAccessToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GitHubOAuthAccessToken(<redacted>)")
+    }
+}
+
+/// Successful GitHub OAuth token-exchange response.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitHubOAuthToken {
+    /// GitHub OAuth access token used only by server-side provider calls.
+    pub access_token: GitHubOAuthAccessToken,
+    /// OAuth token type returned by GitHub, usually `bearer`.
+    pub token_type: String,
+    /// Scopes GitHub granted to the access token.
+    pub scopes: Vec<String>,
+}
+
+impl fmt::Debug for GitHubOAuthToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubOAuthToken")
+            .field("access_token", &self.access_token)
+            .field("token_type", &self.token_type)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+/// HTTP client for exchanging validated GitHub OAuth callbacks for tokens.
+#[derive(Clone, Debug)]
+pub struct GitHubOAuthTokenExchanger {
+    client: Client,
+    token_url: Url,
+}
+
+impl GitHubOAuthTokenExchanger {
+    /// Creates a token exchanger that talks to GitHub.com.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the built-in GitHub token URL is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::GitHubOAuthTokenExchanger;
+    ///
+    /// let exchanger = GitHubOAuthTokenExchanger::new()?;
+    ///
+    /// assert!(format!("{exchanger:?}").contains("GitHubOAuthTokenExchanger"));
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
+    pub fn new() -> ServerResult<Self> {
+        Self::with_token_url(GITHUB_OAUTH_TOKEN_URL)
+    }
+
+    /// Creates a token exchanger with an explicit token endpoint.
+    ///
+    /// This is primarily useful for mocked GitHub API tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when `token_url` is not a valid absolute URL.
+    pub fn with_token_url(token_url: impl AsRef<str>) -> ServerResult<Self> {
+        let token_url = Url::parse(token_url.as_ref())
+            .map_err(|source| invalid_oauth_url("github oauth token endpoint", source))?;
+
+        Ok(Self {
+            client: Client::new(),
+            token_url,
+        })
+    }
+
+    /// Exchanges a validated GitHub OAuth callback code for an access token.
+    ///
+    /// `redirect_url` must match the redirect URL used to create the
+    /// authorization request, binding the code exchange to the callback route.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the redirect URL is invalid, the request to
+    /// GitHub fails, GitHub rejects the code, or the token response is malformed.
+    pub async fn exchange_code(
+        &self,
+        provider: &GitHubProviderConfig,
+        callback: &GitHubOAuthCallback,
+        redirect_url: impl AsRef<str>,
+    ) -> ServerResult<GitHubOAuthToken> {
+        let redirect_url = RedirectUrl::new(redirect_url.as_ref().to_owned())
+            .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
+        let request_body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("client_id", provider.oauth_client_id.as_str())
+            .append_pair("client_secret", provider.oauth_client_secret.as_str())
+            .append_pair("code", callback.code.as_str())
+            .append_pair("redirect_uri", redirect_url.as_str())
+            .finish();
+
+        let response = self
+            .client
+            .post(self.token_url.clone())
+            .header(ACCEPT, HeaderValue::from_static("application/json"))
+            .header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/x-www-form-urlencoded"),
+            )
+            .body(request_body)
+            .send()
+            .await
+            .map_err(|source| token_exchange_upstream_error(provider, None, source))?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let error = response
+                .json::<GitHubOAuthTokenErrorResponse>()
+                .await
+                .map_err(|source| {
+                    token_exchange_upstream_error(provider, Some(status.as_u16()), source)
+                })?;
+
+            return Err(ServerError::Unauthorized {
+                reason: format!(
+                    "github oauth token exchange failed: {}",
+                    error.to_sanitized_reason()
+                ),
+            });
+        }
+
+        let response = response
+            .json::<GitHubOAuthTokenResponse>()
+            .await
+            .map_err(|source| {
+                token_exchange_upstream_error(provider, Some(status.as_u16()), source)
+            })?;
+
+        GitHubOAuthToken::try_from_response(provider, response)
+    }
+}
 
 /// Browser URL plus CSRF state for a GitHub OAuth authorization attempt.
 #[derive(Clone, Eq, PartialEq)]
@@ -321,11 +505,11 @@ impl GitHubOAuthCallback {
         }
 
         if let Some(error) = query.error {
-            let error = sanitize_callback_value(&validate_required_callback_error(error)?);
+            let error = sanitize_oauth_diagnostic_value(&validate_required_callback_error(error)?);
             let description = query
                 .error_description
                 .as_deref()
-                .map(sanitize_callback_value)
+                .map(sanitize_oauth_diagnostic_value)
                 .filter(|value| !value.is_empty())
                 .map(|value| format!(": {value}"))
                 .unwrap_or_default();
@@ -388,6 +572,121 @@ pub fn github_oauth_authorization_url(
     redirect_url: impl Into<String>,
 ) -> ServerResult<GitHubOAuthAuthorization> {
     GitHubOAuthAuthorization::new(provider, redirect_url)
+}
+
+/// Exchanges a validated GitHub OAuth callback code for an access token.
+///
+/// This convenience wrapper uses the default GitHub.com token endpoint.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] when the token exchange cannot complete.
+pub async fn exchange_github_oauth_code(
+    provider: &GitHubProviderConfig,
+    callback: &GitHubOAuthCallback,
+    redirect_url: impl AsRef<str>,
+) -> ServerResult<GitHubOAuthToken> {
+    GitHubOAuthTokenExchanger::new()?
+        .exchange_code(provider, callback, redirect_url)
+        .await
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubOAuthTokenResponse {
+    access_token: Option<String>,
+    token_type: Option<String>,
+    scope: Option<String>,
+}
+
+impl GitHubOAuthToken {
+    fn try_from_response(
+        provider: &GitHubProviderConfig,
+        response: GitHubOAuthTokenResponse,
+    ) -> ServerResult<Self> {
+        let access_token = response
+            .access_token
+            .ok_or_else(|| malformed_token_response_error(provider, "missing access_token"))?;
+        let token_type = response
+            .token_type
+            .ok_or_else(|| malformed_token_response_error(provider, "missing token_type"))?;
+
+        Ok(Self {
+            access_token: GitHubOAuthAccessToken::from_secret(access_token)
+                .map_err(|_| malformed_token_response_error(provider, "invalid access_token"))?,
+            token_type: validate_token_type(token_type)
+                .map_err(|_| malformed_token_response_error(provider, "invalid token_type"))?,
+            scopes: parse_scope_list(response.scope.as_deref().unwrap_or_default()),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubOAuthTokenErrorResponse {
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+impl GitHubOAuthTokenErrorResponse {
+    fn to_sanitized_reason(&self) -> String {
+        let error = self
+            .error
+            .as_deref()
+            .map(sanitize_oauth_diagnostic_value)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown_error".to_owned());
+        let description = self
+            .error_description
+            .as_deref()
+            .map(sanitize_oauth_diagnostic_value)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!(": {value}"))
+            .unwrap_or_default();
+
+        format!("{error}{description}")
+    }
+}
+
+fn validate_token_type(token_type: String) -> ServerResult<String> {
+    validate_sensitive_oauth_value(token_type, "github oauth token type")
+}
+
+fn parse_scope_list(scopes: &str) -> Vec<String> {
+    scopes
+        .split([' ', ','])
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn token_exchange_upstream_error(
+    provider: &GitHubProviderConfig,
+    status: Option<u16>,
+    source: reqwest::Error,
+) -> ServerError {
+    repository_provider_upstream_error(provider, status, &source.to_string())
+}
+
+fn malformed_token_response_error(provider: &GitHubProviderConfig, message: &str) -> ServerError {
+    repository_provider_upstream_error(
+        provider,
+        None,
+        &format!("malformed github oauth token response: {message}"),
+    )
+}
+
+fn repository_provider_upstream_error(
+    provider: &GitHubProviderConfig,
+    status: Option<u16>,
+    message: &str,
+) -> ServerError {
+    ServerError::RepositoryProvider {
+        source: RepositoryProviderError::Upstream {
+            provider: provider.id.clone(),
+            status,
+            message: SanitizedMessage::new(sanitize_oauth_diagnostic_value(message)),
+        },
+    }
 }
 
 fn invalid_oauth_url(path: &str, source: UrlParseError) -> ServerError {
@@ -462,7 +761,7 @@ fn constant_time_str_eq(candidate: &str, expected: &str) -> bool {
     diff == 0
 }
 
-fn sanitize_callback_value(value: &str) -> String {
+fn sanitize_oauth_diagnostic_value(value: &str) -> String {
     const MAX_LEN: usize = 200;
 
     let mut sanitized: String = value
@@ -487,14 +786,25 @@ fn sanitize_callback_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
 
+    use axum::{
+        Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
     use oauth2::CsrfToken;
 
     use super::{
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
-        GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthState,
-        github_oauth_authorization_url,
+        GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAuthorization, GitHubOAuthCallback,
+        GitHubOAuthCallbackQuery, GitHubOAuthState, GitHubOAuthTokenExchanger,
+        exchange_github_oauth_code, github_oauth_authorization_url,
     };
     use crate::{GitHubProviderConfig, ServerError};
 
@@ -594,6 +904,128 @@ mod tests {
             query_pairs(&authorization).get("scope").map(String::as_str),
             Some("read:user")
         );
+    }
+
+    #[tokio::test]
+    async fn token_exchange_posts_validated_callback_to_github_token_endpoint() {
+        let (token_url, token_server) = token_server(
+            StatusCode::OK,
+            r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user repo"}"#,
+        )
+        .await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let token = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect("token exchange should succeed");
+
+        assert_eq!(token.access_token.as_str(), "gho_token");
+        assert_eq!(token.token_type, "bearer");
+        assert_eq!(token.scopes, vec!["read:user", "repo"]);
+        let requests = token_server
+            .requests
+            .lock()
+            .expect("request lock should not poison");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.accept.as_deref(), Some("application/json"));
+        assert_eq!(
+            request.body.get("client_id").map(String::as_str),
+            Some("client-id")
+        );
+        assert_eq!(
+            request.body.get("client_secret").map(String::as_str),
+            Some("client-secret")
+        );
+        assert_eq!(
+            request.body.get("code").map(String::as_str),
+            Some("oauth-code")
+        );
+        assert_eq!(
+            request.body.get("redirect_uri").map(String::as_str),
+            Some(REDIRECT_URL)
+        );
+    }
+
+    #[tokio::test]
+    async fn token_exchange_wrapper_uses_default_github_endpoint() {
+        assert_eq!(
+            url::Url::parse(GITHUB_OAUTH_TOKEN_URL)
+                .expect("constant should parse")
+                .host_str(),
+            Some("github.com")
+        );
+
+        let callback = validated_callback("oauth-code", "csrf-state");
+        let error = exchange_github_oauth_code(&provider_config(), &callback, "not a url")
+            .await
+            .expect_err("invalid redirect URL should fail before network I/O");
+
+        assert!(error.to_string().contains("github oauth redirect_url"));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_maps_github_oauth_error_without_echoing_secrets() {
+        let (token_url, _token_server) = token_server(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"bad_verification_code","error_description":"The code passed is incorrect or expired."}"#,
+        )
+        .await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let error = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect_err("GitHub OAuth denial should fail");
+        let rendered = error.to_string();
+
+        assert!(matches!(error, ServerError::Unauthorized { .. }));
+        assert!(rendered.contains("bad_verification_code"));
+        assert!(!rendered.contains("client-secret"));
+        assert!(!rendered.contains("oauth-code"));
+        assert!(!rendered.contains("csrf-state"));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_rejects_malformed_success_response() {
+        let (token_url, _token_server) = token_server(
+            StatusCode::OK,
+            r#"{"token_type":"bearer","scope":"read:user"}"#,
+        )
+        .await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let error = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect_err("missing access_token should fail");
+
+        assert!(matches!(error, ServerError::RepositoryProvider { .. }));
+        assert!(error.to_string().contains("access_token"));
+        assert!(!error.to_string().contains("oauth-code"));
+    }
+
+    #[test]
+    fn token_debug_output_redacts_access_token() {
+        let token =
+            super::GitHubOAuthAccessToken::from_secret("gho_secret").expect("token should parse");
+        let response = super::GitHubOAuthToken {
+            access_token: token,
+            token_type: "bearer".to_owned(),
+            scopes: vec!["read:user".to_owned()],
+        };
+
+        let rendered = format!("{response:?}");
+
+        assert!(rendered.contains("GitHubOAuthToken"));
+        assert!(!rendered.contains("gho_secret"));
     }
 
     #[test]
@@ -835,6 +1267,80 @@ mod tests {
         assert!(!query_debug.contains("csrf-state"));
         assert!(!callback_debug.contains("oauth-code"));
         assert!(!callback_debug.contains("csrf-state"));
+    }
+
+    #[derive(Debug, Default)]
+    struct TokenServerState {
+        status: StatusCode,
+        body: &'static str,
+        requests: Mutex<Vec<CapturedTokenRequest>>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CapturedTokenRequest {
+        accept: Option<String>,
+        body: BTreeMap<String, String>,
+    }
+
+    async fn token_server(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, Arc<TokenServerState>) {
+        let state = Arc::new(TokenServerState {
+            status,
+            body,
+            requests: Mutex::new(Vec::new()),
+        });
+        let app = Router::new()
+            .route("/login/oauth/access_token", post(capture_token_request))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock token server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock token server address should be available");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock token server should run");
+        });
+
+        (format!("http://{address}/login/oauth/access_token"), state)
+    }
+
+    async fn capture_token_request(
+        State(state): State<Arc<TokenServerState>>,
+        headers: HeaderMap,
+        body: String,
+    ) -> impl IntoResponse {
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let body = url::form_urlencoded::parse(body.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+
+        state
+            .requests
+            .lock()
+            .expect("request lock should not poison")
+            .push(CapturedTokenRequest { accept, body });
+
+        (
+            state.status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            state.body,
+        )
+    }
+
+    fn validated_callback(code: &str, state: &str) -> GitHubOAuthCallback {
+        let expected_state = GitHubOAuthState::from_secret(state).expect("state should be valid");
+        let query = GitHubOAuthCallbackQuery::authorization_code(code, state);
+
+        GitHubOAuthCallback::validate(query, &expected_state).expect("callback should validate")
     }
 
     fn query_pairs(authorization: &GitHubOAuthAuthorization) -> BTreeMap<String, String> {
