@@ -336,9 +336,9 @@ pub struct AdvertisedServerUrls {
 #[must_use]
 pub fn advertised_server_urls(bind_host: &str, port: u16) -> AdvertisedServerUrls {
     let local_host = if is_unspecified_host(bind_host) {
-        "127.0.0.1"
+        "127.0.0.1".to_owned()
     } else {
-        bind_host
+        advertised_url_host(bind_host)
     };
     let network = if is_unspecified_host(bind_host) {
         detect_lan_ipv4().map(|ip| format!("http://{ip}:{port}"))
@@ -349,6 +349,14 @@ pub fn advertised_server_urls(bind_host: &str, port: u16) -> AdvertisedServerUrl
     AdvertisedServerUrls {
         local: format!("http://{local_host}:{port}"),
         network,
+    }
+}
+
+fn advertised_url_host(host: &str) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
+        Ok(IpAddr::V4(ip)) => ip.to_string(),
+        Err(_) => host.to_owned(),
     }
 }
 
@@ -465,14 +473,24 @@ repositories:
     fn advertised_urls_report_localhost_and_best_effort_network_url() {
         let localhost = advertised_server_urls("127.0.0.1", 8080);
         let all_interfaces = advertised_server_urls("0.0.0.0", 8080);
+        let all_ipv6_interfaces = advertised_server_urls("::", 8080);
 
         assert_eq!(localhost.local, "http://127.0.0.1:8080");
         assert_eq!(localhost.network, None);
         assert_eq!(all_interfaces.local, "http://127.0.0.1:8080");
+        assert_eq!(all_ipv6_interfaces.local, "http://127.0.0.1:8080");
 
         let message = render_server_startup_message(&all_interfaces);
         assert!(message.contains("lfs-cloud server running"));
         assert!(message.contains("local:   http://127.0.0.1:8080"));
         assert!(message.contains("network: "));
+    }
+
+    #[test]
+    fn advertised_urls_bracket_ipv6_literals() {
+        let loopback = advertised_server_urls("::1", 8080);
+
+        assert_eq!(loopback.local, "http://[::1]:8080");
+        assert_eq!(loopback.network, None);
     }
 }
