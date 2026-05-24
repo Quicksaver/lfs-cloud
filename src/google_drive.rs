@@ -351,8 +351,7 @@ impl GoogleDriveTokenRefresher {
             .await
             .map_err(|source| refresh_transport_error(credential, source))?;
         let status = response.status();
-        let response_body = response
-            .text()
+        let response_body = read_google_oauth_response_body(response)
             .await
             .map_err(|source| refresh_transport_error(credential, source))?;
 
@@ -609,6 +608,25 @@ fn refresh_transport_error(
     }
 }
 
+async fn read_google_oauth_response_body(
+    mut response: reqwest::Response,
+) -> Result<String, reqwest::Error> {
+    let mut body = Vec::new();
+    while body.len() < MAX_GOOGLE_OAUTH_ERROR_BODY_LEN {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        let remaining = MAX_GOOGLE_OAUTH_ERROR_BODY_LEN - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -806,6 +824,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresher_caps_large_upstream_error_body_before_diagnostics() {
+        let large_body = format!(
+            "{}after-limit client-secret refresh-token",
+            "x".repeat(super::MAX_GOOGLE_OAUTH_ERROR_BODY_LEN)
+        );
+        let server = TokenServer::start(StatusCode::BAD_GATEWAY, large_body).await;
+        let credential = credential_with_token_url(&server.url);
+        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
+
+        let error = refresher
+            .refresh_access_token(&credential)
+            .await
+            .expect_err("large upstream error should fail");
+
+        assert!(matches!(
+            error,
+            StorageError::Retryable {
+                provider,
+                message,
+            } if provider == "drive-user-a"
+                && message.len() == super::MAX_GOOGLE_OAUTH_ERROR_BODY_LEN
+                && !message.contains("after-limit")
+                && !message.contains("client-secret")
+                && !message.contains("refresh-token")
+        ));
+    }
+
+    #[tokio::test]
     async fn refresher_maps_rate_limits_to_retryable_errors() {
         let server = TokenServer::start(
             StatusCode::TOO_MANY_REQUESTS,
@@ -871,10 +917,10 @@ mod tests {
     }
 
     impl TokenServer {
-        async fn start(status: StatusCode, body: &'static str) -> Self {
+        async fn start(status: StatusCode, body: impl Into<String>) -> Self {
             let state = Arc::new(TokenServerState {
                 status,
-                body: body.to_owned(),
+                body: body.into(),
                 requests: Mutex::new(Vec::new()),
             });
             let app = Router::new()
