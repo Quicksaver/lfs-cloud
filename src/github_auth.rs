@@ -918,8 +918,7 @@ fn github_user_status_error(
     body: &str,
     token: &GitHubOAuthAccessToken,
 ) -> ServerError {
-    let message = github_api_error_message(body)
-        .map(|message| redact_oauth_secret(&message, token))
+    let message = github_api_error_message(body, token)
         .unwrap_or_else(|| "github authenticated user request failed".to_owned());
 
     repository_provider_upstream_error(provider, Some(status.as_u16()), &message)
@@ -1126,10 +1125,11 @@ fn sanitize_oauth_diagnostic_value(value: &str) -> String {
     sanitized
 }
 
-fn github_api_error_message(body: &str) -> Option<String> {
+fn github_api_error_message(body: &str, token: &GitHubOAuthAccessToken) -> Option<String> {
     serde_json::from_str::<GitHubApiErrorResponse>(body)
         .ok()
         .and_then(|error| error.message)
+        .map(|message| redact_oauth_secret(&message, token))
         .map(|message| sanitize_oauth_diagnostic_value(&message))
         .filter(|message| !message.is_empty())
 }
@@ -1573,6 +1573,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_client_redacts_long_token_before_truncating_upstream_error_message() {
+        let token_secret = format!("gho_{}", "a".repeat(240));
+        let body = format!(r#"{{"message":"echo {token_secret}"}}"#);
+        let (api_url, _user_server) = user_server(StatusCode::BAD_GATEWAY, &body).await;
+        let provider = provider_config_with_api_url(api_url);
+        let token =
+            GitHubOAuthAccessToken::from_secret(token_secret.clone()).expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("upstream user lookup should fail");
+        let rendered = error.to_string();
+
+        assert!(matches!(error, ServerError::RepositoryProvider { .. }));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(&token_secret));
+        assert!(!rendered.contains(&token_secret[..200]));
+    }
+
+    #[tokio::test]
     async fn user_client_rejects_malformed_identity_response() {
         let (api_url, _user_server) = user_server(StatusCode::OK, r#"{"id":583231}"#).await;
         let provider = provider_config_with_api_url(api_url);
@@ -1855,7 +1877,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct UserServerState {
         status: StatusCode,
-        body: &'static str,
+        body: String,
         requests: Mutex<Vec<CapturedUserRequest>>,
     }
 
@@ -1893,10 +1915,13 @@ mod tests {
         (format!("http://{address}/login/oauth/access_token"), state)
     }
 
-    async fn user_server(status: StatusCode, body: &'static str) -> (String, Arc<UserServerState>) {
+    async fn user_server(
+        status: StatusCode,
+        body: impl Into<String>,
+    ) -> (String, Arc<UserServerState>) {
         let state = Arc::new(UserServerState {
             status,
-            body,
+            body: body.into(),
             requests: Mutex::new(Vec::new()),
         });
         let app = Router::new()
@@ -1969,7 +1994,7 @@ mod tests {
         (
             state.status,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
-            state.body,
+            state.body.clone(),
         )
     }
 
