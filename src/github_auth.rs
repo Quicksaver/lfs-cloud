@@ -247,6 +247,9 @@ pub struct GitHubOAuthCallbackRouteResponse {
     /// OAuth scopes granted by GitHub.
     pub granted_scopes: Vec<String>,
     /// Opaque LFS Cloud token to store for the configured Git LFS URL.
+    ///
+    /// This response intentionally exposes only a local LFS Cloud bearer token,
+    /// never the upstream GitHub OAuth token. Do not log serialized responses.
     pub lfs_token: String,
     /// Expiration time for `lfs_token`, as seconds since the Unix epoch.
     pub lfs_token_expires_at_unix_seconds: u64,
@@ -370,7 +373,8 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
             ServerError::ConfigRead { .. }
             | ServerError::ConfigParse { .. }
             | ServerError::InvalidConfiguration { .. }
-            | ServerError::RouteNotConfigured { .. } => (
+            | ServerError::RouteNotConfigured { .. }
+            | ServerError::Internal { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "GitHub OAuth callback could not be completed.",

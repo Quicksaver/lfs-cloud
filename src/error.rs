@@ -199,6 +199,13 @@ pub enum ServerError {
         message: String,
     },
 
+    /// The server could not complete a request due to an internal invariant failure.
+    #[error("internal server error: {message}")]
+    Internal {
+        /// Human-readable internal failure summary.
+        message: String,
+    },
+
     /// A request was authenticated incorrectly or lacked required access.
     #[error("unauthorized request: {reason}")]
     Unauthorized {

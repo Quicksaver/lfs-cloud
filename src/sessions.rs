@@ -12,6 +12,7 @@ use std::{
 };
 
 use oauth2::CsrfToken;
+use sha2::{Digest, Sha256};
 
 use crate::{RepositoryUser, ServerError, ServerResult};
 
@@ -20,6 +21,7 @@ pub const DEFAULT_LFS_SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 const MAX_LFS_SESSION_TOKEN_LEN: usize = 1024;
 const MAX_LOCAL_LFS_SESSIONS: usize = 1024;
+const MAX_LFS_SESSION_TOKEN_GENERATION_ATTEMPTS: usize = 8;
 
 /// Opaque bearer token issued by LFS Cloud for Git LFS clients.
 ///
@@ -42,7 +44,8 @@ impl LfsSessionToken {
     /// ```
     #[must_use]
     pub fn generate() -> Self {
-        Self(CsrfToken::new_random().secret().clone())
+        Self::from_secret(CsrfToken::new_random().secret().clone())
+            .expect("oauth2-generated CSRF token should be a valid local LFS token")
     }
 
     /// Restores an existing local LFS session token secret.
@@ -153,7 +156,7 @@ impl fmt::Debug for IssuedLfsSession {
 /// LFS receives only [`LfsSessionToken`], never the GitHub OAuth token.
 #[derive(Clone, Default)]
 pub struct LocalLfsSessionStore {
-    sessions: Arc<Mutex<BTreeMap<String, LfsSessionMetadata>>>,
+    sessions: Arc<Mutex<BTreeMap<LfsSessionTokenKey, LfsSessionMetadata>>>,
 }
 
 impl LocalLfsSessionStore {
@@ -180,8 +183,8 @@ impl LocalLfsSessionStore {
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError`] when `ttl` is zero or the expiration timestamp
-    /// cannot be represented.
+    /// Returns [`ServerError`] when `ttl` is zero, the expiration timestamp
+    /// cannot be represented, or a unique token cannot be generated.
     pub fn issue_session_with_ttl(
         &self,
         user: &RepositoryUser,
@@ -189,19 +192,17 @@ impl LocalLfsSessionStore {
         ttl: Duration,
     ) -> ServerResult<IssuedLfsSession> {
         if ttl.is_zero() {
-            return Err(ServerError::InvalidConfiguration {
+            return Err(ServerError::InvalidRequest {
                 message: "lfs session ttl must be greater than zero".to_owned(),
             });
         }
 
         let issued_at = SystemTime::now();
-        let expires_at =
-            issued_at
-                .checked_add(ttl)
-                .ok_or_else(|| ServerError::InvalidConfiguration {
-                    message: "lfs session expiration timestamp overflowed".to_owned(),
-                })?;
-        let token = LfsSessionToken::generate();
+        let expires_at = issued_at
+            .checked_add(ttl)
+            .ok_or_else(|| ServerError::InvalidRequest {
+                message: "lfs session expiration timestamp overflowed".to_owned(),
+            })?;
         let metadata = LfsSessionMetadata::new(user, granted_scopes, issued_at, expires_at);
 
         let mut sessions = self
@@ -209,12 +210,26 @@ impl LocalLfsSessionStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_sessions(&mut sessions, issued_at);
-        if !sessions.contains_key(token.as_str()) && sessions.len() >= MAX_LOCAL_LFS_SESSIONS {
-            evict_session_expiring_soonest(&mut sessions);
-        }
-        sessions.insert(token.as_str().to_owned(), metadata.clone());
 
-        Ok(IssuedLfsSession { token, metadata })
+        for _ in 0..MAX_LFS_SESSION_TOKEN_GENERATION_ATTEMPTS {
+            let token = LfsSessionToken::generate();
+            let token_key = LfsSessionTokenKey::from_token(&token);
+
+            if sessions.contains_key(&token_key) {
+                continue;
+            }
+
+            if sessions.len() >= MAX_LOCAL_LFS_SESSIONS {
+                evict_session_expiring_soonest(&mut sessions);
+            }
+
+            sessions.insert(token_key, metadata.clone());
+            return Ok(IssuedLfsSession { token, metadata });
+        }
+
+        Err(ServerError::Internal {
+            message: "failed to generate a unique lfs session token".to_owned(),
+        })
     }
 
     /// Returns non-secret metadata for a valid, unexpired token.
@@ -228,9 +243,8 @@ impl LocalLfsSessionStore {
         prune_expired_sessions(&mut sessions, now);
 
         sessions
-            .iter()
-            .find(|(stored_token, _)| constant_time_str_eq(token.as_str(), stored_token))
-            .map(|(_, metadata)| metadata.clone())
+            .get(&LfsSessionTokenKey::from_token(token))
+            .cloned()
     }
 
     /// Revokes a token if it is currently stored.
@@ -244,9 +258,9 @@ impl LocalLfsSessionStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_sessions(&mut sessions, now);
 
-        let before = sessions.len();
-        sessions.retain(|stored_token, _| !constant_time_str_eq(token.as_str(), stored_token));
-        sessions.len() != before
+        sessions
+            .remove(&LfsSessionTokenKey::from_token(token))
+            .is_some()
     }
 
     fn len(&self) -> usize {
@@ -296,32 +310,31 @@ fn validate_lfs_session_secret(value: String) -> ServerResult<String> {
     Ok(value)
 }
 
-fn prune_expired_sessions(sessions: &mut BTreeMap<String, LfsSessionMetadata>, now: SystemTime) {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LfsSessionTokenKey([u8; 32]);
+
+impl LfsSessionTokenKey {
+    fn from_token(token: &LfsSessionToken) -> Self {
+        let digest: [u8; 32] = Sha256::digest(token.as_str().as_bytes()).into();
+        Self(digest)
+    }
+}
+
+fn prune_expired_sessions(
+    sessions: &mut BTreeMap<LfsSessionTokenKey, LfsSessionMetadata>,
+    now: SystemTime,
+) {
     sessions.retain(|_, metadata| metadata.expires_at > now);
 }
 
-fn evict_session_expiring_soonest(sessions: &mut BTreeMap<String, LfsSessionMetadata>) {
+fn evict_session_expiring_soonest(sessions: &mut BTreeMap<LfsSessionTokenKey, LfsSessionMetadata>) {
     if let Some(token) = sessions
         .iter()
         .min_by_key(|(_, metadata)| metadata.expires_at)
-        .map(|(token, _)| token.clone())
+        .map(|(token, _)| *token)
     {
         sessions.remove(&token);
     }
-}
-
-fn constant_time_str_eq(candidate: &str, expected: &str) -> bool {
-    let candidate = candidate.as_bytes();
-    let expected = expected.as_bytes();
-    let mut diff = candidate.len() ^ expected.len();
-
-    for index in 0..MAX_LFS_SESSION_TOKEN_LEN {
-        let candidate_byte = candidate.get(index).copied().unwrap_or_default();
-        let expected_byte = expected.get(index).copied().unwrap_or_default();
-        diff |= usize::from(candidate_byte ^ expected_byte);
-    }
-
-    diff == 0
 }
 
 fn unix_timestamp_seconds(time: SystemTime) -> u64 {
@@ -358,6 +371,15 @@ mod tests {
     }
 
     #[test]
+    fn generated_session_token_round_trips_through_validation() {
+        let generated = LfsSessionToken::generate();
+        let restored =
+            LfsSessionToken::from_secret(generated.as_str()).expect("generated token should parse");
+
+        assert_eq!(restored.as_str(), generated.as_str());
+    }
+
+    #[test]
     fn session_store_issues_metadata_for_repository_user() {
         let store = LocalLfsSessionStore::new();
 
@@ -375,6 +397,16 @@ mod tests {
         assert!(metadata.expires_at > metadata.issued_at);
         assert_eq!(metadata, issued.metadata);
         assert!(!format!("{issued:?}").contains(issued.token.as_str()));
+    }
+
+    #[test]
+    fn session_store_rejects_zero_ttl_as_invalid_request() {
+        let store = LocalLfsSessionStore::new();
+        let error = store
+            .issue_session_with_ttl(&user(), ["read:user"], Duration::ZERO)
+            .unwrap_err();
+
+        assert!(matches!(error, ServerError::InvalidRequest { .. }));
     }
 
     #[test]
