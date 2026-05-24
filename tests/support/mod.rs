@@ -96,13 +96,11 @@ impl TempGitRepo {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = Command::new("git")
+        Command::new("git")
             .args(args)
             .current_dir(self.root.path())
             .output()
-            .expect("git command should start");
-
-        output
+            .expect("git command should start")
     }
 
     /// Stages all changes and creates a commit.

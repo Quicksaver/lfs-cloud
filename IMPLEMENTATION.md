@@ -1090,25 +1090,26 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 0 foundations complete; reusable integration-test
-> fixtures are available for temp Git repos, fake providers, and Git LFS
-> pointer files. Phase 1 server configuration is the next implementation area.
+> **Status**: Phase 1 server configuration is complete with typed YAML
+> loading, environment interpolation, duplicate detection, and path-specific
+> validation errors. Phase 2 GitHub authentication is the next implementation
+> area.
 
 ### Progress Summary
 
-| Phase                                    | Total Tasks | Done  | Remaining |
-| ---------------------------------------- | ----------- | ----- | --------- |
-| 0. Foundations                           | 8           | 8     | 0         |
-| 1. Server Config                         | 8           | 0     | 8         |
-| 2. GitHub Auth                           | 12          | 0     | 12        |
-| 3. Google Drive Storage                  | 9           | 0     | 9         |
-| 4. Metadata DB                           | 8           | 0     | 8         |
-| 5. LFS Server Protocol                   | 12          | 0     | 12        |
-| 6. CLI Commands                          | 13          | 0     | 13        |
-| 7. Migration                             | 12          | 0     | 12        |
-| 8. Local Cache And Materialization       | 8           | 0     | 8         |
-| 9. Verification, Docs, And Release Shape | 8           | 0     | 8         |
-| **Total**                                | **98**      | **8** | **90**    |
+| Phase                                    | Total Tasks | Done   | Remaining |
+| ---------------------------------------- | ----------- | ------ | --------- |
+| 0. Foundations                           | 8           | 8      | 0         |
+| 1. Server Config                         | 8           | 8      | 0         |
+| 2. GitHub Auth                           | 12          | 0      | 12        |
+| 3. Google Drive Storage                  | 9           | 0      | 9         |
+| 4. Metadata DB                           | 8           | 0      | 8         |
+| 5. LFS Server Protocol                   | 12          | 0      | 12        |
+| 6. CLI Commands                          | 13          | 0      | 13        |
+| 7. Migration                             | 12          | 0      | 12        |
+| 8. Local Cache And Materialization       | 8           | 0      | 8         |
+| 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
+| **Total**                                | **98**      | **16** | **82**    |
 
 ### Legend
 
@@ -1143,17 +1144,17 @@ Defer:
 
 #### Epic 1.1: YAML Schema
 
-- [ ] [T] Define `lfs-cloud.yml` schema for server bind, public URL, GitHub provider, Google Drive providers, and repository mappings.
-- [ ] [T] Implement config loading from explicit path and default path.
-- [ ] [T] Implement environment-variable interpolation for non-secret and secret references.
-- [ ] [T] Reject duplicate provider IDs, storage IDs, repo IDs, and route paths.
+- [x] [T] Define `lfs-cloud.yml` schema for server bind, public URL, GitHub provider, Google Drive providers, and repository mappings.
+- [x] [T] Implement config loading from explicit path and default path.
+- [x] [T] Implement environment-variable interpolation for non-secret and secret references.
+- [x] [T] Reject duplicate provider IDs, storage IDs, repo IDs, and route paths.
 
 #### Epic 1.2: Config Validation
 
-- [ ] [T] Validate GitHub provider entries require API URL and OAuth client settings.
-- [ ] [T] Validate Google Drive storage entries require credential reference and root folder ID.
-- [ ] [T] Validate each repository mapping points to existing repository and storage providers.
-- [ ] [T] Add config error messages that identify the exact invalid path/key.
+- [x] [T] Validate GitHub provider entries require API URL and OAuth client settings.
+- [x] [T] Validate Google Drive storage entries require credential reference and root folder ID.
+- [x] [T] Validate each repository mapping points to existing repository and storage providers.
+- [x] [T] Add config error messages that identify the exact invalid path/key.
 
 ### Phase 2: GitHub Auth
 

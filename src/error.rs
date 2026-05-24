@@ -158,6 +158,26 @@ impl CliError {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
+    /// The server configuration file could not be read.
+    #[error("failed to read server config {}: {source}", path.display())]
+    ConfigRead {
+        /// Configuration path that was being read.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The server configuration could not be parsed as YAML.
+    #[error("failed to parse server config {path}: {source}")]
+    ConfigParse {
+        /// Configuration path, or `<memory>` for test/string sources.
+        path: String,
+        /// Underlying config parser or deserializer failure.
+        #[source]
+        source: config::ConfigError,
+    },
+
     /// Server configuration is syntactically valid but semantically invalid.
     #[error("invalid configuration: {message}")]
     InvalidConfiguration {

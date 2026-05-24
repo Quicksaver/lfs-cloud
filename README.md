@@ -124,6 +124,8 @@ Example shape:
 
 ```yaml
 server:
+  host: 127.0.0.1
+  port: 8080
   public_url: http://127.0.0.1:8080
 
 repository_providers:
@@ -147,6 +149,10 @@ repositories:
     name: repo
     storage_provider: drive-user-a
 ```
+
+String values may reference environment variables with `${NAME}`. This keeps
+OAuth client settings and backend credential references out of the YAML file
+while still letting validation report the exact missing key.
 
 The `.lfsconfig` file points only to the LFS Cloud endpoint. It should not contain Google Drive, S3, or other backend credentials.
 
@@ -178,6 +184,6 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, and a minimal Rust binary scaffold. The actual CLI/server behavior has not been implemented yet.
+This repository currently contains planning documents, project configuration, typed config loading/validation, and a minimal Rust binary scaffold. The actual CLI/server behavior has not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
