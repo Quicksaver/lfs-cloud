@@ -1031,11 +1031,11 @@ fn handle_pipe_event(
 
 fn retain_stdout_data(stdout: &mut Vec<u8>, data: &[u8]) {
     let retained = stdout.len();
-    if retained >= MAX_CREDENTIAL_OUTPUT_LEN {
+    if retained > MAX_CREDENTIAL_OUTPUT_LEN {
         return;
     }
 
-    let remaining = MAX_CREDENTIAL_OUTPUT_LEN - retained;
+    let remaining = (MAX_CREDENTIAL_OUTPUT_LEN + 1) - retained;
     stdout.extend_from_slice(&data[..remaining.min(data.len())]);
 }
 
@@ -1675,7 +1675,16 @@ exit 0
         );
         retain_stdout_data(&mut stdout, b"extra");
 
-        assert_eq!(stdout.len(), MAX_CREDENTIAL_OUTPUT_LEN);
+        assert_eq!(stdout.len(), MAX_CREDENTIAL_OUTPUT_LEN + 1);
+
+        let lfs_url = url::Url::parse("https://lfs.example.com/repo.git/info/lfs")
+            .expect("test URL should parse");
+        let error =
+            parse_git_credential_fill_output(&lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME, &stdout)
+                .expect_err("retained oversized output should be rejected");
+
+        assert!(matches!(error, CliError::ExternalCommandOutput { .. }));
+        assert!(error.to_string().contains("too much output"));
     }
 
     #[test]
