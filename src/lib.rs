@@ -22,8 +22,9 @@ pub use github_auth::{
     GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization, GitHubOAuthCallback,
     GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteResponse, GitHubOAuthCallbackRouteState,
     GitHubOAuthCode, GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthToken,
-    GitHubOAuthTokenExchanger, GitHubUserClient, exchange_github_oauth_code,
-    fetch_authenticated_github_user, github_oauth_authorization_url, github_oauth_callback_router,
+    GitHubOAuthTokenExchanger, GitHubRepositoryPermissionClient, GitHubUserClient,
+    exchange_github_oauth_code, fetch_authenticated_github_user, github_oauth_authorization_url,
+    github_oauth_callback_router,
 };
 pub use lfs::{
     LFS_POINTER_VERSION, LfsBatchAction, LfsBatchObjectError, LfsBatchObjectResponse,

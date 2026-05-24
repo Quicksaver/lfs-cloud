@@ -30,18 +30,21 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    GitHubProviderConfig, IssuedLfsSession, LocalLfsSessionStore, RepositoryProviderError,
-    RepositoryUser, SanitizedMessage, ServerError, ServerResult,
+    GitHubProviderConfig, IssuedLfsSession, LocalLfsSessionStore, RepositoryAuthorization,
+    RepositoryIdentity, RepositoryPermission, RepositoryProviderError, RepositoryUser,
+    SanitizedMessage, ServerError, ServerResult,
 };
 
 const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
 const MAX_GITHUB_ERROR_BODY_LEN: usize = 16 * 1024;
 const GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_USER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_PERMISSION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PENDING_GITHUB_OAUTH_STATES: usize = 1024;
 const GITHUB_USER_AGENT: &str = concat!("lfs-cloud/", env!("CARGO_PKG_VERSION"));
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
+const GITHUB_SSO_HEADER: &str = "x-github-sso";
 
 static DEFAULT_GITHUB_OAUTH_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 static DEFAULT_GITHUB_API_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
@@ -538,6 +541,134 @@ impl GitHubUserClient {
             .map_err(|source| github_user_request_error(provider, Some(status), source))?;
 
         response.into_repository_user(provider)
+    }
+}
+
+/// HTTP client for checking GitHub repository permissions.
+///
+/// GitHub's collaborator permission endpoint returns a legacy base permission
+/// (`read`, `write`, `admin`, or `none`) after considering direct, team,
+/// organization, and enterprise grants. LFS Cloud uses that base permission as
+/// the conservative MVP authorization source for LFS downloads and uploads.
+#[derive(Clone, Debug)]
+pub struct GitHubRepositoryPermissionClient {
+    client: Client,
+}
+
+impl GitHubRepositoryPermissionClient {
+    /// Creates a GitHub repository permission client with default HTTP settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the default HTTP client cannot be built.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::GitHubRepositoryPermissionClient;
+    ///
+    /// let client = GitHubRepositoryPermissionClient::new()?;
+    ///
+    /// assert!(format!("{client:?}").contains("GitHubRepositoryPermissionClient"));
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
+    pub fn new() -> ServerResult<Self> {
+        Ok(Self::with_client(default_github_api_http_client()?))
+    }
+
+    /// Creates a GitHub repository permission client from an existing client.
+    ///
+    /// This is useful for tests and for server code that shares one configured
+    /// GitHub API client across identity and authorization calls.
+    #[must_use]
+    pub fn with_client(client: Client) -> Self {
+        Self { client }
+    }
+
+    /// Checks whether `user` has `required` access to `repository`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the GitHub API URL is invalid, the request
+    /// fails, GitHub requires SSO authorization, or the returned permission does
+    /// not satisfy the requested access.
+    pub async fn check_permission(
+        &self,
+        provider: &GitHubProviderConfig,
+        token: &GitHubOAuthAccessToken,
+        repository: &RepositoryIdentity,
+        user: &RepositoryUser,
+        required: RepositoryPermission,
+    ) -> ServerResult<RepositoryAuthorization> {
+        validate_github_permission_request(provider, repository, user)?;
+        let endpoint = github_repository_permission_endpoint(provider, repository, user)?;
+        let response = self
+            .client
+            .get(endpoint)
+            .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .map_err(|source| github_permission_request_error(provider, None, source))?;
+        let status = response.status();
+
+        if !status.is_success() {
+            if status == StatusCode::UNAUTHORIZED {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: provider.id.clone(),
+                    },
+                });
+            }
+
+            if status == StatusCode::NOT_FOUND {
+                return Err(github_permission_denied(provider, repository, required));
+            }
+
+            if status == StatusCode::FORBIDDEN && response.headers().contains_key(GITHUB_SSO_HEADER)
+            {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::SsoRequired {
+                        provider: provider.id.clone(),
+                        organization: repository.owner.clone(),
+                    },
+                });
+            }
+
+            let body = read_github_error_body(response).await.map_err(|source| {
+                github_permission_request_error(provider, Some(status), source)
+            })?;
+            if status == StatusCode::FORBIDDEN && github_forbidden_body_indicates_auth(&body) {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: provider.id.clone(),
+                    },
+                });
+            }
+
+            return Err(github_permission_status_error(
+                provider, status, &body, token,
+            ));
+        }
+
+        let response = response
+            .json::<GitHubRepositoryPermissionResponse>()
+            .await
+            .map_err(|source| github_permission_request_error(provider, Some(status), source))?;
+        let Some(granted) = response.base_permission() else {
+            return Err(github_permission_denied(provider, repository, required));
+        };
+
+        if !github_permission_satisfies(granted, required) {
+            return Err(github_permission_denied(provider, repository, required));
+        }
+
+        Ok(RepositoryAuthorization {
+            user: user.clone(),
+            repository: repository.clone(),
+            required,
+            granted,
+        })
     }
 }
 
@@ -1219,6 +1350,23 @@ impl GitHubUserResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubRepositoryPermissionResponse {
+    permission: Option<String>,
+}
+
+impl GitHubRepositoryPermissionResponse {
+    fn base_permission(&self) -> Option<RepositoryPermission> {
+        match self.permission.as_deref() {
+            Some("read") => Some(RepositoryPermission::Read),
+            Some("write") => Some(RepositoryPermission::Write),
+            Some("admin") => Some(RepositoryPermission::Admin),
+            Some("none") => None,
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct GitHubApiErrorResponse {
     message: Option<String>,
     #[serde(default)]
@@ -1392,6 +1540,53 @@ fn github_user_status_error(
     repository_provider_upstream_error(provider, Some(status.as_u16()), &message)
 }
 
+fn github_permission_request_error(
+    provider: &GitHubProviderConfig,
+    status: Option<StatusCode>,
+    source: reqwest::Error,
+) -> ServerError {
+    let message = if source.is_timeout() {
+        "github repository permission request timed out"
+    } else if source.is_connect() {
+        "github api connection failed while checking repository permission"
+    } else if source.is_decode() {
+        "malformed github repository permission response"
+    } else if source.is_body() {
+        "github repository permission response body could not be read"
+    } else {
+        "github repository permission request failed"
+    };
+
+    repository_provider_upstream_error(provider, status.map(|status| status.as_u16()), message)
+}
+
+fn github_permission_status_error(
+    provider: &GitHubProviderConfig,
+    status: StatusCode,
+    body: &str,
+    token: &GitHubOAuthAccessToken,
+) -> ServerError {
+    let message = github_api_error_message(body, token)
+        .unwrap_or_else(|| "github repository permission request failed".to_owned());
+
+    repository_provider_upstream_error(provider, Some(status.as_u16()), &message)
+}
+
+fn github_permission_denied(
+    provider: &GitHubProviderConfig,
+    repository: &RepositoryIdentity,
+    required: RepositoryPermission,
+) -> ServerError {
+    ServerError::RepositoryProvider {
+        source: RepositoryProviderError::PermissionDenied {
+            provider: provider.id.clone(),
+            owner: repository.owner.clone(),
+            repo: repository.name.clone(),
+            required,
+        },
+    }
+}
+
 async fn read_github_error_body(mut response: reqwest::Response) -> Result<String, reqwest::Error> {
     let mut body = Vec::new();
     while body.len() < MAX_GITHUB_ERROR_BODY_LEN {
@@ -1483,6 +1678,103 @@ fn github_user_endpoint(provider: &GitHubProviderConfig) -> ServerResult<Url> {
     Ok(endpoint)
 }
 
+fn github_repository_permission_endpoint(
+    provider: &GitHubProviderConfig,
+    repository: &RepositoryIdentity,
+    user: &RepositoryUser,
+) -> ServerResult<Url> {
+    let mut endpoint = Url::parse(&provider.api_url)
+        .map_err(|source| invalid_oauth_url("github api_url", source))?;
+    append_github_api_path(
+        &mut endpoint,
+        [
+            "repos",
+            repository.owner.as_str(),
+            repository.name.as_str(),
+            "collaborators",
+            user.login.as_str(),
+            "permission",
+        ],
+    )?;
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+
+    Ok(endpoint)
+}
+
+fn append_github_api_path<'a>(
+    endpoint: &mut Url,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> ServerResult<()> {
+    let base_path = endpoint
+        .path_segments()
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut path = endpoint
+        .path_segments_mut()
+        .map_err(|_| ServerError::InvalidConfiguration {
+            message: "github api_url cannot be used as a base URL".to_owned(),
+        })?;
+    path.clear();
+    for segment in base_path {
+        path.push(&segment);
+    }
+    for segment in segments {
+        path.push(segment);
+    }
+
+    Ok(())
+}
+
+fn validate_github_permission_request(
+    provider: &GitHubProviderConfig,
+    repository: &RepositoryIdentity,
+    user: &RepositoryUser,
+) -> ServerResult<()> {
+    if repository.provider_id != provider.id {
+        return Err(ServerError::InvalidRequest {
+            message: format!(
+                "repository provider id {} does not match github provider {}",
+                repository.provider_id, provider.id
+            ),
+        });
+    }
+    if user.provider_id != provider.id {
+        return Err(ServerError::InvalidRequest {
+            message: format!(
+                "user provider id {} does not match github provider {}",
+                user.provider_id, provider.id
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn github_permission_satisfies(
+    granted: RepositoryPermission,
+    required: RepositoryPermission,
+) -> bool {
+    match required {
+        RepositoryPermission::Read => matches!(
+            granted,
+            RepositoryPermission::Read | RepositoryPermission::Write | RepositoryPermission::Admin
+        ),
+        RepositoryPermission::Write => {
+            matches!(
+                granted,
+                RepositoryPermission::Write | RepositoryPermission::Admin
+            )
+        }
+        RepositoryPermission::Admin => matches!(granted, RepositoryPermission::Admin),
+    }
+}
+
 fn default_github_oauth_http_client() -> ServerResult<Client> {
     match DEFAULT_GITHUB_OAUTH_HTTP_CLIENT.get_or_init(|| {
         build_github_oauth_http_client()
@@ -1516,7 +1808,7 @@ fn build_github_oauth_http_client() -> Result<Client, reqwest::Error> {
 
 fn build_github_api_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
-        .timeout(GITHUB_USER_FETCH_TIMEOUT)
+        .timeout(GITHUB_USER_FETCH_TIMEOUT.max(GITHUB_PERMISSION_CHECK_TIMEOUT))
         .user_agent(GITHUB_USER_AGENT)
         .build()
 }
@@ -1693,8 +1985,11 @@ mod tests {
 
     use axum::{
         Router,
-        extract::State,
-        http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+        extract::{Path, State},
+        http::{
+            HeaderMap, HeaderValue, StatusCode,
+            header::{AUTHORIZATION, CONTENT_TYPE},
+        },
         response::IntoResponse,
         routing::{get, post},
     };
@@ -1705,14 +2000,14 @@ mod tests {
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
         GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization,
         GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteState,
-        GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthTokenExchanger, GitHubUserClient,
-        MAX_PENDING_GITHUB_OAUTH_STATES, exchange_github_oauth_code,
-        fetch_authenticated_github_user, github_oauth_authorization_url,
-        github_oauth_callback_router,
+        GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthTokenExchanger,
+        GitHubRepositoryPermissionClient, GitHubUserClient, MAX_PENDING_GITHUB_OAUTH_STATES,
+        exchange_github_oauth_code, fetch_authenticated_github_user,
+        github_oauth_authorization_url, github_oauth_callback_router,
     };
     use crate::{
-        GitHubProviderConfig, LfsSessionToken, LocalLfsSessionStore, RepositoryProviderError,
-        ServerError,
+        GitHubProviderConfig, LfsSessionToken, LocalLfsSessionStore, RepositoryIdentity,
+        RepositoryPermission, RepositoryProviderError, RepositoryUser, ServerError,
     };
 
     const REDIRECT_URL: &str = "http://127.0.0.1:8080/auth/github/callback";
@@ -2247,6 +2542,222 @@ mod tests {
         assert!(matches!(error, ServerError::RepositoryProvider { .. }));
         assert!(error.to_string().contains("missing login"));
         assert!(!error.to_string().contains("gho_token"));
+    }
+
+    #[tokio::test]
+    async fn permission_client_allows_public_read_repo_download() {
+        let (api_url, permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"read","role_name":"triage"}"#,
+            None,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let repository = repository_identity("public-owner", "public-repo");
+        let user = repository_user("octocat");
+        let client = GitHubRepositoryPermissionClient::new().expect("client should build");
+
+        let authorization = client
+            .check_permission(
+                &provider,
+                &token,
+                &repository,
+                &user,
+                RepositoryPermission::Read,
+            )
+            .await
+            .expect("read permission should authorize download");
+
+        assert_eq!(authorization.required, RepositoryPermission::Read);
+        assert_eq!(authorization.granted, RepositoryPermission::Read);
+        let requests = permission_server.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.owner, "public-owner");
+        assert_eq!(request.repo, "public-repo");
+        assert_eq!(request.username, "octocat");
+        assert_eq!(request.accept.as_deref(), Some(super::GITHUB_API_ACCEPT));
+        assert_eq!(request.authorization.as_deref(), Some("Bearer gho_token"));
+    }
+
+    #[tokio::test]
+    async fn permission_client_allows_private_write_repo_upload() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"write","role_name":"write"}"#,
+            None,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let repository = repository_identity("private-owner", "private-repo");
+        let user = repository_user("octocat");
+        let client = GitHubRepositoryPermissionClient::new().expect("client should build");
+
+        let authorization = client
+            .check_permission(
+                &provider,
+                &token,
+                &repository,
+                &user,
+                RepositoryPermission::Write,
+            )
+            .await
+            .expect("write permission should authorize upload");
+
+        assert_eq!(authorization.granted, RepositoryPermission::Write);
+    }
+
+    #[tokio::test]
+    async fn permission_client_allows_org_admin_repo_upload() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"admin","role_name":"admin"}"#,
+            None,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let repository = repository_identity("org-name", "org-repo");
+        let user = repository_user("octocat");
+        let client = GitHubRepositoryPermissionClient::new().expect("client should build");
+
+        let authorization = client
+            .check_permission(
+                &provider,
+                &token,
+                &repository,
+                &user,
+                RepositoryPermission::Write,
+            )
+            .await
+            .expect("admin permission should authorize upload");
+
+        assert_eq!(authorization.granted, RepositoryPermission::Admin);
+    }
+
+    #[tokio::test]
+    async fn permission_client_denies_read_only_repo_upload() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"read","role_name":"read"}"#,
+            None,
+        )
+        .await;
+        let error = mocked_permission_check(
+            api_url,
+            "private-owner",
+            "read-only-repo",
+            RepositoryPermission::Write,
+        )
+        .await
+        .expect_err("read-only permission should not authorize upload");
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::PermissionDenied { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_client_denies_none_permission() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"none","role_name":"none"}"#,
+            None,
+        )
+        .await;
+        let error = mocked_permission_check(
+            api_url,
+            "private-owner",
+            "denied-repo",
+            RepositoryPermission::Read,
+        )
+        .await
+        .expect_err("none permission should deny download");
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::PermissionDenied { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_client_denies_404_as_permission_denied() {
+        let (api_url, _permission_server) =
+            permission_server(StatusCode::NOT_FOUND, r#"{"message":"Not Found"}"#, None).await;
+        let error = mocked_permission_check(
+            api_url,
+            "private-owner",
+            "missing-or-denied-repo",
+            RepositoryPermission::Read,
+        )
+        .await
+        .expect_err("404 should deny without exposing repository existence");
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::PermissionDenied { .. }
+            }
+        ));
+        assert!(!matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::RepositoryNotFound { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_client_maps_sso_header_to_sso_required() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::FORBIDDEN,
+            r#"{"message":"Resource protected by organization SAML enforcement"}"#,
+            Some("required; url=https://github.com/orgs/org-name/sso?authorization_request=1"),
+        )
+        .await;
+        let error =
+            mocked_permission_check(api_url, "org-name", "sso-repo", RepositoryPermission::Read)
+                .await
+                .expect_err("SSO-required response should deny access");
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::SsoRequired { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_client_denies_unknown_permission_state() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"custom-role","role_name":"custom-role"}"#,
+            None,
+        )
+        .await;
+        let error = mocked_permission_check(
+            api_url,
+            "org-name",
+            "custom-role-repo",
+            RepositoryPermission::Read,
+        )
+        .await
+        .expect_err("unknown permission state should deny access");
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::PermissionDenied { .. }
+            }
+        ));
     }
 
     #[test]
@@ -2819,6 +3330,23 @@ mod tests {
         authorization: Option<String>,
     }
 
+    #[derive(Debug, Default)]
+    struct PermissionServerState {
+        status: StatusCode,
+        body: String,
+        sso_header: Option<String>,
+        requests: Mutex<Vec<CapturedPermissionRequest>>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CapturedPermissionRequest {
+        owner: String,
+        repo: String,
+        username: String,
+        accept: Option<String>,
+        authorization: Option<String>,
+    }
+
     async fn token_server(
         status: StatusCode,
         body: &'static str,
@@ -2870,6 +3398,39 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("mock user server should run");
+        });
+
+        (format!("http://{address}/api/v3"), state)
+    }
+
+    async fn permission_server(
+        status: StatusCode,
+        body: impl Into<String>,
+        sso_header: Option<&str>,
+    ) -> (String, Arc<PermissionServerState>) {
+        let state = Arc::new(PermissionServerState {
+            status,
+            body: body.into(),
+            sso_header: sso_header.map(ToOwned::to_owned),
+            requests: Mutex::new(Vec::new()),
+        });
+        let app = Router::new()
+            .route(
+                "/api/v3/repos/{owner}/{repo}/collaborators/{username}/permission",
+                get(capture_permission_request),
+            )
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock permission server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock permission server address should be available");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock permission server should run");
         });
 
         (format!("http://{address}/api/v3"), state)
@@ -2966,6 +3527,75 @@ mod tests {
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             state.body.clone(),
         )
+    }
+
+    async fn capture_permission_request(
+        State(state): State<Arc<PermissionServerState>>,
+        Path((owner, repo, username)): Path<(String, String, String)>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let authorization = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+
+        state.requests.lock().await.push(CapturedPermissionRequest {
+            owner,
+            repo,
+            username,
+            accept,
+            authorization,
+        });
+
+        let mut response = (
+            state.status,
+            [(CONTENT_TYPE, "application/json")],
+            state.body.clone(),
+        )
+            .into_response();
+        if let Some(sso_header) = &state.sso_header {
+            response.headers_mut().insert(
+                super::GITHUB_SSO_HEADER,
+                HeaderValue::from_str(sso_header).expect("test SSO header should parse"),
+            );
+        }
+
+        response
+    }
+
+    async fn mocked_permission_check(
+        api_url: String,
+        owner: &str,
+        repo: &str,
+        required: RepositoryPermission,
+    ) -> Result<crate::RepositoryAuthorization, ServerError> {
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let repository = repository_identity(owner, repo);
+        let user = repository_user("octocat");
+        let client = GitHubRepositoryPermissionClient::new().expect("client should build");
+
+        client
+            .check_permission(&provider, &token, &repository, &user, required)
+            .await
+    }
+
+    fn repository_identity(owner: &str, repo: &str) -> RepositoryIdentity {
+        RepositoryIdentity {
+            provider_id: "github-main".to_owned(),
+            stable_id: None,
+            host: "github.com".to_owned(),
+            owner: owner.to_owned(),
+            name: repo.to_owned(),
+        }
+    }
+
+    fn repository_user(login: &str) -> RepositoryUser {
+        RepositoryUser::new("github-main", login, Some("583231".to_owned()))
     }
 
     fn validated_callback(code: &str, state: &str) -> GitHubOAuthCallback {

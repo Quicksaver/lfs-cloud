@@ -1094,7 +1094,9 @@ Defer:
 > authorization URL generation, CSRF state creation, and callback state
 > validation, callback routing, code-to-token exchange, and authenticated
 > GitHub user identity lookup. Successful callbacks now issue local LFS Cloud
-> session tokens without exposing GitHub OAuth tokens to Git LFS.
+> session tokens without exposing GitHub OAuth tokens to Git LFS. GitHub
+> repository permission checks now map collaborator base permissions into the
+> internal read/write/admin authorization model.
 
 ### Progress Summary
 
@@ -1102,7 +1104,7 @@ Defer:
 | ---------------------------------------- | ----------- | ------ | --------- |
 | 0. Foundations                           | 8           | 8      | 0         |
 | 1. Server Config                         | 8           | 8      | 0         |
-| 2. GitHub Auth                           | 12          | 6      | 6         |
+| 2. GitHub Auth                           | 13          | 10     | 3         |
 | 3. Google Drive Storage                  | 9           | 0      | 9         |
 | 4. Metadata DB                           | 8           | 0      | 8         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
@@ -1110,7 +1112,7 @@ Defer:
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **98**      | **22** | **76**    |
+| **Total**                                | **99**      | **26** | **73**    |
 
 ### Legend
 
@@ -1176,10 +1178,10 @@ Defer:
 
 #### Epic 2.3: Repository Permission Checks
 
-- [ ] [T] Implement GitHub `GET /repos/{owner}/{repo}/collaborators/{username}/permission`.
-- [ ] [T] Map GitHub `read` to download and `write`/`admin` to upload.
-- [ ] [T] Treat `none`, `404`, SSO-required, and unknown states as deny.
-- [ ] [T] Add mocked GitHub API tests for public, private, org, read-only, write, admin, and denied repos.
+- [x] [T] Implement GitHub `GET /repos/{owner}/{repo}/collaborators/{username}/permission`.
+- [x] [T] Map GitHub `read` to download and `write`/`admin` to upload.
+- [x] [T] Treat `none`, `404`, SSO-required, and unknown states as deny.
+- [x] [T] Add mocked GitHub API tests for public, private, org, read-only, write, admin, and denied repos.
 
 ### Phase 3: Google Drive Storage
 
