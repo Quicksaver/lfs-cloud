@@ -8,7 +8,7 @@
 //! tasks.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
@@ -29,6 +29,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
@@ -478,6 +479,7 @@ struct LfsServerState {
     public_url: String,
     authorizer: Arc<dyn LfsBatchAuthorizer>,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
+    upload_locks: Arc<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl LfsServerState {
@@ -493,7 +495,25 @@ impl LfsServerState {
             public_url: config.server.public_url,
             authorizer,
             transfer_store,
+            upload_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    fn upload_lock_for(&self, repository: &RepositoryMapping, oid: &LfsOid) -> Arc<AsyncMutex<()>> {
+        let key = format!(
+            "{}:{}:{}",
+            repository.id,
+            repository.storage_provider,
+            oid.as_hex()
+        );
+        let mut locks = self
+            .upload_locks
+            .lock()
+            .expect("upload lock map should not be poisoned");
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 }
 
@@ -669,6 +689,9 @@ async fn handle_lfs_upload_request(
         return upload_payload_too_large_response();
     }
 
+    let upload_lock = state.upload_lock_for(&repository, &oid);
+    let _upload_lock_guard = upload_lock.lock().await;
+
     let staged_upload = match stage_upload_request_body(&oid, declared_size, request).await {
         Ok(staged_upload) => staged_upload,
         Err(UploadStagingError::PayloadTooLarge) => {
@@ -691,6 +714,33 @@ async fn handle_lfs_upload_request(
         session.metadata().login.clone(),
         session.metadata().stable_id.clone(),
     );
+
+    match state
+        .transfer_store
+        .object_exists(&repository, &object)
+        .await
+    {
+        Ok(true) => {
+            tracing::debug!(
+                repo_id = repository.id.as_str(),
+                storage_provider = repository.storage_provider.as_str(),
+                oid = object.oid.as_hex(),
+                size = object.size.bytes(),
+                "Git LFS upload transfer found an existing object"
+            );
+            return StatusCode::OK.into_response();
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(
+                repo_id = repository.id.as_str(),
+                oid = object.oid.as_hex(),
+                %error,
+                "Git LFS upload transfer existence check failed"
+            );
+            return git_lfs_storage_error_response(error);
+        }
+    }
 
     match state
         .transfer_store
@@ -1521,6 +1571,7 @@ mod tests {
         },
         routing::get,
     };
+    use tokio::sync::{Barrier, Notify};
     use tower::ServiceExt;
 
     use super::{
@@ -1666,8 +1717,10 @@ repositories:
 
     #[derive(Clone, Default)]
     struct RecordingTransferStore {
-        existing: bool,
+        existing: Arc<std::sync::atomic::AtomicBool>,
         uploads: Arc<Mutex<Vec<RecordedUpload>>>,
+        upload_started: Option<Arc<Notify>>,
+        upload_release: Option<Arc<Barrier>>,
     }
 
     impl RecordingTransferStore {
@@ -1677,8 +1730,19 @@ repositories:
 
         fn existing() -> Self {
             Self {
-                existing: true,
+                existing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 uploads: Arc::new(Mutex::new(Vec::new())),
+                upload_started: None,
+                upload_release: None,
+            }
+        }
+
+        fn blocking_missing(upload_started: Arc<Notify>, upload_release: Arc<Barrier>) -> Self {
+            Self {
+                existing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                uploads: Arc::new(Mutex::new(Vec::new())),
+                upload_started: Some(upload_started),
+                upload_release: Some(upload_release),
             }
         }
 
@@ -1704,7 +1768,7 @@ repositories:
             _repository: &'a RepositoryMapping,
             _object: &'a LfsObject,
         ) -> ProviderFuture<'a, ServerResult<bool>> {
-            Box::pin(async move { Ok(self.existing) })
+            Box::pin(async move { Ok(self.existing.load(std::sync::atomic::Ordering::SeqCst)) })
         }
 
         fn upload_object<'a>(
@@ -1715,6 +1779,14 @@ repositories:
             created_by: &'a RepositoryUser,
         ) -> ProviderFuture<'a, ServerResult<StoredObject>> {
             Box::pin(async move {
+                if let Some(upload_started) = &self.upload_started {
+                    upload_started.notify_waiters();
+                }
+                if let Some(upload_release) = &self.upload_release {
+                    upload_release.wait().await;
+                }
+                self.existing
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let bytes = std::fs::read(source).map_err(|source| ServerError::Internal {
                     message: format!("test upload file could not be read: {source}"),
                 })?;
@@ -2308,6 +2380,67 @@ repositories:
         )
         .await;
         assert!(transfer_store.uploads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_serializes_retrying_uploads_for_the_same_object() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let upload_started = Arc::new(Notify::new());
+        let upload_release = Arc::new(Barrier::new(2));
+        let transfer_store = RecordingTransferStore::blocking_missing(
+            upload_started.clone(),
+            upload_release.clone(),
+        );
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+        );
+        let body = b"hello from lfs cloud";
+        let oid = format!("{:x}", Sha256::digest(body));
+        let path = format!("/github.com/owner/repo.git/info/lfs/objects/{oid}");
+        let upload_started_wait = upload_started.notified();
+
+        let first_router = router.clone();
+        let first_token = token.clone();
+        let first_path = path.clone();
+        let first = tokio::spawn(async move {
+            first_router
+                .oneshot(lfs_request_with_method_and_body(
+                    Method::PUT,
+                    &first_path,
+                    Some(&format!("Bearer {first_token}")),
+                    body.to_vec(),
+                ))
+                .await
+                .expect("first router response should exist")
+        });
+
+        upload_started_wait.await;
+
+        let second_router = router.clone();
+        let second_token = token.clone();
+        let second_path = path.clone();
+        let second = tokio::spawn(async move {
+            second_router
+                .oneshot(lfs_request_with_method_and_body(
+                    Method::PUT,
+                    &second_path,
+                    Some(&format!("Bearer {second_token}")),
+                    body.to_vec(),
+                ))
+                .await
+                .expect("second router response should exist")
+        });
+
+        upload_release.wait().await;
+
+        let first_response = first.await.expect("first upload task should complete");
+        let second_response = second.await.expect("second upload task should complete");
+
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(second_response.status(), StatusCode::OK);
+        assert_eq!(transfer_store.uploads().len(), 1);
     }
 
     #[tokio::test]
