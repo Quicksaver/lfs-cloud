@@ -931,17 +931,30 @@ repo B -> Google Drive storage provider B
 repo C -> Google Drive storage provider A
 ```
 
-Use the narrowest Google Drive OAuth scope that supports the chosen folder strategy. Preferred direction is `drive.file` if the app creates/owns or is explicitly granted access to the root folder and objects. If that cannot reliably manage the configured root folder for the MVP, document the reason and use the broader Drive scope only for the local/private MVP.
+Use `https://www.googleapis.com/auth/drive.file` for the MVP Google Drive
+OAuth scope. This keeps Drive access per-file/app-accessible rather than
+requesting the restricted full-Drive scope. The configured `root_folder_id`
+must therefore refer to a folder that the app created, opened through the app's
+setup flow, or was otherwise explicitly made accessible to this OAuth client.
+Do not treat an arbitrary manually copied folder ID as valid merely because it
+exists in the user's Drive.
 
 Best MVP storage setup procedure:
 
 ```text
 user authorizes Google OAuth
 lfs-cloud creates or records an app-accessible root folder
+lfs-cloud validates root_folder_id with a non-mutating Drive metadata probe
 lfs-cloud.yml stores the root_folder_id and credential reference
 ```
 
 Avoid requiring full-Drive access merely to browse for arbitrary folders. If a manually created folder is used, the setup flow must verify that the app can create, list, read, and delete test objects under that folder before accepting the config.
+
+Startup and health checks should validate the configured root folder with a
+safe `files.get` metadata request before object transfers depend on it. The
+current validator confirms that the ID resolves to a live Drive folder and that
+the credential can add child objects there. Resumable upload and download
+implementation tasks remain responsible for transfer-level verification.
 
 Use Google Drive resumable uploads for large object writes. The first implementation may stage uploads to a local temp file so it can verify SHA-256 and size before uploading to Drive.
 
@@ -1057,8 +1070,6 @@ Defer:
 
 ## Open Questions
 
-- What is the smallest Google Drive OAuth scope needed for storing and retrieving LFS objects under the configured root folder?
-- Can `drive.file` reliably support the configured-root-folder strategy, or does the local MVP need broader Drive scope with clear documentation?
 - How much should the service depend on committed `.lfsconfig` versus local user configuration?
 - Which self-hosted or VPS option gives the best balance of stable URLs, cost, bandwidth, and operational simplicity?
 - Should the first local implementation wrap stock Git LFS behavior, or replace the smudge/filter-process path from the start?
@@ -1092,10 +1103,10 @@ Defer:
 
 > **Status**: Phase 3 Google Drive storage has started. Server-side Google
 > Drive credential references can now load flat OAuth credential JSON from
-> environment-backed secret references, and refresh tokens can be exchanged for
-> bearer access tokens without exposing Drive credentials to Git LFS clients.
-> Token refresh failures now preserve the storage error boundary while
-> redacting configured Drive secrets from upstream diagnostics.
+> environment-backed secret references, refresh tokens can be exchanged for
+> bearer access tokens, and configured Drive root folders can be validated with
+> a non-mutating metadata probe. The MVP Drive scope is `drive.file`, with
+> root folders required to be app-created or explicitly app-accessible.
 
 ### Progress Summary
 
@@ -1104,14 +1115,14 @@ Defer:
 | 0. Foundations                           | 8           | 8      | 0         |
 | 1. Server Config                         | 8           | 8      | 0         |
 | 2. GitHub Auth                           | 13          | 13     | 0         |
-| 3. Google Drive Storage                  | 9           | 2      | 7         |
+| 3. Google Drive Storage                  | 9           | 4      | 5         |
 | 4. Metadata DB                           | 8           | 0      | 8         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **31** | **68**    |
+| **Total**                                | **99**      | **33** | **66**    |
 
 ### Legend
 
@@ -1188,8 +1199,8 @@ Defer:
 
 - [x] [T] Implement Google Drive credential loading from server-side config references.
 - [x] [T] Implement refresh-token based access-token refresh.
-- [ ] [M] Decide and document MVP Drive scope after validating `drive.file` against the configured root-folder strategy.
-- [ ] [M] Validate configured Drive root folder access at server startup or health check.
+- [x] [M] Decide and document MVP Drive scope after validating `drive.file` against the configured root-folder strategy.
+- [x] [M] Validate configured Drive root folder access at server startup or health check.
 
 #### Epic 3.2: Object Storage Operations
 
