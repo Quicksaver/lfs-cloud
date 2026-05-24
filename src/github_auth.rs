@@ -5,7 +5,12 @@
 //! the returned CSRF state before exchanging an OAuth code and only returns
 //! non-secret identity metadata.
 
-use std::{fmt, sync::OnceLock, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -65,10 +70,10 @@ pub const GITHUB_OAUTH_CALLBACK_PATH: &str = "/auth/github/callback";
 pub const DEFAULT_GITHUB_OAUTH_SCOPES: &[&str] = &["read:user"];
 
 /// State required by the GitHub OAuth callback route.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitHubOAuthCallbackRouteState {
     provider: GitHubProviderConfig,
-    expected_state: GitHubOAuthState,
+    csrf_states: GitHubOAuthStateRegistry,
     redirect_url: String,
     token_exchanger: GitHubOAuthTokenExchanger,
     user_client: GitHubUserClient,
@@ -77,14 +82,15 @@ pub struct GitHubOAuthCallbackRouteState {
 impl GitHubOAuthCallbackRouteState {
     /// Creates callback route state using default GitHub HTTP clients.
     ///
-    /// `expected_state` must be the CSRF value generated for the matching
-    /// authorization URL, and `redirect_url` must match the OAuth app callback.
+    /// `csrf_states` must contain the CSRF values generated for pending
+    /// authorization URLs, and `redirect_url` must match the OAuth app callback.
     ///
     /// # Examples
     ///
     /// ```
     /// use lfs_cloud::{
-    ///     GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubProviderConfig,
+    ///     GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubOAuthStateRegistry,
+    ///     GitHubProviderConfig,
     /// };
     ///
     /// let provider = GitHubProviderConfig {
@@ -93,11 +99,12 @@ impl GitHubOAuthCallbackRouteState {
     ///     oauth_client_id: "client-id".to_owned(),
     ///     oauth_client_secret: "client-secret".to_owned(),
     /// };
-    /// let expected_state = GitHubOAuthState::from_secret("csrf-state")?;
+    /// let csrf_states = GitHubOAuthStateRegistry::new();
+    /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?);
     ///
     /// let route_state = GitHubOAuthCallbackRouteState::new(
     ///     provider,
-    ///     expected_state,
+    ///     csrf_states,
     ///     "https://lfs.example.com/auth/github/callback",
     /// )?;
     ///
@@ -111,12 +118,12 @@ impl GitHubOAuthCallbackRouteState {
     /// the redirect URL is not a valid absolute URL.
     pub fn new(
         provider: GitHubProviderConfig,
-        expected_state: GitHubOAuthState,
+        csrf_states: GitHubOAuthStateRegistry,
         redirect_url: impl Into<String>,
     ) -> ServerResult<Self> {
         Self::with_clients(
             provider,
-            expected_state,
+            csrf_states,
             redirect_url,
             GitHubOAuthTokenExchanger::new()?,
             GitHubUserClient::new()?,
@@ -133,7 +140,7 @@ impl GitHubOAuthCallbackRouteState {
     /// ```
     /// use lfs_cloud::{
     ///     GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubOAuthTokenExchanger,
-    ///     GitHubProviderConfig, GitHubUserClient,
+    ///     GitHubOAuthStateRegistry, GitHubProviderConfig, GitHubUserClient,
     /// };
     ///
     /// let provider = GitHubProviderConfig {
@@ -142,13 +149,14 @@ impl GitHubOAuthCallbackRouteState {
     ///     oauth_client_id: "client-id".to_owned(),
     ///     oauth_client_secret: "client-secret".to_owned(),
     /// };
-    /// let expected_state = GitHubOAuthState::from_secret("csrf-state")?;
+    /// let csrf_states = GitHubOAuthStateRegistry::new();
+    /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?);
     /// let token_exchanger = GitHubOAuthTokenExchanger::new()?;
     /// let user_client = GitHubUserClient::new()?;
     ///
     /// let route_state = GitHubOAuthCallbackRouteState::with_clients(
     ///     provider,
-    ///     expected_state,
+    ///     csrf_states,
     ///     "https://lfs.example.com/auth/github/callback",
     ///     token_exchanger,
     ///     user_client,
@@ -163,7 +171,7 @@ impl GitHubOAuthCallbackRouteState {
     /// Returns [`ServerError`] when `redirect_url` is not a valid absolute URL.
     pub fn with_clients(
         provider: GitHubProviderConfig,
-        expected_state: GitHubOAuthState,
+        csrf_states: GitHubOAuthStateRegistry,
         redirect_url: impl Into<String>,
         token_exchanger: GitHubOAuthTokenExchanger,
         user_client: GitHubUserClient,
@@ -174,11 +182,24 @@ impl GitHubOAuthCallbackRouteState {
 
         Ok(Self {
             provider,
-            expected_state,
+            csrf_states,
             redirect_url,
             token_exchanger,
             user_client,
         })
+    }
+}
+
+impl fmt::Debug for GitHubOAuthCallbackRouteState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubOAuthCallbackRouteState")
+            .field("provider_id", &self.provider.id)
+            .field("csrf_states", &self.csrf_states)
+            .field("redirect_url", &self.redirect_url)
+            .field("token_exchanger", &self.token_exchanger)
+            .field("user_client", &self.user_client)
+            .finish()
     }
 }
 
@@ -221,7 +242,7 @@ async fn github_oauth_callback_route(
     State(state): State<GitHubOAuthCallbackRouteState>,
     Query(query): Query<GitHubOAuthCallbackQuery>,
 ) -> Result<Json<GitHubOAuthCallbackRouteResponse>, GitHubOAuthCallbackRouteError> {
-    let callback = GitHubOAuthCallback::validate(query, &state.expected_state)?;
+    let callback = GitHubOAuthCallback::validate_registered(query, &state.csrf_states)?;
     let token = state
         .token_exchanger
         .exchange_code(&state.provider, &callback, &state.redirect_url)
@@ -661,6 +682,75 @@ impl fmt::Debug for GitHubOAuthAuthorization {
     }
 }
 
+/// Shared one-time registry for GitHub OAuth CSRF states.
+///
+/// Register each generated [`GitHubOAuthAuthorization::csrf_state`] before
+/// returning the authorization URL. The callback route consumes the matching
+/// state before exchanging the code, which lets one mounted router handle many
+/// concurrent login attempts without accepting replayed callbacks.
+#[derive(Clone, Default)]
+pub struct GitHubOAuthStateRegistry {
+    states: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl GitHubOAuthStateRegistry {
+    /// Creates an empty CSRF state registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a registry preloaded with one CSRF state.
+    #[must_use]
+    pub fn with_state(state: GitHubOAuthState) -> Self {
+        let registry = Self::new();
+        registry.register(state);
+        registry
+    }
+
+    /// Registers a generated CSRF state for one future callback.
+    pub fn register(&self, state: GitHubOAuthState) {
+        self.states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(state.0);
+    }
+
+    fn consume(&self, state: &GitHubOAuthState) -> bool {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matched_state = states
+            .iter()
+            .find(|candidate| constant_time_str_eq(candidate, state.as_str()))
+            .cloned();
+
+        if let Some(matched_state) = matched_state {
+            states.remove(&matched_state);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+impl fmt::Debug for GitHubOAuthStateRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubOAuthStateRegistry")
+            .field("pending_states", &self.len())
+            .finish()
+    }
+}
+
 /// CSRF state generated for a GitHub OAuth authorization attempt.
 #[derive(Clone, Eq, PartialEq)]
 pub struct GitHubOAuthState(String);
@@ -855,6 +945,40 @@ impl GitHubOAuthCallback {
         Ok(Self {
             code: GitHubOAuthCode(code),
             state: GitHubOAuthState(state),
+        })
+    }
+
+    fn validate_registered(
+        query: GitHubOAuthCallbackQuery,
+        csrf_states: &GitHubOAuthStateRegistry,
+    ) -> ServerResult<Self> {
+        let state = GitHubOAuthState(required_callback_param(query.state, "state")?);
+        if !csrf_states.consume(&state) {
+            return Err(ServerError::Unauthorized {
+                reason: "github oauth csrf state mismatch".to_owned(),
+            });
+        }
+
+        if let Some(error) = query.error {
+            let error = sanitize_oauth_diagnostic_value(&validate_required_callback_error(error)?);
+            let description = query
+                .error_description
+                .as_deref()
+                .map(sanitize_oauth_diagnostic_value)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default();
+
+            return Err(ServerError::Unauthorized {
+                reason: format!("github oauth callback failed with {error}{description}"),
+            });
+        }
+
+        let code = required_callback_param(query.code, "code")?;
+
+        Ok(Self {
+            code: GitHubOAuthCode(code),
+            state,
         })
     }
 }
@@ -1461,9 +1585,9 @@ mod tests {
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
         GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization,
         GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteState,
-        GitHubOAuthState, GitHubOAuthTokenExchanger, GitHubUserClient, exchange_github_oauth_code,
-        fetch_authenticated_github_user, github_oauth_authorization_url,
-        github_oauth_callback_router,
+        GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthTokenExchanger, GitHubUserClient,
+        exchange_github_oauth_code, fetch_authenticated_github_user,
+        github_oauth_authorization_url, github_oauth_callback_router,
     };
     use crate::{GitHubProviderConfig, RepositoryProviderError, ServerError};
 
@@ -2081,6 +2205,28 @@ mod tests {
     }
 
     #[test]
+    fn callback_route_state_debug_redacts_provider_secret_and_pending_states() {
+        let csrf_states = GitHubOAuthStateRegistry::with_state(
+            GitHubOAuthState::from_secret("csrf-state").expect("state should parse"),
+        );
+        let route_state = GitHubOAuthCallbackRouteState::with_clients(
+            provider_config(),
+            csrf_states,
+            REDIRECT_URL,
+            GitHubOAuthTokenExchanger::new().expect("token exchanger should build"),
+            GitHubUserClient::new().expect("user client should build"),
+        )
+        .expect("callback route state should build");
+
+        let rendered = format!("{route_state:?}");
+
+        assert!(rendered.contains("GitHubOAuthCallbackRouteState"));
+        assert!(rendered.contains("github-main"));
+        assert!(!rendered.contains("client-secret"));
+        assert!(!rendered.contains("csrf-state"));
+    }
+
+    #[test]
     fn callback_path_matches_authorization_redirect_examples() {
         assert_eq!(GITHUB_OAUTH_CALLBACK_PATH, "/auth/github/callback");
         assert!(REDIRECT_URL.ends_with(GITHUB_OAUTH_CALLBACK_PATH));
@@ -2096,11 +2242,12 @@ mod tests {
         let (api_url, user_server) =
             user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
         let provider = provider_config_with_api_url(api_url);
-        let expected_state =
-            GitHubOAuthState::from_secret("csrf-state").expect("state should parse");
+        let csrf_states = GitHubOAuthStateRegistry::with_state(
+            GitHubOAuthState::from_secret("csrf-state").expect("state should parse"),
+        );
         let route_state = GitHubOAuthCallbackRouteState::with_clients(
             provider,
-            expected_state,
+            csrf_states,
             REDIRECT_URL,
             GitHubOAuthTokenExchanger::with_token_url(token_url)
                 .expect("mock token URL should parse"),
@@ -2143,6 +2290,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_route_accepts_multiple_registered_states_once() {
+        let (token_url, token_server) = token_server(
+            StatusCode::OK,
+            r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user"}"#,
+        )
+        .await;
+        let (api_url, user_server) =
+            user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
+        let csrf_states = GitHubOAuthStateRegistry::new();
+        csrf_states.register(
+            GitHubOAuthState::from_secret("first-state").expect("first state should parse"),
+        );
+        csrf_states.register(
+            GitHubOAuthState::from_secret("second-state").expect("second state should parse"),
+        );
+        let route_state = GitHubOAuthCallbackRouteState::with_clients(
+            provider_config_with_api_url(api_url),
+            csrf_states,
+            REDIRECT_URL,
+            GitHubOAuthTokenExchanger::with_token_url(token_url)
+                .expect("mock token URL should parse"),
+            GitHubUserClient::new().expect("user client should build"),
+        )
+        .expect("callback route state should build");
+        let callback_url = callback_server(route_state).await;
+        let client = reqwest::Client::new();
+
+        for (code, state) in [
+            ("first-code", "first-state"),
+            ("second-code", "second-state"),
+        ] {
+            let response = client
+                .get(format!(
+                    "{callback_url}{GITHUB_OAUTH_CALLBACK_PATH}?code={code}&state={state}"
+                ))
+                .send()
+                .await
+                .expect("callback request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let replay = client
+            .get(format!(
+                "{callback_url}{GITHUB_OAUTH_CALLBACK_PATH}?code=replay-code&state=first-state"
+            ))
+            .send()
+            .await
+            .expect("replay callback request should complete");
+
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(token_server.requests.lock().await.len(), 2);
+        assert_eq!(user_server.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
     async fn callback_route_rejects_csrf_mismatch_before_token_exchange() {
         let (token_url, token_server) = token_server(
             StatusCode::OK,
@@ -2151,11 +2354,12 @@ mod tests {
         .await;
         let (api_url, user_server) =
             user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
-        let expected_state =
-            GitHubOAuthState::from_secret("expected-state").expect("state should parse");
+        let csrf_states = GitHubOAuthStateRegistry::with_state(
+            GitHubOAuthState::from_secret("expected-state").expect("state should parse"),
+        );
         let route_state = GitHubOAuthCallbackRouteState::with_clients(
             provider_config_with_api_url(api_url),
-            expected_state,
+            csrf_states,
             REDIRECT_URL,
             GitHubOAuthTokenExchanger::with_token_url(token_url)
                 .expect("mock token URL should parse"),
