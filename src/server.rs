@@ -66,9 +66,10 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
         options.port,
     )?;
 
-    // Opening metadata during startup keeps route serving coupled to validated,
-    // server-owned state without exposing the SQLite handle to handlers yet.
-    let _metadata = MetadataDatabase::open(config.server.metadata_path.clone())?;
+    // Keep the metadata connection alive for the server lifetime. Handlers do
+    // not use it yet, but startup should fail before listening if server-owned
+    // state cannot be opened or migrated.
+    let metadata_database = MetadataDatabase::open(config.server.metadata_path.clone())?;
     config.server.host = bind.host.clone();
     config.server.port = bind.port;
 
@@ -87,9 +88,11 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
 
     println!("{}", render_server_startup_message(&urls));
 
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .await
-        .map_err(|source| ServerError::Serve { source })
+        .map_err(|source| ServerError::Serve { source });
+    drop(metadata_database);
+    result
 }
 
 /// Builds the Axum router for configured Git LFS paths.
@@ -127,11 +130,18 @@ async fn handle_lfs_request(
             "No configured LFS Cloud repository route matches this path.\n",
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid LFS Cloud route: {error}\n"),
-        )
-            .into_response(),
+        Err(error @ ServerError::InvalidRequest { .. }) => {
+            tracing::debug!(path = uri.path(), %error, "invalid LFS route request");
+            (StatusCode::BAD_REQUEST, "Invalid LFS Cloud route.\n").into_response()
+        }
+        Err(error) => {
+            tracing::error!(path = uri.path(), %error, "failed to resolve LFS route");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "LFS Cloud route handling failed.\n",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -161,7 +171,14 @@ impl ServerBind {
                 message: "server.host must not include leading or trailing whitespace".to_owned(),
             });
         }
+        if !is_valid_bind_host(&host) {
+            return Err(ServerError::InvalidConfiguration {
+                message: "server.host must be an IP address or DNS hostname".to_owned(),
+            });
+        }
         if port == 0 {
+            // User-facing server config should advertise a stable URL instead
+            // of silently choosing an OS-assigned ephemeral listener.
             return Err(ServerError::InvalidConfiguration {
                 message: "server.port must be greater than zero".to_owned(),
             });
@@ -244,9 +261,13 @@ impl LfsRouteResolver {
             .repositories
             .iter()
             .cloned()
-            .map(|repository| ConfiguredLfsRoute {
-                route_path: repository.route_path(),
-                repository,
+            .map(|repository| {
+                let route_path = repository.route_path();
+                ConfiguredLfsRoute {
+                    route_path_with_slash: format!("{route_path}/"),
+                    route_path,
+                    repository,
+                }
             })
             .collect::<Vec<_>>();
 
@@ -270,14 +291,14 @@ impl LfsRouteResolver {
         }
 
         for route in &self.routes {
-            if path == route.route_path {
+            if path == route.route_path || path == route.route_path_with_slash {
                 return Ok(ResolvedLfsRoute {
                     repository: route.repository.clone(),
                     endpoint: LfsRouteEndpoint::Info,
                 });
             }
 
-            let Some(suffix) = path.strip_prefix(&format!("{}/", route.route_path)) else {
+            let Some(suffix) = path.strip_prefix(&route.route_path_with_slash) else {
                 continue;
             };
 
@@ -296,6 +317,7 @@ impl LfsRouteResolver {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConfiguredLfsRoute {
     route_path: String,
+    route_path_with_slash: String,
     repository: RepositoryMapping,
 }
 
@@ -360,6 +382,25 @@ fn advertised_url_host(host: &str) -> String {
     }
 }
 
+fn is_valid_bind_host(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok() || is_valid_dns_hostname(host)
+}
+
+fn is_valid_dns_hostname(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.bytes().enumerate().all(|(index, byte)| {
+                    let is_alphanumeric = byte.is_ascii_alphanumeric();
+                    let is_inner_hyphen = byte == b'-' && index > 0 && index + 1 < label.len();
+                    is_alphanumeric || is_inner_hyphen
+                })
+        })
+}
+
 /// Renders the startup message shown by `lfs-cloud serve`.
 #[must_use]
 pub fn render_server_startup_message(urls: &AdvertisedServerUrls) -> String {
@@ -377,6 +418,8 @@ fn is_unspecified_host(host: &str) -> bool {
 
 fn detect_lan_ipv4() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok()?;
+    // UDP connect only asks the OS which local interface would be used; no
+    // LFS Cloud payload is sent to this public address.
     socket.connect(SocketAddr::from(([8, 8, 8, 8], 80))).ok()?;
 
     match socket.local_addr().ok()?.ip() {
@@ -388,7 +431,8 @@ fn detect_lan_ipv4() -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LfsRouteEndpoint, LfsRouteResolver, advertised_server_urls, render_server_startup_message,
+        LfsRouteEndpoint, LfsRouteResolver, ServerBind, advertised_server_urls,
+        render_server_startup_message,
     };
     use crate::{ServerConfig, ServerError};
 
@@ -427,6 +471,9 @@ repositories:
         let info = resolver
             .resolve_path("/github.com/owner/repo.git/info/lfs")
             .expect("base info route should resolve");
+        let info_with_trailing_slash = resolver
+            .resolve_path("/github.com/owner/repo.git/info/lfs/")
+            .expect("base info route with a trailing slash should resolve");
         let batch = resolver
             .resolve_path("/github.com/owner/repo.git/info/lfs/objects/batch")
             .expect("batch route should resolve");
@@ -438,6 +485,7 @@ repositories:
 
         assert_eq!(info.repository.id, "github-main:owner/repo");
         assert_eq!(info.endpoint, LfsRouteEndpoint::Info);
+        assert_eq!(info_with_trailing_slash.endpoint, LfsRouteEndpoint::Info);
         assert_eq!(batch.endpoint, LfsRouteEndpoint::Batch);
         assert!(
             matches!(object.endpoint, LfsRouteEndpoint::Object { oid } if oid.as_hex() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -492,5 +540,13 @@ repositories:
 
         assert_eq!(loopback.local, "http://[::1]:8080");
         assert_eq!(loopback.network, None);
+    }
+
+    #[test]
+    fn server_bind_rejects_invalid_host_before_listener_bind() {
+        let error = ServerBind::from_config_and_overrides("bad host", 8080, None, None)
+            .expect_err("host with spaces should fail config validation");
+
+        assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
     }
 }
