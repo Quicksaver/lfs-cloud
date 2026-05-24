@@ -207,7 +207,11 @@ impl GitCredentialLookup {
     }
 
     fn credential_query_input(&self) -> String {
-        format!("url={}\n\n", self.lfs_url.as_str())
+        format!(
+            "url={}\nusername={}\n\n",
+            self.lfs_url.as_str(),
+            self.username
+        )
     }
 }
 
@@ -1137,7 +1141,7 @@ printf '%s\n' \
 
         assert_eq!(
             fs::read_to_string(stdin_path).expect("stdin capture should be readable"),
-            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\n\n"
+            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\n\n"
         );
         assert_eq!(credential.lfs_url(), lookup.lfs_url());
         assert_eq!(credential.username(), DEFAULT_GIT_CREDENTIAL_USERNAME);
