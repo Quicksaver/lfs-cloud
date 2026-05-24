@@ -10,6 +10,7 @@ pub mod lfs;
 pub mod logging;
 pub mod providers;
 pub mod server_config;
+pub mod sessions;
 
 pub use error::{
     CliError, CliResult, ErrorCategory, LfsCloudError, LfsCloudResult, MigrationError,
@@ -40,6 +41,10 @@ pub use providers::{
 pub use server_config::{
     DEFAULT_CONFIG_PATH, GitHubProviderConfig, GoogleDriveStorageConfig, RepositoryMapping,
     RepositoryProviderConfig, ServerConfig, ServerSettings, StorageProviderConfig,
+};
+pub use sessions::{
+    DEFAULT_LFS_SESSION_TTL, IssuedLfsSession, LfsSessionMetadata, LfsSessionToken,
+    LocalLfsSessionStore,
 };
 
 /// Returns the placeholder message shown by the scaffold CLI.

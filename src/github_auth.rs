@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    GitHubProviderConfig, RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerError,
-    ServerResult,
+    GitHubProviderConfig, IssuedLfsSession, LocalLfsSessionStore, RepositoryProviderError,
+    RepositoryUser, SanitizedMessage, ServerError, ServerResult,
 };
 
 const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
@@ -79,6 +79,7 @@ pub struct GitHubOAuthCallbackRouteState {
     redirect_url: String,
     token_exchanger: GitHubOAuthTokenExchanger,
     user_client: GitHubUserClient,
+    session_store: LocalLfsSessionStore,
 }
 
 impl GitHubOAuthCallbackRouteState {
@@ -178,6 +179,33 @@ impl GitHubOAuthCallbackRouteState {
         token_exchanger: GitHubOAuthTokenExchanger,
         user_client: GitHubUserClient,
     ) -> ServerResult<Self> {
+        Self::with_clients_and_session_store(
+            provider,
+            csrf_states,
+            redirect_url,
+            token_exchanger,
+            user_client,
+            LocalLfsSessionStore::new(),
+        )
+    }
+
+    /// Creates callback route state with explicit clients and session storage.
+    ///
+    /// Tests and future server wiring can inject a shared store so successful
+    /// callbacks make the issued LFS Cloud token immediately verifiable by
+    /// request-auth middleware.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when `redirect_url` is not a valid absolute URL.
+    pub fn with_clients_and_session_store(
+        provider: GitHubProviderConfig,
+        csrf_states: GitHubOAuthStateRegistry,
+        redirect_url: impl Into<String>,
+        token_exchanger: GitHubOAuthTokenExchanger,
+        user_client: GitHubUserClient,
+        session_store: LocalLfsSessionStore,
+    ) -> ServerResult<Self> {
         let redirect_url = redirect_url.into();
         RedirectUrl::new(redirect_url.clone())
             .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
@@ -188,6 +216,7 @@ impl GitHubOAuthCallbackRouteState {
             redirect_url,
             token_exchanger,
             user_client,
+            session_store,
         })
     }
 }
@@ -201,12 +230,13 @@ impl fmt::Debug for GitHubOAuthCallbackRouteState {
             .field("redirect_url", &self.redirect_url)
             .field("token_exchanger", &"<redacted>")
             .field("user_client", &"<redacted>")
+            .field("session_store", &self.session_store)
             .finish()
     }
 }
 
 /// Response returned by the GitHub OAuth callback route.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct GitHubOAuthCallbackRouteResponse {
     /// Configured repository provider that authenticated the user.
     pub provider_id: String,
@@ -216,6 +246,10 @@ pub struct GitHubOAuthCallbackRouteResponse {
     pub stable_id: Option<String>,
     /// OAuth scopes granted by GitHub.
     pub granted_scopes: Vec<String>,
+    /// Opaque LFS Cloud token to store for the configured Git LFS URL.
+    pub lfs_token: String,
+    /// Expiration time for `lfs_token`, as seconds since the Unix epoch.
+    pub lfs_token_expires_at_unix_seconds: u64,
 }
 
 #[derive(Serialize)]
@@ -225,13 +259,37 @@ struct GitHubOAuthCallbackRouteErrorBody {
 }
 
 impl GitHubOAuthCallbackRouteResponse {
-    fn new(provider: &GitHubProviderConfig, user: RepositoryUser, scopes: Vec<String>) -> Self {
+    fn new(
+        provider: &GitHubProviderConfig,
+        user: RepositoryUser,
+        scopes: Vec<String>,
+        session: IssuedLfsSession,
+    ) -> Self {
         Self {
             provider_id: provider.id.clone(),
             login: user.login,
             stable_id: user.stable_id,
             granted_scopes: scopes,
+            lfs_token: session.token.as_str().to_owned(),
+            lfs_token_expires_at_unix_seconds: session.metadata.expires_at_unix_seconds(),
         }
+    }
+}
+
+impl fmt::Debug for GitHubOAuthCallbackRouteResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubOAuthCallbackRouteResponse")
+            .field("provider_id", &self.provider_id)
+            .field("login", &self.login)
+            .field("stable_id", &self.stable_id)
+            .field("granted_scopes", &self.granted_scopes)
+            .field("lfs_token", &"<redacted>")
+            .field(
+                "lfs_token_expires_at_unix_seconds",
+                &self.lfs_token_expires_at_unix_seconds,
+            )
+            .finish()
     }
 }
 
@@ -259,7 +317,9 @@ async fn github_oauth_callback_route(
         .user_client
         .fetch_authenticated_user(&state.provider, &token.access_token)
         .await?;
-    let response = GitHubOAuthCallbackRouteResponse::new(&state.provider, user, token.scopes);
+    let scopes = token.scopes;
+    let session = state.session_store.issue_session(&user, scopes.clone())?;
+    let response = GitHubOAuthCallbackRouteResponse::new(&state.provider, user, scopes, session);
 
     Ok(Json(response))
 }
@@ -1646,7 +1706,10 @@ mod tests {
         fetch_authenticated_github_user, github_oauth_authorization_url,
         github_oauth_callback_router,
     };
-    use crate::{GitHubProviderConfig, RepositoryProviderError, ServerError};
+    use crate::{
+        GitHubProviderConfig, LfsSessionToken, LocalLfsSessionStore, RepositoryProviderError,
+        ServerError,
+    };
 
     const REDIRECT_URL: &str = "http://127.0.0.1:8080/auth/github/callback";
 
@@ -2331,7 +2394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_route_exchanges_code_and_returns_user_without_token() {
+    async fn callback_route_exchanges_code_and_issues_lfs_token_without_github_token() {
         let (token_url, token_server) = token_server(
             StatusCode::OK,
             r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user,repo"}"#,
@@ -2343,13 +2406,15 @@ mod tests {
         let csrf_states = GitHubOAuthStateRegistry::with_state(
             GitHubOAuthState::from_secret("csrf-state").expect("state should parse"),
         );
-        let route_state = GitHubOAuthCallbackRouteState::with_clients(
+        let session_store = LocalLfsSessionStore::new();
+        let route_state = GitHubOAuthCallbackRouteState::with_clients_and_session_store(
             provider,
             csrf_states,
             REDIRECT_URL,
             GitHubOAuthTokenExchanger::with_token_url(token_url)
                 .expect("mock token URL should parse"),
             GitHubUserClient::new().expect("user client should build"),
+            session_store.clone(),
         )
         .expect("callback route state should build");
         let callback_server = callback_server(route_state).await;
@@ -2376,6 +2441,24 @@ mod tests {
         assert_eq!(
             body["granted_scopes"],
             serde_json::json!(["read:user", "repo"])
+        );
+        let lfs_token = body["lfs_token"]
+            .as_str()
+            .expect("callback should return local lfs token");
+        assert!(!lfs_token.is_empty());
+        let token = LfsSessionToken::from_secret(lfs_token).expect("lfs token should validate");
+        let metadata = session_store
+            .verify(&token)
+            .expect("callback should store issued lfs session metadata");
+        assert_eq!(metadata.provider_id, "github-main");
+        assert_eq!(metadata.login, "octocat");
+        assert_eq!(metadata.stable_id.as_deref(), Some("42"));
+        assert_eq!(metadata.granted_scopes, vec!["read:user", "repo"]);
+        assert!(
+            body["lfs_token_expires_at_unix_seconds"]
+                .as_u64()
+                .expect("expiration should be a timestamp")
+                >= metadata.expires_at_unix_seconds()
         );
 
         let token_requests = token_server.requests.lock().await;
