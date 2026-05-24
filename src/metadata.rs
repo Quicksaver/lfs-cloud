@@ -19,6 +19,24 @@ use crate::{LfsObject, LfsObjectSize, LfsOid, RepositoryUser, ServerError, Serve
 pub const METADATA_SCHEMA_VERSION: u32 = 2;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const OBJECT_RECORD_BY_IDENTITY_SQL: &str = "SELECT
+        id,
+        repo_id,
+        storage_provider_id,
+        oid,
+        size_bytes,
+        backend_id,
+        created_by_provider_id,
+        created_by_login,
+        created_by_stable_id,
+        verification_status,
+        created_at_unix_seconds,
+        last_verified_at_unix_seconds
+     FROM objects
+     WHERE repo_id = ?1
+       AND storage_provider_id = ?2
+       AND oid = ?3
+       AND size_bytes = ?4";
 
 const INITIAL_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -377,39 +395,15 @@ impl MetadataDatabase {
         object: &LfsObject,
     ) -> ServerResult<Option<MetadataObjectRecord>> {
         let size_bytes = sqlite_size_bytes(object)?;
-        self.lock_connection()?
-            .query_row(
-                "SELECT
-                    id,
-                    repo_id,
-                    storage_provider_id,
-                    oid,
-                    size_bytes,
-                    backend_id,
-                    created_by_provider_id,
-                    created_by_login,
-                    created_by_stable_id,
-                    verification_status,
-                    created_at_unix_seconds,
-                    last_verified_at_unix_seconds
-                 FROM objects
-                 WHERE repo_id = ?1
-                   AND storage_provider_id = ?2
-                   AND oid = ?3
-                   AND size_bytes = ?4",
-                params![
-                    repo_id,
-                    storage_provider_id,
-                    object.oid.as_hex(),
-                    size_bytes
-                ],
-                metadata_object_record_from_row,
-            )
-            .optional()
-            .map_err(|source| ServerError::MetadataQuery {
-                path: self.path.clone(),
-                source,
-            })
+        let connection = self.lock_connection()?;
+        query_optional_object_record(
+            &connection,
+            repo_id,
+            storage_provider_id,
+            object,
+            size_bytes,
+            &self.path,
+        )
     }
 
     /// Inserts or repairs object metadata after a successful verified upload.
@@ -431,9 +425,11 @@ impl MetadataDatabase {
         created_by: &RepositoryUser,
     ) -> ServerResult<MetadataObjectRecord> {
         let size_bytes = sqlite_size_bytes(object)?;
+        let verified_status = MetadataObjectVerificationStatus::Verified.as_database_str();
         let connection = self.lock_connection()?;
+        // Keep the same locked connection through the write and RETURNING decode.
         connection
-            .execute(
+            .query_row(
                 "INSERT INTO objects(
                     repo_id,
                     storage_provider_id,
@@ -445,15 +441,28 @@ impl MetadataDatabase {
                     created_by_stable_id,
                     verification_status,
                     last_verified_at_unix_seconds
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'verified', unixepoch())
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch())
                 ON CONFLICT(repo_id, storage_provider_id, oid, size_bytes)
                 DO UPDATE SET
                     backend_id = excluded.backend_id,
                     created_by_provider_id = excluded.created_by_provider_id,
                     created_by_login = excluded.created_by_login,
                     created_by_stable_id = excluded.created_by_stable_id,
-                    verification_status = 'verified',
-                    last_verified_at_unix_seconds = excluded.last_verified_at_unix_seconds",
+                    verification_status = excluded.verification_status,
+                    last_verified_at_unix_seconds = excluded.last_verified_at_unix_seconds
+                RETURNING
+                    id,
+                    repo_id,
+                    storage_provider_id,
+                    oid,
+                    size_bytes,
+                    backend_id,
+                    created_by_provider_id,
+                    created_by_login,
+                    created_by_stable_id,
+                    verification_status,
+                    created_at_unix_seconds,
+                    last_verified_at_unix_seconds",
                 params![
                     repo_id,
                     storage_provider_id,
@@ -463,20 +472,14 @@ impl MetadataDatabase {
                     created_by.provider_id.as_str(),
                     created_by.login.as_str(),
                     created_by.stable_id.as_deref(),
+                    verified_status,
                 ],
+                metadata_object_record_from_row,
             )
-            .map_err(|source| ServerError::MetadataQuery {
+            .map_err(|source| ServerError::MetadataOperation {
                 path: self.path.clone(),
                 source,
-            })?;
-        query_object_record(
-            &connection,
-            repo_id,
-            storage_provider_id,
-            object,
-            size_bytes,
-            &self.path,
-        )
+            })
     }
 
     fn configure_connection(&self) -> ServerResult<()> {
@@ -521,34 +524,17 @@ fn sqlite_size_bytes(object: &LfsObject) -> ServerResult<i64> {
     })
 }
 
-fn query_object_record(
+fn query_optional_object_record(
     connection: &Connection,
     repo_id: &str,
     storage_provider_id: &str,
     object: &LfsObject,
     size_bytes: i64,
     path: &Path,
-) -> ServerResult<MetadataObjectRecord> {
+) -> ServerResult<Option<MetadataObjectRecord>> {
     connection
         .query_row(
-            "SELECT
-                id,
-                repo_id,
-                storage_provider_id,
-                oid,
-                size_bytes,
-                backend_id,
-                created_by_provider_id,
-                created_by_login,
-                created_by_stable_id,
-                verification_status,
-                created_at_unix_seconds,
-                last_verified_at_unix_seconds
-             FROM objects
-             WHERE repo_id = ?1
-               AND storage_provider_id = ?2
-               AND oid = ?3
-               AND size_bytes = ?4",
+            OBJECT_RECORD_BY_IDENTITY_SQL,
             params![
                 repo_id,
                 storage_provider_id,
@@ -557,23 +543,27 @@ fn query_object_record(
             ],
             metadata_object_record_from_row,
         )
-        .map_err(|source| ServerError::MetadataQuery {
+        .optional()
+        .map_err(|source| ServerError::MetadataOperation {
             path: path.to_path_buf(),
             source,
         })
 }
 
 fn metadata_object_record_from_row(row: &Row<'_>) -> rusqlite::Result<MetadataObjectRecord> {
+    let oid_column_index = row.as_ref().column_index("oid")?;
+    let size_column_index = row.as_ref().column_index("size_bytes")?;
+    let verification_status_column_index = row.as_ref().column_index("verification_status")?;
     let oid_text = row.get::<_, String>("oid")?;
     let oid = LfsOid::new(&oid_text).map_err(|source| {
-        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(source))
+        rusqlite::Error::FromSqlConversionFailure(oid_column_index, Type::Text, Box::new(source))
     })?;
     let size_bytes = row.get::<_, i64>("size_bytes")?;
     let size = u64::try_from(size_bytes)
         .map(LfsObjectSize::new)
         .map_err(|_| {
             rusqlite::Error::FromSqlConversionFailure(
-                4,
+                size_column_index,
                 Type::Integer,
                 Box::new(MetadataDecodeError::InvalidObjectSize(size_bytes)),
             )
@@ -582,7 +572,13 @@ fn metadata_object_record_from_row(row: &Row<'_>) -> rusqlite::Result<MetadataOb
     let verification_status = MetadataObjectVerificationStatus::from_database_str(
         &verification_status_text,
     )
-    .map_err(|source| rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(source)))?;
+    .map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(
+            verification_status_column_index,
+            Type::Text,
+            Box::new(source),
+        )
+    })?;
 
     Ok(MetadataObjectRecord {
         id: row.get("id")?,
@@ -614,7 +610,7 @@ impl std::fmt::Debug for MetadataDatabase {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::{LfsObject, LfsObjectSize, LfsOid, RepositoryUser};
+    use crate::{LfsObject, LfsObjectSize, LfsOid, RepositoryUser, ServerError};
 
     use super::{METADATA_SCHEMA_VERSION, MetadataDatabase, MetadataObjectVerificationStatus};
 
@@ -1063,6 +1059,68 @@ PRAGMA user_version = 1;
         );
         assert!(repaired.last_verified_at_unix_seconds.is_some());
         assert_eq!(object_row_count(&database), 1);
+    }
+
+    #[test]
+    fn object_lookup_decodes_failed_verification_status() {
+        let database = MetadataDatabase::open_in_memory().expect("metadata DB should open");
+        {
+            let connection = database
+                .connection
+                .lock()
+                .expect("metadata connection should lock");
+            insert_storage_provider_and_repository_mapping(&connection);
+            insert_object_without_verification_timestamp(&connection, '1', "failed");
+        }
+
+        let record = database
+            .lookup_object(
+                "github-main:owner/repo",
+                "drive-user-a",
+                &lfs_object('1', 42),
+            )
+            .expect("failed object lookup should decode")
+            .expect("failed object should exist");
+
+        assert_eq!(
+            record.verification_status,
+            MetadataObjectVerificationStatus::Failed
+        );
+    }
+
+    #[test]
+    fn object_lookup_rejects_invalid_verification_status() {
+        let database = MetadataDatabase::open_in_memory().expect("metadata DB should open");
+        {
+            let connection = database
+                .connection
+                .lock()
+                .expect("metadata connection should lock");
+            insert_storage_provider_and_repository_mapping(&connection);
+            connection
+                .pragma_update(None, "ignore_check_constraints", "ON")
+                .expect("constraint checks should be disabled for corrupt fixture");
+            insert_object_without_verification_timestamp(&connection, '2', "corrupt");
+            connection
+                .pragma_update(None, "ignore_check_constraints", "OFF")
+                .expect("constraint checks should be restored");
+        }
+
+        let error = database
+            .lookup_object(
+                "github-main:owner/repo",
+                "drive-user-a",
+                &lfs_object('2', 42),
+            )
+            .expect_err("invalid status should fail decode");
+
+        match error {
+            ServerError::MetadataOperation { source, .. } => match source {
+                rusqlite::Error::FromSqlConversionFailure(_, rusqlite::types::Type::Text, _) => {}
+                other => panic!("expected status conversion failure, got {other:?}"),
+            },
+            other => panic!("expected metadata operation error, got {other:?}"),
+        }
     }
 
     #[test]

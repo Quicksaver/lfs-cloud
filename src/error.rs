@@ -255,8 +255,8 @@ pub enum ServerError {
     },
 
     /// The server could not query or update metadata database records.
-    #[error("failed to query metadata database {}: {source}", path.display())]
-    MetadataQuery {
+    #[error("failed to operate on metadata database {}: {source}", path.display())]
+    MetadataOperation {
         /// SQLite database path whose records were being queried or updated.
         path: PathBuf,
         /// Underlying SQLite failure.

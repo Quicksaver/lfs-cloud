@@ -380,7 +380,7 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
             | ServerError::MetadataOpen { .. }
             | ServerError::MetadataConfigure { .. }
             | ServerError::MetadataMigration { .. }
-            | ServerError::MetadataQuery { .. }
+            | ServerError::MetadataOperation { .. }
             | ServerError::MetadataConnectionPoisoned { .. }
             | ServerError::RouteNotConfigured { .. }
             | ServerError::Internal { .. } => (
