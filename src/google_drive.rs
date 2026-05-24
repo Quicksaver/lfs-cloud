@@ -430,7 +430,8 @@ impl GoogleDriveRootValidator {
     /// # Errors
     ///
     /// Returns [`StorageError`] if `api_base_url` is not an absolute HTTP(S)
-    /// URL without credentials, query, or fragment components.
+    /// URL without credentials, query, or fragment components. HTTP is accepted
+    /// only for loopback hosts used by local tests and development tools.
     pub fn with_client_and_api_base_url(
         client: Client,
         api_base_url: impl AsRef<str>,
@@ -774,6 +775,15 @@ fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
             status: None,
             message: SanitizedMessage::new(
                 "Google Drive API base URL must be an absolute http or https URL",
+            ),
+        });
+    }
+    if url.scheme() == "http" && !is_loopback_http_url(&url) {
+        return Err(StorageError::Upstream {
+            provider: "google_drive".to_owned(),
+            status: None,
+            message: SanitizedMessage::new(
+                "Google Drive API base URL must use https unless it targets a loopback host",
             ),
         });
     }
@@ -1291,6 +1301,27 @@ mod tests {
         .expect("loopback HTTP token URI should be accepted for local testing");
 
         assert_eq!(credential.token_url().as_str(), "http://localhost/token");
+    }
+
+    #[test]
+    fn root_validator_requires_https_api_base_except_loopback() {
+        let error = GoogleDriveRootValidator::with_client_and_api_base_url(
+            reqwest::Client::new(),
+            "http://drive.example.com/drive/v3",
+        )
+        .expect_err("non-loopback HTTP API base should fail");
+
+        assert!(error.to_string().contains(
+            "Google Drive API base URL must use https unless it targets a loopback host"
+        ));
+
+        let validator = GoogleDriveRootValidator::with_client_and_api_base_url(
+            reqwest::Client::new(),
+            "http://localhost/drive/v3",
+        )
+        .expect("loopback HTTP API base should be accepted for local testing");
+
+        assert_eq!(validator.api_base_url.as_str(), "http://localhost/drive/v3");
     }
 
     #[test]
