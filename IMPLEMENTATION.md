@@ -1120,9 +1120,11 @@ Defer:
 > best-effort LAN URLs, resolves configured repository LFS paths, and requires
 > a valid local LFS Cloud session token before parsing Git LFS batch requests.
 > Download and upload batch operations now enforce GitHub repository read/write
-> authorization before returning Git LFS JSON with per-object errors until
-> storage availability lookup and transfer handling are wired. Upload and
-> download handlers remain planned.
+> authorization before returning Git LFS JSON with per-object errors. LFS route,
+> authentication, method, body-size, parse, and authorization failures now use
+> Git LFS JSON error payloads with matching HTTP statuses. Upload and download
+> handlers remain planned until storage availability lookup and transfer
+> handling are wired.
 
 ### Progress Summary
 
@@ -1133,12 +1135,12 @@ Defer:
 | 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
-| 5. LFS Server Protocol                   | 12          | 8      | 4         |
+| 5. LFS Server Protocol                   | 12          | 9      | 3         |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **54** | **45**    |
+| **Total**                                | **99**      | **55** | **44**    |
 
 ### Legend
 
@@ -1262,7 +1264,7 @@ Defer:
 
 - [ ] [M] Implement upload endpoint with temp-file staging, SHA-256 hashing, and size verification.
 - [ ] [M] Implement download endpoint streaming bytes from Google Drive through `lfs-cloud`.
-- [ ] [T] Return Git LFS-compatible error payloads and HTTP status codes.
+- [x] [T] Return Git LFS-compatible error payloads and HTTP status codes.
 - [ ] [T] Add request size, temp-space, and timeout guardrails with clear errors.
 
 ### Phase 6: CLI Commands

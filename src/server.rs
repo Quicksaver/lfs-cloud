@@ -20,7 +20,7 @@ use axum::{
     extract::{FromRequest, OriginalUri, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+        header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
     },
     response::{IntoResponse, Response},
 };
@@ -342,29 +342,26 @@ async fn handle_lfs_request(
             }
             Err(error) => {
                 tracing::error!(path = uri.path(), %error, "failed to authenticate LFS route request");
-                (
+                git_lfs_json_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "LFS Cloud authentication failed.\n",
+                    "LFS Cloud authentication failed",
                 )
-                    .into_response()
             }
         },
-        Err(ServerError::RouteNotConfigured { .. }) => (
+        Err(ServerError::RouteNotConfigured { .. }) => git_lfs_json_error_response(
             StatusCode::NOT_FOUND,
-            "No configured LFS Cloud repository route matches this path.\n",
-        )
-            .into_response(),
+            "No configured LFS Cloud repository route matches this path",
+        ),
         Err(error @ ServerError::InvalidRequest { .. }) => {
             tracing::debug!(path = uri.path(), %error, "invalid LFS route request");
-            (StatusCode::BAD_REQUEST, "Invalid LFS Cloud route.\n").into_response()
+            git_lfs_json_error_response(StatusCode::BAD_REQUEST, "Invalid LFS Cloud route")
         }
         Err(error) => {
             tracing::error!(path = uri.path(), %error, "failed to resolve LFS route");
-            (
+            git_lfs_json_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "LFS Cloud route handling failed.\n",
+                "LFS Cloud route handling failed",
             )
-                .into_response()
         }
     }
 }
@@ -380,11 +377,10 @@ async fn handle_authenticated_lfs_request(
         LfsRouteEndpoint::Batch => {
             handle_lfs_batch_request(route.repository, session, method, request, state).await
         }
-        LfsRouteEndpoint::Info | LfsRouteEndpoint::Object { .. } => (
+        LfsRouteEndpoint::Info | LfsRouteEndpoint::Object { .. } => git_lfs_json_error_response(
             StatusCode::NOT_IMPLEMENTED,
-            "Git LFS endpoint routing is configured; protocol handling is not implemented yet.\n",
-        )
-            .into_response(),
+            "Git LFS endpoint routing is configured; transfer handling is not implemented yet",
+        ),
     }
 }
 
@@ -396,11 +392,14 @@ async fn handle_lfs_batch_request(
     state: &LfsServerState,
 ) -> Response {
     if method != Method::POST {
-        return (
+        let mut response = git_lfs_json_error_response(
             StatusCode::METHOD_NOT_ALLOWED,
-            "Git LFS batch endpoint requires POST.\n",
-        )
-            .into_response();
+            "Git LFS batch endpoint requires POST",
+        );
+        response
+            .headers_mut()
+            .insert(ALLOW, HeaderValue::from_static("POST"));
+        return response;
     }
 
     match Bytes::from_request(request, &()).await {
@@ -417,7 +416,10 @@ async fn handle_lfs_batch_request(
             }
             Err(error) => {
                 tracing::debug!(repo_id = repository.id.as_str(), %error, "invalid Git LFS batch request");
-                (StatusCode::BAD_REQUEST, "Invalid Git LFS batch request.\n").into_response()
+                git_lfs_json_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid Git LFS batch request",
+                )
             }
         },
         Err(error) => {
@@ -426,7 +428,7 @@ async fn handle_lfs_batch_request(
                 %error,
                 "failed to read Git LFS batch request body"
             );
-            error.into_response()
+            git_lfs_body_error_response(error.into_response())
         }
     }
 }
@@ -533,11 +535,22 @@ fn git_lfs_json_error_response(status: StatusCode, message: impl Into<String>) -
     (
         status,
         [(CONTENT_TYPE, GIT_LFS_JSON_CONTENT_TYPE)],
-        Json(LfsBatchErrorResponse {
+        Json(LfsErrorResponse {
             message: message.into(),
         }),
     )
         .into_response()
+}
+
+fn git_lfs_body_error_response(rejection_response: Response) -> Response {
+    let status = rejection_response.status();
+    let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        "Git LFS request body exceeds the configured limit"
+    } else {
+        "Git LFS request body could not be read"
+    };
+
+    git_lfs_json_error_response(status, message)
 }
 
 fn git_lfs_authorization_error_response(error: ServerError) -> Response {
@@ -593,7 +606,7 @@ fn git_lfs_authorization_error_response(error: ServerError) -> Response {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct LfsBatchErrorResponse {
+struct LfsErrorResponse {
     message: String,
 }
 
@@ -686,7 +699,10 @@ fn authentication_required_response() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         headers,
-        "LFS Cloud authentication required.\n",
+        [(CONTENT_TYPE, GIT_LFS_JSON_CONTENT_TYPE)],
+        Json(LfsErrorResponse {
+            message: "LFS Cloud authentication required".to_owned(),
+        }),
     )
         .into_response()
 }
@@ -987,7 +1003,7 @@ mod tests {
         extract::Path,
         http::{
             HeaderMap, HeaderValue, Method, Request, StatusCode,
-            header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+            header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
         },
         routing::get,
     };
@@ -1324,8 +1340,24 @@ repositories:
             .collect::<Vec<_>>();
         assert!(challenge_values.contains(&LFS_AUTH_CHALLENGE));
         assert!(challenge_values.contains(&"Bearer realm=\"lfs-cloud\""));
-        assert_eq!(unknown_route.status(), StatusCode::NOT_FOUND);
-        assert_eq!(authenticated.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_lfs_json_error(
+            unauthenticated,
+            StatusCode::UNAUTHORIZED,
+            "LFS Cloud authentication required",
+        )
+        .await;
+        assert_lfs_json_error(
+            unknown_route,
+            StatusCode::NOT_FOUND,
+            "No configured LFS Cloud repository route matches this path",
+        )
+        .await;
+        assert_lfs_json_error(
+            authenticated,
+            StatusCode::NOT_IMPLEMENTED,
+            "Git LFS endpoint routing is configured; transfer handling is not implemented yet",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1606,8 +1638,18 @@ repositories:
             .await
             .expect("router should respond");
 
-        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_lfs_json_error(
+            unauthenticated,
+            StatusCode::UNAUTHORIZED,
+            "LFS Cloud authentication required",
+        )
+        .await;
+        assert_lfs_json_error(
+            invalid,
+            StatusCode::BAD_REQUEST,
+            "Invalid Git LFS batch request",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1626,7 +1668,12 @@ repositories:
             .await
             .expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_lfs_json_error(
+            response,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Git LFS request body exceeds the configured limit",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1645,7 +1692,12 @@ repositories:
             .await
             .expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_lfs_json_error(
+            response,
+            StatusCode::UNAUTHORIZED,
+            "LFS Cloud authentication required",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1663,7 +1715,19 @@ repositories:
             .await
             .expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response
+                .headers()
+                .get(ALLOW)
+                .and_then(|value| value.to_str().ok()),
+            Some("POST")
+        );
+        assert_lfs_json_error(
+            response,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Git LFS batch endpoint requires POST",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1715,6 +1779,31 @@ repositories:
         let error = server_router_with_sessions(config, LocalLfsSessionStore::new())
             .expect_err("router should reject ambiguous GitHub providers");
         assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
+    }
+
+    async fn assert_lfs_json_error(
+        response: axum::response::Response,
+        status: StatusCode,
+        message: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.git-lfs+json")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("response should be JSON");
+
+        assert_eq!(
+            body.get("message").and_then(|value| value.as_str()),
+            Some(message)
+        );
     }
 
     fn issued_session_token(ttl: Duration) -> (LocalLfsSessionStore, String) {
