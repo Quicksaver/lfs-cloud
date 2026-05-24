@@ -507,6 +507,7 @@ impl GitHubUserClient {
             .get(endpoint)
             .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
             .bearer_auth(token.as_str())
+            .timeout(GITHUB_USER_FETCH_TIMEOUT)
             .send()
             .await
             .map_err(|source| github_user_request_error(provider, None, source))?;
@@ -607,6 +608,7 @@ impl GitHubRepositoryPermissionClient {
             .get(endpoint)
             .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
             .bearer_auth(token.as_str())
+            .timeout(GITHUB_PERMISSION_CHECK_TIMEOUT)
             .send()
             .await
             .map_err(|source| github_permission_request_error(provider, None, source))?;
@@ -646,6 +648,10 @@ impl GitHubRepositoryPermissionClient {
                 });
             }
 
+            if status == StatusCode::FORBIDDEN {
+                return Err(github_permission_denied(provider, repository, required));
+            }
+
             return Err(github_permission_status_error(
                 provider, status, &body, token,
             ));
@@ -655,8 +661,21 @@ impl GitHubRepositoryPermissionClient {
             .json::<GitHubRepositoryPermissionResponse>()
             .await
             .map_err(|source| github_permission_request_error(provider, Some(status), source))?;
-        let Some(granted) = response.base_permission() else {
-            return Err(github_permission_denied(provider, repository, required));
+        let granted = match response.base_permission() {
+            GitHubBasePermission::Granted(granted) => granted,
+            GitHubBasePermission::None => {
+                return Err(github_permission_denied(provider, repository, required));
+            }
+            GitHubBasePermission::Unknown(permission) => {
+                tracing::warn!(
+                    provider = %provider.id,
+                    owner = %repository.owner,
+                    repo = %repository.name,
+                    permission = %sanitize_oauth_diagnostic_value(&permission),
+                    "github repository permission response contained an unknown base permission"
+                );
+                return Err(github_permission_denied(provider, repository, required));
+            }
         };
 
         if !github_permission_satisfies(granted, required) {
@@ -1354,14 +1373,20 @@ struct GitHubRepositoryPermissionResponse {
     permission: Option<String>,
 }
 
+enum GitHubBasePermission {
+    Granted(RepositoryPermission),
+    None,
+    Unknown(String),
+}
+
 impl GitHubRepositoryPermissionResponse {
-    fn base_permission(&self) -> Option<RepositoryPermission> {
+    fn base_permission(&self) -> GitHubBasePermission {
         match self.permission.as_deref() {
-            Some("read") => Some(RepositoryPermission::Read),
-            Some("write") => Some(RepositoryPermission::Write),
-            Some("admin") => Some(RepositoryPermission::Admin),
-            Some("none") => None,
-            _ => None,
+            Some("read") => GitHubBasePermission::Granted(RepositoryPermission::Read),
+            Some("write") => GitHubBasePermission::Granted(RepositoryPermission::Write),
+            Some("admin") => GitHubBasePermission::Granted(RepositoryPermission::Admin),
+            Some("none") | None => GitHubBasePermission::None,
+            Some(permission) => GitHubBasePermission::Unknown(permission.to_owned()),
         }
     }
 }
@@ -1706,27 +1731,12 @@ fn append_github_api_path<'a>(
     endpoint: &mut Url,
     segments: impl IntoIterator<Item = &'a str>,
 ) -> ServerResult<()> {
-    let base_path = endpoint
-        .path_segments()
-        .map(|segments| {
-            segments
-                .filter(|segment| !segment.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let mut path = endpoint
         .path_segments_mut()
         .map_err(|_| ServerError::InvalidConfiguration {
             message: "github api_url cannot be used as a base URL".to_owned(),
         })?;
-    path.clear();
-    for segment in base_path {
-        path.push(&segment);
-    }
-    for segment in segments {
-        path.push(segment);
-    }
+    path.pop_if_empty().extend(segments);
 
     Ok(())
 }
@@ -1750,6 +1760,19 @@ fn validate_github_permission_request(
                 "user provider id {} does not match github provider {}",
                 user.provider_id, provider.id
             ),
+        });
+    }
+    validate_github_permission_path_segment(&repository.owner, "repository owner")?;
+    validate_github_permission_path_segment(&repository.name, "repository name")?;
+    validate_github_permission_path_segment(&user.login, "repository user login")?;
+
+    Ok(())
+}
+
+fn validate_github_permission_path_segment(value: &str, label: &str) -> ServerResult<()> {
+    if value.trim().is_empty() {
+        return Err(ServerError::InvalidRequest {
+            message: format!("github permission {label} must not be blank"),
         });
     }
 
@@ -1807,10 +1830,7 @@ fn build_github_oauth_http_client() -> Result<Client, reqwest::Error> {
 }
 
 fn build_github_api_http_client() -> Result<Client, reqwest::Error> {
-    Client::builder()
-        .timeout(GITHUB_USER_FETCH_TIMEOUT.max(GITHUB_PERMISSION_CHECK_TIMEOUT))
-        .user_agent(GITHUB_USER_AGENT)
-        .build()
+    Client::builder().user_agent(GITHUB_USER_AGENT).build()
 }
 
 fn required_callback_param(value: Option<String>, name: &str) -> ServerResult<String> {
@@ -2736,6 +2756,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_client_maps_unauthorized_to_authentication_required() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::UNAUTHORIZED,
+            r#"{"message":"Bad credentials gho_secret"}"#,
+            None,
+        )
+        .await;
+        let error = mocked_permission_check(
+            api_url,
+            "org-name",
+            "private-repo",
+            RepositoryPermission::Read,
+        )
+        .await
+        .expect_err("unauthorized permission check should require authentication");
+        let rendered = error.to_string();
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::AuthenticationRequired { .. }
+            }
+        ));
+        assert!(!rendered.contains("gho_secret"));
+    }
+
+    #[tokio::test]
+    async fn permission_client_maps_forbidden_scope_failure_to_authentication_required() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::FORBIDDEN,
+            r#"{"message":"Resource not accessible by personal access token gho_secret"}"#,
+            None,
+        )
+        .await;
+        let error = mocked_permission_check(
+            api_url,
+            "org-name",
+            "private-repo",
+            RepositoryPermission::Read,
+        )
+        .await
+        .expect_err("auth-related forbidden response should require authentication");
+        let rendered = error.to_string();
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::AuthenticationRequired { .. }
+            }
+        ));
+        assert!(!rendered.contains("gho_secret"));
+    }
+
+    #[tokio::test]
+    async fn permission_client_denies_generic_forbidden_response() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::FORBIDDEN,
+            r#"{"message":"policy rejected gho_secret"}"#,
+            None,
+        )
+        .await;
+        let error = mocked_permission_check(
+            api_url,
+            "org-name",
+            "private-repo",
+            RepositoryPermission::Read,
+        )
+        .await
+        .expect_err("generic forbidden response should deny permission");
+        let rendered = error.to_string();
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::PermissionDenied { .. }
+            }
+        ));
+        assert!(!rendered.contains("gho_secret"));
+    }
+
+    #[tokio::test]
     async fn permission_client_denies_unknown_permission_state() {
         let (api_url, _permission_server) = permission_server(
             StatusCode::OK,
@@ -2758,6 +2859,21 @@ mod tests {
                 source: RepositoryProviderError::PermissionDenied { .. }
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn permission_client_rejects_empty_repository_path_segments() {
+        let error = mocked_permission_check(
+            "https://api.github.com".to_owned(),
+            "",
+            "private-repo",
+            RepositoryPermission::Read,
+        )
+        .await
+        .expect_err("empty repository owner should fail before building the GitHub URL");
+
+        assert!(matches!(error, ServerError::InvalidRequest { .. }));
+        assert!(error.to_string().contains("repository owner"));
     }
 
     #[test]
