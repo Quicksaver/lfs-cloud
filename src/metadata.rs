@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS repository_mappings (
     host TEXT NOT NULL,
     owner TEXT NOT NULL,
     name TEXT NOT NULL,
-    storage_provider_id TEXT NOT NULL,
+    storage_provider_id TEXT NOT NULL REFERENCES storage_providers(id) ON DELETE RESTRICT,
     route_path TEXT NOT NULL UNIQUE,
     provider_stable_id TEXT,
     created_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -324,6 +324,88 @@ mod tests {
 
         assert_eq!(
             error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+    }
+
+    #[test]
+    fn repository_mappings_require_existing_storage_provider() {
+        let database = MetadataDatabase::open_in_memory().expect("metadata DB should open");
+
+        let missing_storage_error = database
+            .connection
+            .execute(
+                "INSERT INTO repository_mappings(
+                    id,
+                    repo_provider_id,
+                    host,
+                    owner,
+                    name,
+                    storage_provider_id,
+                    route_path
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    "github-main:owner/repo",
+                    "github-main",
+                    "github.com",
+                    "owner",
+                    "repo",
+                    "missing-storage",
+                    "/github.com/owner/repo.git/info/lfs",
+                ),
+            )
+            .expect_err("repository mapping should require an existing storage provider");
+
+        assert_eq!(
+            missing_storage_error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+
+        database
+            .connection
+            .execute(
+                "INSERT INTO storage_providers(
+                    id,
+                    provider_type,
+                    backend_root_id
+                ) VALUES (?1, ?2, ?3)",
+                ("drive-user-a", "google_drive", "drive-root"),
+            )
+            .expect("storage provider should insert");
+        database
+            .connection
+            .execute(
+                "INSERT INTO repository_mappings(
+                    id,
+                    repo_provider_id,
+                    host,
+                    owner,
+                    name,
+                    storage_provider_id,
+                    route_path
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    "github-main:owner/repo",
+                    "github-main",
+                    "github.com",
+                    "owner",
+                    "repo",
+                    "drive-user-a",
+                    "/github.com/owner/repo.git/info/lfs",
+                ),
+            )
+            .expect("repository mapping should insert after storage provider exists");
+
+        let delete_error = database
+            .connection
+            .execute(
+                "DELETE FROM storage_providers WHERE id = ?1",
+                ["drive-user-a"],
+            )
+            .expect_err("mapped storage provider should be delete-restricted");
+
+        assert_eq!(
+            delete_error.sqlite_error_code(),
             Some(rusqlite::ErrorCode::ConstraintViolation)
         );
     }
