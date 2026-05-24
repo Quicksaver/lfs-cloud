@@ -312,7 +312,7 @@ async fn handle_lfs_batch_request(
                 %error,
                 "failed to read Git LFS batch request body"
             );
-            (StatusCode::BAD_REQUEST, "Invalid Git LFS batch request.\n").into_response()
+            error.into_response()
         }
     }
 }
@@ -998,6 +998,25 @@ repositories:
 
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_route_preserves_payload_too_large_after_authentication() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions(test_config(), store);
+        let large_body = "x".repeat(2 * 1024 * 1024 + 1);
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                large_body,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
