@@ -158,8 +158,10 @@ For the current server-side Google Drive credential loader, a bare
 `credentials_ref` such as `google-drive-user-a` maps to an environment variable
 named `LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_GOOGLE_DRIVE_USER_A`. The environment
 value is a JSON object containing `client_id`, `client_secret`, `refresh_token`,
-and optionally `token_uri`. Use `env:NAME` as the `credentials_ref` value when
-the environment variable name must be explicit.
+and optionally `token_uri`. Custom `token_uri` values must use HTTPS, except
+for loopback HTTP endpoints used by local tests and development tools. Use
+`env:NAME` as the `credentials_ref` value when the environment variable name
+must be explicit.
 
 The `.lfsconfig` file points only to the LFS Cloud endpoint. It should not contain Google Drive, S3, or other backend credentials.
 
