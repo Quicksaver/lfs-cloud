@@ -73,9 +73,9 @@ pub const GITHUB_OAUTH_LOGIN_PATH: &str = "/auth/github/login";
 
 /// Default GitHub OAuth scopes for the initial login URL.
 ///
-/// `read:user` lets the server identify the authenticated GitHub account
-/// without putting the broader repository scope decision into this URL helper.
-pub const DEFAULT_GITHUB_OAUTH_SCOPES: &[&str] = &["read:user"];
+/// `read:user` identifies the authenticated GitHub account, and `repo` lets
+/// the server re-check repository permissions for private repositories.
+pub const DEFAULT_GITHUB_OAUTH_SCOPES: &[&str] = &["read:user", "repo"];
 
 /// State required by the GitHub OAuth callback route.
 #[derive(Clone)]
@@ -2115,7 +2115,10 @@ mod tests {
             query.get("redirect_uri").map(String::as_str),
             Some(REDIRECT_URL)
         );
-        assert_eq!(query.get("scope").map(String::as_str), Some("read:user"));
+        assert_eq!(
+            query.get("scope").map(String::as_str),
+            Some("read:user repo")
+        );
         assert_eq!(query.get("state").map(String::as_str), Some("csrf-state"));
         assert_eq!(authorization.csrf_state.as_str(), "csrf-state");
     }
@@ -2169,7 +2172,7 @@ mod tests {
         );
         assert_eq!(
             query_pairs(&authorization).get("scope").map(String::as_str),
-            Some("read:user")
+            Some("read:user repo")
         );
     }
 
@@ -3123,10 +3126,21 @@ mod tests {
         let metadata = session_store
             .verify(&token)
             .expect("callback should store issued lfs session metadata");
+        let record = session_store
+            .verify_record(&token)
+            .expect("callback should retain the GitHub token server-side");
         assert_eq!(metadata.provider_id, "github-main");
         assert_eq!(metadata.login, "octocat");
         assert_eq!(metadata.stable_id.as_deref(), Some("42"));
         assert_eq!(metadata.granted_scopes, vec!["read:user", "repo"]);
+        assert_eq!(
+            record
+                .github_access_token()
+                .expect("github token should be retained")
+                .as_str(),
+            "gho_token"
+        );
+        assert!(!format!("{record:?}").contains("gho_token"));
         assert!(
             body["lfs_token_expires_at_unix_seconds"]
                 .as_u64()

@@ -576,7 +576,20 @@ fn git_lfs_authorization_error_response(error: ServerError) -> Response {
         ),
     };
 
-    git_lfs_json_error_response(status, message)
+    let mut response = git_lfs_json_error_response(status, message);
+    if status == StatusCode::UNAUTHORIZED {
+        let headers = response.headers_mut();
+        headers.append(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static(LFS_AUTH_CHALLENGE),
+        );
+        headers.append(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"lfs-cloud\""),
+        );
+    }
+
+    response
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1499,6 +1512,35 @@ repositories:
         assert_eq!(
             body.get("message").and_then(|value| value.as_str()),
             Some("repository provider denied this Git LFS operation")
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_route_returns_auth_challenge_when_github_token_is_missing() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions(test_config(), store);
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                VALID_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge_values = response.headers().get_all(WWW_AUTHENTICATE);
+        assert!(
+            challenge_values
+                .iter()
+                .any(|value| value.to_str().ok() == Some(LFS_AUTH_CHALLENGE))
+        );
+        assert!(
+            challenge_values
+                .iter()
+                .any(|value| value.to_str().ok() == Some("Bearer realm=\"lfs-cloud\""))
         );
     }
 
