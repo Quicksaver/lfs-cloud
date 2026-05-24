@@ -25,9 +25,10 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use crate::{
-    DEFAULT_GIT_CREDENTIAL_USERNAME, LfsOid, LfsSessionMetadata, LfsSessionToken,
-    LocalLfsSessionStore, MetadataDatabase, RepositoryMapping, ServerConfig, ServerError,
-    ServerResult,
+    DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
+    GitHubOAuthStateRegistry, LfsOid, LfsSessionMetadata, LfsSessionToken, LocalLfsSessionStore,
+    MetadataDatabase, RepositoryMapping, RepositoryProviderConfig, ServerConfig, ServerError,
+    ServerResult, github_oauth_callback_router,
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
@@ -85,7 +86,8 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
     config.server.host = bind.host.clone();
     config.server.port = bind.port;
 
-    let router = lfs_server_router(config);
+    let session_store = LocalLfsSessionStore::new();
+    let router = server_router_with_sessions(config, session_store)?;
     let listener = tokio::net::TcpListener::bind((bind.host.as_str(), bind.port))
         .await
         .map_err(|source| ServerError::Bind {
@@ -112,6 +114,28 @@ pub fn lfs_server_router(config: ServerConfig) -> Router {
     lfs_server_router_with_sessions(config, LocalLfsSessionStore::new())
 }
 
+/// Builds the full server router with authentication and Git LFS routes.
+///
+/// GitHub OAuth callbacks and Git LFS endpoints share `session_store` so an
+/// OAuth callback can issue a local LFS Cloud token that the LFS routes accept
+/// immediately.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] if OAuth callback state cannot be initialized from
+/// the validated server configuration.
+pub fn server_router_with_sessions(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+) -> ServerResult<Router> {
+    let lfs_router = lfs_server_router_with_sessions(config.clone(), session_store.clone());
+    let Some(auth_router) = github_oauth_router(config, session_store)? else {
+        return Ok(lfs_router);
+    };
+
+    Ok(auth_router.merge(lfs_router))
+}
+
 /// Builds the Axum router with an explicit local LFS session store.
 ///
 /// This constructor lets login/callback wiring and tests share the same
@@ -125,6 +149,37 @@ pub fn lfs_server_router_with_sessions(
     let state = Arc::new(LfsServerState::new(config, session_store));
 
     Router::new().fallback(handle_lfs_request).with_state(state)
+}
+
+fn github_oauth_router(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+) -> ServerResult<Option<Router>> {
+    let Some(provider) = config
+        .repository_providers
+        .values()
+        .map(|provider| match provider {
+            RepositoryProviderConfig::GitHub(provider) => provider,
+        })
+        .next()
+    else {
+        return Ok(None);
+    };
+    let redirect_url = format!(
+        "{}{}",
+        config.server.public_url.trim_end_matches('/'),
+        GITHUB_OAUTH_CALLBACK_PATH
+    );
+    let route_state = GitHubOAuthCallbackRouteState::with_clients_and_session_store(
+        provider.clone(),
+        GitHubOAuthStateRegistry::new(),
+        redirect_url,
+        crate::GitHubOAuthTokenExchanger::new()?,
+        crate::GitHubUserClient::new()?,
+        session_store,
+    )?;
+
+    Ok(Some(github_oauth_callback_router(route_state)))
 }
 
 #[derive(Clone, Debug)]
@@ -264,13 +319,21 @@ fn unauthorized(reason: impl Into<String>) -> ServerError {
 
 fn authentication_required_response() -> Response {
     let mut headers = HeaderMap::new();
-    headers.append(WWW_AUTHENTICATE, HeaderValue::from_static(LFS_AUTH_CHALLENGE));
+    headers.append(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static(LFS_AUTH_CHALLENGE),
+    );
     headers.append(
         WWW_AUTHENTICATE,
         HeaderValue::from_static("Bearer realm=\"lfs-cloud\""),
     );
 
-    (StatusCode::UNAUTHORIZED, headers, "LFS Cloud authentication required.\n").into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        headers,
+        "LFS Cloud authentication required.\n",
+    )
+        .into_response()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -572,7 +635,7 @@ mod tests {
     use super::{
         BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsRouteEndpoint, LfsRouteResolver, ServerBind,
         advertised_server_urls, authenticate_lfs_session, lfs_server_router_with_sessions,
-        render_server_startup_message,
+        render_server_startup_message, server_router_with_sessions,
     };
     use base64::Engine as _;
 
@@ -742,17 +805,14 @@ repositories:
 
         std::thread::sleep(Duration::from_millis(1200));
 
-        for headers in [
-            authorization_headers(&format!("Bearer {token}")),
-            {
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    AUTHORIZATION,
-                    basic_authorization(DEFAULT_GIT_CREDENTIAL_USERNAME, &token),
-                );
-                headers
-            },
-        ] {
+        for headers in [authorization_headers(&format!("Bearer {token}")), {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                basic_authorization(DEFAULT_GIT_CREDENTIAL_USERNAME, &token),
+            );
+            headers
+        }] {
             let error = authenticate_lfs_session(&headers, &store)
                 .expect_err("expired token should be denied");
             assert!(matches!(error, ServerError::Unauthorized { .. }));
@@ -799,6 +859,19 @@ repositories:
         assert!(challenge_values.contains(&"Bearer realm=\"lfs-cloud\""));
         assert_eq!(unknown_route.status(), StatusCode::NOT_FOUND);
         assert_eq!(authenticated.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn server_router_mounts_github_oauth_callback_before_lfs_fallback() {
+        let router = server_router_with_sessions(test_config(), LocalLfsSessionStore::new())
+            .expect("server router should build");
+
+        let response = router
+            .oneshot(lfs_request("/auth/github/callback", None))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     fn issued_session_token(ttl: Duration) -> (LocalLfsSessionStore, String) {
