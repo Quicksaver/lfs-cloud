@@ -224,12 +224,12 @@ fn validate_credential_field(label: &str, value: String) -> CliResult<String> {
 
 fn sanitize_command_stderr(stderr: &[u8], token: &str) -> SanitizedMessage {
     let mut message = String::from_utf8_lossy(stderr).into_owned();
+    if !token.is_empty() {
+        message = message.replace(token, "<redacted>");
+    }
     if message.len() > MAX_COMMAND_STDERR_LEN {
         message.truncate(MAX_COMMAND_STDERR_LEN);
         message.push_str("...");
-    }
-    if !token.is_empty() {
-        message = message.replace(token, "<redacted>");
     }
     let message = message.trim();
 
@@ -244,7 +244,10 @@ fn sanitize_command_stderr(stderr: &[u8], token: &str) -> SanitizedMessage {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval};
+    use super::{
+        DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, MAX_COMMAND_STDERR_LEN,
+        sanitize_command_stderr,
+    };
     use crate::{CliError, LfsSessionToken};
 
     fn token() -> LfsSessionToken {
@@ -357,6 +360,19 @@ exit 42
         assert!(display.contains("git -c credential.useHttpPath=true credential approve failed"));
         assert!(display.contains("<redacted>"));
         assert!(!display.contains("local-lfs-token"));
+    }
+
+    #[test]
+    fn command_stderr_redacts_token_before_truncating() {
+        let token = "split-token-secret";
+        let prefix = "x".repeat(MAX_COMMAND_STDERR_LEN - 5);
+        let stderr = format!("{prefix}{token} suffix");
+
+        let sanitized = sanitize_command_stderr(stderr.as_bytes(), token);
+
+        assert!(sanitized.as_str().len() <= MAX_COMMAND_STDERR_LEN + "...".len());
+        assert!(!sanitized.as_str().contains("split"));
+        assert!(!sanitized.as_str().contains("split-token-secret"));
     }
 
     #[cfg(unix)]
