@@ -10,12 +10,15 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > requests.
 > Git LFS batch request parsing plus download and upload batch response
 > generation are implemented, with GitHub read/write authorization enforced per
-> batch operation. Batch responses currently return Git LFS object-level errors
-> until storage availability lookup and transfer handling are wired. LFS route,
-> authentication, method, body-size, parse, and authorization failures return
-> Git LFS JSON error payloads with matching HTTP statuses.
-> Upload/download transfer handling and the other commands below are still
-> planned product behavior.
+> batch operation. Upload batches now check configured storage availability,
+> advertise upload actions for missing objects, and accept authenticated object
+> `PUT` uploads through temp-file staging, SHA-256 verification, Google Drive
+> storage, and metadata recording. Download batches still return Git LFS
+> object-level errors until download transfer handling is wired. LFS route,
+> authentication, method, body-size, parse, authorization, and upload-integrity
+> failures return Git LFS JSON error payloads with matching HTTP statuses.
+> Download transfer handling and the other commands below are still planned
+> product behavior.
 
 ## Why
 
@@ -217,6 +220,6 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body/parse/authorization failures, and generates download and upload batch responses with per-object errors until storage availability lookup and transfer handling are wired. Transfer endpoints and most CLI behavior have not been implemented yet.
+This repository currently contains planning documents, project configuration, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body/parse/authorization/upload-integrity failures, generates download batch responses with per-object errors until download transfer handling is wired, generates upload batch actions after storage availability lookup, and accepts authenticated object uploads through temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording. Download transfers and most CLI behavior have not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
