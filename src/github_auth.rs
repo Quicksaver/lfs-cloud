@@ -705,7 +705,7 @@ fn validate_token_type(token_type: String) -> ServerResult<String> {
 
 fn parse_scope_list(scopes: &str) -> Vec<String> {
     scopes
-        .split(' ')
+        .split(',')
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
         .map(ToOwned::to_owned)
@@ -1040,7 +1040,7 @@ mod tests {
     async fn token_exchange_posts_validated_callback_to_github_token_endpoint() {
         let (token_url, token_server) = token_server(
             StatusCode::OK,
-            r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user repo"}"#,
+            r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user,repo"}"#,
         )
         .await;
         let exchanger =
@@ -1271,10 +1271,10 @@ mod tests {
     }
 
     #[test]
-    fn token_response_scopes_are_split_on_oauth_space_delimiter_only() {
+    fn token_response_scopes_are_split_on_github_comma_delimiter() {
         assert_eq!(
-            super::parse_scope_list("read:user repo,workflow"),
-            vec!["read:user", "repo,workflow"]
+            super::parse_scope_list("read:user, repo,workflow,,"),
+            vec!["read:user", "repo", "workflow"]
         );
     }
 
