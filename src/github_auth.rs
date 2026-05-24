@@ -15,6 +15,8 @@ use url::Url;
 
 use crate::{GitHubProviderConfig, ServerError, ServerResult};
 
+const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
+
 /// GitHub's OAuth authorization endpoint for the initial GitHub.com provider.
 ///
 /// This browser-facing OAuth URL is intentionally not derived from
@@ -156,7 +158,8 @@ impl GitHubOAuthState {
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError`] when the state is blank or padded.
+    /// Returns [`ServerError`] when the state is blank, padded, too long, or
+    /// contains whitespace/control characters.
     ///
     /// # Examples
     ///
@@ -169,14 +172,7 @@ impl GitHubOAuthState {
     /// # Ok::<(), lfs_cloud::ServerError>(())
     /// ```
     pub fn from_secret(secret: impl Into<String>) -> ServerResult<Self> {
-        let secret = secret.into();
-        if secret.trim().is_empty() || secret != secret.trim() {
-            return Err(ServerError::InvalidRequest {
-                message: "github oauth state must not be blank or padded".to_owned(),
-            });
-        }
-
-        Ok(Self(secret))
+        validate_sensitive_oauth_value(secret.into(), "github oauth state").map(Self)
     }
 
     /// Returns the state value that must match the OAuth callback.
@@ -224,19 +220,19 @@ impl fmt::Debug for GitHubOAuthCode {
 pub struct GitHubOAuthCallbackQuery {
     /// OAuth authorization code returned by GitHub.
     #[serde(default)]
-    pub code: Option<String>,
+    code: Option<String>,
     /// CSRF state returned by GitHub.
     #[serde(default)]
-    pub state: Option<String>,
+    state: Option<String>,
     /// OAuth error code returned by GitHub, such as `access_denied`.
     #[serde(default)]
-    pub error: Option<String>,
+    error: Option<String>,
     /// Optional human-readable GitHub OAuth error description.
     #[serde(default)]
-    pub error_description: Option<String>,
+    error_description: Option<String>,
     /// Optional GitHub documentation URL for the OAuth error.
     #[serde(default)]
-    pub error_uri: Option<String>,
+    error_uri: Option<String>,
 }
 
 impl GitHubOAuthCallbackQuery {
@@ -247,9 +243,11 @@ impl GitHubOAuthCallbackQuery {
     /// ```
     /// use lfs_cloud::GitHubOAuthCallbackQuery;
     ///
-    /// let query = GitHubOAuthCallbackQuery::authorization_code("code", "state");
+    /// let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "csrf-state");
     ///
-    /// assert_eq!(query.code.as_deref(), Some("code"));
+    /// let rendered = format!("{query:?}");
+    /// assert!(!rendered.contains("oauth-code"));
+    /// assert!(!rendered.contains("csrf-state"));
     /// ```
     #[must_use]
     pub fn authorization_code(code: impl Into<String>, state: impl Into<String>) -> Self {
@@ -277,7 +275,7 @@ impl fmt::Debug for GitHubOAuthCallbackQuery {
 }
 
 /// Validated GitHub OAuth callback ready for code-to-token exchange.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct GitHubOAuthCallback {
     /// Authorization code returned by GitHub.
     pub code: GitHubOAuthCode,
@@ -316,14 +314,14 @@ impl GitHubOAuthCallback {
         expected_state: &GitHubOAuthState,
     ) -> ServerResult<Self> {
         let state = required_callback_param(query.state, "state")?;
-        if state != expected_state.as_str() {
+        if !constant_time_str_eq(&state, expected_state.as_str()) {
             return Err(ServerError::Unauthorized {
                 reason: "github oauth csrf state mismatch".to_owned(),
             });
         }
 
         if let Some(error) = query.error {
-            let error = sanitize_callback_value(&required_callback_param(Some(error), "error")?);
+            let error = sanitize_callback_value(&validate_required_callback_error(error)?);
             let description = query
                 .error_description
                 .as_deref()
@@ -343,6 +341,16 @@ impl GitHubOAuthCallback {
             code: GitHubOAuthCode(code),
             state: GitHubOAuthState(state),
         })
+    }
+}
+
+impl fmt::Debug for GitHubOAuthCallback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubOAuthCallback")
+            .field("code", &"<redacted>")
+            .field("state", &"<redacted>")
+            .finish()
     }
 }
 
@@ -392,19 +400,72 @@ fn required_callback_param(value: Option<String>, name: &str) -> ServerResult<St
     let value = value.ok_or_else(|| ServerError::InvalidRequest {
         message: format!("github oauth callback {name} is required"),
     })?;
-    if value.trim().is_empty() || value != value.trim() {
+    validate_sensitive_oauth_value(value, &format!("github oauth callback {name}"))
+}
+
+fn validate_sensitive_oauth_value(value: String, label: &str) -> ServerResult<String> {
+    if value.len() > MAX_OAUTH_SENSITIVE_VALUE_LEN {
         return Err(ServerError::InvalidRequest {
-            message: format!("github oauth callback {name} must not be blank or padded"),
+            message: format!("{label} must not exceed {MAX_OAUTH_SENSITIVE_VALUE_LEN} bytes"),
+        });
+    }
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() != value.len() {
+        return Err(ServerError::InvalidRequest {
+            message: format!("{label} must not be blank or padded"),
+        });
+    }
+
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(ServerError::InvalidRequest {
+            message: format!("{label} must not contain whitespace or control characters"),
         });
     }
 
     Ok(value)
 }
 
+fn validate_required_callback_error(value: String) -> ServerResult<String> {
+    if value.len() > MAX_OAUTH_SENSITIVE_VALUE_LEN {
+        return Err(ServerError::InvalidRequest {
+            message: format!(
+                "github oauth callback error must not exceed {MAX_OAUTH_SENSITIVE_VALUE_LEN} bytes"
+            ),
+        });
+    }
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() != value.len() {
+        return Err(ServerError::InvalidRequest {
+            message: "github oauth callback error must not be blank or padded".to_owned(),
+        });
+    }
+
+    Ok(value)
+}
+
+fn constant_time_str_eq(candidate: &str, expected: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let expected = expected.as_bytes();
+    let mut diff = candidate.len() ^ expected.len();
+
+    for index in 0..MAX_OAUTH_SENSITIVE_VALUE_LEN {
+        let candidate_byte = candidate.get(index).copied().unwrap_or_default();
+        let expected_byte = expected.get(index).copied().unwrap_or_default();
+        diff |= usize::from(candidate_byte ^ expected_byte);
+    }
+
+    diff == 0
+}
+
 fn sanitize_callback_value(value: &str) -> String {
     const MAX_LEN: usize = 200;
 
-    value
+    let mut sanitized: String = value
         .chars()
         .map(|character| {
             if character.is_control() {
@@ -414,9 +475,14 @@ fn sanitize_callback_value(value: &str) -> String {
             }
         })
         .take(MAX_LEN)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+        .collect();
+    let trimmed_end_len = sanitized.trim_end().len();
+    sanitized.truncate(trimmed_end_len);
+    let trimmed_start_len = sanitized.len() - sanitized.trim_start().len();
+    if trimmed_start_len > 0 {
+        sanitized.drain(..trimmed_start_len);
+    }
+    sanitized
 }
 
 #[cfg(test)]
@@ -498,6 +564,21 @@ mod tests {
             .expect("second authorization URL should build");
 
         assert_ne!(first.csrf_state, second.csrf_state);
+    }
+
+    #[test]
+    fn csrf_state_from_secret_validates_stored_secret() {
+        for invalid in ["", "  ", " csrf-state", "csrf-state ", "csrf\nstate"] {
+            let error = GitHubOAuthState::from_secret(invalid).unwrap_err();
+            assert!(matches!(error, ServerError::InvalidRequest { .. }));
+        }
+
+        let oversized = "x".repeat(super::MAX_OAUTH_SENSITIVE_VALUE_LEN + 1);
+        let error = GitHubOAuthState::from_secret(oversized).unwrap_err();
+        assert!(matches!(error, ServerError::InvalidRequest { .. }));
+
+        let state = GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
+        assert_eq!(state.as_str(), "csrf-state");
     }
 
     #[test]
@@ -643,6 +724,21 @@ mod tests {
                 error_uri: None,
             },
             GitHubOAuthCallbackQuery::authorization_code("oauth-code", "  "),
+        ] {
+            let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+            assert!(matches!(error, ServerError::InvalidRequest { .. }));
+        }
+    }
+
+    #[test]
+    fn callback_validation_rejects_oversized_required_fields() {
+        let expected_state =
+            GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
+        let oversized = "x".repeat(super::MAX_OAUTH_SENSITIVE_VALUE_LEN + 1);
+
+        for query in [
+            GitHubOAuthCallbackQuery::authorization_code(oversized.clone(), "csrf-state"),
+            GitHubOAuthCallbackQuery::authorization_code("oauth-code", oversized),
         ] {
             let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
             assert!(matches!(error, ServerError::InvalidRequest { .. }));
