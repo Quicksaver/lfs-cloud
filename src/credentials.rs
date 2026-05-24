@@ -342,17 +342,17 @@ impl GitCredentialApproval {
         )?;
 
         if status.success() {
-            return if git_config_output_has_helper(&stdout)? {
-                Ok(())
-            } else {
-                Err(missing_credential_helper_error(
-                    &self.lfs_url,
-                    &self.username,
-                ))
-            };
+            if git_config_output_has_helper(&stdout, &command_name)? {
+                return Ok(());
+            }
+
+            return Err(missing_credential_helper_error(
+                &self.lfs_url,
+                &self.username,
+            ));
         }
 
-        if status.code() == Some(1) && stdout.is_empty() && stderr.is_empty() {
+        if status.code() == Some(1) && stdout.is_empty() {
             return Err(missing_credential_helper_error(
                 &self.lfs_url,
                 &self.username,
@@ -489,27 +489,36 @@ fn missing_credential_helper_error(lfs_url: &Url, username: &str) -> CliError {
 }
 
 fn credential_helper_fallback_instructions(lfs_url: &Url, username: &str) -> String {
-    format!(
-        "Configure a Git credential helper, then retry the lfs-cloud login or init command.\n\
-         Recommended persistent helpers:\n\
-           macOS:   git config --global credential.helper osxkeychain\n\
-           Windows: git config --global credential.helper manager\n\
-           Linux:   git config --global credential.helper libsecret\n\
-         Temporary local fallback:\n\
-           git config --global credential.helper 'cache --timeout=3600'\n\
-         Last-resort plaintext fallback:\n\
-           git config --global credential.helper store\n\
-         After a helper is configured, lfs-cloud will store username '{username}' for {lfs_url}.\n\
-         Do not store a GitHub OAuth token or personal access token here; Git LFS should receive only the local lfs-cloud session token."
-    )
+    [
+        "Configure a Git credential helper, then retry the lfs-cloud login or init command."
+            .to_owned(),
+        "Recommended persistent helpers:".to_owned(),
+        "  macOS:   git config --global credential.helper osxkeychain".to_owned(),
+        "  Windows: git config --global credential.helper manager".to_owned(),
+        "           Git Credential Manager may also be installed as manager-core.".to_owned(),
+        "  Linux:   git config --global credential.helper libsecret".to_owned(),
+        "           Exact helper names vary by distribution and desktop environment.".to_owned(),
+        "Short-lived in-memory fallback:".to_owned(),
+        "  git config --global credential.helper 'cache --timeout=3600'".to_owned(),
+        "  This writes a global Git helper setting; cached credentials expire after the timeout.".to_owned(),
+        "Avoid plaintext storage unless you deliberately accept unencrypted credentials on disk."
+            .to_owned(),
+        format!(
+            "After a helper is configured, lfs-cloud will store username '{username}' for {lfs_url}."
+        ),
+        "Do not store a GitHub OAuth token or personal access token here; Git LFS should receive only the local lfs-cloud session token.".to_owned(),
+    ]
+    .join("\n")
 }
 
-fn git_config_output_has_helper(stdout: &[u8]) -> CliResult<bool> {
+fn git_config_output_has_helper(stdout: &[u8], command_name: &str) -> CliResult<bool> {
     let output = std::str::from_utf8(stdout).map_err(|_| CliError::ExternalCommandOutput {
-        command: "git config --get-urlmatch credential.helper <lfs-url>".to_owned(),
+        command: command_name.to_owned(),
         message: SanitizedMessage::new("git config returned non-UTF-8 credential helper output"),
     })?;
 
+    // An empty helper entry intentionally clears Git's helper chain; treat blank
+    // output as missing so token approval never silently stores nowhere.
     Ok(output.lines().any(|line| !line.trim().is_empty()))
 }
 
@@ -1255,7 +1264,12 @@ mod tests {
 
         assert!(instructions.contains("git config --global credential.helper osxkeychain"));
         assert!(instructions.contains("git config --global credential.helper manager"));
+        assert!(instructions.contains("manager-core"));
         assert!(instructions.contains("git config --global credential.helper libsecret"));
+        assert!(instructions.contains("vary by distribution"));
+        assert!(instructions.contains("global Git helper setting"));
+        assert!(instructions.contains("Avoid plaintext storage"));
+        assert!(!instructions.contains("git config --global credential.helper store"));
         assert!(instructions.contains("GitHub OAuth token"));
         assert!(instructions.contains("personal access token"));
         assert!(instructions.contains("local lfs-cloud session token"));
@@ -1264,13 +1278,28 @@ mod tests {
     #[test]
     fn credential_helper_config_output_accepts_non_empty_helpers_only() {
         assert!(
-            git_config_output_has_helper(b"osxkeychain\n").expect("helper output should parse")
+            git_config_output_has_helper(
+                b"osxkeychain\n",
+                "git config --get-urlmatch credential.helper https://lfs.example.com/repo.git/info/lfs",
+            )
+            .expect("helper output should parse")
         );
-        assert!(!git_config_output_has_helper(b"\n  \n").expect("blank output should parse"));
-        assert!(matches!(
-            git_config_output_has_helper(b"helper\xff").unwrap_err(),
-            CliError::ExternalCommandOutput { .. }
-        ));
+        assert!(!git_config_output_has_helper(
+            b"\n  \n",
+            "git config --get-urlmatch credential.helper https://lfs.example.com/repo.git/info/lfs",
+        )
+        .expect("blank output should parse"));
+        let error = git_config_output_has_helper(
+            b"helper\xff",
+            "git config --get-urlmatch credential.helper https://lfs.example.com/repo.git/info/lfs",
+        )
+        .unwrap_err();
+        assert!(matches!(error, CliError::ExternalCommandOutput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("https://lfs.example.com/repo.git/info/lfs")
+        );
     }
 
     #[test]
@@ -1569,8 +1598,47 @@ exit 0
         ));
         assert!(display.contains("credential.helper osxkeychain"));
         assert!(display.contains("credential.helper 'cache --timeout=3600'"));
+        assert!(display.contains("writes a global Git helper setting"));
         assert!(display.contains("Do not store a GitHub OAuth token"));
         assert!(!display.contains("local-lfs-token"));
+        assert!(!approve_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approve_treats_credential_helper_check_miss_with_warning_as_missing_helper() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let approve_path = temp.path().join("approve.txt");
+        let fake_git = write_fake_git(
+            temp.path(),
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "--get-urlmatch" ]; then
+  echo "warning: helper lookup miss" >&2
+  exit 1
+fi
+if [ "$1" = "credential" ] && [ "$2" = "approve" ]; then
+  touch '{}'
+fi
+exit 0
+"#,
+                approve_path.display()
+            ),
+        );
+        let approval = GitCredentialApproval::new(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            token(),
+        )
+        .expect("approval should parse");
+
+        let error = approval
+            .approve_with_git_program(&fake_git)
+            .expect_err("helper lookup miss should still produce recovery guidance");
+
+        assert!(matches!(
+            error,
+            CliError::GitCredentialHelperNotConfigured { .. }
+        ));
         assert!(!approve_path.exists());
     }
 

@@ -13,6 +13,8 @@ if GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
   exit 1
 fi
 
+# The substring filter intentionally covers the credential-helper fallback unit
+# tests and the approval tests that guard the missing-helper path.
 cargo test --lib credential_helper
 
-echo "credential-helper fallback instructions verified"
+echo "credential-helper fallback unit tests verified"
