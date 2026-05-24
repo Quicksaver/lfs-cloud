@@ -86,9 +86,9 @@ impl GitCredentialApproval {
     /// Approves the credential through `git credential approve`.
     ///
     /// The token is written on standard input, not passed as a process
-    /// argument, so process listings do not expose the secret. The command
-    /// forces path-aware credential storage so repositories sharing one
-    /// `lfs-cloud` host keep separate LFS URL credentials.
+    /// argument, so process listings do not expose the secret. Before storing
+    /// the credential, this persists path-aware lookup for the LFS Cloud host so
+    /// future Git LFS credential fills also keep repository paths separate.
     ///
     /// # Errors
     ///
@@ -108,9 +108,43 @@ impl GitCredentialApproval {
     /// Returns [`CliError`] when the process cannot be started, stdin cannot be
     /// written, or the helper exits unsuccessfully.
     pub fn approve_with_git_program(&self, git_program: impl AsRef<Path>) -> CliResult<()> {
-        let command_name = "git -c credential.useHttpPath=true credential approve";
-        let mut child = Command::new(git_program.as_ref())
-            .args(["-c", "credential.useHttpPath=true", "credential", "approve"])
+        self.persist_path_aware_lookup(git_program.as_ref())?;
+        self.approve_with_configured_git(git_program.as_ref())
+    }
+
+    fn persist_path_aware_lookup(&self, git_program: &Path) -> CliResult<()> {
+        let credential_scope = credential_host_scope(&self.lfs_url);
+        let config_key = format!("credential.{credential_scope}.useHttpPath");
+        let command_name = format!("git config --global {config_key} true");
+        let output = Command::new(git_program)
+            .args(["config", "--global", &config_key, "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|source| CliError::Io {
+                context: format!("failed to start {command_name}"),
+                source,
+            })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        Err(CliError::ExternalCommand {
+            command: command_name,
+            status: output
+                .status
+                .code()
+                .map_or_else(|| output.status.to_string(), |code| code.to_string()),
+            stderr: sanitize_command_stderr(&output.stderr, self.token.as_str()),
+        })
+    }
+
+    fn approve_with_configured_git(&self, git_program: &Path) -> CliResult<()> {
+        let command_name = "git credential approve";
+        let mut child = Command::new(git_program)
+            .args(["credential", "approve"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -163,6 +197,14 @@ impl GitCredentialApproval {
             self.token.as_str()
         )
     }
+}
+
+fn credential_host_scope(url: &Url) -> String {
+    let mut scope = url.clone();
+    scope.set_path("");
+    scope.set_query(None);
+    scope.set_fragment(None);
+    scope.to_string()
 }
 
 impl fmt::Debug for GitCredentialApproval {
@@ -228,7 +270,11 @@ fn sanitize_command_stderr(stderr: &[u8], token: &str) -> SanitizedMessage {
         message = message.replace(token, "<redacted>");
     }
     if message.len() > MAX_COMMAND_STDERR_LEN {
-        message.truncate(MAX_COMMAND_STDERR_LEN);
+        let boundary = (0..=MAX_COMMAND_STDERR_LEN)
+            .rev()
+            .find(|&index| message.is_char_boundary(index))
+            .expect("zero is always a valid string boundary");
+        message.truncate(boundary);
         message.push_str("...");
     }
     let message = message.trim();
@@ -302,19 +348,28 @@ mod tests {
     fn approve_invokes_git_credential_approve_with_stdin_payload() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let stdin_path = temp.path().join("stdin.txt");
+        let config_path = temp.path().join("config.txt");
         let fake_git = write_fake_git(
             temp.path(),
             &format!(
                 r#"#!/bin/sh
-if [ "$1" != "credential" ] || [ "$2" != "approve" ]; then
-  shift 2
+if [ "$1" = "config" ]; then
+  if [ "$2" != "--global" ] ||
+     [ "$3" != "credential.https://lfs.example.com/.useHttpPath" ] ||
+     [ "$4" != "true" ]; then
+    echo "unexpected config args: $*" >&2
+    exit 64
+  fi
+  printf '%s\n' "$*" > '{}'
+  exit 0
 fi
 if [ "$1" != "credential" ] || [ "$2" != "approve" ]; then
   echo "unexpected args: $*" >&2
   exit 64
 fi
 cat > '{}'
-"#,
+	"#,
+                config_path.display(),
                 stdin_path.display()
             ),
         );
@@ -332,6 +387,10 @@ cat > '{}'
             fs::read_to_string(stdin_path).expect("stdin capture should be readable"),
             approval.credential_input()
         );
+        assert_eq!(
+            fs::read_to_string(config_path).expect("config capture should be readable"),
+            "config --global credential.https://lfs.example.com/.useHttpPath true\n"
+        );
     }
 
     #[test]
@@ -341,6 +400,9 @@ cat > '{}'
         let fake_git = write_fake_git(
             temp.path(),
             r#"#!/bin/sh
+if [ "$1" = "config" ]; then
+  exit 0
+fi
 echo "helper rejected local-lfs-token" >&2
 exit 42
 "#,
@@ -357,9 +419,48 @@ exit 42
         let display = error.to_string();
 
         assert!(matches!(error, CliError::ExternalCommand { .. }));
-        assert!(display.contains("git -c credential.useHttpPath=true credential approve failed"));
+        assert!(display.contains("git credential approve failed"));
         assert!(display.contains("<redacted>"));
         assert!(!display.contains("local-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approve_failure_reports_config_errors_without_running_approve() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let approve_path = temp.path().join("approve.txt");
+        let fake_git = write_fake_git(
+            temp.path(),
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "config" ]; then
+  echo "config rejected local-lfs-token" >&2
+  exit 43
+fi
+touch '{}'
+exit 0
+"#,
+                approve_path.display()
+            ),
+        );
+        let approval = GitCredentialApproval::new(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            token(),
+        )
+        .expect("approval should parse");
+
+        let error = approval
+            .approve_with_git_program(&fake_git)
+            .expect_err("fake git config should fail");
+        let display = error.to_string();
+
+        assert!(matches!(error, CliError::ExternalCommand { .. }));
+        assert!(display.contains(
+            "git config --global credential.https://lfs.example.com/.useHttpPath true failed"
+        ));
+        assert!(display.contains("<redacted>"));
+        assert!(!display.contains("local-lfs-token"));
+        assert!(!approve_path.exists());
     }
 
     #[test]
@@ -373,6 +474,18 @@ exit 42
         assert!(sanitized.as_str().len() <= MAX_COMMAND_STDERR_LEN + "...".len());
         assert!(!sanitized.as_str().contains("split"));
         assert!(!sanitized.as_str().contains("split-token-secret"));
+    }
+
+    #[test]
+    fn command_stderr_truncates_at_utf8_boundary() {
+        let stderr = format!("{}é", "x".repeat(MAX_COMMAND_STDERR_LEN - 1));
+
+        let sanitized = sanitize_command_stderr(stderr.as_bytes(), "unused-token");
+
+        assert_eq!(
+            sanitized.as_str(),
+            &format!("{}...", "x".repeat(MAX_COMMAND_STDERR_LEN - 1))
+        );
     }
 
     #[cfg(unix)]
