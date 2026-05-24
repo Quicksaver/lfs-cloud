@@ -28,7 +28,7 @@ const MAX_RETAINED_COMMAND_STDERR_LEN: usize = MAX_COMMAND_STDERR_LEN + MAX_CRED
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const STDERR_DRAIN_AFTER_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 const STDERR_DRAIN_AFTER_KILL_TIMEOUT: Duration = Duration::from_millis(100);
-const STDERR_EVENTS_PER_WAIT_POLL: usize = 64;
+const PIPE_EVENTS_PER_DRAIN: usize = 64;
 
 /// Credential-helper payload for approving one configured LFS URL.
 #[derive(Clone, Eq, PartialEq)]
@@ -207,11 +207,20 @@ impl GitCredentialLookup {
     }
 
     fn credential_query_input(&self) -> String {
-        format!(
-            "url={}\nusername={}\n\n",
-            self.lfs_url.as_str(),
-            self.username
-        )
+        let mut input = format!(
+            "protocol={}\nhost={}\n",
+            self.lfs_url.scheme(),
+            credential_host_field(&self.lfs_url)
+        );
+        if let Some(path) = expected_credential_path(&self.lfs_url) {
+            input.push_str("path=");
+            input.push_str(&path);
+            input.push('\n');
+        }
+        input.push_str("username=");
+        input.push_str(&self.username);
+        input.push_str("\n\n");
+        input
     }
 }
 
@@ -482,7 +491,8 @@ fn parse_git_credential_fill_output(
     if fields.protocol.as_deref() != Some(lfs_url.scheme())
         || fields.host.as_deref() != Some(&credential_host_field(lfs_url))
         || fields.username.as_deref() != Some(expected_username)
-        || fields.path.as_deref() != expected_credential_path(lfs_url).as_deref()
+        || normalize_credential_path(fields.path.as_deref()).as_deref()
+            != expected_credential_path(lfs_url).as_deref()
     {
         return Err(invalid_credential_output(
             "git credential fill returned a credential for a different LFS URL or username",
@@ -552,7 +562,11 @@ fn credential_host_field(url: &Url) -> String {
 }
 
 fn expected_credential_path(url: &Url) -> Option<String> {
-    let path = url.path().trim_start_matches('/');
+    normalize_credential_path(Some(url.path()))
+}
+
+fn normalize_credential_path(path: Option<&str>) -> Option<String> {
+    let path = path?.trim_start_matches('/');
     if path.is_empty() {
         None
     } else {
@@ -561,8 +575,9 @@ fn expected_credential_path(url: &Url) -> Option<String> {
 }
 
 fn invalid_credential_output(message: impl Into<String>) -> CliError {
-    CliError::InvalidArguments {
-        message: message.into(),
+    CliError::ExternalCommandOutput {
+        command: "git credential fill".to_owned(),
+        message: SanitizedMessage::new(message.into()),
     }
 }
 
@@ -827,32 +842,32 @@ fn stop_timed_out_child_process_tree(child: &Child) {
 fn stop_timed_out_child_process_tree(_child: &Child) {}
 
 struct PipeReader {
-    receiver: Receiver<StderrEvent>,
+    receiver: Receiver<PipeEvent>,
     _reader_thread: thread::JoinHandle<()>,
     closed: bool,
 }
 
 impl PipeReader {
     fn new(mut pipe: impl Read + Send + 'static) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(STDERR_EVENTS_PER_WAIT_POLL);
+        let (sender, receiver) = mpsc::sync_channel(PIPE_EVENTS_PER_DRAIN);
         let reader_thread = thread::spawn(move || {
             let mut buffer = [0; 8192];
             loop {
                 match pipe.read(&mut buffer) {
                     Ok(0) => {
-                        let _ = sender.send(StderrEvent::Closed);
+                        let _ = sender.send(PipeEvent::Closed);
                         break;
                     }
                     Ok(count) => {
                         if sender
-                            .send(StderrEvent::Data(buffer[..count].to_vec()))
+                            .send(PipeEvent::Data(buffer[..count].to_vec()))
                             .is_err()
                         {
                             break;
                         }
                     }
                     Err(source) => {
-                        let _ = sender.send(StderrEvent::Error(source));
+                        let _ = sender.send(PipeEvent::Error(source));
                         break;
                     }
                 }
@@ -867,7 +882,7 @@ impl PipeReader {
     }
 }
 
-enum StderrEvent {
+enum PipeEvent {
     Data(Vec<u8>),
     Error(std::io::Error),
     Closed,
@@ -912,7 +927,7 @@ fn drain_available_pipe_reader(
     command_name: &str,
     retain: fn(&mut Vec<u8>, &[u8]),
 ) -> CliResult<()> {
-    for _ in 0..STDERR_EVENTS_PER_WAIT_POLL {
+    for _ in 0..PIPE_EVENTS_PER_DRAIN {
         if reader.closed {
             break;
         }
@@ -991,21 +1006,21 @@ fn drain_pipe_until(
 }
 
 fn handle_pipe_event(
-    event: StderrEvent,
+    event: PipeEvent,
     reader: &mut PipeReader,
     output: &mut Vec<u8>,
     command_name: &str,
     retain: fn(&mut Vec<u8>, &[u8]),
 ) -> CliResult<()> {
     match event {
-        StderrEvent::Data(data) => retain(output, &data),
-        StderrEvent::Closed => {
+        PipeEvent::Data(data) => retain(output, &data),
+        PipeEvent::Closed => {
             reader.closed = true;
         }
-        StderrEvent::Error(source) => {
+        PipeEvent::Error(source) => {
             reader.closed = true;
             return Err(CliError::Io {
-                context: format!("failed to read stderr from {command_name}"),
+                context: format!("failed to read pipe output from {command_name}"),
                 source,
             });
         }
@@ -1016,11 +1031,11 @@ fn handle_pipe_event(
 
 fn retain_stdout_data(stdout: &mut Vec<u8>, data: &[u8]) {
     let retained = stdout.len();
-    if retained > MAX_CREDENTIAL_OUTPUT_LEN {
+    if retained >= MAX_CREDENTIAL_OUTPUT_LEN {
         return;
     }
 
-    let remaining = MAX_CREDENTIAL_OUTPUT_LEN + 1 - retained;
+    let remaining = MAX_CREDENTIAL_OUTPUT_LEN - retained;
     stdout.extend_from_slice(&data[..remaining.min(data.len())]);
 }
 
@@ -1052,8 +1067,10 @@ mod tests {
 
     use super::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, GitCredentialLookup,
-        MAX_COMMAND_STDERR_LEN, MAX_RETAINED_COMMAND_STDERR_LEN, git_command, retain_stderr_data,
-        sanitize_command_stderr, wait_for_git_command_timeout,
+        MAX_COMMAND_STDERR_LEN, MAX_CREDENTIAL_FIELD_LEN, MAX_CREDENTIAL_OUTPUT_LEN,
+        MAX_RETAINED_COMMAND_STDERR_LEN, git_command, parse_git_credential_fill_output,
+        retain_stderr_data, retain_stdout_data, sanitize_command_stderr,
+        wait_for_git_command_timeout,
     };
     use crate::{CliError, LfsSessionToken};
 
@@ -1141,12 +1158,51 @@ printf '%s\n' \
 
         assert_eq!(
             fs::read_to_string(stdin_path).expect("stdin capture should be readable"),
-            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\n\n"
+            "protocol=https\nhost=lfs.example.com\npath=github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\n\n"
         );
         assert_eq!(credential.lfs_url(), lookup.lfs_url());
         assert_eq!(credential.username(), DEFAULT_GIT_CREDENTIAL_USERNAME);
         assert_eq!(credential.token().as_str(), "local-lfs-token");
         assert!(!format!("{credential:?}").contains("local-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lookup_supports_custom_username_and_explicit_port_scope() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let stdin_path = temp.path().join("stdin.txt");
+        let fake_git = write_fake_git(
+            temp.path(),
+            &format!(
+                r#"#!/bin/sh
+cat > '{}'
+printf '%s\n' \
+  'protocol=https' \
+  'host=lfs.example.com:8443' \
+  'path=/github.com/owner/repo.git/info/lfs' \
+  'username=custom-lfs-user' \
+  'password=local-lfs-token' \
+  ''
+"#,
+                stdin_path.display()
+            ),
+        );
+        let lookup = GitCredentialLookup::with_username(
+            "https://lfs.example.com:8443/github.com/owner/repo.git/info/lfs",
+            "custom-lfs-user",
+        )
+        .expect("lookup should parse");
+
+        let credential = lookup
+            .lookup_with_git_program(&fake_git)
+            .expect("fake git lookup should succeed");
+
+        assert_eq!(
+            fs::read_to_string(stdin_path).expect("stdin capture should be readable"),
+            "protocol=https\nhost=lfs.example.com:8443\npath=github.com/owner/repo.git/info/lfs\nusername=custom-lfs-user\n\n"
+        );
+        assert_eq!(credential.username(), "custom-lfs-user");
+        assert_eq!(credential.token().as_str(), "local-lfs-token");
     }
 
     #[test]
@@ -1175,7 +1231,7 @@ printf '%s\n' \
             .expect_err("path mismatch should be rejected");
         let display = error.to_string();
 
-        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        assert!(matches!(error, CliError::ExternalCommandOutput { .. }));
         assert!(display.contains("different LFS URL or username"));
         assert!(!display.contains("local-lfs-token"));
     }
@@ -1206,9 +1262,39 @@ printf '%s\n' \
             .expect_err("invalid token should be rejected");
         let display = error.to_string();
 
-        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        assert!(matches!(error, CliError::ExternalCommandOutput { .. }));
         assert!(display.contains("invalid local LFS token"));
         assert!(!display.contains("local token"));
+    }
+
+    #[test]
+    fn lookup_rejects_oversized_stdout_as_invalid_helper_output() {
+        let lfs_url = url::Url::parse("https://lfs.example.com/repo.git/info/lfs")
+            .expect("test URL should parse");
+        let oversized = vec![b'x'; MAX_CREDENTIAL_OUTPUT_LEN + 1];
+
+        let error =
+            parse_git_credential_fill_output(&lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME, &oversized)
+                .expect_err("oversized output should be rejected");
+
+        assert!(matches!(error, CliError::ExternalCommandOutput { .. }));
+        assert!(error.to_string().contains("too much output"));
+    }
+
+    #[test]
+    fn lookup_rejects_non_utf8_stdout_without_leaking_output() {
+        let lfs_url = url::Url::parse("https://lfs.example.com/repo.git/info/lfs")
+            .expect("test URL should parse");
+        let output = b"protocol=https\npassword=local-lfs-token\xff\n";
+
+        let error =
+            parse_git_credential_fill_output(&lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME, output)
+                .expect_err("non-UTF-8 output should be rejected");
+        let display = error.to_string();
+
+        assert!(matches!(error, CliError::ExternalCommandOutput { .. }));
+        assert!(display.contains("non-UTF-8 output"));
+        assert!(!display.contains("local-lfs-token"));
     }
 
     #[test]
@@ -1578,6 +1664,18 @@ exit 0
         );
 
         assert_eq!(stderr.len(), MAX_RETAINED_COMMAND_STDERR_LEN);
+    }
+
+    #[test]
+    fn retained_credential_stdout_is_capped_before_parsing() {
+        let mut stdout = Vec::new();
+        retain_stdout_data(
+            &mut stdout,
+            &vec![b'x'; MAX_CREDENTIAL_OUTPUT_LEN + MAX_CREDENTIAL_FIELD_LEN],
+        );
+        retain_stdout_data(&mut stdout, b"extra");
+
+        assert_eq!(stdout.len(), MAX_CREDENTIAL_OUTPUT_LEN);
     }
 
     #[test]

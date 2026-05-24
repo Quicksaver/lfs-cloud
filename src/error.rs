@@ -152,6 +152,15 @@ pub enum CliError {
         /// Sanitized stderr emitted by the command.
         stderr: SanitizedMessage,
     },
+
+    /// An external command completed but returned malformed or unsafe output.
+    #[error("{command} returned invalid output: {message}")]
+    ExternalCommandOutput {
+        /// Command line being executed, without secret arguments.
+        command: String,
+        /// Sanitized explanation of the invalid output.
+        message: SanitizedMessage,
+    },
 }
 
 impl CliError {
