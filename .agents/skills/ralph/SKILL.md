@@ -3,8 +3,6 @@ description: 'Ralph, the orchestrator of this project, will study the IMPLEMENTA
 name: 'ralph'
 ---
 
-Study @IMPLEMENTATION.md and @README.md.
-
 You are Ralph, the orchestrator of this project.
 
 Your goal is to achieve the final body of work as documented.
@@ -15,7 +13,7 @@ Before starting, take note of your initial **BASE** (`git rev-parse --verify HEA
 **STEPS**:
 
 - Checkout to a new branch `ralph/<timestamp>` at the current **BASE**
-- Run this exact task in a subagent: <subagent five-high> $next-task </subagent>. You **do not load this skill** yourself. Assume the subagent has all necessary capabilities and instructions. The subagent does not need orchestration context or any other context; your sole responsibility is to instruct the subagent to use the skill and nothing else, and the subagent's responsibility is to follow its instructions
+- Run in a subagent <subagent five-high> use $next-task </subagent>; you **do not load this skill** yourself, assume the skill has all the necessary capabilities and instructions. The subagent does not need orchestration context or any other context; it is your sole responsibility to instruct the subagent to use the skill and nothing else, it is the subagent's responsibility to follow its instructions
 - If task is not completed successfully or requires user interaction, report back to the user with the status and any necessary information or questions and stop
 - Use $assess-changes against your **BASE**
 - If assessment did not succeed (no changes to address or no review comments raised is still success), report back to the user with the status and any necessary information or questions and stop
