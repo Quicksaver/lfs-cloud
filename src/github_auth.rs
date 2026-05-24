@@ -315,8 +315,15 @@ impl GitHubOAuthCallback {
         query: GitHubOAuthCallbackQuery,
         expected_state: &GitHubOAuthState,
     ) -> ServerResult<Self> {
+        let state = required_callback_param(query.state, "state")?;
+        if state != expected_state.as_str() {
+            return Err(ServerError::Unauthorized {
+                reason: "github oauth csrf state mismatch".to_owned(),
+            });
+        }
+
         if let Some(error) = query.error {
-            let error = required_callback_param(Some(error), "error")?;
+            let error = sanitize_callback_value(&required_callback_param(Some(error), "error")?);
             let description = query
                 .error_description
                 .as_deref()
@@ -331,12 +338,6 @@ impl GitHubOAuthCallback {
         }
 
         let code = required_callback_param(query.code, "code")?;
-        let state = required_callback_param(query.state, "state")?;
-        if state != expected_state.as_str() {
-            return Err(ServerError::Unauthorized {
-                reason: "github oauth csrf state mismatch".to_owned(),
-            });
-        }
 
         Ok(Self {
             code: GitHubOAuthCode(code),
@@ -666,6 +667,60 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("access_denied"));
         assert!(rendered.contains("User denied access"));
+    }
+
+    #[test]
+    fn callback_validation_sanitizes_github_error_code() {
+        let expected_state =
+            GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
+        let query = GitHubOAuthCallbackQuery {
+            code: None,
+            state: Some("csrf-state".to_owned()),
+            error: Some(format!("access_denied\n{}", "x".repeat(240))),
+            error_description: None,
+            error_uri: None,
+        };
+
+        let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+
+        assert!(matches!(error, ServerError::Unauthorized { .. }));
+        let rendered = error.to_string();
+        assert!(rendered.contains("access_denied "));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains(&"x".repeat(201)));
+    }
+
+    #[test]
+    fn callback_validation_rejects_github_error_without_matching_state() {
+        let expected_state =
+            GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
+
+        let missing_state = GitHubOAuthCallbackQuery {
+            code: None,
+            state: None,
+            error: Some("access_denied".to_owned()),
+            error_description: None,
+            error_uri: None,
+        };
+        let missing_error = GitHubOAuthCallback::validate(missing_state, &expected_state)
+            .expect_err("missing state should fail before provider error handling");
+        assert!(matches!(missing_error, ServerError::InvalidRequest { .. }));
+        assert!(!missing_error.to_string().contains("access_denied"));
+
+        let mismatched_state = GitHubOAuthCallbackQuery {
+            code: None,
+            state: Some("attacker-state".to_owned()),
+            error: Some("access_denied".to_owned()),
+            error_description: None,
+            error_uri: None,
+        };
+        let mismatch_error = GitHubOAuthCallback::validate(mismatched_state, &expected_state)
+            .expect_err("mismatched state should fail before provider error handling");
+        assert!(matches!(mismatch_error, ServerError::Unauthorized { .. }));
+        let rendered = mismatch_error.to_string();
+        assert!(rendered.contains("csrf state mismatch"));
+        assert!(!rendered.contains("access_denied"));
+        assert!(!rendered.contains("attacker-state"));
     }
 
     #[test]

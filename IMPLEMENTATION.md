@@ -1160,7 +1160,8 @@ Defer:
 #### Epic 2.1: OAuth Login
 
 - [x] [T] Implement GitHub OAuth authorization URL generation with CSRF state.
-- [x] [T] Implement OAuth callback route and state validation.
+- [x] [T] Implement OAuth callback query parsing and CSRF state validation helper.
+- [ ] [T] Implement OAuth callback route that uses the validated callback.
 - [ ] [T] Implement GitHub OAuth code-to-token exchange.
 - [ ] [T] Fetch authenticated GitHub user identity with the OAuth token.
 - [ ] [T] Store local `lfs-cloud` session/token metadata without exposing the GitHub token to Git LFS.
