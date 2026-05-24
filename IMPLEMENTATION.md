@@ -1114,13 +1114,13 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 4 metadata setup is underway. The SQLite dependency is
-> present, `server.metadata_path` now resolves to a safe config-relative default
-> of `.lfs-cloud/metadata.sqlite3`, and `MetadataDatabase` opens server-owned
-> SQLite state with foreign-key enforcement and idempotent schema migrations.
-> The initial schema creates repository mapping, storage provider, object,
-> session, and transfer-attempt tables so later object metadata work can add
-> typed lookup and insert/update APIs without revisiting database bootstrap.
+> **Status**: Phase 4 metadata setup is complete. `server.metadata_path`
+> resolves to a safe config-relative default of `.lfs-cloud/metadata.sqlite3`,
+> and `MetadataDatabase` opens server-owned SQLite state with foreign-key
+> enforcement, idempotent schema migrations, typed object lookup, and verified
+> object upsert APIs that repair stale backend IDs without creating duplicate
+> object rows. Phase 5 can now wire these metadata operations into LFS server
+> routes.
 
 ### Progress Summary
 
@@ -1130,13 +1130,13 @@ Defer:
 | 1. Server Config                         | 8           | 8      | 0         |
 | 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
-| 4. Metadata DB                           | 8           | 4      | 4         |
+| 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **42** | **57**    |
+| **Total**                                | **99**      | **46** | **53**    |
 
 ### Legend
 
@@ -1235,10 +1235,10 @@ Defer:
 
 #### Epic 4.2: Object Metadata
 
-- [ ] [T] Implement idempotent object lookup by repo ID, storage provider ID, OID, and size.
-- [ ] [T] Implement verified object insert/update after successful storage upload.
-- [ ] [T] Record created-by user, timestamps, backend file ID, and verification status.
-- [ ] [T] Add tests for duplicate uploads, missing objects, and stale backend IDs.
+- [x] [T] Implement idempotent object lookup by repo ID, storage provider ID, OID, and size.
+- [x] [T] Implement verified object insert/update after successful storage upload.
+- [x] [T] Record created-by user, timestamps, backend file ID, and verification status.
+- [x] [T] Add tests for duplicate uploads, missing objects, and stale backend IDs.
 
 ### Phase 5: LFS Server Protocol
 

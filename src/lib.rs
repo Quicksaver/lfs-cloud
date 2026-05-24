@@ -48,7 +48,10 @@ pub use logging::{
     DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, init_tracing,
     tracing_filter,
 };
-pub use metadata::{METADATA_SCHEMA_VERSION, MetadataDatabase};
+pub use metadata::{
+    METADATA_SCHEMA_VERSION, MetadataDatabase, MetadataObjectRecord,
+    MetadataObjectVerificationStatus,
+};
 pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,
     RepositoryProvider, RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,

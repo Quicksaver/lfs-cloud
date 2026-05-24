@@ -254,6 +254,16 @@ pub enum ServerError {
         source: rusqlite::Error,
     },
 
+    /// The server could not query or update metadata database records.
+    #[error("failed to query metadata database {}: {source}", path.display())]
+    MetadataQuery {
+        /// SQLite database path whose records were being queried or updated.
+        path: PathBuf,
+        /// Underlying SQLite failure.
+        #[source]
+        source: rusqlite::Error,
+    },
+
     /// The metadata database connection mutex was poisoned.
     #[error("metadata database connection lock was poisoned for {}", path.display())]
     MetadataConnectionPoisoned {
