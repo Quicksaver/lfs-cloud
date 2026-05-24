@@ -3,7 +3,7 @@
 //! The root package keeps shared CLI, server, provider, storage, metadata, and
 //! protocol code in one library target so the binary target can stay small.
 
-pub mod cli;
+mod cli;
 pub mod credentials;
 pub mod error;
 pub mod github_auth;
@@ -74,25 +74,3 @@ pub use sessions::{
     DEFAULT_LFS_SESSION_TTL, IssuedLfsSession, LfsSessionMetadata, LfsSessionToken,
     LocalLfsSessionStore,
 };
-
-/// Returns the fallback message used by callers that want a static CLI hint.
-///
-/// # Examples
-///
-/// ```
-/// assert!(lfs_cloud::scaffold_message().contains("--help"));
-/// ```
-#[must_use]
-pub fn scaffold_message() -> &'static str {
-    "Run `lfs-cloud --help` to see available commands."
-}
-
-#[cfg(test)]
-mod tests {
-    use super::scaffold_message;
-
-    #[test]
-    fn scaffold_message_points_to_cli_help() {
-        assert!(scaffold_message().contains("--help"));
-    }
-}

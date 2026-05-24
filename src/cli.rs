@@ -1,8 +1,9 @@
 //! Command-line parsing and dispatch for LFS Cloud.
 //!
 //! This module keeps the binary target small while making CLI behavior
-//! testable without binding sockets or installing a process-global tracing
-//! subscriber.
+//! testable without binding sockets. The process entry point owns global
+//! tracing initialization, while parser and dispatch helpers stay side-effect
+//! free for focused tests.
 
 use std::{future::Future, path::PathBuf};
 
@@ -61,6 +62,9 @@ where
     F: FnOnce(ServeOptions) -> Fut,
     Fut: Future<Output = crate::ServerResult<()>>,
 {
+    // Keep command execution injectable only at the command boundary; each new
+    // subcommand should add its own runner here rather than hiding side effects
+    // in parser code.
     match cli.command {
         Command::Serve(command) => serve(command.serve_options(cli.config))
             .await
@@ -85,7 +89,7 @@ impl ServeCommand {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use clap::{CommandFactory, Parser, error::ErrorKind};
+    use clap::{CommandFactory, Parser};
 
     use super::{Cli, dispatch, tracing_config};
     use crate::{DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, ServeOptions};
@@ -109,9 +113,36 @@ mod tests {
     #[test]
     fn root_command_requires_a_subcommand() {
         let error = Cli::try_parse_from(["lfs-cloud"]).expect_err("command should be required");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("Usage: lfs-cloud"));
+        assert!(rendered.contains("Commands:"));
+    }
+
+    #[test]
+    fn serve_command_accepts_global_config_before_subcommand() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "--config",
+            "custom-lfs-cloud.yml",
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9000",
+        ])
+        .expect("serve command should parse");
+
+        let super::Command::Serve(command) = cli.command;
+        let options = command.serve_options(cli.config);
+
         assert_eq!(
-            error.kind(),
-            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            options,
+            ServeOptions::new(
+                Some("custom-lfs-cloud.yml".into()),
+                Some("0.0.0.0".to_owned()),
+                Some(9000),
+            )
         );
     }
 
