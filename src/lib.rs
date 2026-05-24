@@ -7,6 +7,7 @@
 pub mod credentials;
 pub mod error;
 pub mod github_auth;
+pub mod google_drive;
 pub mod lfs;
 pub mod logging;
 pub mod providers;
@@ -30,6 +31,10 @@ pub use github_auth::{
     GitHubOAuthTokenExchanger, GitHubRepositoryPermissionClient, GitHubUserClient,
     exchange_github_oauth_code, fetch_authenticated_github_user, github_oauth_authorization_url,
     github_oauth_callback_router,
+};
+pub use google_drive::{
+    GOOGLE_OAUTH_TOKEN_URL, GoogleDriveAccessToken, GoogleDriveCredential,
+    GoogleDriveCredentialLoader, GoogleDriveTokenRefresher,
 };
 pub use lfs::{
     LFS_POINTER_VERSION, LfsBatchAction, LfsBatchObjectError, LfsBatchObjectResponse,

@@ -1090,16 +1090,12 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 2 GitHub authentication has started with OAuth
-> authorization URL generation, CSRF state creation, and callback state
-> validation, callback routing, code-to-token exchange, and authenticated
-> GitHub user identity lookup. Successful callbacks now issue local LFS Cloud
-> session tokens without exposing GitHub OAuth tokens to Git LFS. GitHub
-> repository permission checks now map collaborator base permissions into the
-> internal read/write/admin authorization model. Local LFS Cloud tokens can now
-> be approved into and looked up from Git's credential helper for the
-> configured, path-scoped LFS URL, with clear fallback instructions when Git has
-> no credential helper configured.
+> **Status**: Phase 3 Google Drive storage has started. Server-side Google
+> Drive credential references can now load flat OAuth credential JSON from
+> environment-backed secret references, and refresh tokens can be exchanged for
+> bearer access tokens without exposing Drive credentials to Git LFS clients.
+> Token refresh failures now preserve the storage error boundary while
+> redacting configured Drive secrets from upstream diagnostics.
 
 ### Progress Summary
 
@@ -1108,14 +1104,14 @@ Defer:
 | 0. Foundations                           | 8           | 8      | 0         |
 | 1. Server Config                         | 8           | 8      | 0         |
 | 2. GitHub Auth                           | 13          | 13     | 0         |
-| 3. Google Drive Storage                  | 9           | 0      | 9         |
+| 3. Google Drive Storage                  | 9           | 2      | 7         |
 | 4. Metadata DB                           | 8           | 0      | 8         |
 | 5. LFS Server Protocol                   | 12          | 0      | 12        |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **29** | **70**    |
+| **Total**                                | **99**      | **31** | **68**    |
 
 ### Legend
 
@@ -1190,8 +1186,8 @@ Defer:
 
 #### Epic 3.1: Drive Credentials
 
-- [ ] [T] Implement Google Drive credential loading from server-side config references.
-- [ ] [T] Implement refresh-token based access-token refresh.
+- [x] [T] Implement Google Drive credential loading from server-side config references.
+- [x] [T] Implement refresh-token based access-token refresh.
 - [ ] [M] Decide and document MVP Drive scope after validating `drive.file` against the configured root-folder strategy.
 - [ ] [M] Validate configured Drive root folder access at server startup or health check.
 

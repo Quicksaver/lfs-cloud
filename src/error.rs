@@ -370,6 +370,17 @@ impl RepositoryProviderError {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// The storage provider could not load its server-side credentials.
+    #[error("{provider} storage credential {reference:?} could not be loaded: {message}")]
+    CredentialLoad {
+        /// Configured storage provider ID.
+        provider: String,
+        /// Non-secret credential reference from server configuration.
+        reference: String,
+        /// Sanitized load or parse failure details.
+        message: SanitizedMessage,
+    },
+
     /// The storage provider operation requires valid backend credentials.
     #[error("{provider} storage authentication required")]
     AuthenticationRequired {
