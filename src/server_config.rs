@@ -12,6 +12,7 @@ use std::{
 
 use config::{Config, File, FileFormat};
 use serde::Deserialize;
+use url::Url;
 
 use crate::{ServerError, ServerResult};
 
@@ -83,7 +84,9 @@ impl ServerConfig {
     /// Parses config from a YAML string.
     ///
     /// This is primarily useful for tests and tooling that has already loaded
-    /// the config contents.
+    /// the config contents. Environment references are resolved against the
+    /// current process environment; use `load_from_str_with_env` in tests that
+    /// need deterministic environment values.
     ///
     /// # Errors
     ///
@@ -219,6 +222,7 @@ impl ServerSettings {
     ) -> ServerResult<Self> {
         let host = resolve_required(raw.host, "server.host", env)?;
         let public_url = resolve_required(raw.public_url, "server.public_url", env)?;
+        validate_http_url(&public_url, "server.public_url", false)?;
 
         if raw.port == 0 {
             return invalid_config("server.port", "must be greater than zero");
@@ -268,7 +272,7 @@ impl RepositoryProviderConfig {
         match provider_type.as_str() {
             "github" => Ok(Self::GitHub(GitHubProviderConfig {
                 id,
-                api_url: resolve_required(raw.api_url, format!("{base_path}.api_url"), env)?,
+                api_url: resolve_http_url(raw.api_url, format!("{base_path}.api_url"), env)?,
                 oauth_client_id: resolve_required(
                     raw.oauth_client_id,
                     format!("{base_path}.oauth_client_id"),
@@ -421,21 +425,34 @@ impl RepositoryMapping {
         env: &mut impl FnMut(&str) -> Option<String>,
     ) -> ServerResult<Self> {
         let base_path = format!("repositories[{index}]");
+        let id = resolve_required(raw.id, format!("{base_path}.id"), env)?;
+        let repo_provider =
+            resolve_required(raw.repo_provider, format!("{base_path}.repo_provider"), env)?;
+        let host = resolve_required(raw.host, format!("{base_path}.host"), env)?;
+        validate_route_host(&host, format!("{base_path}.host"))?;
+        let owner = resolve_required(raw.owner, format!("{base_path}.owner"), env)?;
+        validate_route_component(&owner, format!("{base_path}.owner"))?;
+        let name = resolve_required(raw.name, format!("{base_path}.name"), env)?;
+        validate_route_component(&name, format!("{base_path}.name"))?;
+        if name.ends_with(".git") {
+            return invalid_config(
+                format!("{base_path}.name"),
+                "must omit the .git suffix because the route adds it",
+            );
+        }
+        let storage_provider = resolve_required(
+            raw.storage_provider,
+            format!("{base_path}.storage_provider"),
+            env,
+        )?;
+
         Ok(Self {
-            id: resolve_required(raw.id, format!("{base_path}.id"), env)?,
-            repo_provider: resolve_required(
-                raw.repo_provider,
-                format!("{base_path}.repo_provider"),
-                env,
-            )?,
-            host: resolve_required(raw.host, format!("{base_path}.host"), env)?,
-            owner: resolve_required(raw.owner, format!("{base_path}.owner"), env)?,
-            name: resolve_required(raw.name, format!("{base_path}.name"), env)?,
-            storage_provider: resolve_required(
-                raw.storage_provider,
-                format!("{base_path}.storage_provider"),
-                env,
-            )?,
+            id,
+            repo_provider,
+            host,
+            owner,
+            name,
+            storage_provider,
         })
     }
 }
@@ -542,15 +559,32 @@ fn resolve_required(
     Ok(value)
 }
 
+fn resolve_http_url(
+    value: Option<String>,
+    path: impl Into<String>,
+    env: &mut impl FnMut(&str) -> Option<String>,
+) -> ServerResult<String> {
+    let path = path.into();
+    let value = resolve_required(value, &path, env)?;
+    validate_http_url(&value, &path, false)?;
+    Ok(value)
+}
+
 fn resolve_optional(
     value: Option<String>,
     path: impl Into<String>,
     env: &mut impl FnMut(&str) -> Option<String>,
 ) -> ServerResult<Option<String>> {
-    value
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| interpolate_env(&value, &path.into(), env))
-        .transpose()
+    let path = path.into();
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let value = interpolate_env(&value, &path, env)?;
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(value))
 }
 
 fn interpolate_env(
@@ -593,8 +627,96 @@ fn interpolate_env(
 }
 
 fn validate_key(key: &str, path: impl Into<String>) -> ServerResult<()> {
+    let path = path.into();
     if key.trim().is_empty() {
         return invalid_config(path, "must not be empty");
+    }
+    if key != key.trim() {
+        return invalid_config(path, "must not have leading or trailing whitespace");
+    }
+    if !key
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return invalid_config(
+            path,
+            "must contain only ASCII letters, digits, '_' or '-' and start with a letter or digit",
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_route_host(host: &str, path: impl Into<String>) -> ServerResult<()> {
+    let path = path.into();
+    validate_no_outer_whitespace(host, &path)?;
+    if host.split('.').any(|label| {
+        label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return invalid_config(
+            path,
+            "must be a route-safe host made of ASCII domain labels",
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_route_component(component: &str, path: impl Into<String>) -> ServerResult<()> {
+    let path = path.into();
+    validate_no_outer_whitespace(component, &path)?;
+    if matches!(component, "." | "..")
+        || component.contains("..")
+        || !component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return invalid_config(
+            path,
+            "must be a route-safe repository component without separators, percent escapes, or traversal segments",
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_http_url(
+    url: &str,
+    path: impl Into<String>,
+    allow_trailing_slash: bool,
+) -> ServerResult<()> {
+    let path = path.into();
+    validate_no_outer_whitespace(url, &path)?;
+    if !allow_trailing_slash && url.ends_with('/') {
+        return invalid_config(path, "must not end with a trailing slash");
+    }
+    let parsed = Url::parse(url)
+        .map_err(|_| invalid_config_error(&path, "must be a valid http or https URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return invalid_config(path, "must be a valid http or https URL");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return invalid_config(path, "must not include a query string or fragment");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return invalid_config(path, "must not include credentials");
+    }
+
+    Ok(())
+}
+
+fn validate_no_outer_whitespace(value: &str, path: &str) -> ServerResult<()> {
+    if value != value.trim() {
+        return invalid_config(path, "must not have leading or trailing whitespace");
     }
 
     Ok(())
@@ -677,15 +799,18 @@ repositories:
             "/github.com/owner/repo.git/info/lfs"
         );
 
-        let RepositoryProviderConfig::GitHub(GitHubProviderConfig {
-            api_url,
-            oauth_client_id,
-            oauth_client_secret,
-            ..
-        }) = &config.repository_providers["github-main"];
-        assert_eq!(api_url, "https://api.github.com");
-        assert_eq!(oauth_client_id, "client-id");
-        assert_eq!(oauth_client_secret, "client-secret");
+        match &config.repository_providers["github-main"] {
+            RepositoryProviderConfig::GitHub(GitHubProviderConfig {
+                api_url,
+                oauth_client_id,
+                oauth_client_secret,
+                ..
+            }) => {
+                assert_eq!(api_url, "https://api.github.com");
+                assert_eq!(oauth_client_id, "client-id");
+                assert_eq!(oauth_client_secret, "client-secret");
+            }
+        }
 
         let StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig {
             credential_ref,
@@ -773,6 +898,87 @@ server:
         assert_error_contains(
             &error,
             "storage_providers.drive-user-a.credentials_ref is required",
+        );
+    }
+
+    #[test]
+    fn optional_environment_references_empty_strings_to_none() {
+        let config = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials_ref: drive-credential
+    root_folder_id: drive-root
+    display_name: ${EMPTY_DISPLAY_NAME}
+"#,
+            "<test>",
+            |name| match name {
+                "EMPTY_DISPLAY_NAME" => Some(String::new()),
+                _ => test_env(name),
+            },
+        )
+        .expect("config should load");
+
+        let StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig { display_name, .. }) =
+            &config.storage_providers["drive-user-a"];
+        assert_eq!(display_name, &None);
+    }
+
+    #[test]
+    fn interpolates_multiple_environment_references() {
+        let config = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://${LFS_HOST}:${LFS_PORT}
+"#,
+            "<test>",
+            |name| match name {
+                "LFS_HOST" => Some("127.0.0.1".to_owned()),
+                "LFS_PORT" => Some("8080".to_owned()),
+                _ => None,
+            },
+        )
+        .expect("config should load");
+
+        assert_eq!(config.server.public_url, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn invalid_environment_reference_names_exact_key_path() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://${LFS-HOST}:8080
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "server.public_url contains invalid environment variable reference \"LFS-HOST\"",
+        );
+    }
+
+    #[test]
+    fn unterminated_environment_reference_names_exact_key_path() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://${LFS_HOST
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "server.public_url contains an unterminated environment reference",
         );
     }
 
@@ -1035,6 +1241,162 @@ storage_providers:
 
         assert!(matches!(error, ServerError::ConfigParse { .. }));
         assert_error_contains(&error, "duplicated key in mapping");
+    }
+
+    #[test]
+    fn rejects_invalid_provider_ids() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  'bad id':
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "repository_providers.bad id must contain only ASCII letters, digits, '_' or '-' and start with a letter or digit",
+        );
+    }
+
+    #[test]
+    fn validates_public_url_shape() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: 127.0.0.1:8080
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "server.public_url must be a valid http or https URL",
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_public_url_slashes() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080/
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "server.public_url must not end with a trailing slash",
+        );
+    }
+
+    #[test]
+    fn validates_repository_provider_api_url_shape() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: ftp://api.github.com
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "repository_providers.github-main.api_url must be a valid http or https URL",
+        );
+    }
+
+    #[test]
+    fn rejects_route_unsafe_repository_components() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credential_ref: drive-credential
+    root_folder_id: drive-root
+repositories:
+  - id: github-main:owner/repo
+    repo_provider: github-main
+    host: github.com
+    owner: owner/team
+    name: repo
+    storage_provider: drive-user-a
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "repositories[0].owner must be a route-safe repository component without separators, percent escapes, or traversal segments",
+        );
+    }
+
+    #[test]
+    fn rejects_repository_names_with_git_suffix() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credential_ref: drive-credential
+    root_folder_id: drive-root
+repositories:
+  - id: github-main:owner/repo
+    repo_provider: github-main
+    host: github.com
+    owner: owner
+    name: repo.git
+    storage_provider: drive-user-a
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "repositories[0].name must omit the .git suffix because the route adds it",
+        );
     }
 
     #[test]
