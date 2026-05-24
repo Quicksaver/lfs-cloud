@@ -919,6 +919,7 @@ dependencies = [
  "axum",
  "clap",
  "config",
+ "futures-util",
  "oauth2",
  "reqwest",
  "rusqlite",
