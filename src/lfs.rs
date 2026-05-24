@@ -893,14 +893,21 @@ fn lfs_object_transfer_action_url(
     let Ok(mut url) = Url::parse(public_url.trim_end_matches('/')) else {
         return fallback();
     };
-    let path = format!(
-        "{}/{}/objects/{}",
-        url.path().trim_end_matches('/'),
-        repository_lfs_path.trim_matches('/'),
-        object.oid.as_hex()
-    );
-    url.set_path(&path);
     url.set_query(None);
+    let Ok(mut segments) = url.path_segments_mut() else {
+        return fallback();
+    };
+    segments.pop_if_empty();
+    for segment in repository_lfs_path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        segments.push(segment);
+    }
+    segments.push("objects");
+    segments.push(object.oid.as_hex());
+    drop(segments);
     url.query_pairs_mut()
         .append_pair("size", &object.size.bytes().to_string());
     url.to_string()
@@ -1367,6 +1374,30 @@ mod tests {
             .expect("unavailable object should preserve object-level error");
         assert_eq!(unavailable_error.code, 503);
         assert_eq!(unavailable_error.message, "storage temporarily unavailable");
+    }
+
+    #[test]
+    fn batch_action_urls_preserve_encoded_public_url_path_prefix() {
+        let available = lfs_object('a', 42);
+
+        let response = LfsBatchResponse::download(
+            "https://lfs.example.com/lfs%20cloud/",
+            "/github.com/owner/repo.git/info/lfs",
+            [LfsBatchDownloadObject::available(available.clone())],
+        );
+
+        let expected_href = format!(
+            "https://lfs.example.com/lfs%20cloud/github.com/owner/repo.git/info/lfs/objects/{}?size={}",
+            available.oid.as_hex(),
+            available.size.bytes()
+        );
+        assert_eq!(
+            response.objects[0]
+                .actions
+                .get("download")
+                .map(|action| action.href.as_str()),
+            Some(expected_href.as_str())
+        );
     }
 
     #[test]

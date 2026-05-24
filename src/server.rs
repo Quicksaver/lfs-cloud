@@ -979,7 +979,7 @@ fn transfer_request_expected_size(request: &Request, action: &str) -> ServerResu
                 .map_err(|_| ServerError::InvalidRequest {
                     message: format!("invalid {action} size query value {value:?}"),
                 })?;
-            if size > MAX_UPLOAD_OBJECT_BYTES {
+            if action == "upload" && size > MAX_UPLOAD_OBJECT_BYTES {
                 return Err(ServerError::InvalidRequest {
                     message: format!(
                         "{action} action size {size} exceeds the maximum supported object size"
@@ -2913,9 +2913,17 @@ repositories:
     }
 
     #[tokio::test]
-    async fn download_endpoint_rejects_oversized_size_query_parameter() {
+    async fn download_endpoint_accepts_objects_larger_than_upload_limit() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
-        let transfer_store = RecordingTransferStore::existing();
+        let object = LfsObject::new(
+            LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("test oid should parse"),
+            LfsObjectSize::new(MAX_UPLOAD_OBJECT_BYTES + 1),
+        );
+        let transfer_store = RecordingTransferStore::existing_object_with_download_body(
+            StoredObject::new("drive-user-a", object.clone(), "drive-file-existing"),
+            b"download body".to_vec(),
+        );
         let router = test_router_with_authorizer_and_transfer_store(
             store,
             RecordingBatchAuthorizer::allow(),
@@ -2936,13 +2944,14 @@ repositories:
             .await
             .expect("router should respond");
 
-        assert_lfs_json_error(
-            response,
-            StatusCode::BAD_REQUEST,
-            "Git LFS download action did not include a valid size query parameter",
-        )
-        .await;
-        assert!(transfer_store.downloads().is_empty());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            transfer_store.downloads(),
+            vec![RecordedDownload {
+                repo_id: "github-main:owner/repo".to_owned(),
+                object,
+            }]
+        );
     }
 
     #[tokio::test]
