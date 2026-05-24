@@ -58,6 +58,13 @@ pub enum LfsObjectError {
     #[error("LFS pointer is missing the oid line")]
     PointerMissingOid,
 
+    /// The pointer file object identifier did not use the required `sha256:` prefix.
+    #[error("LFS pointer oid is missing the sha256: prefix: {oid}")]
+    PointerOidMissingSha256Prefix {
+        /// Object identifier text found after the `oid` key.
+        oid: String,
+    },
+
     /// The pointer file was missing the required size line.
     #[error("LFS pointer is missing the size line")]
     PointerMissingSize,
@@ -118,6 +125,10 @@ impl LfsOid {
             None => value,
         };
 
+        Self::from_sha256_hex(hex)
+    }
+
+    fn from_sha256_hex(hex: &str) -> Result<Self, LfsObjectError> {
         if hex.len() != SHA256_HEX_LENGTH {
             return Err(LfsObjectError::InvalidSha256Length { actual: hex.len() });
         }
@@ -235,6 +246,8 @@ impl LfsObject {
 pub struct LfsPointer {
     /// Pointer version URL.
     pub version: &'static str,
+    /// Extension records keyed by pointer extension name.
+    pub extensions: BTreeMap<String, LfsOid>,
     /// Object referenced by the pointer file.
     pub object: LfsObject,
 }
@@ -245,6 +258,7 @@ impl LfsPointer {
     pub fn new(object: LfsObject) -> Self {
         Self {
             version: LFS_POINTER_VERSION,
+            extensions: BTreeMap::new(),
             object,
         }
     }
@@ -266,56 +280,105 @@ impl LfsPointer {
     /// # Ok::<(), lfs_cloud::LfsObjectError>(())
     /// ```
     pub fn parse(contents: &str) -> Result<Self, LfsObjectError> {
-        let mut version = None;
-        let mut oid = None;
-        let mut size = None;
+        let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
 
-        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-            if let Some(value) = line.strip_prefix("version ") {
-                version = Some(value);
-            } else if let Some(value) = line.strip_prefix("oid ") {
-                oid = Some(LfsOid::new(value)?);
-            } else if let Some(value) = line.strip_prefix("size ") {
-                let parsed_size =
-                    value
-                        .parse::<u64>()
-                        .map_err(|source| LfsObjectError::PointerInvalidSize {
-                            value: value.to_owned(),
-                            source,
-                        })?;
-                size = Some(LfsObjectSize::new(parsed_size));
-            } else {
-                return Err(LfsObjectError::PointerUnexpectedLine {
-                    line: line.to_owned(),
-                });
+        let version_line = lines.next().ok_or(LfsObjectError::PointerMissingVersion)?;
+        let version = version_line.strip_prefix("version ").ok_or_else(|| {
+            LfsObjectError::PointerUnexpectedLine {
+                line: version_line.to_owned(),
             }
-        }
+        })?;
 
         match version {
-            Some(LFS_POINTER_VERSION) => {}
-            Some(version) => {
+            LFS_POINTER_VERSION => {}
+            version => {
                 return Err(LfsObjectError::PointerInvalidVersion {
                     version: version.to_owned(),
                 });
             }
-            None => return Err(LfsObjectError::PointerMissingVersion),
         }
 
-        Ok(Self::new(LfsObject::new(
-            oid.ok_or(LfsObjectError::PointerMissingOid)?,
-            size.ok_or(LfsObjectError::PointerMissingSize)?,
-        )))
+        let mut previous_key = None;
+        let mut extensions = BTreeMap::new();
+        let mut oid = None;
+        let mut size = None;
+
+        for line in lines {
+            let (key, value) =
+                line.split_once(' ')
+                    .ok_or_else(|| LfsObjectError::PointerUnexpectedLine {
+                        line: line.to_owned(),
+                    })?;
+
+            if previous_key
+                .as_deref()
+                .is_some_and(|previous| key <= previous)
+            {
+                return Err(LfsObjectError::PointerUnexpectedLine {
+                    line: line.to_owned(),
+                });
+            }
+            previous_key = Some(key.to_owned());
+
+            match key {
+                "oid" => {
+                    oid = Some(Self::parse_pointer_oid(value)?);
+                }
+                "size" => {
+                    let parsed_size = value.parse::<u64>().map_err(|source| {
+                        LfsObjectError::PointerInvalidSize {
+                            value: value.to_owned(),
+                            source,
+                        }
+                    })?;
+                    size = Some(LfsObjectSize::new(parsed_size));
+                }
+                extension_key if extension_key.starts_with("ext-") => {
+                    extensions.insert(extension_key.to_owned(), Self::parse_pointer_oid(value)?);
+                }
+                _ => {
+                    return Err(LfsObjectError::PointerUnexpectedLine {
+                        line: line.to_owned(),
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            version: LFS_POINTER_VERSION,
+            extensions,
+            object: LfsObject::new(
+                oid.ok_or(LfsObjectError::PointerMissingOid)?,
+                size.ok_or(LfsObjectError::PointerMissingSize)?,
+            ),
+        })
     }
 
-    /// Renders this pointer in the canonical three-line Git LFS form.
+    /// Renders this pointer in the canonical Git LFS form.
     #[must_use]
     pub fn to_pointer_file(&self) -> String {
-        format!(
-            "version {}\noid {}\nsize {}\n",
-            self.version,
+        let mut pointer = format!("version {}\n", self.version);
+
+        for (key, oid) in &self.extensions {
+            pointer.push_str(&format!("{key} {}\n", oid.as_pointer_oid()));
+        }
+
+        pointer.push_str(&format!(
+            "oid {}\nsize {}\n",
             self.object.oid.as_pointer_oid(),
             self.object.size
-        )
+        ));
+        pointer
+    }
+
+    fn parse_pointer_oid(value: &str) -> Result<LfsOid, LfsObjectError> {
+        let oid_hex = value.strip_prefix(SHA256_PREFIX).ok_or_else(|| {
+            LfsObjectError::PointerOidMissingSha256Prefix {
+                oid: value.to_owned(),
+            }
+        })?;
+
+        LfsOid::from_sha256_hex(oid_hex)
     }
 }
 
@@ -532,13 +595,36 @@ mod tests {
     }
 
     #[test]
+    fn pointer_parses_and_renders_extension_records() {
+        let contents = "version https://git-lfs.github.com/spec/v1\n\
+             ext-0-foo sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             size 42\n";
+
+        let pointer = LfsPointer::parse(contents).expect("extended pointer should parse");
+
+        assert_eq!(pointer.object.oid.as_hex(), OID);
+        assert_eq!(
+            pointer
+                .extensions
+                .get("ext-0-foo")
+                .map(LfsOid::as_pointer_oid),
+            Some(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned()
+            )
+        );
+        assert_eq!(pointer.to_pointer_file(), contents);
+    }
+
+    #[test]
     fn pointer_rejects_missing_and_unexpected_lines() {
         let missing_size = "version https://git-lfs.github.com/spec/v1\n\
              oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
         let unexpected = "version https://git-lfs.github.com/spec/v1\n\
              oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
              size 42\n\
-             ext-key value\n";
+             metadata value\n";
 
         assert!(matches!(
             LfsPointer::parse(missing_size),
@@ -546,6 +632,38 @@ mod tests {
         ));
         assert!(matches!(
             LfsPointer::parse(unexpected),
+            Err(LfsObjectError::PointerUnexpectedLine { .. })
+        ));
+    }
+
+    #[test]
+    fn pointer_rejects_raw_oid_without_sha256_prefix() {
+        let contents = "version https://git-lfs.github.com/spec/v1\n\
+             oid aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             size 42\n";
+
+        assert!(matches!(
+            LfsPointer::parse(contents),
+            Err(LfsObjectError::PointerOidMissingSha256Prefix { .. })
+        ));
+    }
+
+    #[test]
+    fn pointer_rejects_out_of_order_and_duplicate_keys() {
+        let oid_before_version = "oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             version https://git-lfs.github.com/spec/v1\n\
+             size 42\n";
+        let duplicate_oid = "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             oid sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             size 42\n";
+
+        assert!(matches!(
+            LfsPointer::parse(oid_before_version),
+            Err(LfsObjectError::PointerUnexpectedLine { .. })
+        ));
+        assert!(matches!(
+            LfsPointer::parse(duplicate_oid),
             Err(LfsObjectError::PointerUnexpectedLine { .. })
         ));
     }
