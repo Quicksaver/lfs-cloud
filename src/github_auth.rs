@@ -15,7 +15,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Query, State},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::get,
 };
 use oauth2::{
@@ -67,6 +67,9 @@ pub const GITHUB_OAUTH_TOKEN_URL: &str = "https://github.com/login/oauth/access_
 /// The full redirect URL is formed by combining the configured server public
 /// URL with this path.
 pub const GITHUB_OAUTH_CALLBACK_PATH: &str = "/auth/github/callback";
+
+/// Login redirect path that starts the GitHub OAuth browser flow.
+pub const GITHUB_OAUTH_LOGIN_PATH: &str = "/auth/github/login";
 
 /// Default GitHub OAuth scopes for the initial login URL.
 ///
@@ -308,6 +311,28 @@ pub fn github_oauth_callback_router(state: GitHubOAuthCallbackRouteState) -> Rou
     Router::new()
         .route(GITHUB_OAUTH_CALLBACK_PATH, get(github_oauth_callback_route))
         .with_state(state)
+}
+
+/// Creates an Axum router for the GitHub OAuth login redirect endpoint.
+///
+/// The route is mounted at [`GITHUB_OAUTH_LOGIN_PATH`], generates a fresh
+/// browser authorization URL, registers the matching CSRF state in the shared
+/// registry, and redirects the browser to GitHub.
+pub fn github_oauth_login_router(state: GitHubOAuthCallbackRouteState) -> Router {
+    Router::new()
+        .route(GITHUB_OAUTH_LOGIN_PATH, get(github_oauth_login_route))
+        .with_state(state)
+}
+
+async fn github_oauth_login_route(
+    State(state): State<GitHubOAuthCallbackRouteState>,
+) -> Result<Redirect, GitHubOAuthCallbackRouteError> {
+    let authorization = GitHubOAuthAuthorization::new(&state.provider, &state.redirect_url)?;
+    state.csrf_states.register(authorization.csrf_state.clone());
+
+    Ok(Redirect::temporary(
+        authorization.authorization_url.as_str(),
+    ))
 }
 
 async fn github_oauth_callback_route(
@@ -2010,9 +2035,10 @@ mod tests {
 
     use axum::{
         Router,
+        body::Body,
         extract::{Path, State},
         http::{
-            HeaderMap, HeaderValue, StatusCode,
+            HeaderMap, HeaderValue, Request, StatusCode,
             header::{AUTHORIZATION, CONTENT_TYPE},
         },
         response::IntoResponse,
@@ -2020,15 +2046,18 @@ mod tests {
     };
     use oauth2::CsrfToken;
     use tokio::{sync::Mutex, task::JoinHandle};
+    use tower::ServiceExt;
+    use url::Url;
 
     use super::{
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
-        GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization,
-        GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteState,
-        GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthTokenExchanger,
-        GitHubRepositoryPermissionClient, GitHubUserClient, MAX_PENDING_GITHUB_OAUTH_STATES,
-        exchange_github_oauth_code, fetch_authenticated_github_user,
-        github_oauth_authorization_url, github_oauth_callback_router,
+        GITHUB_OAUTH_LOGIN_PATH, GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken,
+        GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery,
+        GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubOAuthStateRegistry,
+        GitHubOAuthTokenExchanger, GitHubRepositoryPermissionClient, GitHubUserClient,
+        MAX_PENDING_GITHUB_OAUTH_STATES, exchange_github_oauth_code,
+        fetch_authenticated_github_user, github_oauth_authorization_url,
+        github_oauth_callback_router, github_oauth_login_router,
     };
     use crate::{
         GitHubProviderConfig, LfsSessionToken, LocalLfsSessionStore, RepositoryIdentity,
@@ -3109,6 +3138,69 @@ mod tests {
             user_requests[0].authorization.as_deref(),
             Some("Bearer gho_token")
         );
+    }
+
+    #[tokio::test]
+    async fn login_route_registers_state_for_callback_completion() {
+        let (token_url, _token_server) = token_server(
+            StatusCode::OK,
+            r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user,repo"}"#,
+        )
+        .await;
+        let (api_url, _user_server) =
+            user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
+        let provider = provider_config_with_api_url(api_url);
+        let route_state = GitHubOAuthCallbackRouteState::with_clients_and_session_store(
+            provider,
+            GitHubOAuthStateRegistry::new(),
+            REDIRECT_URL,
+            GitHubOAuthTokenExchanger::with_token_url(token_url)
+                .expect("mock token URL should parse"),
+            GitHubUserClient::new().expect("user client should build"),
+            LocalLfsSessionStore::new(),
+        )
+        .expect("callback route state should build");
+        let app = github_oauth_login_router(route_state.clone())
+            .merge(github_oauth_callback_router(route_state));
+
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(GITHUB_OAUTH_LOGIN_PATH)
+                    .body(Body::empty())
+                    .expect("login request should build"),
+            )
+            .await
+            .expect("login request should complete");
+
+        assert_eq!(login_response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = login_response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("login response should redirect")
+            .to_str()
+            .expect("redirect location should be valid ASCII");
+        let login_url = Url::parse(location).expect("redirect location should parse");
+        let state = login_url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .expect("redirect should contain a csrf state");
+
+        let callback_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{GITHUB_OAUTH_CALLBACK_PATH}?code=oauth-code&state={state}"
+                    ))
+                    .body(Body::empty())
+                    .expect("callback request should build"),
+            )
+            .await
+            .expect("callback request should complete");
+
+        assert_eq!(callback_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

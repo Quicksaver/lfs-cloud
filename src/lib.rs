@@ -27,12 +27,13 @@ pub use error::{
 };
 pub use github_auth::{
     DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
-    GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken, GitHubOAuthAuthorization, GitHubOAuthCallback,
-    GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteResponse, GitHubOAuthCallbackRouteState,
-    GitHubOAuthCode, GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthToken,
-    GitHubOAuthTokenExchanger, GitHubRepositoryPermissionClient, GitHubUserClient,
-    exchange_github_oauth_code, fetch_authenticated_github_user, github_oauth_authorization_url,
-    github_oauth_callback_router,
+    GITHUB_OAUTH_LOGIN_PATH, GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken,
+    GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery,
+    GitHubOAuthCallbackRouteResponse, GitHubOAuthCallbackRouteState, GitHubOAuthCode,
+    GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthToken, GitHubOAuthTokenExchanger,
+    GitHubRepositoryPermissionClient, GitHubUserClient, exchange_github_oauth_code,
+    fetch_authenticated_github_user, github_oauth_authorization_url, github_oauth_callback_router,
+    github_oauth_login_router,
 };
 pub use google_drive::{
     GOOGLE_DRIVE_API_BASE_URL, GOOGLE_DRIVE_FILE_SCOPE, GOOGLE_OAUTH_TOKEN_URL,

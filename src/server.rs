@@ -28,7 +28,7 @@ use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
     GitHubOAuthStateRegistry, LfsOid, LfsSessionMetadata, LfsSessionToken, LocalLfsSessionStore,
     MetadataDatabase, RepositoryMapping, RepositoryProviderConfig, ServerConfig, ServerError,
-    ServerResult, github_oauth_callback_router,
+    ServerResult, github_oauth_callback_router, github_oauth_login_router,
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
@@ -158,8 +158,8 @@ fn github_oauth_router(
     let github_providers = config
         .repository_providers
         .values()
-        .filter_map(|provider| match provider {
-            RepositoryProviderConfig::GitHub(provider) => Some(provider),
+        .map(|provider| match provider {
+            RepositoryProviderConfig::GitHub(provider) => provider,
         })
         .collect::<Vec<_>>();
 
@@ -186,7 +186,10 @@ fn github_oauth_router(
         session_store,
     )?;
 
-    Ok(Some(github_oauth_callback_router(route_state)))
+    Ok(Some(
+        github_oauth_login_router(route_state.clone())
+            .merge(github_oauth_callback_router(route_state)),
+    ))
 }
 
 #[derive(Clone, Debug)]
