@@ -917,6 +917,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "config",
  "futures-util",
@@ -931,6 +932,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",

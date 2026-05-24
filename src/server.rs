@@ -2,9 +2,10 @@
 //!
 //! This module owns the first server-facing boundary: loading a validated
 //! configuration, binding an Axum listener, reporting reachable URLs, and
-//! resolving incoming Git LFS request paths to configured repository mappings.
-//! Authentication and batch-transfer behavior are layered on top of this route
-//! context in later protocol tasks.
+//! resolving incoming Git LFS request paths to configured repository mappings
+//! before requiring a local LFS Cloud session token. Batch-transfer behavior is
+//! layered on top of this route and authentication context in later protocol
+//! tasks.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
@@ -15,11 +16,21 @@ use std::{
 use axum::{
     Router,
     extract::{OriginalUri, State},
-    http::StatusCode,
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+    },
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
-use crate::{LfsOid, MetadataDatabase, RepositoryMapping, ServerConfig, ServerError, ServerResult};
+use crate::{
+    DEFAULT_GIT_CREDENTIAL_USERNAME, LfsOid, LfsSessionMetadata, LfsSessionToken,
+    LocalLfsSessionStore, MetadataDatabase, RepositoryMapping, ServerConfig, ServerError,
+    ServerResult,
+};
+
+const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
 
 /// Runtime options supplied by `lfs-cloud serve`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,8 +58,9 @@ impl ServeOptions {
 /// Starts the configured LFS Cloud HTTP server and runs until shutdown.
 ///
 /// The server currently resolves configured LFS routes and returns
-/// `501 Not Implemented` for matched endpoints. Batch, transfer, and
-/// authentication behavior are implemented by later protocol tasks.
+/// `401 Unauthorized` for unauthenticated matched endpoints or
+/// `501 Not Implemented` after a valid local LFS session token is accepted.
+/// Batch and transfer behavior are implemented by later protocol tasks.
 ///
 /// # Errors
 ///
@@ -97,7 +109,20 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
 
 /// Builds the Axum router for configured Git LFS paths.
 pub fn lfs_server_router(config: ServerConfig) -> Router {
-    let state = Arc::new(LfsServerState::new(config));
+    lfs_server_router_with_sessions(config, LocalLfsSessionStore::new())
+}
+
+/// Builds the Axum router with an explicit local LFS session store.
+///
+/// This constructor lets login/callback wiring and tests share the same
+/// [`LocalLfsSessionStore`] used by request authentication. Git LFS endpoint
+/// requests must present a valid local LFS session token before protocol
+/// handlers receive the resolved route.
+pub fn lfs_server_router_with_sessions(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+) -> Router {
+    let state = Arc::new(LfsServerState::new(config, session_store));
 
     Router::new().fallback(handle_lfs_request).with_state(state)
 }
@@ -105,12 +130,14 @@ pub fn lfs_server_router(config: ServerConfig) -> Router {
 #[derive(Clone, Debug)]
 struct LfsServerState {
     routes: LfsRouteResolver,
+    session_store: LocalLfsSessionStore,
 }
 
 impl LfsServerState {
-    fn new(config: ServerConfig) -> Self {
+    fn new(config: ServerConfig, session_store: LocalLfsSessionStore) -> Self {
         Self {
             routes: LfsRouteResolver::new(&config),
+            session_store,
         }
     }
 }
@@ -118,13 +145,28 @@ impl LfsServerState {
 async fn handle_lfs_request(
     State(state): State<Arc<LfsServerState>>,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
 ) -> Response {
     match state.routes.resolve_path(uri.path()) {
-        Ok(_route) => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Git LFS endpoint routing is configured; protocol handling is not implemented yet.\n",
-        )
-            .into_response(),
+        Ok(_route) => match authenticate_lfs_session(&headers, &state.session_store) {
+            Ok(_session) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "Git LFS endpoint routing is configured; protocol handling is not implemented yet.\n",
+            )
+                .into_response(),
+            Err(error @ ServerError::Unauthorized { .. }) => {
+                tracing::debug!(path = uri.path(), %error, "LFS route request was not authenticated");
+                authentication_required_response()
+            }
+            Err(error) => {
+                tracing::error!(path = uri.path(), %error, "failed to authenticate LFS route request");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "LFS Cloud authentication failed.\n",
+                )
+                    .into_response()
+            }
+        },
         Err(ServerError::RouteNotConfigured { .. }) => (
             StatusCode::NOT_FOUND,
             "No configured LFS Cloud repository route matches this path.\n",
@@ -143,6 +185,93 @@ async fn handle_lfs_request(
                 .into_response()
         }
     }
+}
+
+fn authenticate_lfs_session(
+    headers: &HeaderMap,
+    session_store: &LocalLfsSessionStore,
+) -> ServerResult<LfsSessionMetadata> {
+    let token = lfs_session_token_from_authorization_header(headers)?;
+
+    session_store
+        .verify(&token)
+        .ok_or_else(|| unauthorized("invalid or expired lfs session token"))
+}
+
+fn lfs_session_token_from_authorization_header(
+    headers: &HeaderMap,
+) -> ServerResult<LfsSessionToken> {
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return Err(unauthorized("missing authorization header"));
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| unauthorized("authorization header is not valid ASCII"))?;
+
+    if let Some(token) = authorization_credentials(value, "Bearer") {
+        return LfsSessionToken::from_secret(token.to_owned()).map_err(|_| {
+            unauthorized("bearer authorization did not contain a valid lfs session token")
+        });
+    }
+
+    if let Some(credentials) = authorization_credentials(value, "Basic") {
+        return lfs_session_token_from_basic_credentials(credentials);
+    }
+
+    Err(unauthorized("unsupported authorization scheme"))
+}
+
+fn lfs_session_token_from_basic_credentials(credentials: &str) -> ServerResult<LfsSessionToken> {
+    let decoded = BASE64_STANDARD
+        .decode(credentials)
+        .map_err(|_| unauthorized("basic authorization credentials were not valid base64"))?;
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| unauthorized("basic authorization credentials were not valid UTF-8"))?;
+    let Some((username, password)) = decoded.split_once(':') else {
+        return Err(unauthorized(
+            "basic authorization credentials were malformed",
+        ));
+    };
+
+    if username != DEFAULT_GIT_CREDENTIAL_USERNAME {
+        return Err(unauthorized(
+            "basic authorization username was not accepted",
+        ));
+    }
+
+    LfsSessionToken::from_secret(password.to_owned())
+        .map_err(|_| unauthorized("basic authorization did not contain a valid lfs session token"))
+}
+
+fn authorization_credentials<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+    let value = value.trim();
+    let scheme_end = value.find(char::is_whitespace).unwrap_or(value.len());
+    let (actual_scheme, rest) = value.split_at(scheme_end);
+
+    if !actual_scheme.eq_ignore_ascii_case(scheme) {
+        return None;
+    }
+
+    let credentials = rest.trim_start();
+    (!credentials.is_empty()).then_some(credentials)
+}
+
+fn unauthorized(reason: impl Into<String>) -> ServerError {
+    ServerError::Unauthorized {
+        reason: reason.into(),
+    }
+}
+
+fn authentication_required_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static(LFS_AUTH_CHALLENGE),
+        )],
+        "LFS Cloud authentication required.\n",
+    )
+        .into_response()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -430,11 +559,28 @@ fn detect_lan_ipv4() -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use axum::{
+        body::Body,
+        http::{
+            HeaderMap, HeaderValue, Request, StatusCode,
+            header::{AUTHORIZATION, WWW_AUTHENTICATE},
+        },
+    };
+    use tower::ServiceExt;
+
     use super::{
-        LfsRouteEndpoint, LfsRouteResolver, ServerBind, advertised_server_urls,
+        BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsRouteEndpoint, LfsRouteResolver, ServerBind,
+        advertised_server_urls, authenticate_lfs_session, lfs_server_router_with_sessions,
         render_server_startup_message,
     };
-    use crate::{ServerConfig, ServerError};
+    use base64::Engine as _;
+
+    use crate::{
+        DEFAULT_GIT_CREDENTIAL_USERNAME, LocalLfsSessionStore, RepositoryUser, ServerConfig,
+        ServerError,
+    };
 
     fn test_config() -> ServerConfig {
         ServerConfig::load_from_str(
@@ -548,5 +694,132 @@ repositories:
             .expect_err("host with spaces should fail config validation");
 
         assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn auth_accepts_bearer_and_basic_lfs_session_tokens() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let mut bearer_headers = HeaderMap::new();
+        bearer_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header should parse"),
+        );
+        let mut basic_headers = HeaderMap::new();
+        basic_headers.insert(
+            AUTHORIZATION,
+            basic_authorization(DEFAULT_GIT_CREDENTIAL_USERNAME, &token),
+        );
+
+        let bearer_session = authenticate_lfs_session(&bearer_headers, &store)
+            .expect("bearer token should authenticate");
+        let basic_session = authenticate_lfs_session(&basic_headers, &store)
+            .expect("basic credential token should authenticate");
+
+        assert_eq!(bearer_session.login, "octocat");
+        assert_eq!(basic_session.login, "octocat");
+        assert_eq!(basic_session.provider_id, "github-main");
+    }
+
+    #[test]
+    fn auth_rejects_missing_malformed_wrong_and_expired_tokens() {
+        let (store, token) = issued_session_token(Duration::from_millis(1));
+        let cases = [
+            HeaderMap::new(),
+            authorization_headers("Digest abc123"),
+            authorization_headers("Bearer local token"),
+            authorization_headers("Basic not-base64"),
+            {
+                let mut headers = HeaderMap::new();
+                headers.insert(AUTHORIZATION, basic_authorization("github", &token));
+                headers
+            },
+        ];
+
+        for headers in cases {
+            let error = authenticate_lfs_session(&headers, &store)
+                .expect_err("invalid credentials should be denied");
+            assert!(matches!(error, ServerError::Unauthorized { .. }));
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let error =
+            authenticate_lfs_session(&authorization_headers(&format!("Bearer {token}")), &store)
+                .expect_err("expired token should be denied");
+        assert!(matches!(error, ServerError::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn configured_lfs_routes_require_valid_session_tokens() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions(test_config(), store);
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(lfs_request(
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                None,
+            ))
+            .await
+            .expect("router should respond");
+        let unknown_route = router
+            .clone()
+            .oneshot(lfs_request(
+                "/github.com/owner/other.git/info/lfs/objects/batch",
+                None,
+            ))
+            .await
+            .expect("router should respond");
+        let authenticated = router
+            .oneshot(lfs_request(
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthenticated.headers().get(WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static(LFS_AUTH_CHALLENGE))
+        );
+        assert_eq!(unknown_route.status(), StatusCode::NOT_FOUND);
+        assert_eq!(authenticated.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    fn issued_session_token(ttl: Duration) -> (LocalLfsSessionStore, String) {
+        let store = LocalLfsSessionStore::new();
+        let user = RepositoryUser::new("github-main", "octocat", Some("42".to_owned()));
+        let issued = store
+            .issue_session_with_ttl(&user, ["read:user"], ttl)
+            .expect("session token should be issued");
+
+        (store, issued.token.as_str().to_owned())
+    }
+
+    fn authorization_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(value).expect("test authorization header should parse"),
+        );
+        headers
+    }
+
+    fn basic_authorization(username: &str, password: &str) -> HeaderValue {
+        let encoded = BASE64_STANDARD.encode(format!("{username}:{password}"));
+        HeaderValue::from_str(&format!("Basic {encoded}"))
+            .expect("test basic authorization header should parse")
+    }
+
+    fn lfs_request(path: &str, authorization: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri(path);
+        if let Some(authorization) = authorization {
+            builder = builder.header(AUTHORIZATION, authorization);
+        }
+
+        builder
+            .body(Body::empty())
+            .expect("test request should build")
     }
 }

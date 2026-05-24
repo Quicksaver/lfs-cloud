@@ -1117,8 +1117,9 @@ Defer:
 > **Status**: Phase 5 server protocol work has started. `lfs-cloud serve`
 > loads validated server config, applies `--host`/`--port` overrides, opens
 > server-owned metadata storage, binds an Axum listener, reports local and
-> best-effort LAN URLs, and resolves configured repository LFS paths before the
-> later auth, batch, upload, and download handlers are attached.
+> best-effort LAN URLs, resolves configured repository LFS paths, and requires
+> a valid local LFS Cloud session token before later batch, upload, and
+> download handlers run.
 
 ### Progress Summary
 
@@ -1129,12 +1130,12 @@ Defer:
 | 2. GitHub Auth                           | 13          | 13     | 0         |
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
-| 5. LFS Server Protocol                   | 12          | 3      | 9         |
+| 5. LFS Server Protocol                   | 12          | 4      | 8         |
 | 6. CLI Commands                          | 13          | 0      | 13        |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **49** | **50**    |
+| **Total**                                | **99**      | **50** | **49**    |
 
 ### Legend
 
@@ -1245,7 +1246,7 @@ Defer:
 - [x] [T] Implement `lfs-cloud serve --host --port --config`.
 - [x] [M] Print localhost and LAN URLs when serving. Manual verification: run `cargo run -- serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080` with a valid local config and confirm the startup output contains both `local:` and `network:` lines.
 - [x] [T] Implement route parsing for configured repo LFS endpoints.
-- [ ] [T] Add auth middleware for `lfs-cloud` LFS tokens.
+- [x] [T] Add auth middleware for `lfs-cloud` LFS tokens.
 
 #### Epic 5.2: Batch API
 
