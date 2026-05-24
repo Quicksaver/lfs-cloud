@@ -254,6 +254,13 @@ pub enum ServerError {
         source: rusqlite::Error,
     },
 
+    /// The metadata database connection mutex was poisoned.
+    #[error("metadata database connection lock was poisoned for {}", path.display())]
+    MetadataConnectionPoisoned {
+        /// SQLite database path whose connection lock was poisoned.
+        path: PathBuf,
+    },
+
     /// No configured repository mapping matches an incoming LFS route.
     #[error("no configured repository route matches {path}")]
     RouteNotConfigured {

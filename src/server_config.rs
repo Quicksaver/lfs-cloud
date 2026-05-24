@@ -109,7 +109,7 @@ impl ServerConfig {
         path: impl Into<String>,
         env: impl FnMut(&str) -> Option<String>,
     ) -> ServerResult<Self> {
-        Self::load_from_str_with_env_and_base_dir(contents, path, Path::new("."), env)
+        Self::load_from_str_with_env_and_base_dir(contents, path, Path::new(""), env)
     }
 
     fn load_from_str_with_env_and_base_dir(
@@ -607,11 +607,29 @@ fn resolve_metadata_path(
     metadata_base_dir: &Path,
     env: &mut impl FnMut(&str) -> Option<String>,
 ) -> ServerResult<PathBuf> {
-    let path = match value.filter(|value| !value.trim().is_empty()) {
+    let path = match value {
         Some(value) => {
+            if value.trim().is_empty() {
+                return invalid_config("server.metadata_path", "must not be empty");
+            }
             let value = interpolate_env(&value, "server.metadata_path", env)?;
             if value.trim().is_empty() {
-                return invalid_config("server.metadata_path", "is required when provided");
+                return invalid_config(
+                    "server.metadata_path",
+                    "must not resolve to an empty value",
+                );
+            }
+            if value.trim() != value {
+                return invalid_config(
+                    "server.metadata_path",
+                    "must not include leading or trailing whitespace",
+                );
+            }
+            if has_trailing_path_separator(&value) {
+                return invalid_config(
+                    "server.metadata_path",
+                    "must include a metadata database file name",
+                );
             }
             PathBuf::from(value)
         }
@@ -622,14 +640,15 @@ fn resolve_metadata_path(
         return invalid_config("server.metadata_path", "must not be empty");
     }
 
-    if path.is_absolute()
-        || metadata_base_dir.as_os_str().is_empty()
-        || metadata_base_dir == Path::new(".")
-    {
+    if path.is_absolute() || metadata_base_dir.as_os_str().is_empty() {
         Ok(path)
     } else {
         Ok(metadata_base_dir.join(path))
     }
+}
+
+fn has_trailing_path_separator(value: &str) -> bool {
+    value.ends_with('/') || value.ends_with('\\')
 }
 
 fn resolve_optional(
@@ -796,7 +815,11 @@ fn invalid_config_error(path: impl Into<String>, message: impl Into<String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use super::{
         DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
@@ -1021,6 +1044,105 @@ server:
         assert_eq!(
             config.server.metadata_path,
             PathBuf::from("state").join("metadata.sqlite3")
+        );
+    }
+
+    #[test]
+    fn metadata_path_rejects_whitespace_only_values() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+  metadata_path: "   "
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(&error, "server.metadata_path must not be empty");
+    }
+
+    #[test]
+    fn metadata_path_rejects_environment_references_resolving_to_empty_values() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+  metadata_path: ${METADATA_PATH}
+"#,
+            "<test>",
+            |name| match name {
+                "METADATA_PATH" => Some(String::new()),
+                _ => test_env(name),
+            },
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "server.metadata_path must not resolve to an empty value",
+        );
+    }
+
+    #[test]
+    fn metadata_path_rejects_environment_references_resolving_to_outer_whitespace() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+  metadata_path: ${METADATA_PATH}
+"#,
+            "<test>",
+            |name| match name {
+                "METADATA_PATH" => Some(" state/metadata.sqlite3 ".to_owned()),
+                _ => test_env(name),
+            },
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "server.metadata_path must not include leading or trailing whitespace",
+        );
+    }
+
+    #[test]
+    fn metadata_path_rejects_values_ending_in_path_separators() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+  metadata_path: state/
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "server.metadata_path must include a metadata database file name",
+        );
+    }
+
+    #[test]
+    fn explicit_relative_metadata_path_joins_current_directory_base() {
+        let config = ServerConfig::load_from_str_with_env_and_base_dir(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+  metadata_path: state/metadata.sqlite3
+"#,
+            "./lfs-cloud.yml",
+            Path::new("."),
+            test_env,
+        )
+        .expect("config should load");
+
+        assert_eq!(
+            config.server.metadata_path,
+            PathBuf::from(".").join("state").join("metadata.sqlite3")
         );
     }
 

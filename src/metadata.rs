@@ -7,6 +7,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -26,6 +27,15 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS storage_providers (
+    id TEXT PRIMARY KEY,
+    provider_type TEXT NOT NULL,
+    backend_root_id TEXT NOT NULL,
+    display_name TEXT,
+    created_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS repository_mappings (
     id TEXT PRIMARY KEY,
     repo_provider_id TEXT NOT NULL,
@@ -35,15 +45,6 @@ CREATE TABLE IF NOT EXISTS repository_mappings (
     storage_provider_id TEXT NOT NULL REFERENCES storage_providers(id) ON DELETE RESTRICT,
     route_path TEXT NOT NULL UNIQUE,
     provider_stable_id TEXT,
-    created_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch()),
-    updated_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch())
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS storage_providers (
-    id TEXT PRIMARY KEY,
-    provider_type TEXT NOT NULL,
-    backend_root_id TEXT NOT NULL,
-    display_name TEXT,
     created_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
@@ -62,7 +63,7 @@ CREATE TABLE IF NOT EXISTS objects (
         verification_status IN ('verified', 'stale', 'failed')
     ),
     created_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch()),
-    last_verified_at_unix_seconds INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_verified_at_unix_seconds INTEGER,
     UNIQUE (repo_id, storage_provider_id, oid, size_bytes)
 ) STRICT;
 
@@ -119,7 +120,7 @@ PRAGMA user_version = 1;
 /// plus the current schema migrations applied.
 pub struct MetadataDatabase {
     path: PathBuf,
-    connection: Connection,
+    connection: Mutex<Connection>,
 }
 
 impl MetadataDatabase {
@@ -147,7 +148,10 @@ impl MetadataDatabase {
             path: path.clone(),
             source,
         })?;
-        let database = Self { path, connection };
+        let database = Self {
+            path,
+            connection: Mutex::new(connection),
+        };
         database.configure_connection()?;
         database.run_migrations()?;
         Ok(database)
@@ -166,7 +170,10 @@ impl MetadataDatabase {
                 path: path.clone(),
                 source,
             })?;
-        let database = Self { path, connection };
+        let database = Self {
+            path,
+            connection: Mutex::new(connection),
+        };
         database.configure_connection()?;
         database.run_migrations()?;
         Ok(database)
@@ -178,14 +185,23 @@ impl MetadataDatabase {
         &self.path
     }
 
-    /// Applies all metadata schema migrations idempotently.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] if SQLite rejects a schema statement.
-    pub fn run_migrations(&self) -> ServerResult<()> {
-        self.connection
+    fn run_migrations(&self) -> ServerResult<()> {
+        let mut connection = self.lock_connection()?;
+        let transaction =
+            connection
+                .transaction()
+                .map_err(|source| ServerError::MetadataMigration {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        transaction
             .execute_batch(INITIAL_SCHEMA)
+            .map_err(|source| ServerError::MetadataMigration {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
             .map_err(|source| ServerError::MetadataMigration {
                 path: self.path.clone(),
                 source,
@@ -198,7 +214,7 @@ impl MetadataDatabase {
     ///
     /// Returns [`ServerError`] if SQLite cannot read the schema version.
     pub fn schema_version(&self) -> ServerResult<u32> {
-        self.connection
+        self.lock_connection()?
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .map_err(|source| ServerError::MetadataConfigure {
                 path: self.path.clone(),
@@ -207,19 +223,27 @@ impl MetadataDatabase {
     }
 
     fn configure_connection(&self) -> ServerResult<()> {
-        self.connection
+        self.lock_connection()?
             .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .map_err(|source| ServerError::MetadataConfigure {
                 path: self.path.clone(),
                 source,
             })?;
-        self.connection
+        self.lock_connection()?
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|source| ServerError::MetadataConfigure {
                 path: self.path.clone(),
                 source,
             })?;
         Ok(())
+    }
+
+    fn lock_connection(&self) -> ServerResult<MutexGuard<'_, Connection>> {
+        self.connection
+            .lock()
+            .map_err(|_| ServerError::MetadataConnectionPoisoned {
+                path: self.path.clone(),
+            })
     }
 }
 
@@ -280,6 +304,8 @@ mod tests {
 
         let migration_count: u32 = database
             .connection
+            .lock()
+            .expect("metadata connection should lock")
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
@@ -299,6 +325,8 @@ mod tests {
 
         let error = database
             .connection
+            .lock()
+            .expect("metadata connection should lock")
             .execute(
                 "INSERT INTO objects(
                     repo_id,
@@ -334,6 +362,8 @@ mod tests {
 
         let missing_storage_error = database
             .connection
+            .lock()
+            .expect("metadata connection should lock")
             .execute(
                 "INSERT INTO repository_mappings(
                     id,
@@ -361,8 +391,11 @@ mod tests {
             Some(rusqlite::ErrorCode::ConstraintViolation)
         );
 
-        database
+        let connection = database
             .connection
+            .lock()
+            .expect("metadata connection should lock");
+        connection
             .execute(
                 "INSERT INTO storage_providers(
                     id,
@@ -372,8 +405,7 @@ mod tests {
                 ("drive-user-a", "google_drive", "drive-root"),
             )
             .expect("storage provider should insert");
-        database
-            .connection
+        connection
             .execute(
                 "INSERT INTO repository_mappings(
                     id,
@@ -396,8 +428,7 @@ mod tests {
             )
             .expect("repository mapping should insert after storage provider exists");
 
-        let delete_error = database
-            .connection
+        let delete_error = connection
             .execute(
                 "DELETE FROM storage_providers WHERE id = ?1",
                 ["drive-user-a"],
@@ -410,9 +441,93 @@ mod tests {
         );
     }
 
-    fn table_names(database: &MetadataDatabase) -> BTreeSet<String> {
-        let mut statement = database
+    #[test]
+    fn newly_inserted_objects_start_without_verification_timestamp() {
+        let database = MetadataDatabase::open_in_memory().expect("metadata DB should open");
+        let connection = database
             .connection
+            .lock()
+            .expect("metadata connection should lock");
+
+        connection
+            .execute(
+                "INSERT INTO storage_providers(
+                    id,
+                    provider_type,
+                    backend_root_id
+                ) VALUES (?1, ?2, ?3)",
+                ("drive-user-a", "google_drive", "drive-root"),
+            )
+            .expect("storage provider should insert");
+        connection
+            .execute(
+                "INSERT INTO repository_mappings(
+                    id,
+                    repo_provider_id,
+                    host,
+                    owner,
+                    name,
+                    storage_provider_id,
+                    route_path
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    "github-main:owner/repo",
+                    "github-main",
+                    "github.com",
+                    "owner",
+                    "repo",
+                    "drive-user-a",
+                    "/github.com/owner/repo.git/info/lfs",
+                ),
+            )
+            .expect("repository mapping should insert");
+        connection
+            .execute(
+                "INSERT INTO objects(
+                    repo_id,
+                    storage_provider_id,
+                    oid,
+                    size_bytes,
+                    backend_id,
+                    created_by_provider_id,
+                    created_by_login,
+                    verification_status
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'stale')",
+                (
+                    "github-main:owner/repo",
+                    "drive-user-a",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    42_i64,
+                    "drive-file-id",
+                    "github-main",
+                    "octocat",
+                ),
+            )
+            .expect("object should insert");
+
+        let last_verified_at: Option<i64> = connection
+            .query_row(
+                "SELECT last_verified_at_unix_seconds FROM objects",
+                [],
+                |row| row.get(0),
+            )
+            .expect("verification timestamp should load");
+        assert_eq!(last_verified_at, None);
+    }
+
+    #[test]
+    fn metadata_database_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<MetadataDatabase>();
+    }
+
+    fn table_names(database: &MetadataDatabase) -> BTreeSet<String> {
+        let connection = database
+            .connection
+            .lock()
+            .expect("metadata connection should lock");
+        let mut statement = connection
             .prepare(
                 "SELECT name
                  FROM sqlite_schema
