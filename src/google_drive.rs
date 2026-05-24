@@ -932,8 +932,8 @@ impl GoogleDriveObjectStore {
     /// # Errors
     ///
     /// Returns [`StorageError`] when the object is missing, Drive rejects the
-    /// media request, the response size conflicts with the requested object, or
-    /// the HTTP response cannot be built.
+    /// media request, the response omits or conflicts with the requested object
+    /// size, or the HTTP response cannot be built.
     pub async fn download_object_response(
         &self,
         object: &LfsObject,
@@ -975,9 +975,16 @@ impl GoogleDriveObjectStore {
             ));
         }
 
-        if let Some(actual_size) = download_response.content_length()
-            && actual_size != object.size.bytes()
-        {
+        let Some(actual_size) = download_response.content_length() else {
+            return Err(StorageError::Upstream {
+                provider: self.storage.id.clone(),
+                status: None,
+                message: SanitizedMessage::new(
+                    "Google Drive download response omitted Content-Length",
+                ),
+            });
+        };
+        if actual_size != object.size.bytes() {
             return Err(StorageError::IntegrityMismatch {
                 expected_oid: object.oid.as_hex().to_owned(),
                 expected_size: object.size.bytes(),
@@ -2356,13 +2363,14 @@ async fn read_google_response_body(
 mod tests {
     use std::{
         collections::BTreeMap,
+        io::Cursor,
         str::FromStr,
         sync::{Arc, Mutex},
     };
 
     use axum::{
         Router,
-        body::{Bytes, to_bytes},
+        body::{Body, Bytes, to_bytes},
         extract::{Path, State},
         http::{
             HeaderMap, HeaderValue, Uri,
@@ -2373,6 +2381,7 @@ mod tests {
     };
     use reqwest::StatusCode;
     use sha2::{Digest, Sha256};
+    use tokio_util::io::ReaderStream;
 
     use super::{
         GOOGLE_OAUTH_TOKEN_URL, GoogleDriveCredential, GoogleDriveCredentialLoader,
@@ -3593,6 +3602,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_store_rejects_download_without_content_length() {
+        let server = DriveDownloadServer::start_without_download_content_length(
+            drive_object_list_json("drive-file-download", OBJECT_OID, 42),
+            StatusCode::OK,
+            vec![b'x'; 42],
+        )
+        .await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let error = store
+            .download_object_response(&lfs_object())
+            .await
+            .expect_err("missing content-length should fail before streaming");
+
+        assert!(matches!(
+            error,
+            StorageError::Upstream {
+                ref provider,
+                ref message,
+                ..
+            } if provider == "drive-user-a" && message.as_str().contains("omitted Content-Length")
+        ));
+    }
+
+    #[tokio::test]
     async fn root_validator_confirms_app_accessible_writable_folder() {
         let server = DriveMetadataServer::start(StatusCode::OK, drive_folder_json()).await;
         let validator = GoogleDriveRootValidator::with_client_and_api_base_url(
@@ -4022,10 +4063,40 @@ mod tests {
             download_status: StatusCode,
             download_body: Vec<u8>,
         ) -> Self {
+            Self::start_with_download_content_length(
+                list_body,
+                download_status,
+                download_body,
+                true,
+            )
+            .await
+        }
+
+        async fn start_without_download_content_length(
+            list_body: impl Into<String>,
+            download_status: StatusCode,
+            download_body: Vec<u8>,
+        ) -> Self {
+            Self::start_with_download_content_length(
+                list_body,
+                download_status,
+                download_body,
+                false,
+            )
+            .await
+        }
+
+        async fn start_with_download_content_length(
+            list_body: impl Into<String>,
+            download_status: StatusCode,
+            download_body: Vec<u8>,
+            include_download_content_length: bool,
+        ) -> Self {
             let state = Arc::new(DriveDownloadServerState {
                 list_body: list_body.into(),
                 download_status,
                 download_body,
+                include_download_content_length,
                 list_requests: Mutex::new(Vec::new()),
                 download_requests: Mutex::new(Vec::new()),
             });
@@ -4082,6 +4153,7 @@ mod tests {
         list_body: String,
         download_status: StatusCode,
         download_body: Vec<u8>,
+        include_download_content_length: bool,
         list_requests: Mutex<Vec<CapturedDriveFilesListRequest>>,
         download_requests: Mutex<Vec<CapturedDriveDownloadRequest>>,
     }
@@ -4130,6 +4202,15 @@ mod tests {
                 headers,
                 query: uri.query().unwrap_or_default().to_owned(),
             });
+
+        if !state.include_download_content_length {
+            let stream = ReaderStream::new(Cursor::new(state.download_body.clone()));
+            return Response::builder()
+                .status(state.download_status)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from_stream(stream))
+                .expect("streaming download response should build");
+        }
 
         let mut response = (
             state.download_status,
