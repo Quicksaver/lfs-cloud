@@ -574,25 +574,32 @@ impl GoogleDriveObjectKey {
         )
     }
 
-    fn expected_app_properties(&self) -> BTreeMap<&'static str, String> {
-        BTreeMap::from([
+    fn expected_app_properties(&self) -> GoogleDriveObjectProperties {
+        GoogleDriveObjectProperties {
+            repo_namespace: self.repo_namespace.clone(),
+            oid: self.object.oid.as_hex().to_owned(),
+            size: self.object.size.bytes().to_string(),
+        }
+    }
+}
+
+struct GoogleDriveObjectProperties {
+    repo_namespace: String,
+    oid: String,
+    size: String,
+}
+
+impl GoogleDriveObjectProperties {
+    fn pairs(&self) -> [(&'static str, &str); 4] {
+        [
             (
                 GOOGLE_DRIVE_OBJECT_VERSION_PROPERTY,
-                GOOGLE_DRIVE_OBJECT_VERSION.to_owned(),
+                GOOGLE_DRIVE_OBJECT_VERSION,
             ),
-            (
-                GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY,
-                self.repo_namespace.clone(),
-            ),
-            (
-                GOOGLE_DRIVE_OBJECT_OID_PROPERTY,
-                self.object.oid.as_hex().to_owned(),
-            ),
-            (
-                GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY,
-                self.object.size.bytes().to_string(),
-            ),
-        ])
+            (GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY, &self.repo_namespace),
+            (GOOGLE_DRIVE_OBJECT_OID_PROPERTY, &self.oid),
+            (GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY, &self.size),
+        ]
     }
 }
 
@@ -669,7 +676,7 @@ impl GoogleDriveObjectStore {
         GoogleDriveObjectKey::new(&self.repo_namespace, object.clone())
     }
 
-    /// Checks whether the object exists under the configured Drive root.
+    /// Checks whether a matching object is visible to the configured Drive app.
     ///
     /// # Errors
     ///
@@ -689,12 +696,14 @@ impl GoogleDriveObjectStore {
     /// files for the same repository/OID/size tuple.
     pub async fn lookup_object(&self, object: &LfsObject) -> StorageResult<Option<StoredObject>> {
         let key = self.object_key(object)?;
+        let expected_properties = key.expected_app_properties();
         let response = self
             .client
             .get(drive_object_lookup_url(
                 self.api_base_url.clone(),
                 &self.storage.root_folder_id,
                 &key,
+                &expected_properties,
             )?)
             .header(ACCEPT, "application/json")
             .header(
@@ -718,7 +727,13 @@ impl GoogleDriveObjectStore {
             ));
         }
 
-        parse_drive_object_lookup_success(&self.storage, &key, status, &response_body)
+        parse_drive_object_lookup_success(
+            &self.storage,
+            &key,
+            &expected_properties,
+            status,
+            &response_body,
+        )
     }
 }
 
@@ -1124,6 +1139,7 @@ fn drive_object_lookup_url(
     mut api_base_url: Url,
     root_folder_id: &str,
     key: &GoogleDriveObjectKey,
+    expected_properties: &GoogleDriveObjectProperties,
 ) -> StorageResult<Url> {
     if root_folder_id.trim().is_empty() {
         return Err(StorageError::Upstream {
@@ -1165,23 +1181,25 @@ fn drive_object_lookup_url(
         .append_pair("corpora", "user")
         .append_pair("includeItemsFromAllDrives", "true")
         .append_pair("supportsAllDrives", "true")
-        .append_pair("q", &drive_object_lookup_query(root_folder_id, key));
+        .append_pair("q", &drive_object_lookup_query(key, expected_properties));
 
     Ok(api_base_url)
 }
 
-fn drive_object_lookup_query(root_folder_id: &str, key: &GoogleDriveObjectKey) -> String {
+fn drive_object_lookup_query(
+    key: &GoogleDriveObjectKey,
+    expected_properties: &GoogleDriveObjectProperties,
+) -> String {
     let mut query = format!(
-        "'{}' in parents and trashed = false and name = '{}'",
-        escape_drive_query_string(root_folder_id),
+        "trashed = false and name = '{}'",
         escape_drive_query_string(&key.file_name())
     );
 
-    for (property, value) in key.expected_app_properties() {
+    for (property, value) in expected_properties.pairs() {
         query.push_str(&format!(
             " and appProperties has {{ key='{}' and value='{}' }}",
             escape_drive_query_string(property),
-            escape_drive_query_string(&value)
+            escape_drive_query_string(value)
         ));
     }
 
@@ -1399,6 +1417,7 @@ fn parse_drive_root_error(
 fn parse_drive_object_lookup_success(
     storage: &GoogleDriveStorageConfig,
     key: &GoogleDriveObjectKey,
+    expected_properties: &GoogleDriveObjectProperties,
     status: StatusCode,
     body: &str,
 ) -> StorageResult<Option<StoredObject>> {
@@ -1424,12 +1443,13 @@ fn parse_drive_object_lookup_success(
     let Some(file) = response.files.into_iter().next() else {
         return Ok(None);
     };
-    verify_drive_object_file(storage, key, status, file).map(Some)
+    verify_drive_object_file(storage, key, expected_properties, status, file).map(Some)
 }
 
 fn verify_drive_object_file(
     storage: &GoogleDriveStorageConfig,
     key: &GoogleDriveObjectKey,
+    expected_properties: &GoogleDriveObjectProperties,
     status: StatusCode,
     file: GoogleDriveObjectFile,
 ) -> StorageResult<StoredObject> {
@@ -1449,8 +1469,8 @@ fn verify_drive_object_file(
             oid: key.object.oid.as_hex().to_owned(),
         });
     }
-    for (property, expected) in key.expected_app_properties() {
-        if file.app_properties.get(property) != Some(&expected) {
+    for (property, expected) in expected_properties.pairs() {
+        if file.app_properties.get(property).map(String::as_str) != Some(expected) {
             return Err(StorageError::Conflict {
                 provider: storage.id.clone(),
                 oid: key.object.oid.as_hex().to_owned(),
@@ -1460,9 +1480,12 @@ fn verify_drive_object_file(
     let actual_size = file
         .size
         .as_deref()
-        .ok_or_else(|| StorageError::Conflict {
+        .ok_or_else(|| StorageError::Upstream {
             provider: storage.id.clone(),
-            oid: key.object.oid.as_hex().to_owned(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive object lookup response did not include size",
+            ),
         })?
         .parse::<u64>()
         .map_err(|_| StorageError::Upstream {
@@ -1929,13 +1952,14 @@ mod tests {
     }
 
     #[test]
-    fn drive_object_lookup_url_searches_root_with_private_app_properties() {
+    fn drive_object_lookup_url_searches_with_private_app_properties() {
         let key = GoogleDriveObjectKey::new("github.com/owner/repo", lfs_object())
             .expect("key should build");
         let url = super::drive_object_lookup_url(
             url::Url::parse("http://localhost/proxy/drive/v3").expect("base URL should parse"),
             "drive-root",
             &key,
+            &key.expected_app_properties(),
         )
         .expect("lookup URL should build");
 
@@ -1950,7 +1974,6 @@ mod tests {
         assert_eq!(query["corpora"], "user");
         assert_eq!(query["includeItemsFromAllDrives"], "true");
         assert_eq!(query["supportsAllDrives"], "true");
-        assert!(query["q"].contains("'drive-root' in parents"));
         assert!(query["q"].contains("trashed = false"));
         assert!(query["q"].contains(&format!("name = 'sha256-{OBJECT_OID}-42.lfs'")));
         assert!(query["q"].contains(
@@ -1960,6 +1983,30 @@ mod tests {
             "appProperties has {{ key='lfsCloudOid' and value='{OBJECT_OID}' }}"
         )));
         assert!(query["q"].contains("appProperties has { key='lfsCloudSize' and value='42' }"));
+    }
+
+    #[test]
+    fn drive_object_key_rejects_blank_namespace() {
+        let error = GoogleDriveObjectKey::new(" \t\n", lfs_object())
+            .expect_err("blank namespace should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("repository namespace must not be blank")
+        );
+    }
+
+    #[test]
+    fn drive_object_key_rejects_control_characters_in_namespace() {
+        let error = GoogleDriveObjectKey::new("github.com/owner\nrepo", lfs_object())
+            .expect_err("control character should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("repository namespace must not contain control characters")
+        );
     }
 
     #[test]
@@ -2241,7 +2288,6 @@ mod tests {
         assert_eq!(query["corpora"], "user");
         assert_eq!(query["includeItemsFromAllDrives"], "true");
         assert_eq!(query["supportsAllDrives"], "true");
-        assert!(query["q"].contains("'drive-root' in parents"));
         assert!(query["q"].contains(
             "appProperties has { key='lfsCloudRepoNamespace' and value='github.com/owner/repo' }"
         ));
@@ -2310,7 +2356,21 @@ mod tests {
     async fn object_store_verifies_drive_binary_size() {
         let server = DriveFilesListServer::start(
             StatusCode::OK,
-            drive_object_list_json("drive-file-123", OBJECT_OID, 41),
+            format!(
+                r#"{{
+                    "files":[{{
+                        "id":"drive-file-123",
+                        "name":"sha256-{OBJECT_OID}-42.lfs",
+                        "size":"41",
+                        "appProperties":{{
+                            "lfsCloudVersion":"1",
+                            "lfsCloudRepoNamespace":"github.com/owner/repo",
+                            "lfsCloudOid":"{OBJECT_OID}",
+                            "lfsCloudSize":"42"
+                        }}
+                    }}]
+                }}"#
+            ),
         )
         .await;
         let store = GoogleDriveObjectStore::with_client_and_api_base_url(
@@ -2334,6 +2394,52 @@ mod tests {
                 actual_size: 41,
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_store_rejects_missing_drive_binary_size_as_upstream_error() {
+        let server = DriveFilesListServer::start(
+            StatusCode::OK,
+            format!(
+                r#"{{
+                    "files":[{{
+                        "id":"drive-file-123",
+                        "name":"sha256-{OBJECT_OID}-42.lfs",
+                        "appProperties":{{
+                            "lfsCloudVersion":"1",
+                            "lfsCloudRepoNamespace":"github.com/owner/repo",
+                            "lfsCloudOid":"{OBJECT_OID}",
+                            "lfsCloudSize":"42"
+                        }}
+                    }}]
+                }}"#
+            ),
+        )
+        .await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let error = store
+            .lookup_object(&lfs_object())
+            .await
+            .expect_err("missing size should be an upstream error");
+
+        assert!(matches!(
+            error,
+            StorageError::Upstream {
+                ref provider,
+                status: Some(200),
+                ref message,
+            } if provider == "drive-user-a"
+                && message.as_str()
+                    == "Google Drive object lookup response did not include size"
         ));
     }
 
@@ -2682,13 +2788,13 @@ mod tests {
         format!(
             r#"{{
                 "id":"{file_id}",
-                "name":"sha256-{oid}-42.lfs",
+                "name":"sha256-{oid}-{size}.lfs",
                 "size":"{size}",
                 "appProperties":{{
                     "lfsCloudVersion":"1",
                     "lfsCloudRepoNamespace":"github.com/owner/repo",
                     "lfsCloudOid":"{oid}",
-                    "lfsCloudSize":"42"
+                    "lfsCloudSize":"{size}"
                 }}
             }}"#
         )
