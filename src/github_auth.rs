@@ -648,10 +648,6 @@ impl GitHubRepositoryPermissionClient {
                 });
             }
 
-            if status == StatusCode::FORBIDDEN {
-                return Err(github_permission_denied(provider, repository, required));
-            }
-
             return Err(github_permission_status_error(
                 provider, status, &body, token,
             ));
@@ -2810,10 +2806,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_client_denies_generic_forbidden_response() {
+    async fn permission_client_keeps_generic_forbidden_response_as_upstream_error() {
         let (api_url, _permission_server) = permission_server(
             StatusCode::FORBIDDEN,
-            r#"{"message":"policy rejected gho_secret"}"#,
+            r#"{"message":"secondary rate limit rejected gho_token"}"#,
             None,
         )
         .await;
@@ -2824,16 +2820,20 @@ mod tests {
             RepositoryPermission::Read,
         )
         .await
-        .expect_err("generic forbidden response should deny permission");
+        .expect_err("generic forbidden response should stay upstream");
         let rendered = error.to_string();
 
-        assert!(matches!(
-            error,
+        match error {
             ServerError::RepositoryProvider {
-                source: RepositoryProviderError::PermissionDenied { .. }
-            }
-        ));
-        assert!(!rendered.contains("gho_secret"));
+                source:
+                    RepositoryProviderError::Upstream {
+                        status: Some(403), ..
+                    },
+            } => {}
+            other => panic!("expected upstream forbidden response, got {other:?}"),
+        }
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("gho_token"));
     }
 
     #[tokio::test]
