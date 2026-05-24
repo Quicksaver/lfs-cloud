@@ -206,7 +206,7 @@ fn lfs_session_token_from_authorization_header(
     };
     let value = value
         .to_str()
-        .map_err(|_| unauthorized("authorization header is not valid ASCII"))?;
+        .map_err(|_| unauthorized("authorization header is not valid UTF-8"))?;
 
     if let Some(token) = authorization_credentials(value, "Bearer") {
         return LfsSessionToken::from_secret(token.to_owned()).map_err(|_| {
@@ -263,15 +263,14 @@ fn unauthorized(reason: impl Into<String>) -> ServerError {
 }
 
 fn authentication_required_response() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(
-            WWW_AUTHENTICATE,
-            HeaderValue::from_static(LFS_AUTH_CHALLENGE),
-        )],
-        "LFS Cloud authentication required.\n",
-    )
-        .into_response()
+    let mut headers = HeaderMap::new();
+    headers.append(WWW_AUTHENTICATE, HeaderValue::from_static(LFS_AUTH_CHALLENGE));
+    headers.append(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"lfs-cloud\""),
+    );
+
+    (StatusCode::UNAUTHORIZED, headers, "LFS Cloud authentication required.\n").into_response()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -722,7 +721,7 @@ repositories:
 
     #[test]
     fn auth_rejects_missing_malformed_wrong_and_expired_tokens() {
-        let (store, token) = issued_session_token(Duration::from_millis(1));
+        let (store, token) = issued_session_token(Duration::from_secs(1));
         let cases = [
             HeaderMap::new(),
             authorization_headers("Digest abc123"),
@@ -741,12 +740,23 @@ repositories:
             assert!(matches!(error, ServerError::Unauthorized { .. }));
         }
 
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(1200));
 
-        let error =
-            authenticate_lfs_session(&authorization_headers(&format!("Bearer {token}")), &store)
+        for headers in [
+            authorization_headers(&format!("Bearer {token}")),
+            {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    AUTHORIZATION,
+                    basic_authorization(DEFAULT_GIT_CREDENTIAL_USERNAME, &token),
+                );
+                headers
+            },
+        ] {
+            let error = authenticate_lfs_session(&headers, &store)
                 .expect_err("expired token should be denied");
-        assert!(matches!(error, ServerError::Unauthorized { .. }));
+            assert!(matches!(error, ServerError::Unauthorized { .. }));
+        }
     }
 
     #[tokio::test]
@@ -779,10 +789,14 @@ repositories:
             .expect("router should respond");
 
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            unauthenticated.headers().get(WWW_AUTHENTICATE),
-            Some(&HeaderValue::from_static(LFS_AUTH_CHALLENGE))
-        );
+        let challenge_values = unauthenticated
+            .headers()
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .map(|value| value.to_str().expect("challenge should be valid ASCII"))
+            .collect::<Vec<_>>();
+        assert!(challenge_values.contains(&LFS_AUTH_CHALLENGE));
+        assert!(challenge_values.contains(&"Bearer realm=\"lfs-cloud\""));
         assert_eq!(unknown_route.status(), StatusCode::NOT_FOUND);
         assert_eq!(authenticated.status(), StatusCode::NOT_IMPLEMENTED);
     }
