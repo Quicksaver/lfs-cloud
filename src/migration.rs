@@ -6,12 +6,10 @@
 //! can build dry-run and transfer plans from one consistent snapshot.
 
 #[cfg(unix)]
-use std::ffi::OsString;
-#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
@@ -1081,14 +1079,15 @@ fn rev_list_commits(worktree_root: &Path, root_commit: &str) -> MigrationResult<
 }
 
 fn tree_blobs_at_commit(worktree_root: &Path, commit: &str) -> MigrationResult<Vec<GitTreeBlob>> {
-    let command_name = format!("git ls-tree -r -z --format=%(objectname)%x00%(path) {commit}");
+    let command_name =
+        format!("git ls-tree -r -z --format=%(objecttype)%x00%(objectname)%x00%(path) {commit}");
     let output = run_git_os_vec(
         worktree_root,
         vec![
             OsString::from("ls-tree"),
             OsString::from("-r"),
             OsString::from("-z"),
-            OsString::from("--format=%(objectname)%x00%(path)"),
+            OsString::from("--format=%(objecttype)%x00%(objectname)%x00%(path)"),
             OsString::from(commit),
         ],
         &command_name,
@@ -1113,8 +1112,8 @@ fn parse_ls_tree_blob_output(
     let mut blobs = Vec::new();
     let mut fields = stdout.split(|byte| *byte == b'\0').peekable();
 
-    while let Some(object_id) = fields.next() {
-        if object_id.is_empty() {
+    while let Some(object_type) = fields.next() {
+        if object_type.is_empty() {
             if fields.peek().is_none() {
                 break;
             }
@@ -1125,12 +1124,28 @@ fn parse_ls_tree_blob_output(
             });
         }
 
+        let Some(object_id) = fields.next() else {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned malformed tree output"),
+            });
+        };
         let Some(relative_path) = fields.next() else {
             return Err(MigrationError::ExternalCommandOutput {
                 command: command_name.to_owned(),
                 message: SanitizedMessage::new("git returned malformed tree output"),
             });
         };
+        let object_type = std::str::from_utf8(object_type).map_err(|_| {
+            MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned non-UTF-8 object type output"),
+            }
+        })?;
+        if object_type != "blob" {
+            continue;
+        }
+
         let object_id =
             std::str::from_utf8(object_id).map_err(|_| MigrationError::ExternalCommandOutput {
                 command: command_name.to_owned(),
@@ -1548,8 +1563,8 @@ mod tests {
         MigrationError, default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
         enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
         enumerate_selected_ref_lfs_pointers, parse_git_check_attr_filter_stdout,
-        parse_lfs_patterns_from_attributes, repo_relative_path_from_git_output,
-        split_gitattributes_line,
+        parse_lfs_patterns_from_attributes, parse_ls_tree_blob_output,
+        repo_relative_path_from_git_output, split_gitattributes_line,
     };
 
     #[test]
@@ -2055,6 +2070,60 @@ mod tests {
         assert!(ref_names.contains("refs/tags/v-main"));
         assert!(objects.contains(&main_object));
         assert!(objects.contains(&branch_object));
+    }
+
+    #[test]
+    fn selected_ref_pointer_scan_skips_lfs_matching_gitlinks() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('9', 555);
+
+        repo.write_file(
+            ".gitattributes",
+            "asset/* filter=lfs\nvendor/* filter=lfs\n",
+        );
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(object.clone()).to_pointer_file(),
+        );
+        repo.git(["add", ".gitattributes", "asset/model.bin"]);
+        repo.git([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            "1111111111111111111111111111111111111111",
+            "vendor/tooling",
+        ]);
+        repo.git(["commit", "-m", "add lfs pointer and gitlink"]);
+
+        let scan = enumerate_selected_ref_lfs_pointers(repo.path(), ["main"])
+            .expect("gitlinks matching LFS attributes should be ignored");
+        let objects = history_scan_objects(&scan.pointers);
+
+        assert!(objects.contains(&object));
+        assert!(
+            scan.pointers
+                .iter()
+                .all(|pointer| pointer.relative_path != Path::new("vendor/tooling"))
+        );
+    }
+
+    #[test]
+    fn ls_tree_parser_skips_non_blob_entries() {
+        let mut stdout = Vec::new();
+        stdout
+            .extend_from_slice(format!("commit\0{}\0vendor/tooling\0", "1".repeat(40)).as_bytes());
+        stdout.extend_from_slice(format!("blob\0{}\0asset/model.bin\0", "2".repeat(40)).as_bytes());
+
+        let blobs = parse_ls_tree_blob_output(&stdout, "git ls-tree test")
+            .expect("non-blob entries should be skipped");
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(
+            blobs[0].object_id,
+            "2222222222222222222222222222222222222222"
+        );
+        assert_eq!(blobs[0].relative_path, Path::new("asset/model.bin"));
     }
 
     #[test]
