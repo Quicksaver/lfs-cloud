@@ -634,8 +634,13 @@ fn register_current_worktree_for_gc(layout: &LocalCacheLayout, start_dir: &Path)
 
 fn is_git_worktree_discovery_error(error: &CliError) -> bool {
     match error {
-        CliError::ExternalCommand { command, .. } => command == "git rev-parse --show-toplevel",
-        CliError::Io { context, .. } => context == "failed to start git rev-parse --show-toplevel",
+        CliError::ExternalCommand {
+            command, stderr, ..
+        } if command == "git rev-parse --show-toplevel" => {
+            let stderr = stderr.as_str();
+            stderr.contains("not a git repository")
+                || stderr.contains("this operation must be run in a work tree")
+        }
         _ => false,
     }
 }
@@ -1283,15 +1288,16 @@ mod tests {
 
     use super::{
         Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, StatusCommand,
-        dispatch, login_url_for_server, probe_server_reachable, run_dehydrate_from_dir,
-        run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir, run_login_from_dir,
-        run_status_from_dir, sanitize_browser_stderr, tracing_config, validate_status_storage,
-        write_init_change,
+        dispatch, is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
+        run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
+        run_login_from_dir, run_status_from_dir, sanitize_browser_stderr, tracing_config,
+        validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
-        LfsOid, LfsPointer, LocalCacheError, LocalCacheLayout, ServeOptions, StorageProviderConfig,
+        LfsOid, LfsPointer, LocalCacheError, LocalCacheLayout, SanitizedMessage, ServeOptions,
+        StorageProviderConfig,
     };
 
     #[test]
@@ -2523,6 +2529,40 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("worktrees: 0 active, 0 pruned"));
         assert!(rendered.contains("objects: 0 retained, 1 removed, 0 skipped"));
+    }
+
+    #[test]
+    fn gc_ignores_only_non_worktree_git_discovery_failures() {
+        let outside_worktree = CliError::ExternalCommand {
+            command: "git rev-parse --show-toplevel".to_owned(),
+            status: "exit status: 128".to_owned(),
+            stderr: SanitizedMessage::new(
+                "fatal: not a git repository (or any of the parent directories): .git",
+            ),
+        };
+        assert!(is_git_worktree_discovery_error(&outside_worktree));
+
+        let bare_repository = CliError::ExternalCommand {
+            command: "git rev-parse --show-toplevel".to_owned(),
+            status: "exit status: 128".to_owned(),
+            stderr: SanitizedMessage::new("fatal: this operation must be run in a work tree"),
+        };
+        assert!(is_git_worktree_discovery_error(&bare_repository));
+
+        let unsafe_repository = CliError::ExternalCommand {
+            command: "git rev-parse --show-toplevel".to_owned(),
+            status: "exit status: 128".to_owned(),
+            stderr: SanitizedMessage::new(
+                "fatal: detected dubious ownership in repository at '/tmp/repo'",
+            ),
+        };
+        assert!(!is_git_worktree_discovery_error(&unsafe_repository));
+
+        let start_failure = CliError::Io {
+            context: "failed to start git rev-parse --show-toplevel".to_owned(),
+            source: io::Error::new(io::ErrorKind::NotFound, "git"),
+        };
+        assert!(!is_git_worktree_discovery_error(&start_failure));
     }
 
     #[test]
