@@ -1200,7 +1200,10 @@ Defer:
 > missing-object, and CLI dry-run no-op migration behavior. A local
 > fake-provider end-to-end test now covers repository init routing, fake GitHub
 > authorization, server-routed fake Drive upload/download actions, and checkout
-> hydration through the shared cache.
+> hydration through the shared cache. Security review found and fixed a
+> resolved GitHub OAuth client-secret debug-output leak in loaded server config,
+> and `scripts/manual/verify-secret-redaction.sh` now runs the focused
+> redaction regression checks.
 
 ### Progress Summary
 
@@ -1215,8 +1218,8 @@ Defer:
 | 6. CLI Commands                          | 13          | 13     | 0         |
 | 7. Migration                             | 12          | 12     | 0         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
-| 9. Verification, Docs, And Release Shape | 8           | 1      | 7         |
-| **Total**                                | **99**      | **92** | **7**     |
+| 9. Verification, Docs, And Release Shape | 8           | 2      | 6         |
+| **Total**                                | **99**      | **93** | **6**     |
 
 ### Legend
 
@@ -1417,7 +1420,7 @@ Defer:
 
 #### Epic 9.2: Security And Documentation
 
-- [ ] [M] Review logs and errors to ensure OAuth tokens, Drive tokens, and object contents are not leaked.
+- [x] [M] Review logs and errors to ensure OAuth tokens, Drive tokens, and object contents are not leaked. Manual verification: `scripts/manual/verify-secret-redaction.sh`.
 - [ ] [M] Document `lfs-cloud.yml` with GitHub + Google Drive examples.
 - [ ] [M] Update README once commands are implemented, removing "planned" wording where appropriate.
 - [ ] [M] Add install/build instructions and release artifact expectations.

@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -322,7 +322,7 @@ impl RepositoryProviderConfig {
 }
 
 /// GitHub repository-provider configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct GitHubProviderConfig {
     /// Configured repository provider ID.
     pub id: String,
@@ -332,6 +332,18 @@ pub struct GitHubProviderConfig {
     pub oauth_client_id: String,
     /// OAuth client secret used for token exchange.
     pub oauth_client_secret: String,
+}
+
+impl fmt::Debug for GitHubProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubProviderConfig")
+            .field("id", &self.id)
+            .field("api_url", &self.api_url)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_client_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Configured storage-provider entry.
@@ -911,6 +923,17 @@ repositories:
         assert_eq!(credential_ref, "drive-credential");
         assert_eq!(root_folder_id, "drive-root-folder");
         assert_eq!(display_name.as_deref(), Some("Main Drive"));
+    }
+
+    #[test]
+    fn server_config_debug_redacts_github_oauth_client_secret() {
+        let config = load_with_test_env(valid_yaml());
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("GitHubProviderConfig"));
+        assert!(rendered.contains("oauth_client_secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("client-secret"));
     }
 
     #[test]
