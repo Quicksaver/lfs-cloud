@@ -593,8 +593,7 @@ where
 {
     let layout = local_cache_layout(command.cache_root)?;
     let repository = GitRepository::discover(start_dir.as_ref())?;
-    let git_dir = repository.git_dir_path()?;
-    let git_lfs_objects_dir = git_dir.join("lfs").join("objects");
+    let git_lfs_objects_dir = git_lfs_objects_dir(&repository)?;
 
     fetch_lfs_objects(&repository.worktree_root)?;
     register_current_worktree(&layout, &repository.worktree_root)?;
@@ -785,6 +784,24 @@ fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
 fn current_checkout_lfs_pointer_files(
     worktree_root: &Path,
 ) -> CliResult<Vec<CurrentCheckoutLfsPointerFile>> {
+    let lfs_tracked_paths = current_checkout_lfs_tracked_paths(worktree_root)?;
+    let mut pointer_files = Vec::new();
+    for relative_path in lfs_tracked_paths {
+        let path = worktree_root.join(&relative_path);
+        let Some(pointer) = read_current_checkout_pointer_candidate(&path)? else {
+            continue;
+        };
+
+        pointer_files.push(CurrentCheckoutLfsPointerFile {
+            path,
+            object: pointer.object,
+        });
+    }
+
+    Ok(pointer_files)
+}
+
+fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> CliResult<Vec<PathBuf>> {
     let output = ProcessCommand::new("git")
         .args(["ls-files", "-z"])
         .current_dir(worktree_root)
@@ -808,20 +825,126 @@ fn current_checkout_lfs_pointer_files(
             message: SanitizedMessage::new("git returned non-UTF-8 path output"),
         })?;
     let mut pointer_files = Vec::new();
-    for relative_path in tracked_paths.split('\0').filter(|path| !path.is_empty()) {
-        let relative_path = safe_git_relative_path(relative_path)?;
-        let path = worktree_root.join(&relative_path);
-        let Some(pointer) = read_current_checkout_pointer_candidate(&path)? else {
-            continue;
-        };
+    if tracked_paths.is_empty() {
+        return Ok(pointer_files);
+    }
 
-        pointer_files.push(CurrentCheckoutLfsPointerFile {
-            path,
-            object: pointer.object,
-        });
+    let output = git_check_attr_filter(worktree_root, &tracked_paths)?;
+    let attributes =
+        String::from_utf8(output.stdout).map_err(|_| CliError::ExternalCommandOutput {
+            command: "git check-attr -z --stdin filter".to_owned(),
+            message: SanitizedMessage::new("git returned non-UTF-8 attribute output"),
+        })?;
+    let mut fields = attributes.split('\0').collect::<Vec<_>>();
+    if fields.last() == Some(&"") {
+        fields.pop();
+    }
+    let chunks = fields.chunks_exact(3);
+    if !chunks.remainder().is_empty() {
+        return Err(git_check_attr_parse_error());
+    }
+    for chunk in chunks {
+        let [relative_path, attribute, value] = chunk else {
+            unreachable!("chunks_exact yielded a non-triple chunk");
+        };
+        if *attribute != "filter" || *value != "lfs" {
+            continue;
+        }
+
+        let relative_path = safe_git_relative_path(relative_path)?;
+        pointer_files.push(relative_path);
     }
 
     Ok(pointer_files)
+}
+
+fn git_check_attr_filter(
+    worktree_root: &Path,
+    tracked_paths: &str,
+) -> CliResult<std::process::Output> {
+    let mut child = ProcessCommand::new("git")
+        .args(["check-attr", "-z", "--stdin", "filter"])
+        .current_dir(worktree_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| CliError::Io {
+            context: "failed to start git check-attr -z --stdin filter".to_owned(),
+            source,
+        })?;
+
+    let mut stdin = child.stdin.take().expect("child stdin should be piped");
+    stdin
+        .write_all(tracked_paths.as_bytes())
+        .map_err(|source| CliError::Io {
+            context: "failed to write git check-attr path input".to_owned(),
+            source,
+        })?;
+    drop(stdin);
+
+    let output = child.wait_with_output().map_err(|source| CliError::Io {
+        context: "failed to wait for git check-attr -z --stdin filter".to_owned(),
+        source,
+    })?;
+
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(CliError::ExternalCommand {
+            command: "git check-attr -z --stdin filter".to_owned(),
+            status: process_status_text(output.status),
+            stderr: sanitized_external_stderr(&output.stderr),
+        })
+    }
+}
+
+fn git_check_attr_parse_error() -> CliError {
+    CliError::ExternalCommandOutput {
+        command: "git check-attr -z --stdin filter".to_owned(),
+        message: SanitizedMessage::new("git returned malformed attribute output"),
+    }
+}
+
+fn git_lfs_objects_dir(repository: &GitRepository) -> CliResult<PathBuf> {
+    let git_common_dir = repository.git_common_dir_path()?;
+    let storage_dir = match configured_git_lfs_storage_dir(&repository.worktree_root)? {
+        Some(storage_dir) if storage_dir.is_absolute() => storage_dir,
+        Some(storage_dir) => git_common_dir.join(storage_dir),
+        None => git_common_dir.join("lfs"),
+    };
+
+    Ok(storage_dir.join("objects"))
+}
+
+fn configured_git_lfs_storage_dir(worktree_root: &Path) -> CliResult<Option<PathBuf>> {
+    let output = ProcessCommand::new("git")
+        .args(["config", "--get", "lfs.storage"])
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: "failed to start git config --get lfs.storage".to_owned(),
+            source,
+        })?;
+
+    if output.status.success() {
+        let storage =
+            String::from_utf8(output.stdout).map_err(|_| CliError::ExternalCommandOutput {
+                command: "git config --get lfs.storage".to_owned(),
+                message: SanitizedMessage::new("git returned non-UTF-8 lfs.storage output"),
+            })?;
+        let storage = storage.trim_end();
+
+        Ok((!storage.is_empty()).then(|| PathBuf::from(storage)))
+    } else if output.status.code() == Some(1) {
+        Ok(None)
+    } else {
+        Err(CliError::ExternalCommand {
+            command: "git config --get lfs.storage".to_owned(),
+            status: process_status_text(output.status),
+            stderr: sanitized_external_stderr(&output.stderr),
+        })
+    }
 }
 
 fn safe_git_relative_path(relative_path: &str) -> CliResult<PathBuf> {
@@ -2430,12 +2553,16 @@ mod tests {
         let worktree_file = repo.join("asset/model.bin");
         let bytes = b"object already fetched by git lfs";
         let object = object_for_bytes(bytes);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(
             &worktree_file,
             LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
         write_file(&repo.join("README.md"), b"not a pointer");
-        run_git(&repo, &["add", "asset/model.bin", "README.md"]);
+        run_git(
+            &repo,
+            &["add", ".gitattributes", "asset/model.bin", "README.md"],
+        );
         write_git_lfs_source_object(&repo, &object, bytes);
         let fetched_root = Arc::new(Mutex::new(None));
         let fetched_root_for_runner = Arc::clone(&fetched_root);
@@ -2476,6 +2603,118 @@ mod tests {
         assert!(rendered.contains("pulled"));
         assert!(rendered.contains("cached"));
         assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn pull_ingests_from_configured_git_lfs_storage_dir() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        run_git(&repo, &["config", "lfs.storage", "custom-lfs"]);
+        let worktree_file = repo.join("asset/model.bin");
+        let bytes = b"object fetched into custom git lfs storage";
+        let object = object_for_bytes(bytes);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(
+            &worktree_file,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
+        write_git_lfs_source_object_in(
+            &repo.join(".git").join("custom-lfs").join("objects"),
+            &object,
+            bytes,
+        );
+        let mut output = Vec::new();
+
+        run_pull_from_dir(
+            PullCommand {
+                cache_root: Some(cache_root.clone()),
+            },
+            &repo,
+            &mut output,
+            |_| Ok(()),
+        )
+        .expect("pull should hydrate from custom git lfs storage");
+
+        assert_eq!(
+            fs::read(&worktree_file).expect("hydrated file should be readable"),
+            bytes
+        );
+        let layout = LocalCacheLayout::new(cache_root);
+        assert_eq!(
+            fs::read(layout.object_path(&object)).expect("cache object should be readable"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn pull_ingests_from_git_common_dir_for_linked_worktree() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let linked = temp.path().join("linked");
+        init_git_repo_with_origin(&repo);
+        run_git(
+            &repo,
+            &["config", "user.email", "lfs-cloud@example.invalid"],
+        );
+        run_git(&repo, &["config", "user.name", "LFS Cloud Test"]);
+        let bytes = b"object fetched into common git lfs storage";
+        let object = object_for_bytes(bytes);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(
+            &repo.join("asset/model.bin"),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
+        run_git(&repo, &["commit", "-m", "add lfs pointer"]);
+        let output = ProcessCommand::new("git")
+            .args([
+                "worktree",
+                "add",
+                linked.to_str().expect("test path should be UTF-8"),
+            ])
+            .current_dir(&repo)
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .output()
+            .expect("git worktree add should start");
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        write_git_lfs_source_object(&repo, &object, bytes);
+        let mut output = Vec::new();
+
+        run_pull_from_dir(
+            PullCommand {
+                cache_root: Some(cache_root.clone()),
+            },
+            &linked,
+            &mut output,
+            |_| Ok(()),
+        )
+        .expect("pull should hydrate from the linked worktree common git dir");
+
+        assert_eq!(
+            fs::read(linked.join("asset/model.bin")).expect("hydrated file should be readable"),
+            bytes
+        );
+        let layout = LocalCacheLayout::new(cache_root);
+        assert_eq!(
+            fs::read(layout.object_path(&object)).expect("cache object should be readable"),
+            bytes
+        );
     }
 
     #[test]
@@ -2521,7 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn current_checkout_pointer_scan_uses_tracked_files_only() {
+    fn current_checkout_pointer_scan_uses_lfs_tracked_files_only() {
         if !git_is_available() {
             return;
         }
@@ -2531,6 +2770,8 @@ mod tests {
         init_git_repo_with_origin(&repo);
         let tracked_object = object_for_bytes(b"tracked pointer object");
         let untracked_object = object_for_bytes(b"untracked pointer object");
+        let ordinary_object = object_for_bytes(b"ordinary tracked pointer-shaped object");
+        write_file(&repo.join(".gitattributes"), b"asset/*.bin filter=lfs\n");
         write_file(
             &repo.join("asset/tracked.bin"),
             LfsPointer::new(tracked_object.clone())
@@ -2543,7 +2784,21 @@ mod tests {
                 .to_pointer_file()
                 .as_bytes(),
         );
-        run_git(&repo, &["add", "asset/tracked.bin"]);
+        write_file(
+            &repo.join("docs/pointer-example.txt"),
+            LfsPointer::new(ordinary_object)
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        run_git(
+            &repo,
+            &[
+                "add",
+                ".gitattributes",
+                "asset/tracked.bin",
+                "docs/pointer-example.txt",
+            ],
+        );
 
         let pointers = current_checkout_lfs_pointer_files(&repo)
             .expect("pointer scan should inspect tracked files");
@@ -3198,14 +3453,16 @@ repositories:
     }
 
     fn write_git_lfs_source_object(repo: &Path, object: &LfsObject, contents: &[u8]) {
+        write_git_lfs_source_object_in(
+            &repo.join(".git").join("lfs").join("objects"),
+            object,
+            contents,
+        );
+    }
+
+    fn write_git_lfs_source_object_in(objects_dir: &Path, object: &LfsObject, contents: &[u8]) {
         let oid = object.oid.as_hex();
-        let path = repo
-            .join(".git")
-            .join("lfs")
-            .join("objects")
-            .join(&oid[..2])
-            .join(&oid[2..4])
-            .join(oid);
+        let path = objects_dir.join(&oid[..2]).join(&oid[2..4]).join(oid);
         write_file(&path, contents);
     }
 

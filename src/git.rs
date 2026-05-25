@@ -122,6 +122,31 @@ impl GitRepository {
         })
     }
 
+    /// Returns the absolute Git common directory path for this repository.
+    ///
+    /// Linked worktrees have per-worktree Git directories but share object and
+    /// Git LFS media storage through the common directory, so local cache
+    /// operations should use this path when they need repository-wide state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git cannot resolve the current repository's
+    /// common directory.
+    pub fn git_common_dir_path(&self) -> CliResult<PathBuf> {
+        let output = git_stdout(
+            &self.worktree_root,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            "git rev-parse --path-format=absolute --git-common-dir",
+        )?;
+        let path = PathBuf::from(output.trim_end());
+
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            self.worktree_root.join(path)
+        })
+    }
+
     /// Writes the Git LFS URL either to `.lfsconfig` or to local Git config.
     ///
     /// The write is delegated to `git config` so Git's own config parser owns

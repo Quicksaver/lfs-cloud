@@ -1167,9 +1167,9 @@ Defer:
 > registered worktrees for Git LFS pointer references, removes unreferenced
 > shared cache objects, prunes missing worktree registrations, and supports
 > `--dry-run` for review before deletion. The `pull` CLI command now runs
-> `git lfs fetch`, ingests fetched current-checkout objects from
-> `.git/lfs/objects` into the shared cache, and hydrates tracked Git LFS
-> pointer files with verified cache bytes.
+> `git lfs fetch`, ingests fetched current-checkout objects from Git LFS media
+> storage into the shared cache, and hydrates LFS-tracked pointer files with
+> verified cache bytes.
 > Migration discovery support can now inspect an existing Git worktree for
 > local Git LFS installation status, visible LFS filter config, repository LFS
 > endpoint config, and `.gitattributes` patterns that declare `filter=lfs`,
