@@ -27,9 +27,10 @@ use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitLfsConfigChange,
     GitLfsConfigTarget, GitRepository, GoogleDriveCredentialLoader, GoogleDriveStorageConfig,
     LfsInitRoute, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
-    LocalCacheDehydration, LocalCacheDehydrationStatus, LocalCacheLayout,
-    LocalCacheMaterialization, LocalCacheMaterializationStatus, ServeOptions, ServerConfig,
-    StorageProviderConfig, TracingConfig, init_tracing,
+    LocalCacheDehydration, LocalCacheDehydrationStatus, LocalCacheGarbageCollection,
+    LocalCacheGarbageCollectionObject, LocalCacheLayout, LocalCacheMaterialization,
+    LocalCacheMaterializationStatus, ServeOptions, ServerConfig, StorageProviderConfig,
+    TracingConfig, init_tracing,
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -65,6 +66,8 @@ enum Command {
     Hydrate(HydrateCommand),
     /// Dehydrate clean worktree files back to Git LFS pointers.
     Dehydrate(DehydrateCommand),
+    /// Remove shared local cache objects no registered worktree references.
+    Gc(GcCommand),
 }
 
 #[derive(Debug, Args)]
@@ -133,6 +136,17 @@ struct DehydrateCommand {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct GcCommand {
+    /// Local cache root to clean instead of ~/.lfs-cloud.
+    #[arg(long, value_name = "PATH")]
+    cache_root: Option<PathBuf>,
+
+    /// Report objects and worktree registrations that would be removed.
+    #[arg(long)]
+    dry_run: bool,
+}
+
 /// Parses process arguments, initializes tracing, and runs the requested command.
 ///
 /// # Errors
@@ -150,11 +164,16 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         run_status_to_stdout,
         run_hydrate_to_stdout,
         run_dehydrate_to_stdout,
+        run_gc_to_stdout,
     )
     .await
 }
 
-async fn dispatch<F, Fut, I, L, S, H, D>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "command dispatch keeps per-subcommand side effects injectable for focused tests"
+)]
+async fn dispatch<F, Fut, I, L, S, H, D, G>(
     cli: Cli,
     serve: F,
     init: I,
@@ -162,6 +181,7 @@ async fn dispatch<F, Fut, I, L, S, H, D>(
     status: S,
     hydrate: H,
     dehydrate: D,
+    gc: G,
 ) -> anyhow::Result<()>
 where
     F: FnOnce(ServeOptions) -> Fut,
@@ -171,6 +191,7 @@ where
     S: FnOnce(StatusCommand, Option<PathBuf>) -> anyhow::Result<()>,
     H: FnOnce(HydrateCommand) -> anyhow::Result<()>,
     D: FnOnce(DehydrateCommand) -> anyhow::Result<()>,
+    G: FnOnce(GcCommand) -> anyhow::Result<()>,
 {
     // Keep command execution injectable only at the command boundary; each new
     // subcommand should add its own runner here rather than hiding side effects
@@ -186,6 +207,7 @@ where
         }
         Command::Hydrate(command) => hydrate(command).context("failed to hydrate paths"),
         Command::Dehydrate(command) => dehydrate(command).context("failed to dehydrate paths"),
+        Command::Gc(command) => gc(command).context("failed to garbage collect local cache"),
     }
 }
 
@@ -262,6 +284,12 @@ fn run_dehydrate_to_stdout(command: DehydrateCommand) -> anyhow::Result<()> {
     let mut stdout = io::stdout().lock();
 
     run_dehydrate_from_dir(command, &current_dir, &mut stdout).map_err(anyhow::Error::from)
+}
+
+fn run_gc_to_stdout(command: GcCommand) -> anyhow::Result<()> {
+    let mut stdout = io::stdout().lock();
+
+    run_gc(command, &mut stdout).map_err(anyhow::Error::from)
 }
 
 fn run_login<R, W>(command: LoginCommand, input: &mut R, output: &mut W) -> anyhow::Result<()>
@@ -572,6 +600,18 @@ where
     Ok(())
 }
 
+fn run_gc<W>(command: GcCommand, output: &mut W) -> CliResult<()>
+where
+    W: Write,
+{
+    let layout = local_cache_layout(command.cache_root)?;
+    let report = layout
+        .garbage_collect(command.dry_run)
+        .map_err(local_cache_cli_error)?;
+
+    write_gc_result(output, layout.root(), &report).map_err(output_error)
+}
+
 fn local_cache_layout(cache_root: Option<PathBuf>) -> CliResult<LocalCacheLayout> {
     match cache_root {
         Some(cache_root) => Ok(LocalCacheLayout::new(cache_root)),
@@ -732,6 +772,82 @@ where
         dehydration.object.oid,
         dehydration.object.size,
         dehydration_status_label(dehydration.status)
+    )
+}
+
+fn write_gc_result<W>(
+    output: &mut W,
+    cache_root: &Path,
+    report: &LocalCacheGarbageCollection,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let action = if report.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
+
+    writeln!(output, "lfs-cloud gc")?;
+    writeln!(output, "  cache: {}", cache_root.display())?;
+    writeln!(
+        output,
+        "  worktrees: {} active, {} {}",
+        report.active_worktree_count,
+        report.pruned_worktrees.len(),
+        if report.dry_run {
+            "would prune"
+        } else {
+            "pruned"
+        }
+    )?;
+    writeln!(
+        output,
+        "  objects: {} retained, {} {}, {} skipped",
+        report.retained_objects.len(),
+        report.unreferenced_objects.len(),
+        action,
+        report.skipped_cache_paths.len()
+    )?;
+
+    for object in &report.unreferenced_objects {
+        write_gc_object(output, action, object)?;
+    }
+    for registration in &report.pruned_worktrees {
+        let action = if report.dry_run {
+            "would prune"
+        } else {
+            "pruned"
+        };
+        writeln!(
+            output,
+            "{action} worktree {} ({})",
+            registration.worktree_root.display(),
+            registration.repository_id
+        )?;
+    }
+    for path in &report.skipped_cache_paths {
+        writeln!(output, "skipped {}", path.display())?;
+    }
+
+    Ok(())
+}
+
+fn write_gc_object<W>(
+    output: &mut W,
+    action: &str,
+    object: &LocalCacheGarbageCollectionObject,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        output,
+        "{action} {} sha256:{} ({} bytes)",
+        object.path.display(),
+        object.oid,
+        object.size_bytes
     )
 }
 
@@ -1123,15 +1239,16 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cli, DehydrateCommand, HydrateCommand, InitCommand, LoginCommand, StatusCommand, dispatch,
-        login_url_for_server, probe_server_reachable, run_dehydrate_from_dir, run_hydrate_from_dir,
-        run_init_from_dir, run_login_from_dir, run_status_from_dir, sanitize_browser_stderr,
-        tracing_config, validate_status_storage, write_init_change,
+        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, StatusCommand,
+        dispatch, login_url_for_server, probe_server_reachable, run_dehydrate_from_dir, run_gc,
+        run_hydrate_from_dir, run_init_from_dir, run_login_from_dir, run_status_from_dir,
+        sanitize_browser_stderr, tracing_config, validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
-        LfsOid, LfsPointer, LocalCacheError, LocalCacheLayout, ServeOptions, StorageProviderConfig,
+        LfsOid, LfsPointer, LocalCacheError, LocalCacheLayout, LocalCacheWorktreeRegistration,
+        ServeOptions, StorageProviderConfig,
     };
 
     #[test]
@@ -1287,6 +1404,25 @@ mod tests {
     }
 
     #[test]
+    fn gc_command_accepts_cache_root_and_dry_run_option() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "gc",
+            "--cache-root",
+            "/tmp/lfs-cloud-cache",
+            "--dry-run",
+        ])
+        .expect("gc command should parse");
+
+        let super::Command::Gc(command) = cli.command else {
+            panic!("gc subcommand should parse");
+        };
+
+        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert!(command.dry_run);
+    }
+
+    #[test]
     fn serve_command_accepts_global_config_before_subcommand() {
         let cli = Cli::try_parse_from([
             "lfs-cloud",
@@ -1394,6 +1530,7 @@ mod tests {
             |_, _| unreachable!("status runner must not be called for serve command"),
             |_| unreachable!("hydrate runner must not be called for serve command"),
             |_| unreachable!("dehydrate runner must not be called for serve command"),
+            |_| unreachable!("gc runner must not be called for serve command"),
         )
         .await
         .expect("serve dispatch should succeed");
@@ -1428,6 +1565,7 @@ mod tests {
             |_, _| unreachable!("status runner must not be called for init command"),
             |_| unreachable!("hydrate runner must not be called for init command"),
             |_| unreachable!("dehydrate runner must not be called for init command"),
+            |_| unreachable!("gc runner must not be called for init command"),
         )
         .await
         .expect("init dispatch should succeed");
@@ -1458,6 +1596,7 @@ mod tests {
             |_, _| unreachable!("status runner must not be called for login command"),
             |_| unreachable!("hydrate runner must not be called for login command"),
             |_| unreachable!("dehydrate runner must not be called for login command"),
+            |_| unreachable!("gc runner must not be called for login command"),
         )
         .await
         .expect("login dispatch should succeed");
@@ -1495,6 +1634,7 @@ mod tests {
             },
             |_| unreachable!("hydrate runner must not be called for status command"),
             |_| unreachable!("dehydrate runner must not be called for status command"),
+            |_| unreachable!("gc runner must not be called for status command"),
         )
         .await
         .expect("status dispatch should succeed");
@@ -1528,6 +1668,7 @@ mod tests {
                 Ok(())
             },
             |_| unreachable!("dehydrate runner must not be called for hydrate command"),
+            |_| unreachable!("gc runner must not be called for hydrate command"),
         )
         .await
         .expect("hydrate dispatch should succeed");
@@ -1558,6 +1699,7 @@ mod tests {
                     .expect("capture mutex should lock") = Some(command.paths);
                 Ok(())
             },
+            |_| unreachable!("gc runner must not be called for dehydrate command"),
         )
         .await
         .expect("dehydrate dispatch should succeed");
@@ -1565,6 +1707,37 @@ mod tests {
         assert_eq!(
             *captured.lock().expect("capture mutex should lock"),
             Some(vec![PathBuf::from("asset/model.bin")])
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_gc_with_dry_run() {
+        let cli =
+            Cli::try_parse_from(["lfs-cloud", "gc", "--dry-run"]).expect("gc command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for gc command") },
+            |_| unreachable!("init runner must not be called for gc command"),
+            |_| unreachable!("login runner must not be called for gc command"),
+            |_, _| unreachable!("status runner must not be called for gc command"),
+            |_| unreachable!("hydrate runner must not be called for gc command"),
+            |_| unreachable!("dehydrate runner must not be called for gc command"),
+            move |command| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(command.dry_run);
+                Ok(())
+            },
+        )
+        .await
+        .expect("gc dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some(true)
         );
     }
 
@@ -2155,6 +2328,76 @@ mod tests {
             fs::read_to_string(&cached_file).expect("second path should remain readable"),
             cached_pointer
         );
+    }
+
+    #[test]
+    fn gc_removes_unreferenced_cache_objects_and_reports_summary() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let keep_bytes = b"gc referenced object";
+        let remove_bytes = b"gc unreferenced object";
+        let keep_object = object_for_bytes(keep_bytes);
+        let remove_object = object_for_bytes(remove_bytes);
+        let layout = LocalCacheLayout::new(&cache_root);
+        let registration =
+            LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
+                .expect("registration should validate");
+        write_file(&layout.object_path(&keep_object), keep_bytes);
+        write_file(&layout.object_path(&remove_object), remove_bytes);
+        write_file(
+            &repo.join("asset/model.bin"),
+            LfsPointer::new(keep_object.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        layout
+            .register_worktree(registration)
+            .expect("worktree should register");
+        let mut output = Vec::new();
+
+        run_gc(
+            GcCommand {
+                cache_root: Some(cache_root),
+                dry_run: false,
+            },
+            &mut output,
+        )
+        .expect("gc should remove unreferenced cache objects");
+
+        assert!(layout.object_path(&keep_object).exists());
+        assert!(!layout.object_path(&remove_object).exists());
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("lfs-cloud gc"));
+        assert!(rendered.contains("worktrees: 1 active, 0 pruned"));
+        assert!(rendered.contains("objects: 1 retained, 1 removed, 0 skipped"));
+        assert!(rendered.contains(remove_object.oid.as_hex()));
+    }
+
+    #[test]
+    fn gc_dry_run_reports_without_removing_cache_objects() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let bytes = b"gc dry-run unreferenced object";
+        let object = object_for_bytes(bytes);
+        let layout = LocalCacheLayout::new(&cache_root);
+        write_file(&layout.object_path(&object), bytes);
+        let mut output = Vec::new();
+
+        run_gc(
+            GcCommand {
+                cache_root: Some(cache_root),
+                dry_run: true,
+            },
+            &mut output,
+        )
+        .expect("gc dry-run should report unreferenced cache objects");
+
+        assert!(layout.object_path(&object).exists());
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("objects: 0 retained, 1 would remove, 0 skipped"));
+        assert!(rendered.contains("would remove"));
+        assert!(rendered.contains(object.oid.as_hex()));
     }
 
     #[test]

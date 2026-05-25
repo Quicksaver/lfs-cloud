@@ -8,6 +8,7 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -458,6 +459,36 @@ pub enum LocalCacheDehydrationStatus {
     CachedAndReplacedWithPointer,
 }
 
+/// Summary returned after local cache garbage collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalCacheGarbageCollection {
+    /// Whether the operation only reported what would be removed.
+    pub dry_run: bool,
+    /// Number of registered worktrees that still existed and were scanned.
+    pub active_worktree_count: usize,
+    /// Worktree registrations whose roots were missing and were pruned.
+    pub pruned_worktrees: Vec<LocalCacheWorktreeRegistration>,
+    /// Valid cached object files that were still referenced by a worktree.
+    pub retained_objects: Vec<LocalCacheGarbageCollectionObject>,
+    /// Valid cached object files that were not referenced by any worktree.
+    pub unreferenced_objects: Vec<LocalCacheGarbageCollectionObject>,
+    /// Valid cached object files removed from disk.
+    pub deleted_objects: Vec<LocalCacheGarbageCollectionObject>,
+    /// Cache paths ignored because they did not match the sharded object layout.
+    pub skipped_cache_paths: Vec<PathBuf>,
+}
+
+/// Cached object file found during local cache garbage collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalCacheGarbageCollectionObject {
+    /// SHA-256 object identifier encoded by the cache path.
+    pub oid: LfsOid,
+    /// Cache object path.
+    pub path: PathBuf,
+    /// Current filesystem size of the cache object.
+    pub size_bytes: u64,
+}
+
 /// Deterministic filesystem layout for local Git LFS object cache paths.
 ///
 /// # Examples
@@ -801,6 +832,82 @@ impl LocalCacheLayout {
         Ok(removed)
     }
 
+    /// Removes cached objects not referenced by any registered worktree.
+    ///
+    /// Reachability is intentionally conservative and local: the collector
+    /// scans existing registered worktree roots for Git LFS pointer files and
+    /// keeps every cached OID that a pointer references. Missing worktree
+    /// registrations are pruned from the registry during a real run. Cache
+    /// paths that do not match the expected sharded SHA-256 layout are reported
+    /// but never deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalCacheError`] when the worktree registry cannot be read or
+    /// written, a registered worktree cannot be scanned, or a cache object
+    /// cannot be removed.
+    pub fn garbage_collect(&self, dry_run: bool) -> LocalCacheResult<LocalCacheGarbageCollection> {
+        let _lock = self.lock_worktree_registry()?;
+        let mut registry = self.load_worktree_registry()?;
+        let (active_worktrees, pruned_worktrees) =
+            partition_existing_worktrees(registry.worktrees())?;
+        let referenced_oids = referenced_worktree_oids(&active_worktrees)?;
+        let (mut cache_objects, mut skipped_cache_paths) = self.cache_object_files()?;
+        let mut retained_objects = Vec::new();
+        let mut unreferenced_objects = Vec::new();
+        let mut deleted_objects = Vec::new();
+
+        cache_objects.sort_by(|left, right| left.path.cmp(&right.path));
+        skipped_cache_paths.sort();
+
+        for object in cache_objects {
+            if referenced_oids.contains(&object.oid) {
+                retained_objects.push(object);
+            } else {
+                if !dry_run {
+                    self.delete_cache_object(&object)?;
+                    deleted_objects.push(object.clone());
+                }
+                unreferenced_objects.push(object);
+            }
+        }
+
+        if !dry_run && !pruned_worktrees.is_empty() {
+            for registration in &pruned_worktrees {
+                registry.remove(&registration.worktree_root);
+            }
+            self.save_worktree_registry(&registry)?;
+        }
+
+        Ok(LocalCacheGarbageCollection {
+            dry_run,
+            active_worktree_count: active_worktrees.len(),
+            pruned_worktrees,
+            retained_objects,
+            unreferenced_objects,
+            deleted_objects,
+            skipped_cache_paths,
+        })
+    }
+
+    fn cache_object_files(
+        &self,
+    ) -> LocalCacheResult<(Vec<LocalCacheGarbageCollectionObject>, Vec<PathBuf>)> {
+        collect_cache_object_files(&self.objects_dir())
+    }
+
+    fn delete_cache_object(
+        &self,
+        object: &LocalCacheGarbageCollectionObject,
+    ) -> LocalCacheResult<()> {
+        fs::remove_file(&object.path).map_err(|source| LocalCacheError::Io {
+            context: "failed to remove unreferenced local cache object",
+            path: object.path.clone(),
+            source,
+        })?;
+        remove_empty_cache_shard_dirs(&object.path, &self.objects_dir())
+    }
+
     fn worktree_registry_lock_path(&self) -> PathBuf {
         self.root.join(WORKTREE_REGISTRY_LOCK_FILE)
     }
@@ -906,6 +1013,295 @@ impl LocalCacheLayout {
 impl Default for LocalCacheWorktreeRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn partition_existing_worktrees(
+    registrations: &[LocalCacheWorktreeRegistration],
+) -> LocalCacheResult<(
+    Vec<LocalCacheWorktreeRegistration>,
+    Vec<LocalCacheWorktreeRegistration>,
+)> {
+    let mut active = Vec::new();
+    let mut missing = Vec::new();
+
+    for registration in registrations {
+        match fs::metadata(&registration.worktree_root) {
+            Ok(metadata) if metadata.is_dir() => active.push(registration.clone()),
+            Ok(_) => {
+                return Err(LocalCacheError::Io {
+                    context: "registered worktree root is not a directory",
+                    path: registration.worktree_root.clone(),
+                    source: io::Error::new(io::ErrorKind::InvalidData, "expected a directory"),
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                missing.push(registration.clone());
+            }
+            Err(source) => {
+                return Err(LocalCacheError::Io {
+                    context: "failed to inspect registered worktree root",
+                    path: registration.worktree_root.clone(),
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok((active, missing))
+}
+
+fn referenced_worktree_oids(
+    registrations: &[LocalCacheWorktreeRegistration],
+) -> LocalCacheResult<BTreeSet<LfsOid>> {
+    let mut referenced = BTreeSet::new();
+
+    for registration in registrations {
+        collect_pointer_oids_from_directory(&registration.worktree_root, &mut referenced)?;
+    }
+
+    Ok(referenced)
+}
+
+fn collect_pointer_oids_from_directory(
+    directory: &Path,
+    referenced: &mut BTreeSet<LfsOid>,
+) -> LocalCacheResult<()> {
+    let entries = fs::read_dir(directory).map_err(|source| LocalCacheError::Io {
+        context: "failed to read registered worktree directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| LocalCacheError::Io {
+            context: "failed to read registered worktree directory entry",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(LocalCacheError::Io {
+                    context: "failed to inspect registered worktree entry type",
+                    path,
+                    source,
+                });
+            }
+        };
+
+        if file_type.is_dir() {
+            if entry.file_name() != OsStr::new(".git") {
+                collect_pointer_oids_from_directory(&path, referenced)?;
+            }
+        } else if file_type.is_file() {
+            collect_pointer_oid_from_file(&path, referenced)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_pointer_oid_from_file(
+    path: &Path,
+    referenced: &mut BTreeSet<LfsOid>,
+) -> LocalCacheResult<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(LocalCacheError::Io {
+                context: "failed to inspect worktree pointer candidate",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_LFS_POINTER_FILE_SIZE {
+        return Ok(());
+    }
+
+    let file = File::open(path).map_err(|source| LocalCacheError::Io {
+        context: "failed to open worktree pointer candidate",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut contents = Vec::new();
+    file.take(MAX_LFS_POINTER_FILE_SIZE + 1)
+        .read_to_end(&mut contents)
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to read worktree pointer candidate",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if contents.len() as u64 > MAX_LFS_POINTER_FILE_SIZE {
+        return Ok(());
+    }
+
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return Ok(());
+    };
+    if let Ok(pointer) = LfsPointer::parse(contents) {
+        referenced.insert(pointer.object.oid);
+    }
+
+    Ok(())
+}
+
+fn collect_cache_object_files(
+    objects_dir: &Path,
+) -> LocalCacheResult<(Vec<LocalCacheGarbageCollectionObject>, Vec<PathBuf>)> {
+    let mut objects = Vec::new();
+    let mut skipped = Vec::new();
+    let first_shards = match fs::read_dir(objects_dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok((objects, skipped)),
+        Err(source) => {
+            return Err(LocalCacheError::Io {
+                context: "failed to read local cache objects directory",
+                path: objects_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    for first_shard in first_shards {
+        let first_shard = read_cache_entry(first_shard, objects_dir)?;
+        let first_path = first_shard.path();
+        if !entry_is_directory(&first_shard, "first-level cache shard")? {
+            skipped.push(first_path);
+            continue;
+        }
+
+        for second_shard in read_cache_directory(&first_path)? {
+            let second_path = second_shard.path();
+            if !entry_is_directory(&second_shard, "second-level cache shard")? {
+                skipped.push(second_path);
+                continue;
+            }
+
+            for object_entry in read_cache_directory(&second_path)? {
+                let path = object_entry.path();
+                if !entry_is_file(&object_entry, "cache object path")? {
+                    skipped.push(path);
+                    continue;
+                }
+
+                match cache_object_from_entry(&object_entry) {
+                    Some(object) => objects.push(object),
+                    None => skipped.push(path),
+                }
+            }
+        }
+    }
+
+    Ok((objects, skipped))
+}
+
+fn read_cache_entry(
+    entry: io::Result<fs::DirEntry>,
+    directory: &Path,
+) -> LocalCacheResult<fs::DirEntry> {
+    entry.map_err(|source| LocalCacheError::Io {
+        context: "failed to read local cache directory entry",
+        path: directory.to_path_buf(),
+        source,
+    })
+}
+
+fn read_cache_directory(directory: &Path) -> LocalCacheResult<Vec<fs::DirEntry>> {
+    let entries = fs::read_dir(directory).map_err(|source| LocalCacheError::Io {
+        context: "failed to read local cache shard directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+
+    entries
+        .map(|entry| read_cache_entry(entry, directory))
+        .collect()
+}
+
+fn entry_is_directory(entry: &fs::DirEntry, label: &'static str) -> LocalCacheResult<bool> {
+    entry
+        .file_type()
+        .map(|file_type| file_type.is_dir())
+        .map_err(|source| LocalCacheError::Io {
+            context: label,
+            path: entry.path(),
+            source,
+        })
+}
+
+fn entry_is_file(entry: &fs::DirEntry, label: &'static str) -> LocalCacheResult<bool> {
+    entry
+        .file_type()
+        .map(|file_type| file_type.is_file())
+        .map_err(|source| LocalCacheError::Io {
+            context: label,
+            path: entry.path(),
+            source,
+        })
+}
+
+fn cache_object_from_entry(entry: &fs::DirEntry) -> Option<LocalCacheGarbageCollectionObject> {
+    let path = entry.path();
+    let oid = LfsOid::new(entry.file_name().to_str()?).ok()?;
+    let [first_shard, second_shard] = object_shards(oid.as_hex());
+    let second_directory = path.parent()?;
+    let first_directory = second_directory.parent()?;
+
+    if first_directory.file_name()?.to_str()? != first_shard
+        || second_directory.file_name()?.to_str()? != second_shard
+    {
+        return None;
+    }
+
+    let size_bytes = entry.metadata().ok()?.len();
+
+    Some(LocalCacheGarbageCollectionObject {
+        oid,
+        path,
+        size_bytes,
+    })
+}
+
+fn remove_empty_cache_shard_dirs(
+    cache_object_path: &Path,
+    objects_dir: &Path,
+) -> LocalCacheResult<()> {
+    let Some(second_shard) = cache_object_path.parent() else {
+        return Ok(());
+    };
+    let Some(first_shard) = second_shard.parent() else {
+        return Ok(());
+    };
+
+    remove_empty_directory(second_shard)?;
+    if first_shard != objects_dir {
+        remove_empty_directory(first_shard)?;
+    }
+
+    Ok(())
+}
+
+fn remove_empty_directory(path: &Path) -> LocalCacheResult<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(LocalCacheError::Io {
+            context: "failed to remove empty local cache shard directory",
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -2674,6 +3070,119 @@ mod tests {
                 .expect("registry should reload")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn garbage_collect_removes_unreferenced_cache_objects_and_prunes_missing_worktrees() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let repo = temp.path().join("repo");
+        let missing_repo = temp.path().join("missing-repo");
+        let referenced_bytes = b"referenced cache object";
+        let unreferenced_bytes = b"unreferenced cache object";
+        let referenced = object_for_bytes(referenced_bytes);
+        let unreferenced = object_for_bytes(unreferenced_bytes);
+        let active_registration =
+            LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
+                .expect("active registration should validate");
+        let missing_registration = LocalCacheWorktreeRegistration::new(
+            "github-main:owner/missing",
+            &missing_repo,
+            missing_repo.join(".git"),
+        )
+        .expect("missing registration should validate");
+
+        fs::create_dir_all(repo.join("asset")).expect("worktree should be created");
+        write_file(&layout.object_path(&referenced), referenced_bytes);
+        write_file(&layout.object_path(&unreferenced), unreferenced_bytes);
+        write_file(
+            &repo.join("asset/model.bin"),
+            LfsPointer::new(referenced.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        layout
+            .register_worktree(active_registration.clone())
+            .expect("active worktree should register");
+        layout
+            .register_worktree(missing_registration.clone())
+            .expect("missing worktree should register");
+
+        let report = layout
+            .garbage_collect(false)
+            .expect("garbage collection should finish");
+
+        assert_eq!(report.active_worktree_count, 1);
+        assert_eq!(report.pruned_worktrees, vec![missing_registration]);
+        assert_eq!(report.retained_objects.len(), 1);
+        assert_eq!(report.retained_objects[0].oid, referenced.oid);
+        assert_eq!(report.unreferenced_objects.len(), 1);
+        assert_eq!(report.unreferenced_objects[0].oid, unreferenced.oid);
+        assert_eq!(report.deleted_objects, report.unreferenced_objects);
+        assert!(layout.object_path(&referenced).exists());
+        assert!(!layout.object_path(&unreferenced).exists());
+        assert_eq!(
+            layout
+                .load_worktree_registry()
+                .expect("registry should reload")
+                .worktrees(),
+            &[active_registration]
+        );
+    }
+
+    #[test]
+    fn garbage_collect_dry_run_leaves_cache_objects_and_registry_untouched() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let missing_repo = temp.path().join("missing-repo");
+        let bytes = b"dry run unreferenced cache object";
+        let object = object_for_bytes(bytes);
+        let missing_registration = LocalCacheWorktreeRegistration::new(
+            "github-main:owner/missing",
+            &missing_repo,
+            missing_repo.join(".git"),
+        )
+        .expect("missing registration should validate");
+
+        write_file(&layout.object_path(&object), bytes);
+        layout
+            .register_worktree(missing_registration.clone())
+            .expect("missing worktree should register");
+
+        let report = layout
+            .garbage_collect(true)
+            .expect("dry-run garbage collection should finish");
+
+        assert!(report.dry_run);
+        assert_eq!(report.active_worktree_count, 0);
+        assert_eq!(report.pruned_worktrees, vec![missing_registration.clone()]);
+        assert_eq!(report.unreferenced_objects.len(), 1);
+        assert!(report.deleted_objects.is_empty());
+        assert!(layout.object_path(&object).exists());
+        assert_eq!(
+            layout
+                .load_worktree_registry()
+                .expect("registry should reload")
+                .worktrees(),
+            &[missing_registration]
+        );
+    }
+
+    #[test]
+    fn garbage_collect_reports_invalid_cache_paths_without_deleting_them() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let invalid_cache_path = layout.objects_dir().join("zz/zz/not-a-sha256");
+        write_file(&invalid_cache_path, b"invalid cache payload");
+
+        let report = layout
+            .garbage_collect(false)
+            .expect("garbage collection should skip invalid paths");
+
+        assert!(report.retained_objects.is_empty());
+        assert!(report.unreferenced_objects.is_empty());
+        assert_eq!(report.skipped_cache_paths, vec![invalid_cache_path.clone()]);
+        assert!(invalid_cache_path.exists());
     }
 
     #[test]

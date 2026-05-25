@@ -1163,7 +1163,10 @@ Defer:
 > shared cache; dirty or unrelated worktree content is left untouched.
 > The `hydrate` and `dehydrate` CLI commands now expose those local cache
 > operations for explicit path lists, including `--cache-root` overrides for
-> tests or non-default local cache locations.
+> tests or non-default local cache locations. The `gc` CLI command now scans
+> registered worktrees for Git LFS pointer references, removes unreferenced
+> shared cache objects, prunes missing worktree registrations, and supports
+> `--dry-run` for review before deletion.
 
 ### Progress Summary
 
@@ -1175,11 +1178,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 11     | 2         |
+| 6. CLI Commands                          | 13          | 12     | 1         |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **77** | **22**    |
+| **Total**                                | **99**      | **78** | **21**    |
 
 ### Legend
 
@@ -1328,7 +1331,7 @@ Defer:
 - [ ] [M] Implement `lfs-cloud pull` wrapper for fetch plus CoW materialization. depends: [8.2.1], [8.2.2], [8.2.3].
 - [x] [M] Implement `lfs-cloud hydrate <path...>`. depends: [8.2.1], [8.2.2], [8.2.3]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
 - [x] [M] Implement `lfs-cloud dehydrate <path...>`. depends: [8.2.4]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
-- [ ] [M] Implement `lfs-cloud gc` for local cache cleanup. depends: [8.1.4].
+- [x] [M] Implement `lfs-cloud gc` for local cache cleanup. depends: [8.1.4]. Manual verification: `scripts/manual/verify-local-cache-gc.sh`.
 
 ### Phase 7: Migration
 
