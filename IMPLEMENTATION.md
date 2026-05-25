@@ -1138,7 +1138,10 @@ Defer:
 > into host, owner, and repository name components. `lfs-cloud init --server`
 > now resolves the current repository's intended Git LFS endpoint, writes or
 > updates `.lfsconfig` with a before/after `lfs.url` summary, and supports
-> `--local` for writing only repository-local Git config.
+> `--local` for writing only repository-local Git config. The `lfs-cloud login`
+> command opens or prints the server GitHub OAuth login URL, accepts the
+> returned local `lfs-cloud` token, and stores only that local token in Git's
+> credential helper for the current repository's LFS URL.
 
 ### Progress Summary
 
@@ -1150,11 +1153,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 7      | 6         |
+| 6. CLI Commands                          | 13          | 8      | 5         |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **65** | **34**    |
+| **Total**                                | **99**      | **66** | **33**    |
 
 ### Legend
 
@@ -1291,7 +1294,7 @@ Defer:
 
 #### Epic 6.2: Login And Init
 
-- [ ] [M] Implement `lfs-cloud login` browser flow for GitHub OAuth.
+- [x] [M] Implement `lfs-cloud login` browser flow for GitHub OAuth. Manual verification: `scripts/manual/verify-login-command.sh`.
 - [x] [T] Implement Git repository detection and remote parsing.
 - [x] [T] Implement `lfs-cloud init --server` route resolution for the current repo.
 - [x] [T] Implement `.lfsconfig` write/update with backup or diff output.

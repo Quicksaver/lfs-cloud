@@ -7,17 +7,19 @@
 
 use std::{
     future::Future,
-    io::{self, Write},
+    io::{self, BufRead, Write},
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
 };
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use url::Url;
 
-use crate::git::redacted_url_for_display;
+use crate::{CliError, CliResult, git::redacted_url_for_display};
 use crate::{
-    GitLfsConfigChange, GitLfsConfigTarget, GitRepository, LfsInitRoute, ServeOptions,
-    TracingConfig, init_tracing,
+    GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitLfsConfigChange, GitLfsConfigTarget,
+    GitRepository, LfsInitRoute, LfsSessionToken, ServeOptions, TracingConfig, init_tracing,
 };
 
 #[derive(Debug, Parser)]
@@ -40,6 +42,8 @@ struct Cli {
 enum Command {
     /// Run the local Git LFS-compatible HTTP server.
     Serve(ServeCommand),
+    /// Start GitHub OAuth login and store the local LFS token for this repo.
+    Login(LoginCommand),
     /// Resolve the Git LFS URL for the current repository.
     Init(InitCommand),
 }
@@ -53,6 +57,17 @@ struct ServeCommand {
     /// TCP port to bind.
     #[arg(long)]
     port: Option<u16>,
+}
+
+#[derive(Debug, Args)]
+struct LoginCommand {
+    /// Base URL of the running LFS Cloud server.
+    #[arg(long, value_name = "URL")]
+    server: String,
+
+    /// Print the login URL without trying to open a browser.
+    #[arg(long)]
+    no_open: bool,
 }
 
 #[derive(Debug, Args)]
@@ -75,14 +90,15 @@ struct InitCommand {
 pub async fn run_from_env() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&tracing_config(&cli)).context("failed to initialize tracing")?;
-    dispatch(cli, crate::serve, run_init_to_stdout).await
+    dispatch(cli, crate::serve, run_init_to_stdout, run_login_to_stdio).await
 }
 
-async fn dispatch<F, Fut, I>(cli: Cli, serve: F, init: I) -> anyhow::Result<()>
+async fn dispatch<F, Fut, I, L>(cli: Cli, serve: F, init: I, login: L) -> anyhow::Result<()>
 where
     F: FnOnce(ServeOptions) -> Fut,
     Fut: Future<Output = crate::ServerResult<()>>,
     I: FnOnce(InitCommand) -> anyhow::Result<()>,
+    L: FnOnce(LoginCommand) -> anyhow::Result<()>,
 {
     // Keep command execution injectable only at the command boundary; each new
     // subcommand should add its own runner here rather than hiding side effects
@@ -91,6 +107,7 @@ where
         Command::Serve(command) => serve(command.serve_options(cli.config))
             .await
             .context("failed to run lfs-cloud server"),
+        Command::Login(command) => login(command).context("failed to complete lfs-cloud login"),
         Command::Init(command) => init(command).context("failed to resolve lfs-cloud init route"),
     }
 }
@@ -123,6 +140,94 @@ fn run_init_to_stdout(command: InitCommand) -> anyhow::Result<()> {
     run_init(command, &mut stdout)
 }
 
+fn run_login_to_stdio(command: LoginCommand) -> anyhow::Result<()> {
+    let stdin = io::stdin().lock();
+    let mut input = io::BufReader::new(stdin);
+    let mut stdout = io::stdout().lock();
+
+    run_login(command, &mut input, &mut stdout)
+}
+
+fn run_login<R, W>(command: LoginCommand, input: &mut R, output: &mut W) -> anyhow::Result<()>
+where
+    R: BufRead,
+    W: Write,
+{
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+
+    run_login_from_dir(
+        command,
+        &current_dir,
+        input,
+        output,
+        open_url_in_default_browser,
+        |approval| approval.approve(),
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn run_login_from_dir<R, W, O, A>(
+    command: LoginCommand,
+    start_dir: impl AsRef<Path>,
+    input: &mut R,
+    output: &mut W,
+    mut open_browser: O,
+    mut approve_credential: A,
+) -> CliResult<()>
+where
+    R: BufRead,
+    W: Write,
+    O: FnMut(&str) -> CliResult<()>,
+    A: FnMut(GitCredentialApproval) -> CliResult<()>,
+{
+    let repository = GitRepository::discover(start_dir.as_ref())?;
+    let route = LfsInitRoute::resolve(&command.server, &repository.remote)?;
+    let login_url = login_url_for_server(&route.server_url)?;
+
+    writeln!(output, "authorize LFS Cloud with GitHub:").map_err(output_error)?;
+    writeln!(output, "  {login_url}").map_err(output_error)?;
+    if command.no_open {
+        writeln!(output, "browser open skipped").map_err(output_error)?;
+    } else {
+        match open_browser(&login_url) {
+            Ok(()) => writeln!(output, "opened browser for GitHub OAuth").map_err(output_error)?,
+            Err(error) => writeln!(output, "browser open failed: {error}").map_err(output_error)?,
+        }
+    }
+    writeln!(
+        output,
+        "paste the lfs_token value from the callback response, then press Enter."
+    )
+    .map_err(output_error)?;
+    write!(output, "lfs_token: ").map_err(output_error)?;
+    output.flush().map_err(output_error)?;
+
+    let mut token = String::new();
+    input.read_line(&mut token).map_err(|source| CliError::Io {
+        context: "failed to read lfs_token from stdin".to_owned(),
+        source,
+    })?;
+    let token =
+        LfsSessionToken::from_secret(token.trim_end_matches(['\r', '\n'])).map_err(|_| {
+            CliError::InvalidArguments {
+                message: "lfs_token was invalid or blank".to_owned(),
+            }
+        })?;
+    let approval = GitCredentialApproval::new(&route.lfs_url, token)?;
+    approve_credential(approval)?;
+
+    writeln!(output, "stored local LFS credential").map_err(output_error)?;
+    writeln!(
+        output,
+        "  lfs.url: {}",
+        redacted_url_for_display(&route.lfs_url)
+    )
+    .map_err(output_error)?;
+    writeln!(output, "  username: {}", approval_username()).map_err(output_error)?;
+
+    Ok(())
+}
+
 fn run_init_from_dir<W>(
     command: InitCommand,
     start_dir: impl AsRef<Path>,
@@ -140,6 +245,67 @@ where
         .context("failed to write Git LFS config")?;
 
     write_init_change(output, &change).context("failed to write init summary")
+}
+
+fn login_url_for_server(server_url: &str) -> CliResult<String> {
+    let mut login_url = Url::parse(server_url).map_err(|source| CliError::InvalidArguments {
+        message: format!("server URL is not valid: {source}"),
+    })?;
+    let mut segments = login_url
+        .path_segments_mut()
+        .map_err(|()| CliError::InvalidArguments {
+            message: "server URL cannot be used as a route base".to_owned(),
+        })?;
+    segments.extend(GITHUB_OAUTH_LOGIN_PATH.trim_start_matches('/').split('/'));
+    drop(segments);
+
+    Ok(login_url.to_string())
+}
+
+fn open_url_in_default_browser(url: &str) -> CliResult<()> {
+    let (program, args): (&str, Vec<&str>) = match std::env::consts::OS {
+        "macos" => ("open", vec![url]),
+        "windows" => ("rundll32", vec!["url.dll,FileProtocolHandler", url]),
+        _ => ("xdg-open", vec![url]),
+    };
+    let status = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|source| CliError::Io {
+            context: format!("failed to start {program}"),
+            source,
+        })?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(CliError::ExternalCommand {
+        command: program.to_owned(),
+        status: process_status_text(status),
+        stderr: crate::SanitizedMessage::new("browser opener exited unsuccessfully"),
+    })
+}
+
+fn process_status_text(status: std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_owned())
+}
+
+fn output_error(source: io::Error) -> CliError {
+    CliError::Io {
+        context: "failed to write command output".to_owned(),
+        source,
+    }
+}
+
+fn approval_username() -> &'static str {
+    crate::DEFAULT_GIT_CREDENTIAL_USERNAME
 }
 
 impl InitCommand {
@@ -194,7 +360,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::Path,
         process::Command as ProcessCommand,
         sync::{Arc, Mutex},
@@ -203,10 +369,13 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use tempfile::TempDir;
 
-    use super::{Cli, InitCommand, dispatch, run_init_from_dir, tracing_config, write_init_change};
+    use super::{
+        Cli, InitCommand, LoginCommand, dispatch, login_url_for_server, run_init_from_dir,
+        run_login_from_dir, tracing_config, write_init_change,
+    };
     use crate::{
-        DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitLfsConfigChange, GitLfsConfigTarget,
-        ServeOptions,
+        DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval, GitLfsConfigChange,
+        GitLfsConfigTarget, ServeOptions,
     };
 
     #[test]
@@ -272,6 +441,25 @@ mod tests {
 
         assert_eq!(command.server, "http://127.0.0.1:8080");
         assert!(command.local);
+    }
+
+    #[test]
+    fn login_command_accepts_server_url_and_no_open_option() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "login",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--no-open",
+        ])
+        .expect("login command should parse");
+
+        let super::Command::Login(command) = cli.command else {
+            panic!("login subcommand should parse");
+        };
+
+        assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert!(command.no_open);
     }
 
     #[test]
@@ -378,6 +566,7 @@ mod tests {
                 }
             },
             |_| unreachable!("init runner must not be called for serve command"),
+            |_| unreachable!("login runner must not be called for serve command"),
         )
         .await
         .expect("serve dispatch should succeed");
@@ -408,9 +597,37 @@ mod tests {
                     .expect("capture mutex should lock") = Some(command.server);
                 Ok(())
             },
+            |_| unreachable!("login runner must not be called for init command"),
         )
         .await
         .expect("init dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some("http://127.0.0.1:8080".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_login_with_server_url() {
+        let cli = Cli::try_parse_from(["lfs-cloud", "login", "--server", "http://127.0.0.1:8080"])
+            .expect("login command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for login command") },
+            |_| unreachable!("init runner must not be called for login command"),
+            move |command| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(command.server);
+                Ok(())
+            },
+        )
+        .await
+        .expect("login dispatch should succeed");
 
         assert_eq!(
             *captured.lock().expect("capture mutex should lock"),
@@ -583,6 +800,124 @@ mod tests {
             !repo.path().join(".lfsconfig").exists(),
             "local-only init should not create .lfsconfig"
         );
+    }
+
+    #[test]
+    fn login_url_preserves_server_base_path() {
+        assert_eq!(
+            login_url_for_server("https://lfs.example.com/custom/base")
+                .expect("login URL should resolve"),
+            "https://lfs.example.com/custom/base/auth/github/login"
+        );
+    }
+
+    #[test]
+    fn login_opens_browser_and_stores_local_lfs_token_for_current_repo() {
+        if !git_is_available() {
+            return;
+        }
+
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), &["init"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let opened_url = Arc::new(Mutex::new(None));
+        let approved = Arc::new(Mutex::new(None));
+        let opened_url_for_runner = Arc::clone(&opened_url);
+        let approved_for_runner = Arc::clone(&approved);
+        let mut input = io::Cursor::new(b"local-lfs-token\n".to_vec());
+        let mut output = Vec::new();
+
+        run_login_from_dir(
+            LoginCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                no_open: false,
+            },
+            repo.path(),
+            &mut input,
+            &mut output,
+            move |url| {
+                *opened_url_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(url.to_owned());
+                Ok(())
+            },
+            move |approval: GitCredentialApproval| {
+                let credential = (
+                    approval.lfs_url().to_string(),
+                    approval.username().to_owned(),
+                    approval.token().as_str().to_owned(),
+                );
+                *approved_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(credential);
+                Ok(())
+            },
+        )
+        .expect("login should complete");
+
+        assert_eq!(
+            *opened_url.lock().expect("capture mutex should lock"),
+            Some("http://127.0.0.1:8080/auth/github/login".to_owned())
+        );
+        assert_eq!(
+            *approved.lock().expect("capture mutex should lock"),
+            Some((
+                "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs".to_owned(),
+                "lfs-cloud".to_owned(),
+                "local-lfs-token".to_owned(),
+            ))
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("authorize LFS Cloud with GitHub:"));
+        assert!(rendered.contains("opened browser for GitHub OAuth"));
+        assert!(rendered.contains("stored local LFS credential"));
+        assert!(!rendered.contains("local-lfs-token"));
+    }
+
+    #[test]
+    fn login_no_open_skips_browser_but_stores_token() {
+        if !git_is_available() {
+            return;
+        }
+
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), &["init"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let approved = Arc::new(Mutex::new(None));
+        let approved_for_runner = Arc::clone(&approved);
+        let mut input = io::Cursor::new(b"local-lfs-token\n".to_vec());
+        let mut output = Vec::new();
+
+        run_login_from_dir(
+            LoginCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                no_open: true,
+            },
+            repo.path(),
+            &mut input,
+            &mut output,
+            |_| panic!("browser opener should not be called with --no-open"),
+            move |approval: GitCredentialApproval| {
+                *approved_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(approval.lfs_url().to_string());
+                Ok(())
+            },
+        )
+        .expect("login should complete");
+
+        assert_eq!(
+            *approved.lock().expect("capture mutex should lock"),
+            Some("http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs".to_owned())
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("browser open skipped"));
     }
 
     fn git_is_available() -> bool {

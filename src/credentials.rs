@@ -278,6 +278,14 @@ impl GitCredentialApproval {
         &self.username
     }
 
+    /// Returns the local LFS Cloud session token to approve.
+    ///
+    /// This is a local `lfs-cloud` token, not an upstream GitHub OAuth token.
+    #[must_use]
+    pub fn token(&self) -> &LfsSessionToken {
+        &self.token
+    }
+
     /// Approves the credential through `git credential approve`.
     ///
     /// The token is written on standard input, not passed as a process

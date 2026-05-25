@@ -13,6 +13,9 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > GitHub-style HTTPS/SSH remotes, and `lfs-cloud init --server` can resolve
 > the current repository's intended Git LFS endpoint, write or update
 > `.lfsconfig`, or write only repository-local Git config with `--local`.
+> `lfs-cloud login --server` can open the server's GitHub OAuth login URL for
+> the current repository, accept the returned local `lfs-cloud` token, and store
+> that local token in Git's credential helper for the repository-scoped LFS URL.
 > Git LFS batch request parsing plus download and upload batch response
 > generation are implemented, with GitHub read/write authorization enforced per
 > batch operation. Upload batches now check configured storage availability,
@@ -120,6 +123,18 @@ Example `.lfsconfig`:
 [lfs]
     url = http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs
 ```
+
+### Authenticate A Repository
+
+```bash
+lfs-cloud login --server http://127.0.0.1:8080
+```
+
+This opens the running server's GitHub OAuth login URL for the current
+repository. After the browser callback returns JSON, paste the `lfs_token`
+value into the CLI prompt. The CLI stores that local LFS Cloud token in Git's
+credential helper for the repository-scoped LFS URL. It does not store the
+GitHub OAuth access token in Git credentials.
 
 ### Migrate From Existing Git LFS
 
@@ -233,6 +248,6 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfs-cloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through `lfs-cloud`. Most CLI behavior beyond `serve` and `init --server` configuration has not been implemented yet.
+This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfs-cloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, `lfs-cloud login --server` browser handoff and local LFS token credential-helper storage, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through `lfs-cloud`. Most CLI behavior beyond `serve`, `init --server`, and `login --server` configuration has not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
