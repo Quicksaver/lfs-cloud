@@ -185,6 +185,61 @@ impl LocalMigrationObjectAvailability {
     }
 }
 
+/// Ref scope used when fetching source Git LFS objects for migration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MigrationFetchMode {
+    /// Fetch objects required by the currently checked-out ref.
+    CurrentCheckout,
+    /// Fetch objects required by the supplied branch, tag, or ref names.
+    SelectedRefs {
+        /// Refs to pass to `git lfs fetch` after validation.
+        refs: Vec<String>,
+    },
+    /// Fetch all objects reachable from fetched local refs.
+    AllFetchedRefs,
+}
+
+impl MigrationFetchMode {
+    /// Builds a selected-ref fetch mode from caller-supplied ref names.
+    ///
+    /// Validation happens when the fetch command is prepared so callers can
+    /// keep raw CLI arguments in one place until migration execution begins.
+    #[must_use]
+    pub fn selected_refs<I, S>(refs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::SelectedRefs {
+            refs: refs.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Result of fetching missing source Git LFS objects into local media storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct MigrationSourceFetch {
+    /// Git worktree root where the source fetch ran.
+    pub worktree_root: PathBuf,
+    /// Ref scope used for the source fetch.
+    pub mode: MigrationFetchMode,
+    /// Safe display form of the `git lfs fetch` command that ran.
+    ///
+    /// `None` means every requested object was already locally available, so no
+    /// source-provider fetch was needed.
+    pub command: Option<String>,
+    /// Availability snapshot before fetching from the source provider.
+    pub before: LocalMigrationObjectAvailability,
+    /// Availability snapshot after fetching from the source provider.
+    pub after: LocalMigrationObjectAvailability,
+    /// Objects that were unavailable before the fetch and available afterward.
+    pub fetched_objects: Vec<LfsObject>,
+    /// Objects that still have no verified local bytes after the fetch.
+    pub unavailable_objects: Vec<LfsObject>,
+}
+
 /// Local availability details for one discovered Git LFS object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -498,6 +553,208 @@ where
         shared_cache_root,
         objects,
     })
+}
+
+/// Fetches missing source Git LFS objects without updating worktree files.
+///
+/// The helper first checks repository-local Git LFS media storage and the
+/// optional shared LFS Cloud cache. If any requested object lacks verified local
+/// bytes, it runs `git lfs fetch` for the requested ref scope and then checks
+/// availability again. Git LFS fetch populates local media storage and does not
+/// smudge or checkout files, so callers can use this before upload planning
+/// without mutating worktree contents.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when the start directory is not a Git worktree,
+/// selected refs use invalid revision syntax, `git lfs fetch` cannot be
+/// started, or the source provider fetch exits unsuccessfully.
+pub fn fetch_missing_migration_objects<I, O>(
+    start_dir: impl AsRef<Path>,
+    objects: I,
+    shared_cache: Option<&LocalCacheLayout>,
+    mode: MigrationFetchMode,
+) -> MigrationResult<MigrationSourceFetch>
+where
+    I: IntoIterator<Item = O>,
+    O: Borrow<LfsObject>,
+{
+    fetch_missing_migration_objects_with_runner(
+        start_dir,
+        objects,
+        shared_cache,
+        mode,
+        run_git_lfs_fetch_command,
+    )
+}
+
+fn fetch_missing_migration_objects_with_runner<I, O, F>(
+    start_dir: impl AsRef<Path>,
+    objects: I,
+    shared_cache: Option<&LocalCacheLayout>,
+    mode: MigrationFetchMode,
+    mut runner: F,
+) -> MigrationResult<MigrationSourceFetch>
+where
+    I: IntoIterator<Item = O>,
+    O: Borrow<LfsObject>,
+    F: FnMut(&Path, &MigrationSourceFetchCommand) -> MigrationResult<()>,
+{
+    let start_dir = start_dir.as_ref();
+    let before = check_local_migration_objects(start_dir, objects, shared_cache)?;
+    let worktree_root = before.worktree_root.clone();
+    let requested_objects = before
+        .objects
+        .iter()
+        .map(|object| object.object.clone())
+        .collect::<Vec<_>>();
+    let mut command = None;
+
+    if before.unavailable_objects().is_empty() {
+        let after =
+            check_local_migration_objects(&worktree_root, &requested_objects, shared_cache)?;
+        return Ok(MigrationSourceFetch {
+            worktree_root,
+            mode,
+            command,
+            fetched_objects: Vec::new(),
+            unavailable_objects: unavailable_migration_objects(&after),
+            before,
+            after,
+        });
+    }
+
+    let fetch_command = migration_source_fetch_command(&worktree_root, &mode)?;
+    runner(&worktree_root, &fetch_command)?;
+    command = Some(fetch_command.display.clone());
+
+    let after = check_local_migration_objects(&worktree_root, &requested_objects, shared_cache)?;
+    let fetched_objects = fetched_migration_objects(&before, &after);
+    let unavailable_objects = unavailable_migration_objects(&after);
+
+    Ok(MigrationSourceFetch {
+        worktree_root,
+        mode,
+        command,
+        before,
+        after,
+        fetched_objects,
+        unavailable_objects,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MigrationSourceFetchCommand {
+    args: Vec<OsString>,
+    display: String,
+}
+
+fn migration_source_fetch_command(
+    worktree_root: &Path,
+    mode: &MigrationFetchMode,
+) -> MigrationResult<MigrationSourceFetchCommand> {
+    let mut args = vec![OsString::from("lfs"), OsString::from("fetch")];
+
+    match mode {
+        MigrationFetchMode::CurrentCheckout => {
+            args.push(OsString::from("--include="));
+            args.push(OsString::from("--exclude="));
+        }
+        MigrationFetchMode::SelectedRefs { refs } => {
+            if refs.is_empty() {
+                return Err(MigrationError::InvalidInput {
+                    message: SanitizedMessage::new(
+                        "selected-ref migration fetch requires at least one ref",
+                    ),
+                });
+            }
+
+            for ref_name in refs {
+                validate_history_ref_name(ref_name)?;
+            }
+
+            args.push(OsString::from("--include="));
+            args.push(OsString::from("--exclude="));
+            args.push(OsString::from(source_remote_name(worktree_root)?));
+            args.extend(
+                refs.iter()
+                    .map(|ref_name| OsString::from(ref_name.as_str())),
+            );
+        }
+        MigrationFetchMode::AllFetchedRefs => {
+            args.push(OsString::from("--all"));
+        }
+    }
+
+    let display = display_git_command(&args);
+    Ok(MigrationSourceFetchCommand { args, display })
+}
+
+fn run_git_lfs_fetch_command(
+    worktree_root: &Path,
+    command: &MigrationSourceFetchCommand,
+) -> MigrationResult<()> {
+    let output = Command::new("git")
+        .args(&command.args)
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|source| MigrationError::Io {
+            context: "failed to start git lfs fetch".to_owned(),
+            source,
+        })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(
+            &command.display,
+            output.status,
+            &output.stderr,
+        ))
+    }
+}
+
+fn fetched_migration_objects(
+    before: &LocalMigrationObjectAvailability,
+    after: &LocalMigrationObjectAvailability,
+) -> Vec<LfsObject> {
+    let after_availability = after
+        .objects
+        .iter()
+        .map(|object| (object.object.clone(), object.is_available()))
+        .collect::<BTreeMap<_, _>>();
+
+    before
+        .objects
+        .iter()
+        .filter(|object| !object.is_available())
+        .filter(|object| {
+            after_availability
+                .get(&object.object)
+                .copied()
+                .unwrap_or(false)
+        })
+        .map(|object| object.object.clone())
+        .collect()
+}
+
+fn unavailable_migration_objects(
+    availability: &LocalMigrationObjectAvailability,
+) -> Vec<LfsObject> {
+    availability
+        .objects
+        .iter()
+        .filter(|object| !object.is_available())
+        .map(|object| object.object.clone())
+        .collect()
+}
+
+fn display_git_command(args: &[OsString]) -> String {
+    std::iter::once(OsStr::new("git"))
+        .chain(args.iter().map(OsString::as_os_str))
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn detect_worktree_root(start_dir: &Path) -> MigrationResult<PathBuf> {
@@ -1989,7 +2246,7 @@ fn repo_relative_path_from_git_output(path: &str) -> MigrationResult<PathBuf> {
 mod tests {
     use std::{
         collections::BTreeSet,
-        fs,
+        fs, io,
         path::{Path, PathBuf},
         process::Command,
     };
@@ -2008,13 +2265,14 @@ mod tests {
     use super::{
         GitLfsSourceEndpointSource, LocalMigrationObjectLocationKind,
         LocalMigrationObjectLocationStatus, MAX_GIT_ATTRIBUTES_BYTES,
-        MAX_MIGRATION_GIT_OUTPUT_BYTES, MigrationError, check_local_migration_objects,
-        default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
-        enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
-        enumerate_selected_ref_lfs_pointers, git_lfs_object_path,
-        parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
-        parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
-        validate_history_ref_name,
+        MAX_MIGRATION_GIT_OUTPUT_BYTES, MigrationError, MigrationFetchMode,
+        check_local_migration_objects, default_lfs_endpoint_for_remote_url,
+        discover_git_lfs_migration, enumerate_all_fetched_ref_lfs_pointers,
+        enumerate_current_checkout_lfs_pointers, enumerate_selected_ref_lfs_pointers,
+        fetch_missing_migration_objects, fetch_missing_migration_objects_with_runner,
+        git_lfs_object_path, migration_source_fetch_command, parse_git_check_attr_filter_stdout,
+        parse_lfs_patterns_from_attributes, parse_ls_tree_blob_output,
+        repo_relative_path_from_git_output, split_gitattributes_line, validate_history_ref_name,
     };
 
     #[test]
@@ -2869,6 +3127,209 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_fetch_skips_git_lfs_when_all_objects_are_available() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"already available source bytes");
+        write_git_lfs_source_object(&repo, &object, b"already available source bytes");
+        let mut fetch_attempted = false;
+
+        let report = fetch_missing_migration_objects_with_runner(
+            repo.path(),
+            [&object],
+            None,
+            MigrationFetchMode::CurrentCheckout,
+            |_, _| {
+                fetch_attempted = true;
+                Ok(())
+            },
+        )
+        .expect("available migration objects should not require fetch");
+
+        assert!(!fetch_attempted);
+        assert!(report.command.is_none());
+        assert!(report.fetched_objects.is_empty());
+        assert!(report.unavailable_objects.is_empty());
+        assert_eq!(report.before.available_objects().len(), 1);
+        assert_eq!(report.after.available_objects().len(), 1);
+    }
+
+    #[test]
+    fn source_fetch_downloads_missing_objects_into_git_lfs_media_storage() {
+        let repo = TempRepo::new();
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+        let object = test_lfs_object_from_bytes(b"downloaded source bytes");
+        let object_for_runner = object.clone();
+        let mut observed_command = None;
+
+        let report = fetch_missing_migration_objects_with_runner(
+            repo.path(),
+            [&object],
+            None,
+            MigrationFetchMode::selected_refs(["main"]),
+            |worktree_root, command| {
+                observed_command = Some(command.clone());
+                write_git_lfs_source_object_in(
+                    &worktree_root.join(".git/lfs/objects"),
+                    &object_for_runner,
+                    b"downloaded source bytes",
+                );
+                Ok(())
+            },
+        )
+        .expect("source fetch should re-check downloaded objects");
+
+        let command = observed_command.expect("missing object should run git lfs fetch");
+        assert_eq!(
+            command.args,
+            vec![
+                OsString::from("lfs"),
+                OsString::from("fetch"),
+                OsString::from("--include="),
+                OsString::from("--exclude="),
+                OsString::from("origin"),
+                OsString::from("main"),
+            ]
+        );
+        assert_eq!(
+            report.command.as_deref(),
+            Some("git lfs fetch --include= --exclude= origin main")
+        );
+        assert_eq!(report.fetched_objects, vec![object]);
+        assert!(report.unavailable_objects.is_empty());
+    }
+
+    #[test]
+    fn source_fetch_reports_objects_still_unavailable_after_fetch() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"still missing source bytes");
+
+        let report = fetch_missing_migration_objects_with_runner(
+            repo.path(),
+            [&object],
+            None,
+            MigrationFetchMode::CurrentCheckout,
+            |_, _| Ok(()),
+        )
+        .expect("source fetch report should include objects still missing afterward");
+
+        assert_eq!(
+            report.command.as_deref(),
+            Some("git lfs fetch --include= --exclude=")
+        );
+        assert!(report.fetched_objects.is_empty());
+        assert_eq!(report.unavailable_objects, vec![object]);
+    }
+
+    #[test]
+    fn source_fetch_commands_match_migration_scope() {
+        let repo = TempRepo::new();
+        repo.git(["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+
+        let current =
+            migration_source_fetch_command(&repo.path(), &MigrationFetchMode::CurrentCheckout)
+                .expect("current checkout fetch command should be built");
+        assert_eq!(current.display, "git lfs fetch --include= --exclude=");
+
+        let selected = migration_source_fetch_command(
+            &repo.path(),
+            &MigrationFetchMode::selected_refs(["main", "refs/tags/v1"]),
+        )
+        .expect("selected-ref fetch command should be built");
+        assert_eq!(
+            selected.display,
+            "git lfs fetch --include= --exclude= origin main refs/tags/v1"
+        );
+
+        let all_refs =
+            migration_source_fetch_command(&repo.path(), &MigrationFetchMode::AllFetchedRefs)
+                .expect("all-ref fetch command should be built");
+        assert_eq!(all_refs.display, "git lfs fetch --all");
+    }
+
+    #[test]
+    fn source_fetch_rejects_empty_or_unsafe_selected_refs() {
+        let repo = TempRepo::new();
+
+        assert!(matches!(
+            migration_source_fetch_command(
+                &repo.path(),
+                &MigrationFetchMode::SelectedRefs { refs: Vec::new() }
+            ),
+            Err(MigrationError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            migration_source_fetch_command(
+                &repo.path(),
+                &MigrationFetchMode::selected_refs(["main..feature"])
+            ),
+            Err(MigrationError::InvalidInput { .. })
+        ));
+    }
+
+    #[ignore = "manual verification requires git-lfs and a local source repository"]
+    #[test]
+    fn source_fetch_downloads_missing_objects_without_changing_worktree_files() {
+        if !git_lfs_is_available() {
+            return;
+        }
+
+        let source = TempRepo::new();
+        source.git(["lfs", "install", "--local"]);
+        source.git(["lfs", "track", "*.bin"]);
+        source.write_bytes("asset/model.bin", b"real source lfs bytes");
+        source.commit_all("add source lfs object");
+
+        let temp = tempfile::tempdir().expect("temporary clone parent should be created");
+        let clone_path = temp.path().join("clone");
+        let output = Command::new("git")
+            .arg("clone")
+            .arg(source.path())
+            .arg(&clone_path)
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .output()
+            .expect("git clone should start");
+        assert!(
+            output.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        match fs::remove_dir_all(clone_path.join(".git/lfs/objects")) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => panic!("clone LFS media storage should be removable: {source}"),
+        }
+        let pointer_path = clone_path.join("asset/model.bin");
+        let pointer_before =
+            fs::read(&pointer_path).expect("clone pointer file should be readable");
+        let pointers = enumerate_current_checkout_lfs_pointers(&clone_path)
+            .expect("clone pointer should be discoverable");
+        assert_eq!(pointers.pointers.len(), 1);
+
+        let report = fetch_missing_migration_objects(
+            &clone_path,
+            pointers.pointers.iter().map(|pointer| &pointer.object),
+            None,
+            MigrationFetchMode::CurrentCheckout,
+        )
+        .expect("real git lfs fetch should download missing object bytes");
+
+        assert_eq!(
+            fs::read(&pointer_path).expect("clone pointer file should remain readable"),
+            pointer_before,
+            "git lfs fetch must not smudge or replace checkout files"
+        );
+        assert_eq!(report.fetched_objects.len(), 1);
+        assert!(report.unavailable_objects.is_empty());
+        assert_git_status_clean(&clone_path);
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_object_check_keeps_checking_after_unreadable_media_object() {
@@ -3161,5 +3622,31 @@ mod tests {
             fs::create_dir_all(parent).expect("test file parent should be created");
         }
         fs::write(path, contents).expect("test file should be written");
+    }
+
+    fn git_lfs_is_available() -> bool {
+        Command::new("git")
+            .args(["lfs", "version"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn assert_git_status_clean(worktree_root: &Path) {
+        let output = Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(worktree_root)
+            .output()
+            .expect("git status should start");
+
+        assert!(
+            output.status.success(),
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "worktree should stay clean after migration source fetch: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 }

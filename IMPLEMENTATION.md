@@ -1183,7 +1183,9 @@ Defer:
 > state. Migration transfer planning can now check discovered object identities
 > against both repository Git LFS media storage and an optional shared
 > `lfs-cloud` cache, verifying SHA-256 and size before treating local bytes as
-> available.
+> available. Missing migration objects can now be fetched from the source Git
+> LFS provider into local media storage without smudging or changing worktree
+> files.
 
 ### Progress Summary
 
@@ -1196,10 +1198,10 @@ Defer:
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 13     | 0         |
-| 7. Migration                             | 12          | 5      | 7         |
+| 7. Migration                             | 12          | 6      | 6         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **84** | **15**    |
+| **Total**                                | **99**      | **85** | **14**    |
 
 ### Legend
 
@@ -1362,7 +1364,7 @@ Defer:
 #### Epic 7.2: Transfer
 
 - [x] [T] Check which discovered objects already exist locally.
-- [ ] [M] Fetch missing objects from the source LFS provider without changing working tree files.
+- [x] [M] Fetch missing objects from the source LFS provider without changing working tree files. Manual verification: `scripts/manual/verify-migration-source-fetch.sh`.
 - [ ] [M] Upload discovered objects to `lfs-cloud` idempotently.
 - [ ] [T] Verify uploaded hashes and sizes against pointers.
 

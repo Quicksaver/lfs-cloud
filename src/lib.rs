@@ -76,10 +76,10 @@ pub use migration::{
     GitLfsHistoryPointer, GitLfsHistoryPointers, GitLfsInstallation, GitLfsMigrationDiscovery,
     GitLfsScannedRef, GitLfsSourceEndpoint, GitLfsSourceEndpointSource, GitLfsTrackedPattern,
     LocalMigrationObject, LocalMigrationObjectAvailability, LocalMigrationObjectLocation,
-    LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus,
-    check_local_migration_objects, discover_git_lfs_migration,
+    LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus, MigrationFetchMode,
+    MigrationSourceFetch, check_local_migration_objects, discover_git_lfs_migration,
     enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
-    enumerate_selected_ref_lfs_pointers,
+    enumerate_selected_ref_lfs_pointers, fetch_missing_migration_objects,
 };
 pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,
