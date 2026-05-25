@@ -67,8 +67,7 @@ struct InitCommand {
 pub async fn run_from_env() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&tracing_config(&cli)).context("failed to initialize tracing")?;
-    let mut stdout = io::stdout().lock();
-    dispatch(cli, crate::serve, |command| run_init(command, &mut stdout)).await
+    dispatch(cli, crate::serve, run_init_to_stdout).await
 }
 
 async fn dispatch<F, Fut, I>(cli: Cli, serve: F, init: I) -> anyhow::Result<()>
@@ -110,6 +109,12 @@ where
     run_init_from_dir(command, &current_dir, output)
 }
 
+fn run_init_to_stdout(command: InitCommand) -> anyhow::Result<()> {
+    let mut stdout = io::stdout().lock();
+
+    run_init(command, &mut stdout)
+}
+
 fn run_init_from_dir<W>(
     command: InitCommand,
     start_dir: impl AsRef<Path>,
@@ -130,6 +135,7 @@ where
 mod tests {
     use std::{
         fs,
+        path::Path,
         process::Command as ProcessCommand,
         sync::{Arc, Mutex},
     };
@@ -331,11 +337,15 @@ mod tests {
 
     #[test]
     fn init_resolves_lfs_url_from_current_repo_origin() {
+        if !git_is_available() {
+            return;
+        }
+
         let repo = TempDir::new().expect("temporary repository should be created");
-        run_git(repo.path(), ["init"]);
+        run_git(repo.path(), &["init"]);
         run_git(
             repo.path(),
-            ["remote", "add", "origin", "git@github.com:owner/repo.git"],
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
         );
         let nested = repo.path().join("nested/path");
         fs::create_dir_all(&nested).expect("nested directory should be created");
@@ -356,7 +366,14 @@ mod tests {
         );
     }
 
-    fn run_git<const N: usize>(current_dir: &std::path::Path, args: [&str; N]) {
+    fn git_is_available() -> bool {
+        ProcessCommand::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn run_git(current_dir: &Path, args: &[&str]) {
         let output = ProcessCommand::new("git")
             .args(args)
             .current_dir(current_dir)
