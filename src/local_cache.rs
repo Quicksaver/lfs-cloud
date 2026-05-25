@@ -416,6 +416,30 @@ pub enum LocalCacheMaterializationStatus {
     Copied,
 }
 
+/// Result of replacing one clean worktree object with a Git LFS pointer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalCacheDehydration {
+    /// Git LFS object identity that was dehydrated.
+    pub object: LfsObject,
+    /// Shared cache object path that preserves the full object bytes.
+    pub cache_path: PathBuf,
+    /// Worktree path that now contains a canonical Git LFS pointer file.
+    pub pointer_path: PathBuf,
+    /// Whether the cache was reused, populated, or the path was already a pointer.
+    pub status: LocalCacheDehydrationStatus,
+}
+
+/// Filesystem outcome for dehydrating a worktree object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalCacheDehydrationStatus {
+    /// The worktree path already contained a matching Git LFS pointer.
+    AlreadyDehydrated,
+    /// Existing verified cache bytes were reused before writing the pointer.
+    ReplacedWithPointer,
+    /// Worktree bytes were copied into cache before writing the pointer.
+    CachedAndReplacedWithPointer,
+}
+
 /// Deterministic filesystem layout for local Git LFS object cache paths.
 ///
 /// # Examples
@@ -563,6 +587,57 @@ impl LocalCacheLayout {
             pointer_path,
             MaterializationMode::ReplaceMatchingPointer,
         )
+    }
+
+    /// Replaces a clean hydrated worktree file with a Git LFS pointer.
+    ///
+    /// The worktree file must contain the exact expected object bytes, unless
+    /// it is already a matching pointer. If the shared cache does not already
+    /// contain a verified copy of those bytes, the bytes are copied into cache
+    /// before the worktree path is replaced. Dirty or unrelated worktree
+    /// content is rejected and left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalCacheError`] when the worktree path is missing, the
+    /// hydrated bytes do not match `object`, the cache object is corrupt, or
+    /// the pointer cannot be written and verified.
+    pub fn dehydrate_file(
+        &self,
+        object: &LfsObject,
+        worktree_path: impl AsRef<Path>,
+    ) -> LocalCacheResult<LocalCacheDehydration> {
+        let worktree_path = worktree_path.as_ref();
+        let cache_path = self.object_path(object);
+
+        if let Some(pointer) = read_existing_lfs_pointer_file(worktree_path)?
+            && pointer.object == *object
+        {
+            return Ok(LocalCacheDehydration {
+                object: object.clone(),
+                cache_path,
+                pointer_path: worktree_path.to_path_buf(),
+                status: LocalCacheDehydrationStatus::AlreadyDehydrated,
+            });
+        }
+
+        let verified_worktree = verify_file_object(worktree_path, object)?;
+        let status = if cache_object_path_exists(&cache_path)? {
+            self.verify_object(object)?;
+            LocalCacheDehydrationStatus::ReplacedWithPointer
+        } else {
+            copy_verified_worktree_object_to_cache(&verified_worktree.path, &cache_path, object)?;
+            LocalCacheDehydrationStatus::CachedAndReplacedWithPointer
+        };
+
+        publish_pointer_file(worktree_path, object)?;
+
+        Ok(LocalCacheDehydration {
+            object: object.clone(),
+            cache_path,
+            pointer_path: worktree_path.to_path_buf(),
+            status,
+        })
     }
 
     /// Ingests an object from an existing repository `.git/lfs/objects` cache.
@@ -872,6 +947,90 @@ fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
     })
 }
 
+fn read_existing_lfs_pointer_file(path: &Path) -> LocalCacheResult<Option<LfsPointer>> {
+    let metadata = fs::metadata(path).map_err(|source| LocalCacheError::Io {
+        context: "failed to inspect dehydration target",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(LocalCacheError::Io {
+            context: "dehydration target is not a file",
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
+        });
+    }
+    if metadata.len() > MAX_LFS_POINTER_FILE_SIZE {
+        return Ok(None);
+    }
+
+    let contents = fs::read(path).map_err(|source| LocalCacheError::Io {
+        context: "failed to read dehydration target",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return Ok(None);
+    };
+
+    Ok(LfsPointer::parse(contents).ok())
+}
+
+fn publish_pointer_file(path: &Path, object: &LfsObject) -> LocalCacheResult<()> {
+    verify_file_object(path, object)?;
+
+    let parent = path.parent().ok_or_else(|| LocalCacheError::Io {
+        context: "failed to resolve dehydration target parent",
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dehydration target path has no parent directory",
+        ),
+    })?;
+    let mode = existing_file_mode(path)?;
+    let mut temp =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| LocalCacheError::Io {
+            context: "failed to create temporary Git LFS pointer",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    let pointer = LfsPointer::new(object.clone()).to_pointer_file();
+
+    temp.write_all(pointer.as_bytes())
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to write temporary Git LFS pointer",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    temp.flush().map_err(|source| LocalCacheError::Io {
+        context: "failed to flush temporary Git LFS pointer",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    set_temporary_file_mode(temp.path(), path, mode)?;
+
+    // Repeat the object verification immediately before the atomic replacement
+    // so a local edit that lands during cache publication is not dehydrated.
+    verify_file_object(path, object)?;
+    temp.persist(path).map_err(|error| LocalCacheError::Io {
+        context: "failed to publish Git LFS pointer",
+        path: path.to_path_buf(),
+        source: error.error,
+    })?;
+
+    let pointer = read_lfs_pointer_file(path)?;
+    if pointer.object != *object {
+        return Err(LocalCacheError::PointerParse {
+            path: path.to_path_buf(),
+            source: LfsObjectError::PointerUnexpectedLine {
+                line: "dehydrated pointer did not round-trip to the expected object".to_owned(),
+            },
+        });
+    }
+
+    Ok(())
+}
+
 fn materialize_verified_object(
     verified: &VerifiedLocalCacheObject,
     destination_path: &Path,
@@ -1087,7 +1246,7 @@ fn publish_materialized_file(
 ) -> LocalCacheResult<()> {
     match mode {
         MaterializationMode::NoReplace => {
-            set_materialized_file_mode(
+            set_temporary_file_mode(
                 temp.path(),
                 destination_path,
                 DEFAULT_MATERIALIZED_FILE_MODE,
@@ -1127,7 +1286,7 @@ fn publish_materialized_file(
                 });
             }
             let replacement_mode = existing_file_mode(destination_path)?;
-            set_materialized_file_mode(temp.path(), destination_path, replacement_mode)?;
+            set_temporary_file_mode(temp.path(), destination_path, replacement_mode)?;
             temp.persist(destination_path)
                 .map_err(|error| LocalCacheError::Io {
                     context: "failed to publish materialized object",
@@ -1158,7 +1317,7 @@ fn existing_file_mode(_path: &Path) -> LocalCacheResult<()> {
 }
 
 #[cfg(unix)]
-fn set_materialized_file_mode(
+fn set_temporary_file_mode(
     temp_path: &Path,
     destination_path: &Path,
     mode: u32,
@@ -1167,7 +1326,7 @@ fn set_materialized_file_mode(
 
     fs::set_permissions(temp_path, fs::Permissions::from_mode(mode)).map_err(|source| {
         LocalCacheError::Io {
-            context: "failed to set temporary materialized object permissions",
+            context: "failed to set temporary file permissions",
             path: destination_path.to_path_buf(),
             source,
         }
@@ -1175,7 +1334,7 @@ fn set_materialized_file_mode(
 }
 
 #[cfg(not(unix))]
-fn set_materialized_file_mode(
+fn set_temporary_file_mode(
     _temp_path: &Path,
     _destination_path: &Path,
     _mode: (),
@@ -1343,6 +1502,37 @@ fn copy_verified_object_to_cache(
     cache_path: &Path,
     object: &LfsObject,
 ) -> LocalCacheResult<LocalCacheIngestStatus> {
+    copy_verified_path_to_cache(
+        source_path,
+        cache_path,
+        object,
+        "failed to open Git LFS source object",
+        "failed to read Git LFS source object",
+    )
+}
+
+fn copy_verified_worktree_object_to_cache(
+    source_path: &Path,
+    cache_path: &Path,
+    object: &LfsObject,
+) -> LocalCacheResult<()> {
+    copy_verified_path_to_cache(
+        source_path,
+        cache_path,
+        object,
+        "failed to open hydrated worktree object",
+        "failed to read hydrated worktree object",
+    )
+    .map(|_| ())
+}
+
+fn copy_verified_path_to_cache(
+    source_path: &Path,
+    cache_path: &Path,
+    object: &LfsObject,
+    open_context: &'static str,
+    read_context: &'static str,
+) -> LocalCacheResult<LocalCacheIngestStatus> {
     let cache_parent = cache_path.parent().ok_or_else(|| LocalCacheError::Io {
         context: "failed to resolve cache object parent",
         path: cache_path.to_path_buf(),
@@ -1358,7 +1548,7 @@ fn copy_verified_object_to_cache(
     })?;
 
     let mut source = File::open(source_path).map_err(|source| LocalCacheError::Io {
-        context: "failed to open Git LFS source object",
+        context: open_context,
         path: source_path.to_path_buf(),
         source,
     })?;
@@ -1368,7 +1558,14 @@ fn copy_verified_object_to_cache(
             path: cache_parent.to_path_buf(),
             source,
         })?;
-    copy_and_verify_object(&mut source, source_path, &mut temp, cache_path, object)?;
+    copy_and_verify_object(
+        &mut source,
+        source_path,
+        &mut temp,
+        cache_path,
+        object,
+        read_context,
+    )?;
     // This deliberately stops at `flush()`: the local cache is recoverable
     // derived state, and every cache reuse revalidates object identity.
     // Avoiding `sync_all()` keeps large-object ingest from paying a durable
@@ -1401,6 +1598,7 @@ fn copy_and_verify_object(
     destination: &mut tempfile::NamedTempFile,
     destination_path: &Path,
     expected: &LfsObject,
+    read_context: &'static str,
 ) -> LocalCacheResult<()> {
     let mut hasher = Sha256::new();
     let mut total_size = 0u64;
@@ -1410,7 +1608,7 @@ fn copy_and_verify_object(
         let read = source
             .read(&mut buffer)
             .map_err(|source| LocalCacheError::Io {
-                context: "failed to read Git LFS source object",
+                context: read_context,
                 path: source_path.to_path_buf(),
                 source,
             })?;
@@ -1947,6 +2145,106 @@ mod tests {
                     && size == MAX_LFS_POINTER_FILE_SIZE + 1
                     && max_size == MAX_LFS_POINTER_FILE_SIZE
         ));
+    }
+
+    #[test]
+    fn dehydrate_file_replaces_clean_hydrated_bytes_with_pointer_and_caches_object() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"worktree bytes to dehydrate";
+        let object = object_for_bytes(bytes);
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(&worktree_path, bytes);
+
+        let dehydration = layout
+            .dehydrate_file(&object, &worktree_path)
+            .expect("clean worktree object should dehydrate");
+
+        assert_eq!(dehydration.object, object);
+        assert_eq!(dehydration.cache_path, layout.object_path(&object));
+        assert_eq!(dehydration.pointer_path, worktree_path);
+        assert_eq!(
+            dehydration.status,
+            LocalCacheDehydrationStatus::CachedAndReplacedWithPointer
+        );
+        assert_eq!(
+            fs::read_to_string(&dehydration.pointer_path).expect("pointer file should be readable"),
+            LfsPointer::new(object.clone()).to_pointer_file()
+        );
+        assert_eq!(
+            fs::read(layout.object_path(&object)).expect("cache object should be readable"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn dehydrate_file_reuses_existing_verified_cache_before_replacing() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"already cached worktree bytes";
+        let object = object_for_bytes(bytes);
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(&worktree_path, bytes);
+
+        let dehydration = layout
+            .dehydrate_file(&object, &worktree_path)
+            .expect("clean cached worktree object should dehydrate");
+
+        assert_eq!(
+            dehydration.status,
+            LocalCacheDehydrationStatus::ReplacedWithPointer
+        );
+        assert_eq!(
+            fs::read_to_string(&worktree_path).expect("pointer file should be readable"),
+            LfsPointer::new(object).to_pointer_file()
+        );
+    }
+
+    #[test]
+    fn dehydrate_file_accepts_matching_pointer_without_cache_object() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let object = object_for_bytes(b"already dehydrated bytes");
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(
+            &worktree_path,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+
+        let dehydration = layout
+            .dehydrate_file(&object, &worktree_path)
+            .expect("matching pointer should already be dehydrated");
+
+        assert_eq!(
+            dehydration.status,
+            LocalCacheDehydrationStatus::AlreadyDehydrated
+        );
+        assert!(!layout.object_path(&object).exists());
+    }
+
+    #[test]
+    fn dehydrate_file_refuses_to_replace_dirty_worktree_content() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"original hydrated bytes";
+        let object = object_for_bytes(bytes);
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(&worktree_path, b"dirty worktree bytes");
+
+        let error = layout
+            .dehydrate_file(&object, &worktree_path)
+            .expect_err("dirty worktree content should not dehydrate");
+
+        assert!(matches!(
+            error,
+            LocalCacheError::IntegrityMismatch { path, .. } if path == worktree_path
+        ));
+        assert_eq!(
+            fs::read(&worktree_path).expect("dirty worktree content should remain"),
+            b"dirty worktree bytes"
+        );
     }
 
     #[test]

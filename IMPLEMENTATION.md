@@ -1158,6 +1158,9 @@ Defer:
 > paths with macOS `/bin/cp -c` copy-on-write cloning where available and
 > fallback copying elsewhere; matching Git LFS pointer files can be hydrated
 > from the shared cache while non-pointer worktree content is left untouched.
+> Clean hydrated worktree files can now be dehydrated back to canonical Git LFS
+> pointer files only after the full bytes are verified and preserved in the
+> shared cache; dirty or unrelated worktree content is left untouched.
 
 ### Progress Summary
 
@@ -1171,9 +1174,9 @@ Defer:
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 9      | 4         |
 | 7. Migration                             | 12          | 0      | 12        |
-| 8. Local Cache And Materialization       | 8           | 7      | 1         |
+| 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **74** | **25**    |
+| **Total**                                | **99**      | **75** | **24**    |
 
 ### Legend
 
@@ -1361,7 +1364,7 @@ Defer:
 - [x] [T] Implement copy-on-write clone abstraction with fallback copy.
 - [x] [M] Add macOS/APFS CoW implementation or shell out to a reliable platform primitive. Manual verification: `scripts/manual/verify-local-cache-materialization.sh`.
 - [x] [T] Materialize hydrated files from cache and verify final bytes.
-- [ ] [T] Dehydrate files back to pointer/placeholder form without losing dirty changes.
+- [x] [T] Dehydrate files back to pointer/placeholder form without losing dirty changes.
 
 ### Phase 9: Verification, Docs, And Release Shape
 
