@@ -756,8 +756,7 @@ fn wait_for_git_lfs_fetch_command(
         }
 
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_timed_out_git_lfs_fetch_child(child, command)?;
             let stderr = join_git_lfs_fetch_stderr_reader(stderr_reader)?;
             return Err(MigrationError::ExternalCommand {
                 command: command.to_owned(),
@@ -769,6 +768,112 @@ fn wait_for_git_lfs_fetch_command(
         thread::sleep(MIGRATION_SOURCE_FETCH_POLL_INTERVAL);
     }
 }
+
+fn stop_timed_out_git_lfs_fetch_child(child: &mut Child, command: &str) -> MigrationResult<()> {
+    stop_timed_out_git_lfs_fetch_process_tree(child);
+
+    if child
+        .try_wait()
+        .map_err(|source| MigrationError::Io {
+            context: format!("failed to wait for timed-out {command}"),
+            source,
+        })?
+        .is_none()
+    {
+        child.kill().map_err(|source| MigrationError::Io {
+            context: format!("failed to stop timed-out {command}"),
+            source,
+        })?;
+    }
+    child.wait().map_err(|source| MigrationError::Io {
+        context: format!("failed to reap timed-out {command}"),
+        source,
+    })?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_timed_out_git_lfs_fetch_process_tree(child: &Child) {
+    let descendants = collect_git_lfs_fetch_descendant_pids(child.id());
+    for pid in descendants.iter().rev() {
+        signal_process("TERM", *pid);
+    }
+    thread::sleep(Duration::from_millis(50));
+    for pid in descendants.iter().rev() {
+        signal_process("KILL", *pid);
+    }
+}
+
+#[cfg(unix)]
+fn collect_git_lfs_fetch_descendant_pids(root_pid: u32) -> Vec<u32> {
+    let mut descendants = Vec::new();
+    let mut pending = child_pids(root_pid);
+
+    while let Some(pid) = pending.pop() {
+        descendants.push(pid);
+        pending.extend(child_pids(pid));
+    }
+
+    descendants
+}
+
+#[cfg(target_os = "linux")]
+fn child_pids(parent_pid: u32) -> Vec<u32> {
+    let children_path = format!("/proc/{parent_pid}/task/{parent_pid}/children");
+    let Ok(children) = fs::read_to_string(children_path) else {
+        return Vec::new();
+    };
+
+    children
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn child_pids(parent_pid: u32) -> Vec<u32> {
+    let Ok(output) = Command::new("pgrep")
+        .args(["-P", &parent_pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+#[cfg(unix)]
+fn signal_process(signal: &str, pid: u32) {
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(windows)]
+fn stop_timed_out_git_lfs_fetch_process_tree(child: &Child) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stop_timed_out_git_lfs_fetch_process_tree(_child: &Child) {}
 
 fn join_git_lfs_fetch_stderr_reader(
     reader: thread::JoinHandle<io::Result<PipeReadResult>>,
@@ -2329,7 +2434,8 @@ mod tests {
         ffi::OsString,
         fs, io,
         path::{Path, PathBuf},
-        process::Command,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
     };
 
     use tempfile::TempDir;
@@ -2349,6 +2455,7 @@ mod tests {
         git_lfs_object_path, migration_source_fetch_command, parse_git_check_attr_filter_stdout,
         parse_lfs_patterns_from_attributes, parse_ls_tree_blob_output,
         repo_relative_path_from_git_output, split_gitattributes_line, validate_history_ref_name,
+        wait_for_git_lfs_fetch_command,
     };
 
     #[test]
@@ -3404,6 +3511,37 @@ mod tests {
                 &MigrationFetchMode::selected_refs(["main..feature"])
             ),
             Err(MigrationError::InvalidInput { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_fetch_timeout_stops_stderr_holding_descendants() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60 & wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("test shell should start");
+
+        let started_at = Instant::now();
+        let error = wait_for_git_lfs_fetch_command(
+            &mut child,
+            "git lfs fetch test",
+            Duration::from_millis(50),
+        )
+        .expect_err("timed-out command should fail");
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "timeout cleanup should not block on descendant stderr handles"
+        );
+        assert!(matches!(
+            error,
+            MigrationError::ExternalCommand { status, .. }
+                if status == "timed out after 0 seconds"
         ));
     }
 
