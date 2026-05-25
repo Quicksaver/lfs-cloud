@@ -625,6 +625,12 @@ where
 /// local source bytes against the pointer OID and size immediately before
 /// delegating to the storage provider.
 ///
+/// Uploads run sequentially so the report preserves discovery order and avoids
+/// imposing provider-wide concurrency before provider-specific rate-limit and
+/// batch APIs exist. The pre-upload existence check is a best-effort
+/// idempotence guard; concurrent writers still rely on each storage provider's
+/// own upload semantics to avoid duplicate backend objects.
+///
 /// # Errors
 ///
 /// Returns [`MigrationError`] when a discovered object has no verified local
@@ -645,7 +651,7 @@ pub async fn upload_migration_objects_to_storage(
         }
 
         let source = verified_migration_upload_source_path(local_object)?;
-        verify_migration_upload_source(source, object)?;
+        verify_migration_upload_source(source, object).await?;
 
         let stored_object = storage.upload_object(object, source).await?;
         validate_migration_uploaded_object(object, storage.provider_id(), &stored_object)?;
@@ -662,23 +668,43 @@ pub async fn upload_migration_objects_to_storage(
 fn verified_migration_upload_source_path(
     local_object: &LocalMigrationObject,
 ) -> MigrationResult<&Path> {
-    local_object
-        .locations
-        .iter()
-        .find(|location| {
-            matches!(
-                location.status,
-                LocalMigrationObjectLocationStatus::Available
-            )
-        })
-        .map(|location| location.path.as_path())
-        .ok_or_else(|| MigrationError::SourceObjectMissing {
-            oid: local_object.object.oid.as_hex().to_owned(),
-            size: local_object.object.size.bytes(),
-        })
+    [
+        LocalMigrationObjectLocationKind::GitLfsMedia,
+        LocalMigrationObjectLocationKind::SharedCache,
+    ]
+    .into_iter()
+    .find_map(|preferred_kind| {
+        local_object
+            .locations
+            .iter()
+            .find(|location| {
+                location.kind == preferred_kind
+                    && matches!(
+                        location.status,
+                        LocalMigrationObjectLocationStatus::Available
+                    )
+            })
+            .map(|location| location.path.as_path())
+    })
+    .ok_or_else(|| MigrationError::SourceObjectMissing {
+        oid: local_object.object.oid.as_hex().to_owned(),
+        size: local_object.object.size.bytes(),
+    })
 }
 
-fn verify_migration_upload_source(path: &Path, object: &LfsObject) -> MigrationResult<()> {
+async fn verify_migration_upload_source(path: &Path, object: &LfsObject) -> MigrationResult<()> {
+    let path = path.to_path_buf();
+    let object = object.clone();
+    tokio::task::spawn_blocking(move || verify_migration_upload_source_blocking(&path, &object))
+        .await
+        .map_err(|error| MigrationError::InvalidInput {
+            message: SanitizedMessage::new(format!(
+                "migration source verification task failed: {error}"
+            )),
+        })?
+}
+
+fn verify_migration_upload_source_blocking(path: &Path, object: &LfsObject) -> MigrationResult<()> {
     let (actual_oid, actual_size) = hash_migration_object_file(path)?;
     if actual_oid == object.oid && actual_size == object.size {
         return Ok(());
@@ -689,9 +715,9 @@ fn verify_migration_upload_source(path: &Path, object: &LfsObject) -> MigrationR
             "local migration source {} no longer matches sha256:{} ({} bytes): got sha256:{} ({} bytes)",
             path.display(),
             object.oid,
-            object.size,
+            object.size.bytes(),
             actual_oid,
-            actual_size
+            actual_size.bytes()
         )),
     })
 }
@@ -710,11 +736,22 @@ fn validate_migration_uploaded_object(
         });
     }
 
+    if stored.backend_id.trim().is_empty() {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new(format!(
+                "storage provider {expected_provider_id} returned an empty backend object ID"
+            )),
+        });
+    }
+
     if stored.object != *expected {
         return Err(MigrationError::InvalidInput {
             message: SanitizedMessage::new(format!(
                 "storage provider returned object sha256:{} ({} bytes), expected sha256:{} ({} bytes)",
-                stored.object.oid, stored.object.size, expected.oid, expected.size
+                stored.object.oid,
+                stored.object.size.bytes(),
+                expected.oid,
+                expected.size.bytes()
             )),
         });
     }
@@ -2566,10 +2603,10 @@ mod tests {
     };
 
     use super::{
-        GitLfsSourceEndpointSource, LocalMigrationObjectLocationKind,
-        LocalMigrationObjectLocationStatus, MAX_GIT_ATTRIBUTES_BYTES,
-        MAX_MIGRATION_GIT_OUTPUT_BYTES, MigrationError, MigrationFetchMode,
-        check_local_migration_objects, default_lfs_endpoint_for_remote_url,
+        GitLfsSourceEndpointSource, LocalMigrationObject, LocalMigrationObjectLocation,
+        LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus,
+        MAX_GIT_ATTRIBUTES_BYTES, MAX_MIGRATION_GIT_OUTPUT_BYTES, MigrationError,
+        MigrationFetchMode, check_local_migration_objects, default_lfs_endpoint_for_remote_url,
         discover_git_lfs_migration, display_git_command, enumerate_all_fetched_ref_lfs_pointers,
         enumerate_current_checkout_lfs_pointers, enumerate_selected_ref_lfs_pointers,
         fetch_missing_migration_objects, fetch_missing_migration_objects_with_runner,
@@ -2577,7 +2614,7 @@ mod tests {
         parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
         parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
         upload_migration_objects_to_storage, validate_history_ref_name,
-        wait_for_git_lfs_fetch_command,
+        verified_migration_upload_source_path, wait_for_git_lfs_fetch_command,
     };
 
     struct FakeMigrationStorageProvider {
@@ -2585,6 +2622,8 @@ mod tests {
         existing: Mutex<BTreeSet<LfsObject>>,
         uploaded: Mutex<Vec<LfsObject>>,
         returned_object_override: Mutex<Option<LfsObject>>,
+        returned_provider_id_override: Mutex<Option<String>>,
+        returned_backend_id_override: Mutex<Option<String>>,
     }
 
     impl FakeMigrationStorageProvider {
@@ -2594,6 +2633,8 @@ mod tests {
                 existing: Mutex::new(BTreeSet::new()),
                 uploaded: Mutex::new(Vec::new()),
                 returned_object_override: Mutex::new(None),
+                returned_provider_id_override: Mutex::new(None),
+                returned_backend_id_override: Mutex::new(None),
             }
         }
 
@@ -2616,6 +2657,20 @@ mod tests {
                 .returned_object_override
                 .lock()
                 .expect("fake override lock should not poison") = Some(object);
+        }
+
+        fn override_returned_provider_id(&self, provider_id: impl Into<String>) {
+            *self
+                .returned_provider_id_override
+                .lock()
+                .expect("fake provider override lock should not poison") = Some(provider_id.into());
+        }
+
+        fn override_returned_backend_id(&self, backend_id: impl Into<String>) {
+            *self
+                .returned_backend_id_override
+                .lock()
+                .expect("fake backend override lock should not poison") = Some(backend_id.into());
         }
     }
 
@@ -2677,11 +2732,23 @@ mod tests {
                     .expect("fake override lock should not poison")
                     .clone()
                     .unwrap_or_else(|| object.clone());
+                let returned_provider_id = self
+                    .returned_provider_id_override
+                    .lock()
+                    .expect("fake provider override lock should not poison")
+                    .clone()
+                    .unwrap_or_else(|| self.provider_id.clone());
+                let returned_backend_id = self
+                    .returned_backend_id_override
+                    .lock()
+                    .expect("fake backend override lock should not poison")
+                    .clone()
+                    .unwrap_or_else(|| format!("fake-storage-{}", object.oid));
 
                 Ok(StoredObject::new(
-                    self.provider_id.clone(),
+                    returned_provider_id,
                     returned_object,
-                    format!("fake-storage-{}", object.oid),
+                    returned_backend_id,
                 ))
             })
         }
@@ -3743,7 +3810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_migration_objects_rejects_provider_identity_mismatch() {
+    async fn upload_migration_objects_rejects_returned_object_mismatch() {
         let repo = TempRepo::new();
         let requested = test_lfs_object_from_bytes(b"requested upload bytes");
         let returned = test_lfs_object_from_bytes(b"different returned object");
@@ -3759,6 +3826,72 @@ mod tests {
 
         assert!(matches!(error, MigrationError::InvalidInput { message }
             if message.as_str().contains("returned object")));
+    }
+
+    #[tokio::test]
+    async fn upload_migration_objects_rejects_provider_id_mismatch() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"provider mismatch bytes");
+        write_git_lfs_source_object(&repo, &object, b"provider mismatch bytes");
+        let availability = check_local_migration_objects(repo.path(), [&object], None)
+            .expect("local migration object should be available");
+        let storage = FakeMigrationStorageProvider::new("drive-user-a");
+        storage.override_returned_provider_id("drive-user-b");
+
+        let error = upload_migration_objects_to_storage(&availability, &storage)
+            .await
+            .expect_err("storage providers must return their configured provider ID");
+
+        assert!(matches!(error, MigrationError::InvalidInput { message }
+            if message.as_str().contains("returned provider ID drive-user-b")));
+    }
+
+    #[tokio::test]
+    async fn upload_migration_objects_rejects_empty_backend_id() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"empty backend id bytes");
+        write_git_lfs_source_object(&repo, &object, b"empty backend id bytes");
+        let availability = check_local_migration_objects(repo.path(), [&object], None)
+            .expect("local migration object should be available");
+        let storage = FakeMigrationStorageProvider::new("drive-user-a");
+        storage.override_returned_backend_id(" ");
+
+        let error = upload_migration_objects_to_storage(&availability, &storage)
+            .await
+            .expect_err("storage providers must return backend object metadata");
+
+        assert!(matches!(error, MigrationError::InvalidInput { message }
+            if message.as_str().contains("empty backend object ID")));
+    }
+
+    #[test]
+    fn migration_upload_source_prefers_git_lfs_media_over_shared_cache() {
+        let temp = tempfile::tempdir().expect("temporary object paths should be created");
+        let object = test_lfs_object_from_bytes(b"source preference bytes");
+        let shared_cache_path = temp.path().join("shared-cache-object");
+        let git_lfs_media_path = temp.path().join("git-lfs-media-object");
+        write_file(&shared_cache_path, b"source preference bytes");
+        write_file(&git_lfs_media_path, b"source preference bytes");
+        let local_object = LocalMigrationObject {
+            object,
+            locations: vec![
+                LocalMigrationObjectLocation {
+                    kind: LocalMigrationObjectLocationKind::SharedCache,
+                    path: shared_cache_path,
+                    status: LocalMigrationObjectLocationStatus::Available,
+                },
+                LocalMigrationObjectLocation {
+                    kind: LocalMigrationObjectLocationKind::GitLfsMedia,
+                    path: git_lfs_media_path.clone(),
+                    status: LocalMigrationObjectLocationStatus::Available,
+                },
+            ],
+        };
+
+        let selected = verified_migration_upload_source_path(&local_object)
+            .expect("available migration source should be selected");
+
+        assert_eq!(selected, git_lfs_media_path);
     }
 
     #[test]
