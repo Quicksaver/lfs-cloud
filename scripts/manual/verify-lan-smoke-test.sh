@@ -34,6 +34,11 @@ fi
 host="${LFS_CLOUD_LAN_HOST:-0.0.0.0}"
 public_url="${LFS_CLOUD_LAN_PUBLIC_URL:-http://127.0.0.1:$port}"
 config_file="${LFS_CLOUD_LAN_CONFIG:-$tmp_dir/lfs-cloud-lan.yml}"
+route_host="${LFS_CLOUD_LAN_ROUTE_HOST:-github.com}"
+route_owner="${LFS_CLOUD_LAN_ROUTE_OWNER:-owner}"
+route_repo="${LFS_CLOUD_LAN_ROUTE_REPO:-repo}"
+route_path="${LFS_CLOUD_LAN_ROUTE_PATH:-/$route_host/$route_owner/$route_repo.git/info/lfs}"
+startup_timeout_seconds="${LFS_CLOUD_LAN_STARTUP_TIMEOUT_SECONDS:-20}"
 
 if [[ "$public_url" == */ ]]; then
   echo "LFS_CLOUD_LAN_PUBLIC_URL must not end with a trailing slash" >&2
@@ -42,6 +47,23 @@ fi
 
 if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -eq 0 ]] || [[ "$port" -gt 65535 ]]; then
   echo "LFS_CLOUD_LAN_PORT must be a TCP port from 1 to 65535" >&2
+  exit 1
+fi
+
+if [[ ! "$startup_timeout_seconds" =~ ^[0-9]+$ ]] || [[ "$startup_timeout_seconds" -eq 0 ]]; then
+  echo "LFS_CLOUD_LAN_STARTUP_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 1
+fi
+
+for route_part in "$route_host" "$route_owner" "$route_repo"; do
+  if [[ -z "$route_part" ]] || [[ "$route_part" == *"/"* ]]; then
+    echo "LFS_CLOUD_LAN_ROUTE_HOST, LFS_CLOUD_LAN_ROUTE_OWNER, and LFS_CLOUD_LAN_ROUTE_REPO must be non-empty path segments" >&2
+    exit 1
+  fi
+done
+
+if [[ "$route_path" != /* ]] || [[ "$route_path" == *"?"* ]] || [[ "$route_path" == *"#"* ]]; then
+  echo "LFS_CLOUD_LAN_ROUTE_PATH must be an absolute path without query or fragment" >&2
   exit 1
 fi
 
@@ -67,11 +89,11 @@ storage_providers:
     root_folder_id: lan-smoke-root
 
 repositories:
-  - id: github-main:owner/repo
+  - id: github-main:$route_owner/$route_repo
     repo_provider: github-main
-    host: github.com
-    owner: owner
-    name: repo
+    host: $route_host
+    owner: $route_owner
+    name: $route_repo
     storage_provider: drive-user-a
 YAML
 elif [[ -n "${LFS_CLOUD_LAN_PUBLIC_URL:-}" ]]; then
@@ -80,12 +102,16 @@ fi
 
 server_log="$tmp_dir/server.log"
 
+cargo build --quiet --manifest-path "$project_dir/Cargo.toml"
+
 cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
   --config "$config_file" serve --host "$host" --port "$port" \
   >"$server_log" 2>&1 &
 server_pid="$!"
 
-for _ in $(seq 1 80); do
+startup_attempts=$((startup_timeout_seconds * 4))
+
+for _ in $(seq 1 "$startup_attempts"); do
   if grep -F "lfs-cloud server running" "$server_log" >/dev/null 2>&1; then
     break
   fi
@@ -111,7 +137,7 @@ if command -v curl >/dev/null 2>&1; then
     curl --silent --show-error \
       --output "$tmp_dir/info-response" \
       --write-out "%{http_code}" \
-      "http://127.0.0.1:$port/github.com/owner/repo.git/info/lfs"
+      "http://127.0.0.1:$port$route_path"
   )"
   if [[ "$http_status" != "401" ]]; then
     cat "$tmp_dir/info-response" >&2
@@ -131,12 +157,14 @@ Manual cross-machine checklist:
      LFS_CLOUD_LAN_PORT=$port \\
      scripts/manual/verify-lan-smoke-test.sh
    For a real disposable-repo transfer run, point LFS_CLOUD_LAN_CONFIG at the
-   real server config and make sure its server.public_url uses that same LAN URL.
+   real server config, make sure its server.public_url uses that same LAN URL,
+   and set LFS_CLOUD_LAN_ROUTE_HOST, LFS_CLOUD_LAN_ROUTE_OWNER, and
+   LFS_CLOUD_LAN_ROUTE_REPO to a mapped repository if it is not github.com/owner/repo.
 2. Confirm the server output includes both:
    local:   http://127.0.0.1:$port
    network: http://<server-lan-ip>:$port
 3. From a second machine on the same trusted LAN, verify the route boundary:
-   curl -i http://<server-lan-ip>:$port/github.com/owner/repo.git/info/lfs
+   curl -i http://<server-lan-ip>:$port$route_path
    Expected: HTTP 401, Git LFS JSON content, and a Basic or Bearer auth challenge.
 4. With a disposable GitHub repo mapped in the real server config, run from the
    client worktree:
