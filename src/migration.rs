@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Output},
 };
 
@@ -18,9 +18,11 @@ use url::Url;
 
 const DEFAULT_REMOTE_NAME: &str = "origin";
 const MAX_MIGRATION_GIT_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_GIT_ATTRIBUTES_BYTES: u64 = 256 * 1024;
 
 /// Read-only discovery result for an existing Git LFS repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct GitLfsMigrationDiscovery {
     /// Git worktree root that was inspected.
     pub worktree_root: PathBuf,
@@ -36,6 +38,7 @@ pub struct GitLfsMigrationDiscovery {
 
 /// Availability and version details for the local `git lfs` command.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct GitLfsInstallation {
     /// True when `git lfs version` exits successfully.
     pub installed: bool,
@@ -47,6 +50,7 @@ pub struct GitLfsInstallation {
 
 /// Git LFS filter settings visible to Git for the inspected repository.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct GitLfsFilterConfig {
     /// `filter.lfs.clean`, usually `git-lfs clean -- %f`.
     pub clean: Option<String>,
@@ -60,6 +64,7 @@ pub struct GitLfsFilterConfig {
 
 /// A `.gitattributes` pattern that declares `filter=lfs`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct GitLfsTrackedPattern {
     /// Pattern token from the `.gitattributes` line.
     pub pattern: String,
@@ -71,6 +76,7 @@ pub struct GitLfsTrackedPattern {
 
 /// Repository-scoped Git LFS source endpoint discovered for migration.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct GitLfsSourceEndpoint {
     /// Source LFS endpoint URL from Git configuration.
     pub url: String,
@@ -80,6 +86,7 @@ pub struct GitLfsSourceEndpoint {
 
 /// Git configuration location that supplied a source LFS endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum GitLfsSourceEndpointSource {
     /// Repository-local `.git/config`.
     LocalGitConfig,
@@ -126,7 +133,7 @@ fn detect_worktree_root(start_dir: &Path) -> MigrationResult<PathBuf> {
     }
 
     let stdout = output_stdout(output, "git rev-parse --show-toplevel")?;
-    Ok(PathBuf::from(stdout.trim_end()))
+    Ok(PathBuf::from(stdout.trim_end_matches(['\n', '\r'])))
 }
 
 fn detect_git_lfs_installation(worktree_root: &Path) -> GitLfsInstallation {
@@ -135,17 +142,27 @@ fn detect_git_lfs_installation(worktree_root: &Path) -> GitLfsInstallation {
         .current_dir(worktree_root)
         .output()
     {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8(output.stdout)
-                .ok()
-                .and_then(|stdout| first_non_empty_line(&stdout).map(str::to_owned));
+        Ok(output) if output.status.success() => match String::from_utf8(output.stdout) {
+            Ok(stdout) => {
+                let version = first_non_empty_line(&stdout).map(str::to_owned);
+                let diagnostic = version.is_none().then(|| {
+                    SanitizedMessage::new("git lfs version succeeded but printed no version")
+                });
 
-            GitLfsInstallation {
-                installed: version.is_some(),
-                version,
-                diagnostic: None,
+                GitLfsInstallation {
+                    installed: true,
+                    version,
+                    diagnostic,
+                }
             }
-        }
+            Err(_) => GitLfsInstallation {
+                installed: true,
+                version: None,
+                diagnostic: Some(SanitizedMessage::new(
+                    "git lfs version succeeded but printed non-UTF-8 output",
+                )),
+            },
+        },
         Ok(output) => GitLfsInstallation {
             installed: false,
             version: None,
@@ -178,7 +195,8 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
         }));
     }
 
-    let remote_lfsurl_key = format!("remote.{DEFAULT_REMOTE_NAME}.lfsurl");
+    let remote_name = source_remote_name(worktree_root)?;
+    let remote_lfsurl_key = format!("remote.{remote_name}.lfsurl");
     if let Some(url) = git_config_get_os(
         worktree_root,
         [
@@ -187,7 +205,7 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
             OsStr::new("--get"),
             OsStr::new(&remote_lfsurl_key),
         ],
-        "git config --local --get remote.origin.lfsurl",
+        &format!("git config --local --get remote.{remote_name}.lfsurl"),
     )? {
         return Ok(Some(GitLfsSourceEndpoint {
             url,
@@ -196,17 +214,18 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
     }
 
     let lfsconfig_path = worktree_root.join(".lfsconfig");
-    if lfsconfig_path.exists()
+    if is_regular_file_without_following_symlinks(&lfsconfig_path)?
         && let Some(url) = git_config_get_os(
             worktree_root,
             [
                 OsStr::new("config"),
+                OsStr::new("--no-includes"),
                 OsStr::new("--file"),
                 lfsconfig_path.as_os_str(),
                 OsStr::new("--get"),
                 OsStr::new("lfs.url"),
             ],
-            "git config --file .lfsconfig --get lfs.url",
+            "git config --no-includes --file .lfsconfig --get lfs.url",
         )?
     {
         return Ok(Some(GitLfsSourceEndpoint {
@@ -215,15 +234,16 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
         }));
     }
 
-    let remote_url_key = format!("remote.{DEFAULT_REMOTE_NAME}.url");
+    let remote_url_key = format!("remote.{remote_name}.url");
     let Some(remote_url) = git_config_get_os(
         worktree_root,
         [
             OsStr::new("config"),
+            OsStr::new("--local"),
             OsStr::new("--get"),
             OsStr::new(&remote_url_key),
         ],
-        "git config --get remote.origin.url",
+        &format!("git config --local --get remote.{remote_name}.url"),
     )?
     else {
         return Ok(None);
@@ -235,6 +255,29 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
             source: GitLfsSourceEndpointSource::RemoteUrlDefault,
         }),
     )
+}
+
+fn source_remote_name(worktree_root: &Path) -> MigrationResult<String> {
+    let Some(branch_name) = git_config_get(
+        worktree_root,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?
+    else {
+        return Ok(DEFAULT_REMOTE_NAME.to_owned());
+    };
+
+    let remote_key = format!("branch.{branch_name}.remote");
+    Ok(git_config_get_os(
+        worktree_root,
+        [
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("--get"),
+            OsStr::new(&remote_key),
+        ],
+        &format!("git config --local --get branch.{branch_name}.remote"),
+    )?
+    .unwrap_or_else(|| DEFAULT_REMOTE_NAME.to_owned()))
 }
 
 fn default_lfs_endpoint_for_remote_url(remote_url: &str) -> Option<String> {
@@ -290,7 +333,9 @@ fn default_https_lfs_endpoint(host: &str, path: &str) -> Option<String> {
     {
         let mut segments = url.path_segments_mut().ok()?;
         segments.extend(path.split('/').filter(|segment| !segment.is_empty()));
-        segments.extend(["info", "lfs"]);
+        if !path_already_ends_with_info_lfs(path) {
+            segments.extend(["info", "lfs"]);
+        }
     }
 
     Some(url.to_string())
@@ -302,12 +347,29 @@ fn append_info_lfs_to_url(mut url: Url) -> Option<String> {
         return None;
     }
 
+    if path_already_ends_with_info_lfs(url.path()) {
+        return Some(url.to_string());
+    }
+
     {
         let mut segments = url.path_segments_mut().ok()?;
         segments.extend(["info", "lfs"]);
     }
 
     Some(url.to_string())
+}
+
+fn path_already_ends_with_info_lfs(path: &str) -> bool {
+    let mut segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .rev();
+
+    matches!(
+        (segments.next(), segments.next()),
+        (Some("lfs"), Some("info"))
+    )
 }
 
 fn discover_lfs_tracked_patterns(
@@ -318,13 +380,29 @@ fn discover_lfs_tracked_patterns(
 
     for attributes_file in attributes_files {
         let path = worktree_root.join(&attributes_file);
-        let contents = fs::read_to_string(&path).map_err(|source| MigrationError::Io {
+        if !is_regular_file_without_following_symlinks(&path)? {
+            continue;
+        }
+
+        let metadata = fs::metadata(&path).map_err(|source| MigrationError::Io {
+            context: format!("failed to inspect {}", path.display()),
+            source,
+        })?;
+        if metadata.len() > MAX_GIT_ATTRIBUTES_BYTES {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: format!("read {}", attributes_file.display()),
+                message: SanitizedMessage::new(".gitattributes file is too large"),
+            });
+        }
+
+        let contents = fs::read(&path).map_err(|source| MigrationError::Io {
             context: format!("failed to read {}", path.display()),
             source,
         })?;
+        let contents = String::from_utf8_lossy(&contents);
 
         patterns.extend(parse_lfs_patterns_from_attributes(
-            &contents,
+            contents.as_ref(),
             attributes_file.clone(),
         ));
     }
@@ -353,13 +431,12 @@ fn git_attributes_files(worktree_root: &Path) -> MigrationResult<Vec<PathBuf>> {
         "git ls-files -z --cached --others --exclude-standard -- .gitattributes ':(glob)**/.gitattributes'",
     )?;
 
-    Ok(stdout
-        .split('\0')
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
+    let mut paths = BTreeSet::new();
+    for value in stdout.split('\0').filter(|value| !value.is_empty()) {
+        paths.insert(repo_relative_path_from_git_output(value)?);
+    }
+
+    Ok(paths.into_iter().collect())
 }
 
 fn parse_lfs_patterns_from_attributes(
@@ -416,13 +493,37 @@ fn expand_attribute_macros(
     let mut expanded = Vec::new();
 
     for attribute in attributes {
-        expanded.push(attribute.clone());
-        if let Some(macro_attributes) = attribute_macros.get(attribute) {
-            expanded.extend(macro_attributes.iter().cloned());
-        }
+        expand_attribute_macro(
+            attribute,
+            attribute_macros,
+            &mut BTreeSet::new(),
+            &mut expanded,
+        );
     }
 
     expanded
+}
+
+fn expand_attribute_macro(
+    attribute: &str,
+    attribute_macros: &BTreeMap<String, Vec<String>>,
+    expanding: &mut BTreeSet<String>,
+    expanded: &mut Vec<String>,
+) {
+    expanded.push(attribute.to_owned());
+
+    let Some(macro_attributes) = attribute_macros.get(attribute) else {
+        return;
+    };
+    if !expanding.insert(attribute.to_owned()) {
+        return;
+    }
+
+    for macro_attribute in macro_attributes {
+        expand_attribute_macro(macro_attribute, attribute_macros, expanding, expanded);
+    }
+
+    expanding.remove(attribute);
 }
 
 fn split_gitattributes_line(line: &str) -> Vec<String> {
@@ -522,7 +623,7 @@ fn optional_stdout(output: Output, command_name: &str) -> MigrationResult<Option
     }
 
     output_stdout(output, command_name).map(|stdout| {
-        let trimmed = stdout.trim_end();
+        let trimmed = stdout.trim_end_matches(['\n', '\r']);
         if trimmed.is_empty() {
             None
         } else {
@@ -587,6 +688,34 @@ fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().find(|line| !line.trim().is_empty())
 }
 
+fn is_regular_file_without_following_symlinks(path: &Path) -> MigrationResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(MigrationError::Io {
+            context: format!("failed to inspect {}", path.display()),
+            source,
+        }),
+    }
+}
+
+fn repo_relative_path_from_git_output(path: &str) -> MigrationResult<PathBuf> {
+    let path = PathBuf::from(path);
+    let is_safe_relative_path = !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
+
+    if is_safe_relative_path {
+        Ok(path)
+    } else {
+        Err(MigrationError::ExternalCommandOutput {
+            command: "git ls-files".to_owned(),
+            message: SanitizedMessage::new("git returned a path outside the worktree"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -598,8 +727,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        GitLfsSourceEndpointSource, MigrationError, discover_git_lfs_migration,
-        parse_lfs_patterns_from_attributes, split_gitattributes_line,
+        GitLfsSourceEndpointSource, MAX_GIT_ATTRIBUTES_BYTES, MigrationError,
+        default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
+        parse_lfs_patterns_from_attributes, repo_relative_path_from_git_output,
+        split_gitattributes_line,
     };
 
     #[test]
@@ -736,6 +867,73 @@ mod tests {
     }
 
     #[test]
+    fn source_endpoint_uses_current_branch_remote_before_origin() {
+        let repo = TempRepo::new();
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/origin/repo.git",
+        ]);
+        repo.git([
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/upstream/repo.git",
+        ]);
+        repo.git(["checkout", "-b", "feature"]);
+        repo.git(["config", "--local", "branch.feature.remote", "upstream"]);
+
+        let discovery =
+            discover_git_lfs_migration(repo.path()).expect("migration discovery should succeed");
+        let endpoint = discovery
+            .source_endpoint
+            .expect("branch remote URL should provide a default LFS endpoint");
+
+        assert_eq!(
+            endpoint.url,
+            "https://github.com/upstream/repo.git/info/lfs"
+        );
+        assert_eq!(
+            endpoint.source,
+            GitLfsSourceEndpointSource::RemoteUrlDefault
+        );
+    }
+
+    #[test]
+    fn lfsconfig_symlink_is_not_used_as_source_endpoint() {
+        let repo = TempRepo::new();
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+        repo.write_file(
+            "outside-lfsconfig",
+            "[lfs]\n    url = https://source.example/symlink.git/info/lfs\n",
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            repo.path().join("outside-lfsconfig"),
+            repo.path().join(".lfsconfig"),
+        )
+        .expect("test symlink should be created");
+
+        let discovery =
+            discover_git_lfs_migration(repo.path()).expect("migration discovery should succeed");
+        let endpoint = discovery
+            .source_endpoint
+            .expect("origin remote URL should provide a default LFS endpoint");
+
+        assert_eq!(endpoint.url, "https://github.com/owner/repo.git/info/lfs");
+        assert_eq!(
+            endpoint.source,
+            GitLfsSourceEndpointSource::RemoteUrlDefault
+        );
+    }
+
+    #[test]
     fn local_endpoint_takes_precedence_over_lfsconfig() {
         let repo = TempRepo::new();
         repo.write_file(
@@ -770,6 +968,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_gitattributes_paths_outside_worktree() {
+        assert!(repo_relative_path_from_git_output("/tmp/.gitattributes").is_err());
+        assert!(repo_relative_path_from_git_output("../.gitattributes").is_err());
+        assert!(repo_relative_path_from_git_output("safe/.gitattributes").is_ok());
+    }
+
+    #[test]
+    fn discovers_lossy_non_utf8_gitattributes_files() {
+        let repo = TempRepo::new();
+        repo.write_bytes(".gitattributes", b"*.bin filter=lfs diff=lfs\n\xFF\n");
+
+        let discovery =
+            discover_git_lfs_migration(repo.path()).expect("migration discovery should succeed");
+
+        assert_eq!(discovery.tracked_patterns.len(), 1);
+        assert_eq!(discovery.tracked_patterns[0].pattern, "*.bin");
+    }
+
+    #[test]
+    fn rejects_oversized_gitattributes_files() {
+        let repo = TempRepo::new();
+        repo.write_bytes(
+            ".gitattributes",
+            &vec![b'a'; MAX_GIT_ATTRIBUTES_BYTES as usize + 1],
+        );
+
+        let error = discover_git_lfs_migration(repo.path())
+            .expect_err("oversized .gitattributes should fail discovery");
+
+        assert!(matches!(
+            error,
+            MigrationError::ExternalCommandOutput { .. }
+        ));
+    }
+
+    #[test]
     fn parses_lfs_patterns_from_gitattributes_lines() {
         let patterns = parse_lfs_patterns_from_attributes(
             "# ignored\n\"assets/big file.bin\" filter=lfs diff=lfs -text\n*.txt text\n*.zip -text filter=lfs\n",
@@ -797,6 +1031,60 @@ mod tests {
         assert_eq!(
             patterns[0].attributes,
             vec!["lfs", "filter=lfs", "diff=lfs", "merge=lfs", "-text"]
+        );
+    }
+
+    #[test]
+    fn parses_lfs_patterns_declared_with_nested_attribute_macros() {
+        let patterns = parse_lfs_patterns_from_attributes(
+            "[attr]lfs filter=lfs diff=lfs merge=lfs -text\n[attr]lfs2 lfs\n*.bin lfs2\n",
+            Path::new(".gitattributes").to_path_buf(),
+        );
+
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].pattern, "*.bin");
+        assert_eq!(
+            patterns[0].attributes,
+            vec![
+                "lfs2",
+                "lfs",
+                "filter=lfs",
+                "diff=lfs",
+                "merge=lfs",
+                "-text"
+            ]
+        );
+    }
+
+    #[test]
+    fn derives_default_lfs_endpoints_for_common_remote_shapes() {
+        assert_eq!(
+            default_lfs_endpoint_for_remote_url("git@github.com:owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo.git/info/lfs")
+        );
+        assert_eq!(
+            default_lfs_endpoint_for_remote_url("ssh://git@github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo.git/info/lfs")
+        );
+        assert_eq!(
+            default_lfs_endpoint_for_remote_url("https://github.com/owner/repo.git/info/lfs")
+                .as_deref(),
+            Some("https://github.com/owner/repo.git/info/lfs")
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_default_lfs_endpoint_remotes() {
+        assert!(
+            default_lfs_endpoint_for_remote_url(" https://github.com/owner/repo.git").is_none()
+        );
+        assert!(
+            default_lfs_endpoint_for_remote_url("https://github.com/owner/repo.git?token=secret")
+                .is_none()
+        );
+        assert!(
+            default_lfs_endpoint_for_remote_url("https://github.com/owner/repo.git#fragment")
+                .is_none()
         );
     }
 
@@ -832,6 +1120,10 @@ mod tests {
         }
 
         fn write_file(&self, relative_path: impl AsRef<Path>, contents: &str) {
+            self.write_bytes(relative_path, contents.as_bytes());
+        }
+
+        fn write_bytes(&self, relative_path: impl AsRef<Path>, contents: &[u8]) {
             let path = self.root.path().join(relative_path);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).expect("test file parent should be created");
