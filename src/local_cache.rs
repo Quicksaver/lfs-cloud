@@ -198,10 +198,17 @@ impl LocalCacheWorktreeRegistration {
     }
 
     fn validate(&self) -> LocalCacheResult<()> {
-        if self.repository_id.trim().is_empty() || self.repository_id.trim() != self.repository_id {
+        let trimmed_repository_id = self.repository_id.trim();
+        if trimmed_repository_id.is_empty() {
             return Err(LocalCacheError::InvalidWorktreeRegistration {
                 field: "repository_id",
-                message: "must not be blank or padded".to_owned(),
+                message: "must not be blank".to_owned(),
+            });
+        }
+        if trimmed_repository_id != self.repository_id {
+            return Err(LocalCacheError::InvalidWorktreeRegistration {
+                field: "repository_id",
+                message: "must not be padded".to_owned(),
             });
         }
         validate_absolute_path("worktree_root", &self.worktree_root)?;
@@ -303,7 +310,7 @@ impl LocalCacheWorktreeRegistry {
 
     fn sort(&mut self) {
         self.worktrees
-            .sort_by_key(|registration| normalized_path_key(&registration.worktree_root));
+            .sort_by_cached_key(|registration| normalized_path_key(&registration.worktree_root));
     }
 }
 
@@ -565,7 +572,6 @@ impl LocalCacheLayout {
 
         let path = self.worktree_registry_lock_path();
         let lock = OpenOptions::new()
-            .read(true)
             .write(true)
             .create(true)
             .truncate(false)
@@ -576,6 +582,8 @@ impl LocalCacheLayout {
                 source,
             })?;
 
+        // This blocking lock is deliberately non-reentrant. Registry callers
+        // must not acquire it again while holding the returned file handle.
         FileExt::lock(&lock).map_err(|source| LocalCacheError::Io {
             context: "failed to lock local cache worktree registry",
             path,
@@ -600,7 +608,7 @@ impl LocalCacheLayout {
         })?;
 
         fs::create_dir_all(parent).map_err(|source| LocalCacheError::Io {
-            context: "failed to create local cache root",
+            context: "failed to create local cache worktree registry directory",
             path: parent.to_path_buf(),
             source,
         })?;
@@ -630,11 +638,23 @@ impl LocalCacheLayout {
             path: path.clone(),
             source,
         })?;
+        temp.as_file_mut()
+            .sync_all()
+            .map_err(|source| LocalCacheError::Io {
+                context: "failed to sync local cache worktree registry",
+                path: path.clone(),
+                source,
+            })?;
 
         temp.persist(&path).map_err(|error| LocalCacheError::Io {
             context: "failed to publish local cache worktree registry",
-            path,
+            path: path.clone(),
             source: error.error,
+        })?;
+        sync_directory(parent).map_err(|source| LocalCacheError::Io {
+            context: "failed to sync local cache worktree registry directory",
+            path: parent.to_path_buf(),
+            source,
         })?;
 
         Ok(())
@@ -658,11 +678,20 @@ fn validate_absolute_path(field: &'static str, path: &Path) -> LocalCacheResult<
     Ok(())
 }
 
-fn normalized_path_key(path: &Path) -> String {
-    dunce::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+fn normalized_path_key(path: &Path) -> PathBuf {
+    // Existing paths compare by canonical identity, while missing paths remain
+    // lexical because there is no stable filesystem identity to resolve yet.
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn object_shards(hex: &str) -> [&str; OBJECT_SHARD_LEVELS] {
@@ -1263,13 +1292,20 @@ mod tests {
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
         fs::create_dir_all(layout.root()).expect("cache root should be created");
         let lock_file = OpenOptions::new()
-            .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(layout.worktree_registry_lock_path())
             .expect("registry lock file should open");
         FileExt::lock(&lock_file).expect("registry lock should be acquired by test");
+        let contended_lock_file = OpenOptions::new()
+            .write(true)
+            .open(layout.worktree_registry_lock_path())
+            .expect("contended registry lock file should open");
+        assert!(
+            FileExt::try_lock(&contended_lock_file).is_err(),
+            "the platform should report the held registry lock as contended"
+        );
 
         let registration = LocalCacheWorktreeRegistration::new(
             "github-main:owner/repo",
@@ -1293,7 +1329,7 @@ mod tests {
             .recv()
             .expect("worker should report before attempting registration");
         assert!(
-            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            done_rx.recv_timeout(Duration::from_secs(1)).is_err(),
             "registration should wait while another process holds the registry lock"
         );
 
@@ -1423,30 +1459,24 @@ mod tests {
         let worktree_root = temp.path().join("repo");
         let first_git_dir = temp.path().join("repo/.git");
         let second_git_dir = temp.path().join("repo/.git/worktrees/duplicate");
+        let registry = LocalCacheWorktreeRegistry {
+            version: WORKTREE_REGISTRY_VERSION,
+            worktrees: vec![
+                LocalCacheWorktreeRegistration {
+                    repository_id: "github-main:owner/repo".to_owned(),
+                    worktree_root: worktree_root.clone(),
+                    git_dir: first_git_dir,
+                },
+                LocalCacheWorktreeRegistration {
+                    repository_id: "github-main:owner/repo".to_owned(),
+                    worktree_root,
+                    git_dir: second_git_dir,
+                },
+            ],
+        };
         write_file(
             &layout.worktree_registry_path(),
-            format!(
-                r#"{{
-  "version": 1,
-  "worktrees": [
-    {{
-      "repository_id": "github-main:owner/repo",
-      "worktree_root": "{}",
-      "git_dir": "{}"
-    }},
-    {{
-      "repository_id": "github-main:owner/repo",
-      "worktree_root": "{}",
-      "git_dir": "{}"
-    }}
-  ]
-}}"#,
-                worktree_root.display(),
-                first_git_dir.display(),
-                worktree_root.display(),
-                second_git_dir.display()
-            )
-            .as_bytes(),
+            &serde_json::to_vec_pretty(&registry).expect("registry fixture should encode"),
         );
 
         let error = layout
