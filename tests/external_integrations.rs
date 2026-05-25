@@ -4,7 +4,7 @@
 //! provider resources. The scripts in `scripts/manual/` set up the exact cargo
 //! invocation and keep normal development runs deterministic.
 
-use std::{env, fs, time::SystemTime};
+use std::{env, fs, process, time::SystemTime};
 
 use lfs_cloud::{
     GitHubOAuthAccessToken, GitHubProviderConfig, GitHubRepositoryPermissionClient,
@@ -13,7 +13,7 @@ use lfs_cloud::{
 };
 use reqwest::{
     Client, Method, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, HeaderValue, USER_AGENT},
+    header::{ACCEPT, USER_AGENT},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -35,6 +35,8 @@ async fn github_disposable_repo_permission_check() {
     let repo_owner = env::var("LFS_CLOUD_GITHUB_OWNER").ok();
     let api_url =
         env::var("LFS_CLOUD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_owned());
+    let repo_host =
+        env::var("LFS_CLOUD_GITHUB_HOST").unwrap_or_else(|_| github_host_from_api_url(&api_url));
     let repo_name = disposable_name("lfs-cloud-it");
     let provider = GitHubProviderConfig {
         id: "github-main".to_owned(),
@@ -57,7 +59,7 @@ async fn github_disposable_repo_permission_check() {
         let repository = RepositoryIdentity {
             provider_id: provider.id.clone(),
             stable_id: Some(created_repo.id.to_string()),
-            host: github_host_from_api_url(&api_url),
+            host: repo_host,
             owner: created_repo.owner.login.clone(),
             name: created_repo.name.clone(),
         };
@@ -71,24 +73,24 @@ async fn github_disposable_repo_permission_check() {
             )
             .await?;
 
-        assert_eq!(authorization.repository.owner, created_repo.owner.login);
-        assert_eq!(authorization.repository.name, created_repo.name);
-        assert_eq!(authorization.required, RepositoryPermission::Write);
-        assert!(
-            matches!(
-                authorization.granted,
-                RepositoryPermission::Write | RepositoryPermission::Admin
-            ),
-            "disposable repo creator should retain write/admin access"
-        );
-
-        Ok::<(), lfs_cloud::ServerError>(())
+        Ok::<_, lfs_cloud::ServerError>(authorization)
     }
     .await;
 
     let delete_result = delete_github_repo(&http, &api_url, &token, &created_repo.full_name).await;
-    check_result.expect("GitHub permission client should authorize disposable repo write access");
     delete_result.expect("disposable GitHub repository should be deleted");
+    let authorization = check_result
+        .expect("GitHub permission client should authorize disposable repo write access");
+    assert_eq!(authorization.repository.owner, created_repo.owner.login);
+    assert_eq!(authorization.repository.name, created_repo.name);
+    assert_eq!(authorization.required, RepositoryPermission::Write);
+    assert!(
+        matches!(
+            authorization.granted,
+            RepositoryPermission::Write | RepositoryPermission::Admin
+        ),
+        "disposable repo creator should retain write/admin access"
+    );
 }
 
 #[tokio::test]
@@ -170,11 +172,11 @@ fn google_drive_credential_json() -> String {
 }
 
 fn disposable_name(prefix: &str) -> String {
-    let millis = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("system clock should be after the Unix epoch")
-        .as_millis();
-    format!("{prefix}-{millis}")
+        .as_nanos();
+    format!("{prefix}-{nanos}-{}", process::id())
 }
 
 fn github_host_from_api_url(api_url: &str) -> String {
@@ -238,7 +240,6 @@ async fn delete_github_repo(
     }
 
     let response = github_request(client, Method::DELETE, endpoint, token, None)
-        .await?
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -264,7 +265,6 @@ async fn github_json<T: for<'de> Deserialize<'de>>(
     body: Option<Value>,
 ) -> Result<T, String> {
     let response = github_request(client, method, endpoint, token, body)
-        .await?
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -282,13 +282,13 @@ async fn github_json<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("GitHub response JSON was invalid: {error}"))
 }
 
-async fn github_request(
+fn github_request(
     client: &Client,
     method: Method,
     endpoint: Url,
     token: &str,
     body: Option<Value>,
-) -> Result<reqwest::RequestBuilder, String> {
+) -> reqwest::RequestBuilder {
     let mut request = client
         .request(method, endpoint)
         .header(ACCEPT, GITHUB_ACCEPT)
@@ -297,7 +297,7 @@ async fn github_request(
     if let Some(body) = body {
         request = request.json(&body);
     }
-    Ok(request)
+    request
 }
 
 async fn create_drive_folder(
@@ -315,10 +315,7 @@ async fn create_drive_folder(
     }
     endpoint
         .query_pairs_mut()
-        .append_pair(
-            "fields",
-            "id,name,mimeType,trashed,capabilities/canAddChildren",
-        )
+        .append_pair("fields", "id,name")
         .append_pair("supportsAllDrives", "true");
 
     let mut metadata = json!({
@@ -403,11 +400,7 @@ fn drive_request(
     let mut request = client
         .request(method, endpoint)
         .header(ACCEPT, "application/json")
-        .header(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {access_token}"))
-                .expect("Google access token should fit in an HTTP header"),
-        );
+        .bearer_auth(access_token);
     if let Some(body) = body {
         request = request.json(&body);
     }

@@ -3,8 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-if [[ "${LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION:-}" != "1" ]]; then
-  echo "skipping Google Drive integration check; set LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION=1 to create a disposable folder"
+is_enabled() {
+  case "${1:-}" in
+    1 | true | TRUE | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if ! is_enabled "${LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION:-}"; then
+  echo "skipping Google Drive integration check; set LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION=1, true, or yes to create a disposable folder"
   exit 0
 fi
 
