@@ -15,7 +15,9 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use sha2::{Digest, Sha256};
@@ -36,6 +38,8 @@ const MAX_HISTORY_COMMIT_LIST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_TREE_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_CHECK_ATTR_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_POINTER_BYTES: u64 = 64 * 1024;
+const MIGRATION_SOURCE_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+const MIGRATION_SOURCE_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Read-only discovery result for an existing Git LFS repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -215,6 +219,15 @@ impl MigrationFetchMode {
             refs: refs.into_iter().map(Into::into).collect(),
         }
     }
+
+    /// Returns the selected ref names when this mode targets explicit refs.
+    #[must_use]
+    pub fn selected_ref_names(&self) -> Option<&[String]> {
+        match self {
+            Self::SelectedRefs { refs } => Some(refs),
+            Self::CurrentCheckout | Self::AllFetchedRefs => None,
+        }
+    }
 }
 
 /// Result of fetching missing source Git LFS objects into local media storage.
@@ -226,6 +239,10 @@ pub struct MigrationSourceFetch {
     /// Ref scope used for the source fetch.
     pub mode: MigrationFetchMode,
     /// Safe display form of the `git lfs fetch` command that ran.
+    ///
+    /// This is a human-readable diagnostic string, not a shell script. Arguments
+    /// that need quoting are single-quoted, and non-UTF-8 argument bytes are
+    /// rendered lossily because Git accepts platform-native paths and ref names.
     ///
     /// `None` means every requested object was already locally available, so no
     /// source-provider fetch was needed.
@@ -603,22 +620,16 @@ where
     let start_dir = start_dir.as_ref();
     let before = check_local_migration_objects(start_dir, objects, shared_cache)?;
     let worktree_root = before.worktree_root.clone();
-    let requested_objects = before
-        .objects
-        .iter()
-        .map(|object| object.object.clone())
-        .collect::<Vec<_>>();
     let mut command = None;
 
     if before.unavailable_objects().is_empty() {
-        let after =
-            check_local_migration_objects(&worktree_root, &requested_objects, shared_cache)?;
+        let after = before.clone();
         return Ok(MigrationSourceFetch {
             worktree_root,
             mode,
             command,
             fetched_objects: Vec::new(),
-            unavailable_objects: unavailable_migration_objects(&after),
+            unavailable_objects: Vec::new(),
             before,
             after,
         });
@@ -628,7 +639,11 @@ where
     runner(&worktree_root, &fetch_command)?;
     command = Some(fetch_command.display.clone());
 
-    let after = check_local_migration_objects(&worktree_root, &requested_objects, shared_cache)?;
+    let after = check_local_migration_objects(
+        &worktree_root,
+        before.objects.iter().map(|object| &object.object),
+        shared_cache,
+    )?;
     let fetched_objects = fetched_migration_objects(&before, &after);
     let unavailable_objects = unavailable_migration_objects(&after);
 
@@ -694,47 +709,94 @@ fn run_git_lfs_fetch_command(
     worktree_root: &Path,
     command: &MigrationSourceFetchCommand,
 ) -> MigrationResult<()> {
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .args(&command.args)
         .current_dir(worktree_root)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|source| MigrationError::Io {
             context: "failed to start git lfs fetch".to_owned(),
             source,
         })?;
+    let (status, stderr) = wait_for_git_lfs_fetch_command(
+        &mut child,
+        &command.display,
+        MIGRATION_SOURCE_FETCH_TIMEOUT,
+    )?;
 
-    if output.status.success() {
+    if status.success() {
         Ok(())
     } else {
-        Err(command_error(
-            &command.display,
-            output.status,
-            &output.stderr,
-        ))
+        Err(command_error(&command.display, status, &stderr))
     }
+}
+
+fn wait_for_git_lfs_fetch_command(
+    child: &mut Child,
+    command: &str,
+    timeout: Duration,
+) -> MigrationResult<(ExitStatus, Vec<u8>)> {
+    let stderr = child.stderr.take().ok_or_else(|| MigrationError::Io {
+        context: "git lfs fetch stderr was not piped".to_owned(),
+        source: io::Error::other("git lfs fetch stderr was not piped"),
+    })?;
+    let stderr_reader =
+        thread::spawn(move || read_pipe_with_limit(stderr, MAX_MIGRATION_GIT_OUTPUT_BYTES + 1));
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Some(status) = child.try_wait().map_err(|source| MigrationError::Io {
+            context: format!("failed to wait for {command}"),
+            source,
+        })? {
+            let stderr = join_git_lfs_fetch_stderr_reader(stderr_reader)?;
+            return Ok((status, stderr.bytes));
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = join_git_lfs_fetch_stderr_reader(stderr_reader)?;
+            return Err(MigrationError::ExternalCommand {
+                command: command.to_owned(),
+                status: format!("timed out after {} seconds", timeout.as_secs()),
+                stderr: SanitizedMessage::new(truncated_lossy_message(&stderr.bytes)),
+            });
+        }
+
+        thread::sleep(MIGRATION_SOURCE_FETCH_POLL_INTERVAL);
+    }
+}
+
+fn join_git_lfs_fetch_stderr_reader(
+    reader: thread::JoinHandle<io::Result<PipeReadResult>>,
+) -> MigrationResult<PipeReadResult> {
+    reader
+        .join()
+        .map_err(|_| MigrationError::Io {
+            context: "git lfs fetch stderr reader panicked".to_owned(),
+            source: io::Error::other("git lfs fetch stderr reader panicked"),
+        })?
+        .map_err(|source| MigrationError::Io {
+            context: "failed to read git lfs fetch stderr".to_owned(),
+            source,
+        })
 }
 
 fn fetched_migration_objects(
     before: &LocalMigrationObjectAvailability,
     after: &LocalMigrationObjectAvailability,
 ) -> Vec<LfsObject> {
-    let after_availability = after
-        .objects
-        .iter()
-        .map(|object| (object.object.clone(), object.is_available()))
-        .collect::<BTreeMap<_, _>>();
-
     before
         .objects
         .iter()
-        .filter(|object| !object.is_available())
-        .filter(|object| {
-            after_availability
-                .get(&object.object)
-                .copied()
-                .unwrap_or(false)
+        .zip(after.objects.iter())
+        .filter(|(before, after)| {
+            before.object == after.object && !before.is_available() && after.is_available()
         })
-        .map(|object| object.object.clone())
+        .map(|(before, _)| before.object.clone())
         .collect()
 }
 
@@ -752,9 +814,25 @@ fn unavailable_migration_objects(
 fn display_git_command(args: &[OsString]) -> String {
     std::iter::once(OsStr::new("git"))
         .chain(args.iter().map(OsString::as_os_str))
-        .map(|arg| arg.to_string_lossy())
+        .map(display_git_command_arg)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn display_git_command_arg(arg: &OsStr) -> String {
+    let arg = arg.to_string_lossy();
+    if arg.is_empty() {
+        return "''".to_owned();
+    }
+
+    if arg
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_./:=@,".contains(character))
+    {
+        return arg.into_owned();
+    }
+
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 fn detect_worktree_root(start_dir: &Path) -> MigrationResult<PathBuf> {
@@ -2265,7 +2343,7 @@ mod tests {
         LocalMigrationObjectLocationStatus, MAX_GIT_ATTRIBUTES_BYTES,
         MAX_MIGRATION_GIT_OUTPUT_BYTES, MigrationError, MigrationFetchMode,
         check_local_migration_objects, default_lfs_endpoint_for_remote_url,
-        discover_git_lfs_migration, enumerate_all_fetched_ref_lfs_pointers,
+        discover_git_lfs_migration, display_git_command, enumerate_all_fetched_ref_lfs_pointers,
         enumerate_current_checkout_lfs_pointers, enumerate_selected_ref_lfs_pointers,
         fetch_missing_migration_objects, fetch_missing_migration_objects_with_runner,
         git_lfs_object_path, migration_source_fetch_command, parse_git_check_attr_filter_stdout,
@@ -3150,6 +3228,7 @@ mod tests {
         assert!(report.unavailable_objects.is_empty());
         assert_eq!(report.before.available_objects().len(), 1);
         assert_eq!(report.after.available_objects().len(), 1);
+        assert_eq!(report.before, report.after);
     }
 
     #[test]
@@ -3203,6 +3282,44 @@ mod tests {
     }
 
     #[test]
+    fn source_fetch_downloads_all_fetched_ref_objects_into_git_lfs_media_storage() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"downloaded all-ref source bytes");
+        let object_for_runner = object.clone();
+        let mut observed_command = None;
+
+        let report = fetch_missing_migration_objects_with_runner(
+            repo.path(),
+            [&object],
+            None,
+            MigrationFetchMode::AllFetchedRefs,
+            |worktree_root, command| {
+                observed_command = Some(command.clone());
+                write_git_lfs_source_object_in(
+                    &worktree_root.join(".git/lfs/objects"),
+                    &object_for_runner,
+                    b"downloaded all-ref source bytes",
+                );
+                Ok(())
+            },
+        )
+        .expect("all-ref source fetch should re-check downloaded objects");
+
+        let command = observed_command.expect("missing object should run git lfs fetch");
+        assert_eq!(
+            command.args,
+            vec![
+                OsString::from("lfs"),
+                OsString::from("fetch"),
+                OsString::from("--all"),
+            ]
+        );
+        assert_eq!(report.command.as_deref(), Some("git lfs fetch --all"));
+        assert_eq!(report.fetched_objects, vec![object]);
+        assert!(report.unavailable_objects.is_empty());
+    }
+
+    #[test]
     fn source_fetch_reports_objects_still_unavailable_after_fetch() {
         let repo = TempRepo::new();
         let object = test_lfs_object_from_bytes(b"still missing source bytes");
@@ -3251,8 +3368,28 @@ mod tests {
     }
 
     #[test]
+    fn source_fetch_command_display_quotes_ambiguous_arguments() {
+        let display = display_git_command(&[
+            OsString::from("lfs"),
+            OsString::from("fetch"),
+            OsString::from("feature branch"),
+            OsString::from("release'candidate"),
+        ]);
+
+        assert_eq!(
+            display,
+            "git lfs fetch 'feature branch' 'release'\\''candidate'"
+        );
+    }
+
+    #[test]
     fn source_fetch_rejects_empty_or_unsafe_selected_refs() {
         let repo = TempRepo::new();
+        let mode = MigrationFetchMode::selected_refs(["main", "refs/tags/v1"]);
+        assert_eq!(
+            mode.selected_ref_names(),
+            Some(&["main".to_owned(), "refs/tags/v1".to_owned()][..])
+        );
 
         assert!(matches!(
             migration_source_fetch_command(
