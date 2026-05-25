@@ -204,14 +204,7 @@ impl LocalCacheLayout {
     pub fn verify_object(&self, object: &LfsObject) -> LocalCacheResult<VerifiedLocalCacheObject> {
         let path = self.object_path(object);
 
-        if !path.is_file() {
-            return Err(LocalCacheError::MissingCacheObject {
-                oid: object.oid.clone(),
-                size: object.size,
-                path,
-            });
-        }
-
+        ensure_cache_object_file(&path, object)?;
         verify_file_object(&path, object)
     }
 
@@ -230,7 +223,7 @@ impl LocalCacheLayout {
         let source_path = git_lfs_object_path(git_lfs_objects_dir, &object.oid);
         let cache_path = self.object_path(object);
 
-        if cache_path.exists() {
+        if cache_object_path_exists(&cache_path)? {
             self.verify_object(object)?;
 
             return Ok(LocalCacheIngest {
@@ -241,17 +234,8 @@ impl LocalCacheLayout {
             });
         }
 
-        if !source_path.is_file() {
-            return Err(LocalCacheError::MissingSourceObject {
-                oid: object.oid.clone(),
-                size: object.size,
-                path: source_path,
-            });
-        }
-
-        verify_file_object(&source_path, object)?;
+        ensure_source_object_file(&source_path, object)?;
         let status = copy_verified_object_to_cache(&source_path, &cache_path, object)?;
-        self.verify_object(object)?;
 
         Ok(LocalCacheIngest {
             object: object.clone(),
@@ -284,6 +268,69 @@ fn git_lfs_object_path(git_lfs_objects_dir: &Path, oid: &LfsOid) -> PathBuf {
         .join(first_shard)
         .join(second_shard)
         .join(hex)
+}
+
+fn cache_object_path_exists(path: &Path) -> LocalCacheResult<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(LocalCacheError::Io {
+            context: "cache object path is not a file",
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(LocalCacheError::Io {
+            context: "failed to inspect cache object",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn ensure_cache_object_file(path: &Path, object: &LfsObject) -> LocalCacheResult<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(LocalCacheError::Io {
+            context: "cache object path is not a file",
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Err(LocalCacheError::MissingCacheObject {
+                oid: object.oid.clone(),
+                size: object.size,
+                path: path.to_path_buf(),
+            })
+        }
+        Err(source) => Err(LocalCacheError::Io {
+            context: "failed to inspect cache object",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn ensure_source_object_file(path: &Path, object: &LfsObject) -> LocalCacheResult<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(LocalCacheError::Io {
+            context: "Git LFS source object path is not a file",
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Err(LocalCacheError::MissingSourceObject {
+                oid: object.oid.clone(),
+                size: object.size,
+                path: path.to_path_buf(),
+            })
+        }
+        Err(source) => Err(LocalCacheError::Io {
+            context: "failed to inspect Git LFS source object",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn verify_file_object(
@@ -338,11 +385,11 @@ fn copy_verified_object_to_cache(
             path: cache_parent.to_path_buf(),
             source,
         })?;
-    io::copy(&mut source, &mut temp).map_err(|source| LocalCacheError::Io {
-        context: "failed to copy object into temporary cache file",
-        path: cache_path.to_path_buf(),
-        source,
-    })?;
+    copy_and_verify_object(&mut source, source_path, &mut temp, cache_path, object)?;
+    // This deliberately stops at `flush()`: the local cache is recoverable
+    // derived state, and every cache reuse revalidates object identity.
+    // Avoiding `sync_all()` keeps large-object ingest from paying a durable
+    // write latency cost on the hot path.
     temp.as_file_mut()
         .flush()
         .map_err(|source| LocalCacheError::Io {
@@ -350,7 +397,6 @@ fn copy_verified_object_to_cache(
             path: cache_path.to_path_buf(),
             source,
         })?;
-    verify_file_object(temp.path(), object)?;
 
     match temp.persist_noclobber(cache_path) {
         Ok(_) => Ok(LocalCacheIngestStatus::Copied),
@@ -364,6 +410,63 @@ fn copy_verified_object_to_cache(
             source: error.error,
         }),
     }
+}
+
+fn copy_and_verify_object(
+    source: &mut File,
+    source_path: &Path,
+    destination: &mut tempfile::NamedTempFile,
+    destination_path: &Path,
+    expected: &LfsObject,
+) -> LocalCacheResult<()> {
+    let mut hasher = Sha256::new();
+    let mut total_size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|source| LocalCacheError::Io {
+                context: "failed to read Git LFS source object",
+                path: source_path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|source| LocalCacheError::Io {
+                context: "failed to write temporary cache object",
+                path: destination_path.to_path_buf(),
+                source,
+            })?;
+        hasher.update(&buffer[..read]);
+        total_size = total_size
+            .checked_add(read as u64)
+            .ok_or_else(|| LocalCacheError::Io {
+                context: "object is too large to measure",
+                path: source_path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::InvalidData, "object size overflow"),
+            })?;
+    }
+
+    let actual_oid =
+        LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid");
+    let actual_size = LfsObjectSize::new(total_size);
+
+    if actual_oid != expected.oid || actual_size != expected.size {
+        return Err(LocalCacheError::IntegrityMismatch {
+            path: source_path.to_path_buf(),
+            expected_oid: expected.oid.clone(),
+            expected_size: expected.size,
+            actual_oid,
+            actual_size,
+        });
+    }
+
+    Ok(())
 }
 
 fn hash_file(path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
@@ -398,26 +501,14 @@ fn hash_file(path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
     }
 
     Ok((
-        LfsOid::new(hex_digest(&hasher.finalize())).expect("SHA-256 hex should be valid"),
+        LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid"),
         LfsObjectSize::new(total_size),
     ))
 }
 
 #[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
-    hex_digest(&Sha256::digest(bytes))
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-
-    output
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -583,6 +674,33 @@ mod tests {
             .expect("verified cache object should be reused without source");
 
         assert_eq!(ingest.status, LocalCacheIngestStatus::AlreadyCached);
+    }
+
+    #[test]
+    fn ingest_rejects_corrupt_existing_cache_without_using_source() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let git_lfs_objects_dir = temp.path().join(".git/lfs/objects");
+        let bytes = b"already present but corrupt in shared cache";
+        let object = object_for_bytes(bytes);
+        write_file(&layout.object_path(&object), b"corrupt cache bytes");
+        write_file(
+            &git_lfs_object_path(&git_lfs_objects_dir, &object.oid),
+            bytes,
+        );
+
+        let error = layout
+            .ingest_git_lfs_object(&git_lfs_objects_dir, &object)
+            .expect_err("corrupt existing cache object should fail ingest");
+
+        assert!(matches!(
+            error,
+            LocalCacheError::IntegrityMismatch { path, .. } if path == layout.object_path(&object)
+        ));
+        assert_eq!(
+            fs::read(layout.object_path(&object)).expect("cache object should remain inspectable"),
+            b"corrupt cache bytes"
+        );
     }
 
     #[test]
