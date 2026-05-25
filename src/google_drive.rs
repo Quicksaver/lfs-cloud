@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     fs::File,
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, Read, Seek, SeekFrom},
     net::IpAddr,
     path::Path,
     sync::OnceLock,
@@ -30,8 +30,8 @@ use tokio_util::io::ReaderStream;
 use url::Url;
 
 use crate::{
-    GoogleDriveStorageConfig, LfsObject, SanitizedMessage, StorageError, StorageResult,
-    StoredObject,
+    GoogleDriveStorageConfig, LfsObject, ProviderFuture, SanitizedMessage, StorageDeleteOutcome,
+    StorageError, StorageProvider, StorageResult, StoredObject,
 };
 
 const GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -939,6 +939,30 @@ impl GoogleDriveObjectStore {
         )
     }
 
+    /// Downloads a verified Drive object into a local destination path.
+    ///
+    /// This accepts only Drive files whose private object metadata and streamed
+    /// bytes match the requested repository-scoped LFS object before publishing
+    /// the bytes to the destination path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the object is missing, Drive rejects the
+    /// media request, the response omits or conflicts with the requested object
+    /// size, streamed bytes fail integrity verification, or the destination
+    /// path cannot be written.
+    pub async fn download_object(
+        &self,
+        object: &LfsObject,
+        destination: impl AsRef<Path>,
+    ) -> StorageResult<StoredObject> {
+        let destination = destination.as_ref().to_path_buf();
+        let (stored_object, verified_file) = self.download_object_to_verified_file(object).await?;
+        persist_verified_drive_download_file(&self.storage, verified_file, &destination).await?;
+
+        Ok(stored_object)
+    }
+
     /// Streams a verified Drive object as an HTTP response.
     ///
     /// This performs a metadata lookup first, so the Drive file ID is accepted
@@ -954,6 +978,32 @@ impl GoogleDriveObjectStore {
         &self,
         object: &LfsObject,
     ) -> StorageResult<GoogleDriveDownloadResponse> {
+        let (stored_object, verified_file) = self.download_object_to_verified_file(object).await?;
+        let response_body =
+            AxumBody::from_stream(ReaderStream::new(tokio::fs::File::from_std(verified_file)));
+        let response = AxumResponse::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
+            .header(CONTENT_LENGTH, object.size.bytes().to_string())
+            .body(response_body)
+            .map_err(|source| StorageError::Upstream {
+                provider: self.storage.id.clone(),
+                status: None,
+                message: SanitizedMessage::new(format!(
+                    "Google Drive download response could not be built: {source}"
+                )),
+            })?;
+
+        Ok(GoogleDriveDownloadResponse {
+            stored_object,
+            response,
+        })
+    }
+
+    async fn download_object_to_verified_file(
+        &self,
+        object: &LfsObject,
+    ) -> StorageResult<(StoredObject, File)> {
         let stored_object =
             self.lookup_object(object)
                 .await?
@@ -1019,24 +1069,49 @@ impl GoogleDriveObjectStore {
             download_response,
         )
         .await?;
-        let response_body =
-            AxumBody::from_stream(ReaderStream::new(tokio::fs::File::from_std(verified_file)));
-        let response = AxumResponse::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
-            .header(CONTENT_LENGTH, object.size.bytes().to_string())
-            .body(response_body)
-            .map_err(|source| StorageError::Upstream {
-                provider: self.storage.id.clone(),
-                status: None,
-                message: SanitizedMessage::new(format!(
-                    "Google Drive download response could not be built: {source}"
-                )),
-            })?;
 
-        Ok(GoogleDriveDownloadResponse {
-            stored_object,
-            response,
+        Ok((stored_object, verified_file))
+    }
+}
+
+impl StorageProvider for GoogleDriveObjectStore {
+    fn provider_id(&self) -> &str {
+        GoogleDriveObjectStore::provider_id(self)
+    }
+
+    fn object_exists<'a>(
+        &'a self,
+        object: &'a LfsObject,
+    ) -> ProviderFuture<'a, StorageResult<bool>> {
+        Box::pin(async move { GoogleDriveObjectStore::object_exists(self, object).await })
+    }
+
+    fn upload_object<'a>(
+        &'a self,
+        object: &'a LfsObject,
+        source: &'a Path,
+    ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+        Box::pin(async move { GoogleDriveObjectStore::upload_object(self, object, source).await })
+    }
+
+    fn download_object<'a>(
+        &'a self,
+        object: &'a LfsObject,
+        destination: &'a Path,
+    ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+        Box::pin(
+            async move { GoogleDriveObjectStore::download_object(self, object, destination).await },
+        )
+    }
+
+    fn delete_or_mark_object<'a>(
+        &'a self,
+        _object: &'a LfsObject,
+    ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
+        Box::pin(async {
+            Ok(StorageDeleteOutcome::Retained {
+                reason: "Google Drive object deletion is not implemented".to_owned(),
+            })
         })
     }
 }
@@ -1089,6 +1164,33 @@ async fn verify_drive_download_response_to_tempfile(
     Ok(temp_file.into_std().await)
 }
 
+async fn persist_verified_drive_download_file(
+    storage: &GoogleDriveStorageConfig,
+    mut source: File,
+    destination: &Path,
+) -> StorageResult<()> {
+    let storage = storage.clone();
+    let provider = storage.id.clone();
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        source.seek(SeekFrom::Start(0)).map_err(|error| {
+            drive_download_destination_file_error(&storage, &destination, error)
+        })?;
+        let mut destination_file = File::create(&destination).map_err(|error| {
+            drive_download_destination_file_error(&storage, &destination, error)
+        })?;
+        io::copy(&mut source, &mut destination_file).map_err(|error| {
+            drive_download_destination_file_error(&storage, &destination, error)
+        })?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| StorageError::Retryable {
+        provider,
+        message: format!("Drive download destination write task failed: {error}"),
+    })?
+}
+
 fn drive_download_staging_file_error(
     storage: &GoogleDriveStorageConfig,
     source: std::io::Error,
@@ -1096,6 +1198,20 @@ fn drive_download_staging_file_error(
     StorageError::Retryable {
         provider: storage.id.clone(),
         message: format!("Drive download staging file could not be written: {source}"),
+    }
+}
+
+fn drive_download_destination_file_error(
+    storage: &GoogleDriveStorageConfig,
+    path: &Path,
+    source: std::io::Error,
+) -> StorageError {
+    StorageError::Retryable {
+        provider: storage.id.clone(),
+        message: format!(
+            "Drive download destination file {} could not be written: {source}",
+            path.display()
+        ),
     }
 }
 
@@ -2481,7 +2597,9 @@ mod tests {
         GoogleDriveObjectKey, GoogleDriveObjectStore, GoogleDriveRootValidator,
         GoogleDriveTokenRefresher,
     };
-    use crate::{GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, StorageError};
+    use crate::{
+        GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, StorageError, StorageProvider,
+    };
 
     const OBJECT_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -3416,6 +3534,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_store_storage_provider_trait_uploads_to_drive() {
+        let staged_bytes = b"storage provider migration upload bytes";
+        let object = lfs_object_for_bytes(staged_bytes);
+        let server = DriveUploadServer::start(drive_object_json(
+            "drive-file-uploaded",
+            object.oid.as_hex(),
+            object.size.bytes(),
+        ))
+        .await;
+        let staged_file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(staged_file.path(), staged_bytes).expect("staged file should be written");
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+        let storage: &dyn StorageProvider = &store;
+
+        let uploaded = storage
+            .upload_object(&object, staged_file.path())
+            .await
+            .expect("trait-backed Drive upload should succeed");
+
+        assert_eq!(uploaded.provider_id, "drive-user-a");
+        assert_eq!(uploaded.object, object);
+        assert_eq!(uploaded.backend_id, "drive-file-uploaded");
+        assert_eq!(server.upload_requests()[0].body, staged_bytes);
+    }
+
+    #[tokio::test]
     async fn object_store_maps_resume_incomplete_upload_to_retryable_error() {
         let staged_bytes = b"0123456789abcdef0123456789abcdef0123456789";
         let object = lfs_object_for_bytes(staged_bytes);
@@ -3640,6 +3791,45 @@ mod tests {
         let query = form_pairs(&download_requests[0].query);
         assert_eq!(query["alt"], "media");
         assert_eq!(query["supportsAllDrives"], "true");
+    }
+
+    #[tokio::test]
+    async fn object_store_storage_provider_trait_downloads_to_path() {
+        let object_bytes = b"storage provider migration download bytes";
+        let object = lfs_object_for_bytes(object_bytes);
+        let server = DriveDownloadServer::start(
+            drive_object_list_json(
+                "drive-file-download",
+                object.oid.as_hex(),
+                object.size.bytes(),
+            ),
+            StatusCode::OK,
+            object_bytes.to_vec(),
+        )
+        .await;
+        let destination = tempfile::NamedTempFile::new().expect("temp file should be created");
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+        let storage: &dyn StorageProvider = &store;
+
+        let downloaded = storage
+            .download_object(&object, destination.path())
+            .await
+            .expect("trait-backed Drive download should succeed");
+
+        assert_eq!(downloaded.provider_id, "drive-user-a");
+        assert_eq!(downloaded.object, object);
+        assert_eq!(downloaded.backend_id, "drive-file-download");
+        assert_eq!(
+            std::fs::read(destination.path()).expect("downloaded file should be readable"),
+            object_bytes
+        );
     }
 
     #[tokio::test]
