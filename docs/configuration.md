@@ -66,7 +66,7 @@ server:
 The `serve` command can also override the bind address and port:
 
 ```bash
-lfs-cloud --config ./lfs-cloud.yml serve --host 0.0.0.0 --port 8080
+lfs-cloud serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080
 ```
 
 `public_url` is the URL embedded in Git LFS batch action responses. Set it to
@@ -90,6 +90,10 @@ For a bare reference such as `google-drive-personal`, the current loader reads:
 ```text
 LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_GOOGLE_DRIVE_PERSONAL
 ```
+
+Bare references are converted by prefixing
+`LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_`, uppercasing ASCII letters, and replacing
+`-` with `_`. They may contain only ASCII letters, digits, `_`, or `-`.
 
 You can name the environment variable explicitly:
 
@@ -126,6 +130,9 @@ config file.
 
 - `server.public_url` and GitHub `api_url` must be HTTP(S) URLs without
   credentials, query strings, or fragments.
+- Google credential JSON `token_uri` values, and custom Google Drive API base
+  URLs used by embedded runtimes or tests, follow the same URL rules and must
+  use HTTPS except for loopback HTTP endpoints.
 - Provider IDs and storage IDs must start with an ASCII letter or digit and use
   only ASCII letters, digits, `_`, or `-`.
 - Repository route components must be safe path segments. Repository names must

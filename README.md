@@ -238,13 +238,8 @@ LFS-tracked pointer files in the current checkout with verified cache bytes. Use
 lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 ```
 
-The current migration command supports read-only planning with `--dry-run`:
-
-```bash
-lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
-```
-
-The dry-run reports scanned refs, planned local config writes, discovered
+The current migration command supports read-only planning with `--dry-run`. The
+dry-run reports scanned refs, planned local config writes, discovered
 objects, objects that would be fetched from the source Git LFS provider,
 objects that would be uploaded to LFS Cloud storage, and local access-check
 results. It does not fetch, upload, write Git config, create cache state, open
@@ -337,32 +332,11 @@ rules.
 
 ## Build And Install
 
-Build and verify locally:
-
-```bash
-cargo build
-cargo test --all-targets
-cargo test --doc
-cargo clippy --all-targets -- -D warnings
-yarn lint:check
-```
-
-Build the optimized binary:
-
-```bash
-cargo build --release
-./target/release/lfs-cloud --help
-```
-
-Install from this checkout for local use:
-
-```bash
-cargo install --path .
-```
+Local development builds, release builds, and checkout-based installs are
+documented in [docs/install-release.md](docs/install-release.md).
 
 Published packages, signed archives, checksums, and installer scripts are not
-defined yet. See [docs/install-release.md](docs/install-release.md) for current
-release artifact expectations.
+defined yet.
 
 ## Deployment Notes
 

@@ -8,7 +8,9 @@ yet.
 
 - Rust toolchain compatible with the crate's `rust-version`.
 - Git.
-- Git LFS for `pull` and migration source-fetch workflows.
+- Git LFS for `lfs-cloud pull` and migration source-fetch steps. Read-only
+  migration planning can still report repository config without fetching, but
+  fetching missing source objects depends on `git lfs fetch`.
 - Node.js/Yarn only for repository formatting checks.
 
 For real GitHub and Google Drive operation you also need:
@@ -32,7 +34,7 @@ Run the CLI from the workspace:
 
 ```bash
 cargo run -- --help
-cargo run -- --config ./lfs-cloud.yml serve
+cargo run -- serve --config ./lfs-cloud.yml
 ```
 
 ## Release Build
