@@ -369,9 +369,13 @@ where
     });
 
     if let Some(server_url) = server_url.as_deref() {
+        let server_url_display = redacted_url_for_display(server_url);
         match probe_server(server_url) {
-            Ok(()) => report.ok("server", format!("{server_url} is reachable")),
-            Err(error) => report.error("server", format!("{server_url} is unreachable: {error}")),
+            Ok(()) => report.ok("server", format!("{server_url_display} is reachable")),
+            Err(error) => report.error(
+                "server",
+                format!("{server_url_display} is unreachable: {error}"),
+            ),
         }
     } else {
         report.error(
@@ -1395,6 +1399,53 @@ mod tests {
         assert!(rendered.contains("storage    error"));
         assert!(rendered.contains("cache      warning"));
         assert!(!rendered.contains("password="));
+    }
+
+    #[test]
+    fn status_redacts_unsafe_server_override_before_route_validation() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repository directory should be created");
+        run_git(&repo, &["init"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let config_path = temp.path().join("lfs-cloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let unsafe_server_url =
+            "http://user:secret@127.0.0.1:8080?token=query-secret#fragment-secret";
+        let mut output = Vec::new();
+
+        let error = run_status_from_dir(
+            StatusCommand {
+                server: Some(unsafe_server_url.to_owned()),
+                cache_root: Some(temp.path().join("cache")),
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |server_url| {
+                assert_eq!(server_url, unsafe_server_url);
+                Ok(())
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect_err("unsafe server URL should make status fail route validation");
+
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("server     ok"));
+        assert!(rendered.contains("REDACTED"));
+        assert!(!rendered.contains("user:secret"));
+        assert!(!rendered.contains("query-secret"));
+        assert!(!rendered.contains("fragment-secret"));
     }
 
     #[test]
