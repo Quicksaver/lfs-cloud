@@ -512,10 +512,18 @@ fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> MigrationResult<V
     }
 
     let output = git_check_attr_filter(worktree_root, &output.stdout)?;
-    let mut fields = output
-        .stdout
-        .split(|byte| *byte == b'\0')
-        .collect::<Vec<_>>();
+    parse_git_check_attr_filter_stdout(&output.stdout)
+}
+
+fn parse_git_check_attr_filter_stdout(stdout: &[u8]) -> MigrationResult<Vec<PathBuf>> {
+    if stdout.len() > MAX_MIGRATION_GIT_OUTPUT_BYTES {
+        return Err(MigrationError::ExternalCommandOutput {
+            command: "git check-attr -z --stdin filter".to_owned(),
+            message: SanitizedMessage::new("git returned too much output"),
+        });
+    }
+
+    let mut fields = stdout.split(|byte| *byte == b'\0').collect::<Vec<_>>();
     if fields.last() == Some(&&[][..]) {
         fields.pop();
     }
@@ -949,10 +957,11 @@ mod tests {
     use crate::{LfsObject, LfsObjectSize, LfsOid, LfsPointer};
 
     use super::{
-        GitLfsSourceEndpointSource, MAX_GIT_ATTRIBUTES_BYTES, MigrationError,
-        default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
-        enumerate_current_checkout_lfs_pointers, parse_lfs_patterns_from_attributes,
-        repo_relative_path_from_git_output, split_gitattributes_line,
+        GitLfsSourceEndpointSource, MAX_GIT_ATTRIBUTES_BYTES, MAX_MIGRATION_GIT_OUTPUT_BYTES,
+        MigrationError, default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
+        enumerate_current_checkout_lfs_pointers, parse_git_check_attr_filter_stdout,
+        parse_lfs_patterns_from_attributes, repo_relative_path_from_git_output,
+        split_gitattributes_line,
     };
 
     #[test]
@@ -1281,6 +1290,23 @@ mod tests {
         assert_eq!(scan.pointers.len(), 1);
         assert_eq!(scan.pointers[0].relative_path, relative_path);
         assert_eq!(scan.pointers[0].object, object);
+    }
+
+    #[test]
+    fn current_checkout_pointer_scan_rejects_oversized_attribute_output() {
+        let stdout = vec![b'a'; MAX_MIGRATION_GIT_OUTPUT_BYTES + 1];
+
+        let error = parse_git_check_attr_filter_stdout(&stdout)
+            .expect_err("oversized check-attr output should fail before parsing");
+
+        assert!(matches!(
+            error,
+            MigrationError::ExternalCommandOutput {
+                ref command,
+                ref message,
+            } if command == "git check-attr -z --stdin filter"
+                && message.as_str() == "git returned too much output"
+        ));
     }
 
     #[test]
