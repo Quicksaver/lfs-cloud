@@ -14,6 +14,7 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
+use crate::git::redacted_url_for_display;
 use crate::{
     GitLfsConfigChange, GitLfsConfigTarget, GitRepository, LfsInitRoute, ServeOptions,
     TracingConfig, init_tracing,
@@ -159,15 +160,31 @@ where
     writeln!(output, "  path: {}", change.path.display())?;
     match change.previous_url.as_deref() {
         Some(previous_url) if previous_url == change.new_url => {
-            writeln!(output, "  lfs.url unchanged: {}", change.new_url)?;
+            writeln!(
+                output,
+                "  lfs.url unchanged: {}",
+                redacted_url_for_display(&change.new_url)
+            )?;
         }
         Some(previous_url) => {
-            writeln!(output, "  - lfs.url: {previous_url}")?;
-            writeln!(output, "  + lfs.url: {}", change.new_url)?;
+            writeln!(
+                output,
+                "  - lfs.url: {}",
+                redacted_url_for_display(previous_url)
+            )?;
+            writeln!(
+                output,
+                "  + lfs.url: {}",
+                redacted_url_for_display(&change.new_url)
+            )?;
         }
         None => {
             writeln!(output, "  - lfs.url: <unset>")?;
-            writeln!(output, "  + lfs.url: {}", change.new_url)?;
+            writeln!(
+                output,
+                "  + lfs.url: {}",
+                redacted_url_for_display(&change.new_url)
+            )?;
         }
     }
 
@@ -186,8 +203,11 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use tempfile::TempDir;
 
-    use super::{Cli, InitCommand, dispatch, run_init_from_dir, tracing_config};
-    use crate::{DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, ServeOptions};
+    use super::{Cli, InitCommand, dispatch, run_init_from_dir, tracing_config, write_init_change};
+    use crate::{
+        DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitLfsConfigChange, GitLfsConfigTarget,
+        ServeOptions,
+    };
 
     #[test]
     fn root_command_exposes_shared_global_flags() {
@@ -493,6 +513,30 @@ mod tests {
             ),
             lfs_url
         );
+    }
+
+    #[test]
+    fn init_summary_redacts_sensitive_previous_lfs_url() {
+        let change = GitLfsConfigChange {
+            target: GitLfsConfigTarget::WorktreeFile,
+            path: Path::new(".lfsconfig").to_owned(),
+            previous_url: Some(
+                "https://user:old-secret@old.example/info/lfs?token=query-secret#fragment-secret"
+                    .to_owned(),
+            ),
+            new_url: "https://lfs.example.com/owner/repo.git/info/lfs".to_owned(),
+        };
+        let mut output = Vec::new();
+
+        write_init_change(&mut output, &change).expect("summary should be written");
+
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(
+            rendered.contains("https://REDACTED:REDACTED@old.example/info/lfs?REDACTED#REDACTED")
+        );
+        assert!(!rendered.contains("old-secret"));
+        assert!(!rendered.contains("query-secret"));
+        assert!(!rendered.contains("fragment-secret"));
     }
 
     #[test]

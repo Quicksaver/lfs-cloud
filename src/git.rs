@@ -574,15 +574,39 @@ fn command_status_text(status: ExitStatus) -> String {
     )
 }
 
-fn redacted_remote_url(value: &str) -> String {
+pub(crate) fn redacted_url_for_display(value: &str) -> String {
     match Url::parse(value) {
-        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
-            let _ = url.set_username("REDACTED");
-            let _ = url.set_password(Some("REDACTED"));
-            url.to_string()
+        Ok(mut url) => {
+            let mut redacted = false;
+            if !url.username().is_empty() {
+                let _ = url.set_username("REDACTED");
+                redacted = true;
+            }
+            if url.password().is_some() {
+                let _ = url.set_password(Some("REDACTED"));
+                redacted = true;
+            }
+            if url.query().is_some() {
+                url.set_query(Some("REDACTED"));
+                redacted = true;
+            }
+            if url.fragment().is_some() {
+                url.set_fragment(Some("REDACTED"));
+                redacted = true;
+            }
+
+            if redacted {
+                url.to_string()
+            } else {
+                value.to_owned()
+            }
         }
         _ => redact_scp_like_remote_url(value).unwrap_or_else(|| value.to_owned()),
     }
+}
+
+fn redacted_remote_url(value: &str) -> String {
+    redacted_url_for_display(value)
 }
 
 fn redact_scp_like_remote_url(value: &str) -> Option<String> {
