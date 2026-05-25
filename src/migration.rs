@@ -26,6 +26,10 @@ const MAX_MIGRATION_GIT_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_GIT_ATTRIBUTES_BYTES: u64 = 256 * 1024;
 const MAX_CURRENT_CHECKOUT_POINTER_BYTES: u64 = 64 * 1024;
 const MAX_CURRENT_CHECKOUT_ATTR_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HISTORY_REF_LIST_BYTES: usize = 2 * 1024 * 1024;
+const MAX_HISTORY_COMMIT_LIST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HISTORY_TREE_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HISTORY_POINTER_BYTES: u64 = 64 * 1024;
 
 /// Read-only discovery result for an existing Git LFS repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +105,42 @@ pub struct CurrentCheckoutLfsPointer {
     pub relative_path: PathBuf,
     /// Absolute worktree path to the pointer file.
     pub path: PathBuf,
+    /// Object identity referenced by the pointer file.
+    pub object: LfsObject,
+}
+
+/// Git LFS pointers discovered by scanning Git history for one or more refs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct GitLfsHistoryPointers {
+    /// Git worktree root whose object database was inspected.
+    pub worktree_root: PathBuf,
+    /// Refs that were resolved and scanned.
+    pub refs: Vec<GitLfsScannedRef>,
+    /// Pointer occurrences found in commits reachable from the scanned refs.
+    pub pointers: Vec<GitLfsHistoryPointer>,
+}
+
+/// A Git ref that was resolved for migration history scanning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct GitLfsScannedRef {
+    /// Ref name requested or discovered for scanning.
+    pub name: String,
+    /// Commit object ID that the ref resolved to when scanning started.
+    pub commit: String,
+}
+
+/// A Git LFS pointer found in a commit reachable from a scanned ref.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct GitLfsHistoryPointer {
+    /// Ref whose reachable history contained this pointer.
+    pub ref_name: String,
+    /// Commit object ID containing this pointer at `relative_path`.
+    pub commit: String,
+    /// Repository-relative path to the pointer file in that commit.
+    pub relative_path: PathBuf,
     /// Object identity referenced by the pointer file.
     pub object: LfsObject,
 }
@@ -191,6 +231,100 @@ pub fn enumerate_current_checkout_lfs_pointers(
     Ok(CurrentCheckoutLfsPointers {
         worktree_root,
         tracked_path_count: lfs_tracked_paths.len(),
+        pointers,
+    })
+}
+
+/// Enumerates Git LFS pointer files reachable from selected refs.
+///
+/// This function is intentionally read-only. It resolves each ref to a commit,
+/// walks reachable commits, asks Git to evaluate `filter=lfs` attributes at
+/// each historical tree, and parses only small LFS pointer blobs at matching
+/// paths. It does not fetch objects, check out refs, or mutate repository
+/// state.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree,
+/// any selected ref cannot be resolved to a commit, or Git returns malformed
+/// history, attribute, or object data.
+pub fn enumerate_selected_ref_lfs_pointers<I, S>(
+    start_dir: impl AsRef<Path>,
+    refs: I,
+) -> MigrationResult<GitLfsHistoryPointers>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let start_dir = start_dir.as_ref();
+    let worktree_root = detect_worktree_root(start_dir)?;
+    let mut scanned_refs = Vec::new();
+    let mut pointers = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for ref_name in refs {
+        let ref_name = ref_name.as_ref();
+        validate_history_ref_name(ref_name)?;
+        let commit = resolve_ref_commit(&worktree_root, ref_name)?;
+        scanned_refs.push(GitLfsScannedRef {
+            name: ref_name.to_owned(),
+            commit: commit.clone(),
+        });
+        enumerate_ref_history_lfs_pointers(
+            &worktree_root,
+            ref_name,
+            &commit,
+            &mut pointers,
+            &mut seen,
+        )?;
+    }
+
+    Ok(GitLfsHistoryPointers {
+        worktree_root,
+        refs: scanned_refs,
+        pointers,
+    })
+}
+
+/// Enumerates Git LFS pointer files reachable from all fetched repository refs.
+///
+/// The scan includes local branches, remote-tracking branches, and tags under
+/// `refs/heads`, `refs/remotes`, and `refs/tags`. Symbolic refs are skipped so
+/// aliases such as `refs/remotes/origin/HEAD` do not duplicate another ref's
+/// history.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree, Git
+/// cannot list refs, or any discovered ref cannot be scanned.
+pub fn enumerate_all_fetched_ref_lfs_pointers(
+    start_dir: impl AsRef<Path>,
+) -> MigrationResult<GitLfsHistoryPointers> {
+    let start_dir = start_dir.as_ref();
+    let worktree_root = detect_worktree_root(start_dir)?;
+    let refs = all_fetched_ref_names(&worktree_root)?;
+    let mut scanned_refs = Vec::new();
+    let mut pointers = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for ref_name in refs {
+        let commit = resolve_ref_commit(&worktree_root, &ref_name)?;
+        scanned_refs.push(GitLfsScannedRef {
+            name: ref_name.clone(),
+            commit: commit.clone(),
+        });
+        enumerate_ref_history_lfs_pointers(
+            &worktree_root,
+            &ref_name,
+            &commit,
+            &mut pointers,
+            &mut seen,
+        )?;
+    }
+
+    Ok(GitLfsHistoryPointers {
+        worktree_root,
+        refs: scanned_refs,
         pointers,
     })
 }
@@ -569,23 +703,41 @@ fn current_checkout_existing_paths(
     Ok(existing_paths)
 }
 
-fn git_check_attr_filter(
+fn git_check_attr_filter(worktree_root: &Path, tracked_paths: Vec<u8>) -> MigrationResult<Output> {
+    git_check_attr_filter_with_source(worktree_root, tracked_paths, None)
+}
+
+fn git_check_attr_filter_with_source(
     worktree_root: &Path,
     mut tracked_paths: Vec<u8>,
+    source: Option<&str>,
 ) -> MigrationResult<Output> {
     if !tracked_paths.ends_with(b"\0") {
         tracked_paths.push(b'\0');
     }
 
+    let mut args = vec![
+        OsString::from("check-attr"),
+        OsString::from("-z"),
+        OsString::from("--stdin"),
+    ];
+    let command_name = if let Some(source) = source {
+        args.push(OsString::from(format!("--source={source}")));
+        format!("git check-attr -z --stdin --source={source} filter")
+    } else {
+        "git check-attr -z --stdin filter".to_owned()
+    };
+    args.push(OsString::from("filter"));
+
     let mut child = Command::new("git")
-        .args(["check-attr", "-z", "--stdin", "filter"])
+        .args(&args)
         .current_dir(worktree_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| MigrationError::Io {
-            context: "failed to start git check-attr -z --stdin filter".to_owned(),
+            context: format!("failed to start {command_name}"),
             source,
         })?;
 
@@ -615,7 +767,7 @@ fn git_check_attr_filter(
     });
 
     let status = child.wait().map_err(|source| MigrationError::Io {
-        context: "failed to wait for git check-attr -z --stdin filter".to_owned(),
+        context: format!("failed to wait for {command_name}"),
         source,
     })?;
 
@@ -651,16 +803,12 @@ fn git_check_attr_filter(
         })?;
 
     if !status.success() {
-        return Err(command_error(
-            "git check-attr -z --stdin filter",
-            status,
-            &stderr.bytes,
-        ));
+        return Err(command_error(&command_name, status, &stderr.bytes));
     }
 
     if stdout.exceeded_limit {
         return Err(MigrationError::ExternalCommandOutput {
-            command: "git check-attr -z --stdin filter".to_owned(),
+            command: command_name,
             message: SanitizedMessage::new("git returned too much attribute output"),
         });
     }
@@ -773,6 +921,303 @@ fn read_current_checkout_pointer_candidate(path: &Path) -> MigrationResult<Optio
     };
 
     Ok(LfsPointer::parse(contents).ok())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitTreeBlob {
+    object_id: String,
+    relative_path: PathBuf,
+    relative_path_bytes: Vec<u8>,
+}
+
+fn validate_history_ref_name(ref_name: &str) -> MigrationResult<()> {
+    if !ref_name.is_empty() && !ref_name.contains('\0') {
+        return Ok(());
+    }
+
+    Err(MigrationError::ExternalCommandOutput {
+        command: "git rev-parse --verify --end-of-options <ref>^{commit}".to_owned(),
+        message: SanitizedMessage::new("selected ref name is empty or contains NUL"),
+    })
+}
+
+fn resolve_ref_commit(worktree_root: &Path, ref_name: &str) -> MigrationResult<String> {
+    let revision = format!("{ref_name}^{{commit}}");
+    let command_name = format!("git rev-parse --verify --end-of-options {revision}");
+    let output = run_git_os_vec(
+        worktree_root,
+        vec![
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--end-of-options"),
+            OsString::from(revision),
+        ],
+        &command_name,
+    )?;
+    let stdout = required_success_stdout(output, &command_name)?;
+    let commit = stdout.trim_end_matches(['\n', '\r']);
+
+    if is_git_object_id(commit) {
+        Ok(commit.to_owned())
+    } else {
+        Err(MigrationError::ExternalCommandOutput {
+            command: command_name,
+            message: SanitizedMessage::new("git returned an invalid commit object ID"),
+        })
+    }
+}
+
+fn all_fetched_ref_names(worktree_root: &Path) -> MigrationResult<Vec<String>> {
+    let command_name =
+        "git for-each-ref --format=%(refname)%00%(symref) refs/heads refs/remotes refs/tags";
+    let output = run_git(
+        worktree_root,
+        [
+            "for-each-ref",
+            "--format=%(refname)%00%(symref)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+    )?;
+    let stdout =
+        required_success_stdout_with_limit(output, command_name, MAX_HISTORY_REF_LIST_BYTES)?;
+    let mut refs = Vec::new();
+
+    for line in stdout.lines().filter(|line| !line.is_empty()) {
+        let Some((ref_name, symref)) = line.split_once('\0') else {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned malformed ref output"),
+            });
+        };
+
+        if symref.is_empty() {
+            refs.push(ref_name.to_owned());
+        }
+    }
+
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
+}
+
+fn enumerate_ref_history_lfs_pointers(
+    worktree_root: &Path,
+    ref_name: &str,
+    root_commit: &str,
+    pointers: &mut Vec<GitLfsHistoryPointer>,
+    seen: &mut BTreeSet<(String, String, PathBuf, LfsObject)>,
+) -> MigrationResult<()> {
+    for commit in rev_list_commits(worktree_root, root_commit)? {
+        let blobs = tree_blobs_at_commit(worktree_root, &commit)?;
+        if blobs.is_empty() {
+            continue;
+        }
+
+        let path_input = git_path_input_from_tree_blobs(&blobs);
+        let attributes =
+            git_check_attr_filter_with_source(worktree_root, path_input, Some(&commit))?;
+        let lfs_paths: BTreeSet<PathBuf> = parse_git_check_attr_filter_stdout(&attributes.stdout)?
+            .into_iter()
+            .collect();
+
+        for blob in blobs
+            .into_iter()
+            .filter(|blob| lfs_paths.contains(&blob.relative_path))
+        {
+            let Some(pointer) =
+                read_history_pointer_blob_candidate(worktree_root, &blob.object_id)?
+            else {
+                continue;
+            };
+
+            let key = (
+                ref_name.to_owned(),
+                commit.clone(),
+                blob.relative_path.clone(),
+                pointer.object.clone(),
+            );
+            if seen.insert(key) {
+                pointers.push(GitLfsHistoryPointer {
+                    ref_name: ref_name.to_owned(),
+                    commit: commit.clone(),
+                    relative_path: blob.relative_path,
+                    object: pointer.object,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn rev_list_commits(worktree_root: &Path, root_commit: &str) -> MigrationResult<Vec<String>> {
+    let command_name = format!("git rev-list --topo-order {root_commit}");
+    let output = run_git_os_vec(
+        worktree_root,
+        vec![
+            OsString::from("rev-list"),
+            OsString::from("--topo-order"),
+            OsString::from(root_commit),
+        ],
+        &command_name,
+    )?;
+    let stdout =
+        required_success_stdout_with_limit(output, &command_name, MAX_HISTORY_COMMIT_LIST_BYTES)?;
+    let mut commits = Vec::new();
+
+    for line in stdout.lines().filter(|line| !line.is_empty()) {
+        if !is_git_object_id(line) {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name,
+                message: SanitizedMessage::new("git returned an invalid commit object ID"),
+            });
+        }
+        commits.push(line.to_owned());
+    }
+
+    Ok(commits)
+}
+
+fn tree_blobs_at_commit(worktree_root: &Path, commit: &str) -> MigrationResult<Vec<GitTreeBlob>> {
+    let command_name = format!("git ls-tree -r -z --format=%(objectname)%x00%(path) {commit}");
+    let output = run_git_os_vec(
+        worktree_root,
+        vec![
+            OsString::from("ls-tree"),
+            OsString::from("-r"),
+            OsString::from("-z"),
+            OsString::from("--format=%(objectname)%x00%(path)"),
+            OsString::from(commit),
+        ],
+        &command_name,
+    )?;
+    if !output.status.success() {
+        return Err(command_error(&command_name, output.status, &output.stderr));
+    }
+    if output.stdout.len() > MAX_HISTORY_TREE_OUTPUT_BYTES {
+        return Err(MigrationError::ExternalCommandOutput {
+            command: command_name,
+            message: SanitizedMessage::new("git returned too much tree output"),
+        });
+    }
+
+    parse_ls_tree_blob_output(&output.stdout, &command_name)
+}
+
+fn parse_ls_tree_blob_output(
+    stdout: &[u8],
+    command_name: &str,
+) -> MigrationResult<Vec<GitTreeBlob>> {
+    let mut blobs = Vec::new();
+    let mut fields = stdout.split(|byte| *byte == b'\0').peekable();
+
+    while let Some(object_id) = fields.next() {
+        if object_id.is_empty() {
+            if fields.peek().is_none() {
+                break;
+            }
+
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned malformed tree output"),
+            });
+        }
+
+        let Some(relative_path) = fields.next() else {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned malformed tree output"),
+            });
+        };
+        let object_id =
+            std::str::from_utf8(object_id).map_err(|_| MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned non-UTF-8 object ID output"),
+            })?;
+        if !is_git_object_id(object_id) {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned an invalid blob object ID"),
+            });
+        }
+
+        blobs.push(GitTreeBlob {
+            object_id: object_id.to_owned(),
+            relative_path: safe_git_relative_path(relative_path, command_name)?,
+            relative_path_bytes: relative_path.to_owned(),
+        });
+    }
+
+    Ok(blobs)
+}
+
+fn git_path_input_from_tree_blobs(blobs: &[GitTreeBlob]) -> Vec<u8> {
+    let mut input = Vec::new();
+    for blob in blobs {
+        input.extend_from_slice(&blob.relative_path_bytes);
+        input.push(b'\0');
+    }
+
+    input
+}
+
+fn read_history_pointer_blob_candidate(
+    worktree_root: &Path,
+    object_id: &str,
+) -> MigrationResult<Option<LfsPointer>> {
+    let size_command = format!("git cat-file -s {object_id}");
+    let size_output = run_git_os_vec(
+        worktree_root,
+        vec![
+            OsString::from("cat-file"),
+            OsString::from("-s"),
+            OsString::from(object_id),
+        ],
+        &size_command,
+    )?;
+    let size_stdout = required_success_stdout(size_output, &size_command)?;
+    let size = size_stdout
+        .trim_end_matches(['\n', '\r'])
+        .parse::<u64>()
+        .map_err(|_| MigrationError::ExternalCommandOutput {
+            command: size_command.clone(),
+            message: SanitizedMessage::new("git returned an invalid blob size"),
+        })?;
+    if size > MAX_HISTORY_POINTER_BYTES {
+        return Ok(None);
+    }
+
+    let blob_command = format!("git cat-file blob {object_id}");
+    let blob_output = run_git_os_vec(
+        worktree_root,
+        vec![
+            OsString::from("cat-file"),
+            OsString::from("blob"),
+            OsString::from(object_id),
+        ],
+        &blob_command,
+    )?;
+    if !blob_output.status.success() {
+        return Err(command_error(
+            &blob_command,
+            blob_output.status,
+            &blob_output.stderr,
+        ));
+    }
+    if blob_output.stdout.len() > MAX_HISTORY_POINTER_BYTES as usize {
+        return Ok(None);
+    }
+    let Ok(contents) = std::str::from_utf8(&blob_output.stdout) else {
+        return Ok(None);
+    };
+
+    Ok(LfsPointer::parse(contents).ok())
+}
+
+fn is_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_lfs_patterns_from_attributes(
@@ -941,12 +1386,35 @@ fn run_git_os<const N: usize>(
         })
 }
 
+fn run_git_os_vec(
+    current_dir: &Path,
+    args: Vec<OsString>,
+    command_name: &str,
+) -> MigrationResult<Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .map_err(|source| MigrationError::Io {
+            context: format!("failed to start {command_name}"),
+            source,
+        })
+}
+
 fn required_success_stdout(output: Output, command_name: &str) -> MigrationResult<String> {
+    required_success_stdout_with_limit(output, command_name, MAX_MIGRATION_GIT_OUTPUT_BYTES)
+}
+
+fn required_success_stdout_with_limit(
+    output: Output,
+    command_name: &str,
+    limit: usize,
+) -> MigrationResult<String> {
     if !output.status.success() {
         return Err(command_error(command_name, output.status, &output.stderr));
     }
 
-    output_stdout(output, command_name)
+    output_stdout_with_limit(output, command_name, limit)
 }
 
 fn optional_stdout(output: Output, command_name: &str) -> MigrationResult<Option<String>> {
@@ -969,7 +1437,15 @@ fn optional_stdout(output: Output, command_name: &str) -> MigrationResult<Option
 }
 
 fn output_stdout(output: Output, command_name: &str) -> MigrationResult<String> {
-    if output.stdout.len() > MAX_MIGRATION_GIT_OUTPUT_BYTES {
+    output_stdout_with_limit(output, command_name, MAX_MIGRATION_GIT_OUTPUT_BYTES)
+}
+
+fn output_stdout_with_limit(
+    output: Output,
+    command_name: &str,
+    limit: usize,
+) -> MigrationResult<String> {
+    if output.stdout.len() > limit {
         return Err(MigrationError::ExternalCommandOutput {
             command: command_name.to_owned(),
             message: SanitizedMessage::new("git returned too much output"),
@@ -1054,13 +1530,14 @@ fn repo_relative_path_from_git_output(path: &str) -> MigrationResult<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
     use std::{
+        collections::BTreeSet,
         fs,
         path::{Path, PathBuf},
         process::Command,
     };
+    #[cfg(unix)]
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     use tempfile::TempDir;
 
@@ -1069,7 +1546,8 @@ mod tests {
     use super::{
         GitLfsSourceEndpointSource, MAX_GIT_ATTRIBUTES_BYTES, MAX_MIGRATION_GIT_OUTPUT_BYTES,
         MigrationError, default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
-        enumerate_current_checkout_lfs_pointers, parse_git_check_attr_filter_stdout,
+        enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
+        enumerate_selected_ref_lfs_pointers, parse_git_check_attr_filter_stdout,
         parse_lfs_patterns_from_attributes, repo_relative_path_from_git_output,
         split_gitattributes_line,
     };
@@ -1468,6 +1946,118 @@ mod tests {
     }
 
     #[test]
+    fn selected_ref_pointer_scan_walks_history_and_respects_historical_attributes() {
+        let repo = TempRepo::new();
+        let old_object = test_lfs_object('a', 123);
+        let new_object = test_lfs_object('b', 456);
+        let non_lfs_object = test_lfs_object('c', 789);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n*.txt text\n");
+        repo.write_file(
+            "asset/old.bin",
+            &LfsPointer::new(old_object.clone()).to_pointer_file(),
+        );
+        repo.write_file(
+            "docs/pointer-example.txt",
+            &LfsPointer::new(non_lfs_object).to_pointer_file(),
+        );
+        repo.commit_all("add historical pointer");
+        repo.git(["rm", "asset/old.bin"]);
+        repo.write_file(
+            "asset/new.bin",
+            &LfsPointer::new(new_object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("replace pointer");
+
+        let scan = enumerate_selected_ref_lfs_pointers(repo.path(), ["main"])
+            .expect("selected ref scan should succeed");
+        let objects = history_scan_objects(&scan.pointers);
+
+        assert_eq!(scan.refs.len(), 1);
+        assert_eq!(scan.refs[0].name, "main");
+        assert!(objects.contains(&old_object));
+        assert!(objects.contains(&new_object));
+        assert!(!objects.contains(&test_lfs_object('c', 789)));
+        assert!(scan.pointers.iter().any(|pointer| {
+            pointer.relative_path == Path::new("asset/old.bin") && pointer.object == old_object
+        }));
+        assert!(
+            scan.pointers
+                .iter()
+                .all(|pointer| pointer.ref_name == "main")
+        );
+    }
+
+    #[test]
+    fn selected_ref_pointer_scan_finds_branch_only_history() {
+        let repo = TempRepo::new();
+        let main_object = test_lfs_object('d', 111);
+        let branch_object = test_lfs_object('e', 222);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/main.bin",
+            &LfsPointer::new(main_object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add main pointer");
+        repo.git(["checkout", "-b", "feature/assets"]);
+        repo.write_file(
+            "asset/branch.bin",
+            &LfsPointer::new(branch_object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add branch pointer");
+        repo.git(["checkout", "main"]);
+
+        let scan = enumerate_selected_ref_lfs_pointers(repo.path(), ["feature/assets"])
+            .expect("selected branch scan should succeed");
+        let objects = history_scan_objects(&scan.pointers);
+
+        assert!(objects.contains(&main_object));
+        assert!(objects.contains(&branch_object));
+        assert!(scan.pointers.iter().any(|pointer| {
+            pointer.relative_path == Path::new("asset/branch.bin")
+                && pointer.object == branch_object
+        }));
+    }
+
+    #[test]
+    fn all_fetched_ref_pointer_scan_includes_local_branches_and_tags() {
+        let repo = TempRepo::new();
+        let main_object = test_lfs_object('f', 333);
+        let branch_object = test_lfs_object('1', 444);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/main.bin",
+            &LfsPointer::new(main_object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add main pointer");
+        repo.git(["tag", "v-main"]);
+        repo.git(["checkout", "-b", "feature/assets"]);
+        repo.write_file(
+            "asset/branch.bin",
+            &LfsPointer::new(branch_object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add branch pointer");
+        repo.git(["checkout", "main"]);
+
+        let scan = enumerate_all_fetched_ref_lfs_pointers(repo.path())
+            .expect("all fetched refs scan should succeed");
+        let ref_names = scan
+            .refs
+            .iter()
+            .map(|scanned_ref| scanned_ref.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let objects = history_scan_objects(&scan.pointers);
+
+        assert!(ref_names.contains("refs/heads/main"));
+        assert!(ref_names.contains("refs/heads/feature/assets"));
+        assert!(ref_names.contains("refs/tags/v-main"));
+        assert!(objects.contains(&main_object));
+        assert!(objects.contains(&branch_object));
+    }
+
+    #[test]
     fn reports_not_git_repository_for_plain_directory() {
         let plain_directory = tempfile::tempdir().expect("temporary directory should be created");
 
@@ -1649,6 +2239,11 @@ mod tests {
             fs::write(path, contents).expect("test file should be written");
         }
 
+        fn commit_all(&self, message: &str) {
+            self.git(["add", "-A"]);
+            self.git(["commit", "-m", message]);
+        }
+
         fn git<const N: usize>(&self, args: [&str; N]) {
             let output = Command::new("git")
                 .args(args)
@@ -1671,5 +2266,12 @@ mod tests {
             LfsOid::new(oid).expect("test OID should be valid"),
             LfsObjectSize::new(size),
         )
+    }
+
+    fn history_scan_objects(pointers: &[super::GitLfsHistoryPointer]) -> BTreeSet<LfsObject> {
+        pointers
+            .iter()
+            .map(|pointer| pointer.object.clone())
+            .collect()
     }
 }

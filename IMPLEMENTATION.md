@@ -1177,7 +1177,10 @@ Defer:
 > checkout migration scanning can now ask Git for tracked paths with
 > `filter=lfs` and parse small checked-out pointer files into object identities
 > without treating hydrated files or non-LFS pointer-shaped fixtures as
-> migration pointers.
+> migration pointers. Selected-ref and all-fetched-ref migration scans can now
+> walk Git history, evaluate `filter=lfs` attributes against each historical
+> tree, and parse pointer blobs without checking out refs or mutating local
+> state.
 
 ### Progress Summary
 
@@ -1190,10 +1193,10 @@ Defer:
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 13     | 0         |
-| 7. Migration                             | 12          | 2      | 10        |
+| 7. Migration                             | 12          | 4      | 8         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **81** | **18**    |
+| **Total**                                | **99**      | **83** | **16**    |
 
 ### Legend
 
@@ -1350,8 +1353,8 @@ Defer:
 
 - [x] [T] Detect existing Git LFS installation, filters, tracked patterns, and source LFS endpoint.
 - [x] [T] Enumerate LFS pointers for current checkout.
-- [ ] [T] Enumerate LFS pointers for selected refs.
-- [ ] [T] Enumerate LFS pointers for all fetched refs.
+- [x] [T] Enumerate LFS pointers for selected refs.
+- [x] [T] Enumerate LFS pointers for all fetched refs.
 
 #### Epic 7.2: Transfer
 
