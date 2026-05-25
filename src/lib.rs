@@ -28,7 +28,7 @@ pub use error::{
     MigrationResult, RepositoryPermission, RepositoryProviderError, RepositoryProviderResult,
     SanitizedMessage, ServerError, ServerResult, StorageError, StorageResult,
 };
-pub use git::{GitRemote, GitRepository};
+pub use git::{GitLfsConfigChange, GitLfsConfigTarget, GitRemote, GitRepository};
 pub use github_auth::{
     DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
     GITHUB_OAUTH_LOGIN_PATH, GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken,

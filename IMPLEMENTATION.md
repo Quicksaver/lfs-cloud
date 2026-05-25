@@ -1136,8 +1136,9 @@ Defer:
 > dispatches `serve` through the server runtime. CLI support code can now
 > detect the current Git worktree and parse GitHub-style HTTPS/SSH remotes
 > into host, owner, and repository name components. `lfs-cloud init --server`
-> now resolves and prints the current repository's intended Git LFS endpoint
-> without writing `.lfsconfig` or local Git config yet.
+> now resolves the current repository's intended Git LFS endpoint, writes or
+> updates `.lfsconfig` with a before/after `lfs.url` summary, and supports
+> `--local` for writing only repository-local Git config.
 
 ### Progress Summary
 
@@ -1149,11 +1150,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 5      | 8         |
+| 6. CLI Commands                          | 13          | 7      | 6         |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **63** | **36**    |
+| **Total**                                | **99**      | **65** | **34**    |
 
 ### Legend
 
@@ -1293,8 +1294,8 @@ Defer:
 - [ ] [M] Implement `lfs-cloud login` browser flow for GitHub OAuth.
 - [x] [T] Implement Git repository detection and remote parsing.
 - [x] [T] Implement `lfs-cloud init --server` route resolution for the current repo.
-- [ ] [T] Implement `.lfsconfig` write/update with backup or diff output.
-- [ ] [T] Implement local-only `git config lfs.url` option if the user does not want committed `.lfsconfig`.
+- [x] [T] Implement `.lfsconfig` write/update with backup or diff output.
+- [x] [T] Implement local-only `git config lfs.url` option if the user does not want committed `.lfsconfig`.
 
 #### Epic 6.3: Operations
 

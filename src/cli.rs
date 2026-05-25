@@ -14,7 +14,10 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
-use crate::{GitRepository, LfsInitRoute, ServeOptions, TracingConfig, init_tracing};
+use crate::{
+    GitLfsConfigChange, GitLfsConfigTarget, GitRepository, LfsInitRoute, ServeOptions,
+    TracingConfig, init_tracing,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "lfs-cloud", version, about, propagate_version = true)]
@@ -56,6 +59,10 @@ struct InitCommand {
     /// Base URL of the running LFS Cloud server.
     #[arg(long, value_name = "URL")]
     server: String,
+
+    /// Write lfs.url to local Git config instead of committed .lfsconfig.
+    #[arg(long)]
+    local: bool,
 }
 
 /// Parses process arguments, initializes tracing, and runs the requested command.
@@ -127,8 +134,44 @@ where
         .context("failed to inspect current Git repository")?;
     let route = LfsInitRoute::resolve(&command.server, &repository.remote)
         .context("failed to build Git LFS URL")?;
+    let change = repository
+        .write_lfs_url(command.target(), &route.lfs_url)
+        .context("failed to write Git LFS config")?;
 
-    writeln!(output, "{}", route.lfs_url).context("failed to write Git LFS URL")
+    write_init_change(output, &change).context("failed to write init summary")
+}
+
+impl InitCommand {
+    fn target(&self) -> GitLfsConfigTarget {
+        if self.local {
+            GitLfsConfigTarget::LocalRepository
+        } else {
+            GitLfsConfigTarget::WorktreeFile
+        }
+    }
+}
+
+fn write_init_change<W>(output: &mut W, change: &GitLfsConfigChange) -> io::Result<()>
+where
+    W: Write,
+{
+    writeln!(output, "configured {}", change.target.label())?;
+    writeln!(output, "  path: {}", change.path.display())?;
+    match change.previous_url.as_deref() {
+        Some(previous_url) if previous_url == change.new_url => {
+            writeln!(output, "  lfs.url unchanged: {}", change.new_url)?;
+        }
+        Some(previous_url) => {
+            writeln!(output, "  - lfs.url: {previous_url}")?;
+            writeln!(output, "  + lfs.url: {}", change.new_url)?;
+        }
+        None => {
+            writeln!(output, "  - lfs.url: <unset>")?;
+            writeln!(output, "  + lfs.url: {}", change.new_url)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -189,6 +232,26 @@ mod tests {
 
         assert_eq!(cli.config, Some("custom-lfs-cloud.yml".into()));
         assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert!(!command.local);
+    }
+
+    #[test]
+    fn init_command_accepts_local_config_option() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "init",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--local",
+        ])
+        .expect("init command should parse");
+
+        let super::Command::Init(command) = cli.command else {
+            panic!("init subcommand should parse");
+        };
+
+        assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert!(command.local);
     }
 
     #[test]
@@ -336,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn init_resolves_lfs_url_from_current_repo_origin() {
+    fn init_writes_lfsconfig_from_current_repo_origin() {
         if !git_is_available() {
             return;
         }
@@ -354,15 +417,127 @@ mod tests {
         run_init_from_dir(
             InitCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                local: false,
             },
             &nested,
             &mut output,
         )
-        .expect("init route should resolve");
+        .expect("init config should be written");
 
+        let lfs_url = "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs";
         assert_eq!(
             String::from_utf8(output).expect("output should be UTF-8"),
-            "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs\n"
+            format!(
+                "configured .lfsconfig\n  path: {}\n  - lfs.url: <unset>\n  + lfs.url: {lfs_url}\n",
+                repo.path()
+                    .canonicalize()
+                    .expect("repo path should canonicalize")
+                    .join(".lfsconfig")
+                    .display()
+            )
+        );
+        assert_eq!(
+            read_git_config(
+                repo.path(),
+                &["config", "--file", ".lfsconfig", "--get", "lfs.url"]
+            ),
+            lfs_url
+        );
+    }
+
+    #[test]
+    fn init_updates_existing_lfsconfig_with_diff_output() {
+        if !git_is_available() {
+            return;
+        }
+
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), &["init"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        fs::write(
+            repo.path().join(".lfsconfig"),
+            "[lfs]\n\turl = https://old.example/info/lfs\n",
+        )
+        .expect("existing .lfsconfig should be written");
+        let mut output = Vec::new();
+
+        run_init_from_dir(
+            InitCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                local: false,
+            },
+            repo.path(),
+            &mut output,
+        )
+        .expect("init config should be updated");
+
+        let lfs_url = "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs";
+        assert_eq!(
+            String::from_utf8(output).expect("output should be UTF-8"),
+            format!(
+                "configured .lfsconfig\n  path: {}\n  - lfs.url: https://old.example/info/lfs\n  + lfs.url: {lfs_url}\n",
+                repo.path()
+                    .canonicalize()
+                    .expect("repo path should canonicalize")
+                    .join(".lfsconfig")
+                    .display()
+            )
+        );
+        assert_eq!(
+            read_git_config(
+                repo.path(),
+                &["config", "--file", ".lfsconfig", "--get", "lfs.url"]
+            ),
+            lfs_url
+        );
+    }
+
+    #[test]
+    fn init_local_option_writes_local_git_config_without_lfsconfig() {
+        if !git_is_available() {
+            return;
+        }
+
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), &["init"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let mut output = Vec::new();
+
+        run_init_from_dir(
+            InitCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                local: true,
+            },
+            repo.path(),
+            &mut output,
+        )
+        .expect("local init config should be written");
+
+        let lfs_url = "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs";
+        assert_eq!(
+            String::from_utf8(output).expect("output should be UTF-8"),
+            format!(
+                "configured local Git config\n  path: {}\n  - lfs.url: <unset>\n  + lfs.url: {lfs_url}\n",
+                repo.path()
+                    .canonicalize()
+                    .expect("repo path should canonicalize")
+                    .join(".git/config")
+                    .display()
+            )
+        );
+        assert_eq!(
+            read_git_config(repo.path(), &["config", "--local", "--get", "lfs.url"]),
+            lfs_url
+        );
+        assert!(
+            !repo.path().join(".lfsconfig").exists(),
+            "local-only init should not create .lfsconfig"
         );
     }
 
@@ -385,5 +560,24 @@ mod tests {
             "git command failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn read_git_config(current_dir: &Path, args: &[&str]) -> String {
+        let output = ProcessCommand::new("git")
+            .args(args)
+            .current_dir(current_dir)
+            .output()
+            .expect("git config command should start");
+
+        assert!(
+            output.status.success(),
+            "git config command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        String::from_utf8(output.stdout)
+            .expect("git config output should be UTF-8")
+            .trim_end()
+            .to_owned()
     }
 }

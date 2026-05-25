@@ -6,6 +6,7 @@
 //! host/owner/name pieces without accepting credentials from remote URLs.
 
 use std::{
+    ffi::OsStr,
     fmt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
@@ -64,6 +65,156 @@ impl GitRepository {
             remote: GitRemote::parse(remote_name, remote_url.trim_end())?,
         })
     }
+
+    /// Returns the worktree `.lfsconfig` path used by committed Git LFS config.
+    #[must_use]
+    pub fn lfsconfig_path(&self) -> PathBuf {
+        self.worktree_root.join(".lfsconfig")
+    }
+
+    /// Returns the repository-local Git config path resolved by Git.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git cannot resolve its local config path.
+    pub fn local_git_config_path(&self) -> CliResult<PathBuf> {
+        let output = git_stdout(
+            &self.worktree_root,
+            ["rev-parse", "--git-path", "config"],
+            "git rev-parse --git-path config",
+        )?;
+        let path = PathBuf::from(output.trim_end());
+
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            self.worktree_root.join(path)
+        })
+    }
+
+    /// Writes the Git LFS URL either to `.lfsconfig` or to local Git config.
+    ///
+    /// The write is delegated to `git config` so Git's own config parser owns
+    /// escaping and section formatting for both the committed and local-only
+    /// targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when the current value cannot be read or `git
+    /// config` cannot persist the new value.
+    pub fn write_lfs_url(
+        &self,
+        target: GitLfsConfigTarget,
+        lfs_url: impl AsRef<str>,
+    ) -> CliResult<GitLfsConfigChange> {
+        let lfs_url = lfs_url.as_ref();
+        let previous_url = self.read_lfs_url(target)?;
+
+        match target {
+            GitLfsConfigTarget::WorktreeFile => {
+                let lfsconfig_path = self.lfsconfig_path();
+                run_git_config(
+                    &self.worktree_root,
+                    [
+                        OsStr::new("config"),
+                        OsStr::new("--file"),
+                        lfsconfig_path.as_os_str(),
+                        OsStr::new("lfs.url"),
+                        OsStr::new(lfs_url),
+                    ],
+                    "git config --file .lfsconfig lfs.url",
+                )?;
+            }
+            GitLfsConfigTarget::LocalRepository => {
+                run_git_config(
+                    &self.worktree_root,
+                    [
+                        OsStr::new("config"),
+                        OsStr::new("--local"),
+                        OsStr::new("lfs.url"),
+                        OsStr::new(lfs_url),
+                    ],
+                    "git config --local lfs.url",
+                )?;
+            }
+        }
+
+        Ok(GitLfsConfigChange {
+            target,
+            path: target.path(self)?,
+            previous_url,
+            new_url: lfs_url.to_owned(),
+        })
+    }
+
+    fn read_lfs_url(&self, target: GitLfsConfigTarget) -> CliResult<Option<String>> {
+        match target {
+            GitLfsConfigTarget::WorktreeFile => {
+                let lfsconfig_path = self.lfsconfig_path();
+                git_config_get(
+                    &self.worktree_root,
+                    [
+                        OsStr::new("config"),
+                        OsStr::new("--file"),
+                        lfsconfig_path.as_os_str(),
+                        OsStr::new("--get"),
+                        OsStr::new("lfs.url"),
+                    ],
+                    "git config --file .lfsconfig --get lfs.url",
+                )
+            }
+            GitLfsConfigTarget::LocalRepository => git_config_get(
+                &self.worktree_root,
+                [
+                    OsStr::new("config"),
+                    OsStr::new("--local"),
+                    OsStr::new("--get"),
+                    OsStr::new("lfs.url"),
+                ],
+                "git config --local --get lfs.url",
+            ),
+        }
+    }
+}
+
+/// Target config location for `lfs-cloud init`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitLfsConfigTarget {
+    /// Write the LFS URL to the worktree `.lfsconfig` file.
+    WorktreeFile,
+    /// Write the LFS URL to the repository-local `.git/config` file.
+    LocalRepository,
+}
+
+impl GitLfsConfigTarget {
+    /// Returns a user-facing label for this config target.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WorktreeFile => ".lfsconfig",
+            Self::LocalRepository => "local Git config",
+        }
+    }
+
+    fn path(self, repository: &GitRepository) -> CliResult<PathBuf> {
+        match self {
+            Self::WorktreeFile => Ok(repository.lfsconfig_path()),
+            Self::LocalRepository => repository.local_git_config_path(),
+        }
+    }
+}
+
+/// Result of writing a Git LFS URL into repository configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitLfsConfigChange {
+    /// Config location that was updated.
+    pub target: GitLfsConfigTarget,
+    /// Filesystem path backing the updated config.
+    pub path: PathBuf,
+    /// Previous `lfs.url` value, when one was configured.
+    pub previous_url: Option<String>,
+    /// Newly configured `lfs.url` value.
+    pub new_url: String,
 }
 
 /// A parsed Git remote suitable for constructing an LFS Cloud route.
@@ -183,6 +334,71 @@ fn git_stdout<const N: usize>(
         command: command_name.to_owned(),
         message: SanitizedMessage::new("git returned non-UTF-8 output"),
     })
+}
+
+fn git_config_get<const N: usize>(
+    current_dir: &Path,
+    args: [&OsStr; N],
+    command_name: &str,
+) -> CliResult<Option<String>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: format!("failed to start {command_name}"),
+            source,
+        })?;
+
+    if !output.status.success() {
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+
+        return Err(git_command_error(
+            command_name,
+            output.status,
+            output.stderr,
+        ));
+    }
+    if output.stdout.len() > MAX_GIT_OUTPUT_BYTES {
+        return Err(CliError::ExternalCommandOutput {
+            command: command_name.to_owned(),
+            message: SanitizedMessage::new("git returned too much output"),
+        });
+    }
+
+    String::from_utf8(output.stdout)
+        .map(|value| Some(value.trim_end().to_owned()))
+        .map_err(|_| CliError::ExternalCommandOutput {
+            command: command_name.to_owned(),
+            message: SanitizedMessage::new("git returned non-UTF-8 output"),
+        })
+}
+
+fn run_git_config<const N: usize>(
+    current_dir: &Path,
+    args: [&OsStr; N],
+    command_name: &str,
+) -> CliResult<()> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: format!("failed to start {command_name}"),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(git_command_error(
+            command_name,
+            output.status,
+            output.stderr,
+        ));
+    }
+
+    Ok(())
 }
 
 fn git_command_error(command: &str, status: ExitStatus, stderr: Vec<u8>) -> CliError {
