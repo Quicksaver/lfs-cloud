@@ -821,6 +821,7 @@ where
         &mut lookup_credential,
         &mut validate_storage,
     );
+    let source_purge = migration_source_purge_report(&discovery, command.purge_source_lfs);
     let report = MigrationDryRunReport {
         discovery,
         scan,
@@ -829,7 +830,7 @@ where
         config_path,
         access_checks,
         would_touch_files: migration_dry_run_touched_files(&repository),
-        source_purge: migration_source_purge_report(&repository, command.purge_source_lfs),
+        source_purge,
     };
 
     write_migration_dry_run_report(output, &report).map_err(output_error)
@@ -1113,20 +1114,33 @@ fn migration_dry_run_touched_files(repository: &GitRepository) -> Vec<PathBuf> {
 }
 
 fn migration_source_purge_report(
-    repository: &GitRepository,
+    discovery: &GitLfsMigrationDiscovery,
     requested: bool,
 ) -> Option<MigrationSourcePurgeReport> {
     if !requested {
         return None;
     }
 
-    if repository.remote.host.eq_ignore_ascii_case("github.com") {
-        Some(MigrationSourcePurgeReport::GitHub)
-    } else {
-        Some(MigrationSourcePurgeReport::Unsupported {
-            host: repository.remote.host.clone(),
-        })
+    match discovery
+        .source_endpoint
+        .as_ref()
+        .map(|endpoint| source_endpoint_provider_label(&endpoint.url))
+    {
+        Some(label) if label.eq_ignore_ascii_case("github.com") => {
+            Some(MigrationSourcePurgeReport::GitHub)
+        }
+        Some(label) => Some(MigrationSourcePurgeReport::Unsupported { host: label }),
+        None => Some(MigrationSourcePurgeReport::Unsupported {
+            host: "<unset>".to_owned(),
+        }),
     }
+}
+
+fn source_endpoint_provider_label(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_else(|| redacted_url_for_display(url))
 }
 
 fn write_migration_dry_run_report<W>(
@@ -1260,6 +1274,14 @@ where
                 output,
                 "    instructions: use GitHub's repository support flow or Virtual Agent, then provide the object IDs and sizes from this report if requested."
             )?;
+            writeln!(output, "    purge manifest:")?;
+            for object in &report.scan.objects {
+                writeln!(
+                    output,
+                    "      sha256:{} ({} bytes)",
+                    object.oid, object.size
+                )?;
+            }
         }
         MigrationSourcePurgeReport::Unsupported { host } => {
             writeln!(output, "    provider: {host}")?;
@@ -3486,8 +3508,66 @@ mod tests {
                 .contains("https://support.github.com/contact-next/product-selection/repositories")
         );
         assert!(rendered.contains("suggested subject: remove git lfs file"));
+        assert!(rendered.contains("purge manifest:"));
         assert!(rendered.contains(object.oid.as_hex()));
         assert!(rendered.contains(&format!("{} bytes", object.size.bytes())));
+    }
+
+    #[test]
+    fn migrate_dry_run_reports_custom_source_as_unsupported_purge_provider() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        let cache_root = temp.path().join("cache");
+        init_git_repo_with_origin(&repo);
+        run_git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "lfs.url",
+                "https://lfs.example.com/owner/repo.git/info/lfs",
+            ],
+        );
+        let object = object_for_bytes(b"migration object from custom source");
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(
+            &repo.join("asset/model.bin"),
+            LfsPointer::new(object).to_pointer_file().as_bytes(),
+        );
+        run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
+        let config_path = temp.path().join("lfs-cloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let mut output = Vec::new();
+
+        run_migrate_from_dir(
+            MigrateCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                cache_root: Some(cache_root),
+                refs: Vec::new(),
+                all_refs: false,
+                dry_run: true,
+                purge_source_lfs: true,
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("dry-run migration purge helper should be reported");
+
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("source: https://lfs.example.com/owner/repo.git/info/lfs"));
+        assert!(rendered.contains("source purge:"));
+        assert!(rendered.contains("provider: lfs.example.com"));
+        assert!(!rendered.contains("provider: GitHub"));
+        assert!(!rendered.contains("GitHub LFS purge requires GitHub Support."));
     }
 
     #[test]
@@ -3537,6 +3617,59 @@ mod tests {
         assert!(rendered.contains("objects discovered: 101"));
         assert!(rendered.contains("... 1 more objects omitted"));
         assert!(rendered.contains("objects uploaded: 0 ready to upload, 101 after fetch"));
+    }
+
+    #[test]
+    fn migrate_dry_run_purge_manifest_lists_all_objects() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        let cache_root = temp.path().join("cache");
+        init_git_repo_with_origin(&repo);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        for index in 0..=super::MIGRATION_OBJECT_REPORT_LIMIT {
+            let bytes = format!("migration object {index}");
+            let object = object_for_bytes(bytes.as_bytes());
+            write_file(
+                &repo.join(format!("asset/model-{index}.bin")),
+                LfsPointer::new(object).to_pointer_file().as_bytes(),
+            );
+        }
+        run_git(&repo, &["add", "."]);
+        let config_path = temp.path().join("lfs-cloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let mut output = Vec::new();
+
+        run_migrate_from_dir(
+            MigrateCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                cache_root: Some(cache_root),
+                refs: Vec::new(),
+                all_refs: false,
+                dry_run: true,
+                purge_source_lfs: true,
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("dry-run migration purge helper should be reported");
+
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        let manifest_count = rendered
+            .lines()
+            .filter(|line| line.starts_with("      sha256:"))
+            .count();
+        assert!(rendered.contains("... 1 more objects omitted"));
+        assert!(rendered.contains("purge manifest:"));
+        assert_eq!(manifest_count, super::MIGRATION_OBJECT_REPORT_LIMIT + 1);
     }
 
     #[test]
