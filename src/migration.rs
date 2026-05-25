@@ -2244,16 +2244,14 @@ fn repo_relative_path_from_git_output(path: &str) -> MigrationResult<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
     use std::{
         collections::BTreeSet,
+        ffi::OsString,
         fs, io,
         path::{Path, PathBuf},
         process::Command,
-    };
-    #[cfg(unix)]
-    use std::{
-        ffi::OsString,
-        os::unix::{ffi::OsStringExt, fs::PermissionsExt},
     };
 
     use tempfile::TempDir;
