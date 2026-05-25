@@ -20,6 +20,9 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > check TCP reachability for the configured server URL, verify that a local LFS
 > credential is available, validate the configured Drive credential reference,
 > and report local cache directory readiness.
+> `lfs-cloud pull` can run a Git LFS fetch for the current checkout, ingest
+> fetched objects from `.git/lfs/objects` into the shared cache, and hydrate
+> tracked pointer files with verified cache bytes.
 > Git LFS batch request parsing plus download and upload batch response
 > generation are implemented, with GitHub read/write authorization enforced per
 > batch operation. Upload batches now check configured storage availability,
@@ -200,6 +203,17 @@ This scans registered worktrees in the shared cache registry, keeps cached
 objects referenced by Git LFS pointer files in those worktrees, and removes
 unreferenced cached objects. It also prunes missing worktree registrations
 during a real run. Use `--cache-root` to target a non-default local cache root.
+
+### Pull And Materialize LFS Objects
+
+```bash
+lfs-cloud pull
+```
+
+This runs `git lfs fetch`, copies verified fetched objects from the repository
+Git LFS cache into the shared `lfs-cloud` cache, and replaces tracked Git LFS
+pointer files in the current checkout with verified cache bytes. Use
+`--cache-root` to target a non-default local cache root.
 
 ### Migrate From Existing Git LFS
 

@@ -11,7 +11,7 @@ use std::{
     future::Future,
     io::{self, BufRead, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
@@ -28,9 +28,9 @@ use crate::{
     GitLfsConfigTarget, GitRepository, GoogleDriveCredentialLoader, GoogleDriveStorageConfig,
     LfsInitRoute, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
     LocalCacheDehydration, LocalCacheDehydrationStatus, LocalCacheGarbageCollection,
-    LocalCacheGarbageCollectionObject, LocalCacheLayout, LocalCacheMaterialization,
-    LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration, ServeOptions, ServerConfig,
-    StorageProviderConfig, TracingConfig, init_tracing,
+    LocalCacheGarbageCollectionObject, LocalCacheIngest, LocalCacheIngestStatus, LocalCacheLayout,
+    LocalCacheMaterialization, LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
+    ServeOptions, ServerConfig, StorageProviderConfig, TracingConfig, init_tracing,
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -62,6 +62,8 @@ enum Command {
     Init(InitCommand),
     /// Check repository, server, auth, storage, and local cache readiness.
     Status(StatusCommand),
+    /// Fetch current Git LFS objects and hydrate pointer files from cache.
+    Pull(PullCommand),
     /// Hydrate Git LFS pointer files from the shared local cache.
     Hydrate(HydrateCommand),
     /// Dehydrate clean worktree files back to Git LFS pointers.
@@ -119,6 +121,13 @@ struct StatusCommand {
 }
 
 #[derive(Debug, Args)]
+struct PullCommand {
+    /// Local cache root to use instead of ~/.lfs-cloud.
+    #[arg(long, value_name = "PATH")]
+    cache_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct HydrateCommand {
     /// Local cache root to use instead of ~/.lfs-cloud.
     #[arg(long, value_name = "PATH")]
@@ -166,6 +175,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         run_init_to_stdout,
         run_login_to_stdio,
         run_status_to_stdout,
+        run_pull_to_stdout,
         run_hydrate_to_stdout,
         run_dehydrate_to_stdout,
         run_gc_to_stdout,
@@ -177,12 +187,13 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     clippy::too_many_arguments,
     reason = "command dispatch keeps per-subcommand side effects injectable for focused tests"
 )]
-async fn dispatch<F, Fut, I, L, S, H, D, G>(
+async fn dispatch<F, Fut, I, L, S, P, H, D, G>(
     cli: Cli,
     serve: F,
     init: I,
     login: L,
     status: S,
+    pull: P,
     hydrate: H,
     dehydrate: D,
     gc: G,
@@ -193,6 +204,7 @@ where
     I: FnOnce(InitCommand) -> anyhow::Result<()>,
     L: FnOnce(LoginCommand) -> anyhow::Result<()>,
     S: FnOnce(StatusCommand, Option<PathBuf>) -> anyhow::Result<()>,
+    P: FnOnce(PullCommand) -> anyhow::Result<()>,
     H: FnOnce(HydrateCommand) -> anyhow::Result<()>,
     D: FnOnce(DehydrateCommand) -> anyhow::Result<()>,
     G: FnOnce(GcCommand) -> anyhow::Result<()>,
@@ -209,6 +221,7 @@ where
         Command::Status(command) => {
             status(command, cli.config).context("failed to check lfs-cloud status")
         }
+        Command::Pull(command) => pull(command).context("failed to pull LFS objects"),
         Command::Hydrate(command) => hydrate(command).context("failed to hydrate paths"),
         Command::Dehydrate(command) => dehydrate(command).context("failed to dehydrate paths"),
         Command::Gc(command) => gc(command).context("failed to garbage collect local cache"),
@@ -274,6 +287,14 @@ fn run_status_to_stdout_blocking(
         validate_status_storage,
     )
     .map_err(anyhow::Error::from)
+}
+
+fn run_pull_to_stdout(command: PullCommand) -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+    let mut stdout = io::stdout().lock();
+
+    run_pull_from_dir(command, &current_dir, &mut stdout, fetch_git_lfs_objects)
+        .map_err(anyhow::Error::from)
 }
 
 fn run_hydrate_to_stdout(command: HydrateCommand) -> anyhow::Result<()> {
@@ -560,6 +581,42 @@ where
     Ok(())
 }
 
+fn run_pull_from_dir<W, F>(
+    command: PullCommand,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+    mut fetch_lfs_objects: F,
+) -> CliResult<()>
+where
+    W: Write,
+    F: FnMut(&Path) -> CliResult<()>,
+{
+    let layout = local_cache_layout(command.cache_root)?;
+    let repository = GitRepository::discover(start_dir.as_ref())?;
+    let git_dir = repository.git_dir_path()?;
+    let git_lfs_objects_dir = git_dir.join("lfs").join("objects");
+
+    fetch_lfs_objects(&repository.worktree_root)?;
+    register_current_worktree(&layout, &repository.worktree_root)?;
+
+    let pointer_files = current_checkout_lfs_pointer_files(&repository.worktree_root)?;
+    writeln!(output, "lfs-cloud pull").map_err(output_error)?;
+    writeln!(output, "  fetched Git LFS objects").map_err(output_error)?;
+    writeln!(output, "  pointers: {}", pointer_files.len()).map_err(output_error)?;
+
+    for pointer_file in pointer_files {
+        let ingest = layout
+            .ingest_git_lfs_object(&git_lfs_objects_dir, &pointer_file.object)
+            .map_err(local_cache_cli_error)?;
+        let materialization = layout
+            .hydrate_pointer_file(&pointer_file.path)
+            .map_err(local_cache_cli_error)?;
+        write_pull_result(output, &ingest, &materialization).map_err(output_error)?;
+    }
+
+    Ok(())
+}
+
 fn run_hydrate_from_dir<W>(
     command: HydrateCommand,
     start_dir: impl AsRef<Path>,
@@ -698,6 +755,118 @@ fn resolve_cli_path(start_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct CurrentCheckoutLfsPointerFile {
+    path: PathBuf,
+    object: LfsObject,
+}
+
+fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
+    let output = ProcessCommand::new("git")
+        .args(["lfs", "fetch"])
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: "failed to start git lfs fetch".to_owned(),
+            source,
+        })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(CliError::ExternalCommand {
+            command: "git lfs fetch".to_owned(),
+            status: process_status_text(output.status),
+            stderr: sanitized_external_stderr(&output.stderr),
+        })
+    }
+}
+
+fn current_checkout_lfs_pointer_files(
+    worktree_root: &Path,
+) -> CliResult<Vec<CurrentCheckoutLfsPointerFile>> {
+    let output = ProcessCommand::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: "failed to start git ls-files -z".to_owned(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(CliError::ExternalCommand {
+            command: "git ls-files -z".to_owned(),
+            status: process_status_text(output.status),
+            stderr: sanitized_external_stderr(&output.stderr),
+        });
+    }
+
+    let tracked_paths =
+        String::from_utf8(output.stdout).map_err(|_| CliError::ExternalCommandOutput {
+            command: "git ls-files -z".to_owned(),
+            message: SanitizedMessage::new("git returned non-UTF-8 path output"),
+        })?;
+    let mut pointer_files = Vec::new();
+    for relative_path in tracked_paths.split('\0').filter(|path| !path.is_empty()) {
+        let relative_path = safe_git_relative_path(relative_path)?;
+        let path = worktree_root.join(&relative_path);
+        let Some(pointer) = read_current_checkout_pointer_candidate(&path)? else {
+            continue;
+        };
+
+        pointer_files.push(CurrentCheckoutLfsPointerFile {
+            path,
+            object: pointer.object,
+        });
+    }
+
+    Ok(pointer_files)
+}
+
+fn safe_git_relative_path(relative_path: &str) -> CliResult<PathBuf> {
+    let path = PathBuf::from(relative_path);
+    let valid = !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
+
+    if valid {
+        Ok(path)
+    } else {
+        Err(CliError::ExternalCommandOutput {
+            command: "git ls-files -z".to_owned(),
+            message: SanitizedMessage::new("git returned a path outside the worktree"),
+        })
+    }
+}
+
+fn read_current_checkout_pointer_candidate(path: &Path) -> CliResult<Option<LfsPointer>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CliError::Io {
+                context: format!("failed to inspect checkout path {}", path.display()),
+                source,
+            });
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_CLI_POINTER_CANDIDATE_SIZE {
+        return Ok(None);
+    }
+
+    let contents = fs::read(path).map_err(|source| CliError::Io {
+        context: format!("failed to read checkout path {}", path.display()),
+        source,
+    })?;
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return Ok(None);
+    };
+
+    Ok(LfsPointer::parse(contents).ok())
+}
+
 fn object_for_dehydration_path(path: &Path) -> CliResult<LfsObject> {
     let metadata = fs::metadata(path).map_err(|source| CliError::Io {
         context: format!("failed to inspect dehydration path {}", path.display()),
@@ -823,6 +992,25 @@ where
     )
 }
 
+fn write_pull_result<W>(
+    output: &mut W,
+    ingest: &LocalCacheIngest,
+    materialization: &LocalCacheMaterialization,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        output,
+        "pulled {} sha256:{} ({} bytes) {} {}",
+        materialization.destination_path.display(),
+        materialization.object.oid,
+        materialization.object.size,
+        ingest_status_label(ingest.status),
+        materialization_status_label(materialization.status)
+    )
+}
+
 fn write_gc_result<W>(
     output: &mut W,
     cache_root: &Path,
@@ -904,6 +1092,13 @@ fn materialization_status_label(status: LocalCacheMaterializationStatus) -> &'st
         LocalCacheMaterializationStatus::AlreadyMaterialized => "already-materialized",
         LocalCacheMaterializationStatus::CopyOnWriteAttempted => "copy-on-write-attempted",
         LocalCacheMaterializationStatus::Copied => "copied",
+    }
+}
+
+fn ingest_status_label(status: LocalCacheIngestStatus) -> &'static str {
+    match status {
+        LocalCacheIngestStatus::AlreadyCached => "already-cached",
+        LocalCacheIngestStatus::Copied => "cached",
     }
 }
 
@@ -1195,6 +1390,28 @@ fn process_status_text(status: std::process::ExitStatus) -> String {
         .unwrap_or_else(|| "terminated by signal".to_owned())
 }
 
+fn sanitized_external_stderr(stderr: &[u8]) -> SanitizedMessage {
+    const MAX_EXTERNAL_STDERR_LEN: usize = 1024;
+
+    let mut message = String::from_utf8_lossy(stderr).into_owned();
+    message = message.replace(['\r', '\n'], " ");
+    if message.len() > MAX_EXTERNAL_STDERR_LEN {
+        let boundary = (0..=MAX_EXTERNAL_STDERR_LEN)
+            .rev()
+            .find(|&index| message.is_char_boundary(index))
+            .expect("zero is always a valid string boundary");
+        message.truncate(boundary);
+        message.push_str("...");
+    }
+    let message = message.trim();
+
+    if message.is_empty() {
+        SanitizedMessage::new("<no stderr>")
+    } else {
+        SanitizedMessage::new(message.to_owned())
+    }
+}
+
 fn output_error(source: io::Error) -> CliError {
     CliError::Io {
         context: "failed to write command output".to_owned(),
@@ -1287,11 +1504,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, StatusCommand,
-        dispatch, is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
+        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, PullCommand,
+        StatusCommand, current_checkout_lfs_pointer_files, dispatch,
+        is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
         run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
-        run_login_from_dir, run_status_from_dir, sanitize_browser_stderr, tracing_config,
-        validate_status_storage, write_init_change,
+        run_login_from_dir, run_pull_from_dir, run_status_from_dir, sanitize_browser_stderr,
+        tracing_config, validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
@@ -1404,6 +1622,19 @@ mod tests {
 
         assert_eq!(cli.config, Some("lfs-cloud.test.yml".into()));
         assert_eq!(command.server, Some("http://127.0.0.1:8080".to_owned()));
+        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+    }
+
+    #[test]
+    fn pull_command_accepts_cache_root_option() {
+        let cli =
+            Cli::try_parse_from(["lfs-cloud", "pull", "--cache-root", "/tmp/lfs-cloud-cache"])
+                .expect("pull command should parse");
+
+        let super::Command::Pull(command) = cli.command else {
+            panic!("pull subcommand should parse");
+        };
+
         assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
     }
 
@@ -1577,6 +1808,7 @@ mod tests {
             |_| unreachable!("init runner must not be called for serve command"),
             |_| unreachable!("login runner must not be called for serve command"),
             |_, _| unreachable!("status runner must not be called for serve command"),
+            |_| unreachable!("pull runner must not be called for serve command"),
             |_| unreachable!("hydrate runner must not be called for serve command"),
             |_| unreachable!("dehydrate runner must not be called for serve command"),
             |_| unreachable!("gc runner must not be called for serve command"),
@@ -1612,6 +1844,7 @@ mod tests {
             },
             |_| unreachable!("login runner must not be called for init command"),
             |_, _| unreachable!("status runner must not be called for init command"),
+            |_| unreachable!("pull runner must not be called for init command"),
             |_| unreachable!("hydrate runner must not be called for init command"),
             |_| unreachable!("dehydrate runner must not be called for init command"),
             |_| unreachable!("gc runner must not be called for init command"),
@@ -1643,6 +1876,7 @@ mod tests {
                 Ok(())
             },
             |_, _| unreachable!("status runner must not be called for login command"),
+            |_| unreachable!("pull runner must not be called for login command"),
             |_| unreachable!("hydrate runner must not be called for login command"),
             |_| unreachable!("dehydrate runner must not be called for login command"),
             |_| unreachable!("gc runner must not be called for login command"),
@@ -1681,6 +1915,7 @@ mod tests {
                     .expect("capture mutex should lock") = Some((command.server, config_path));
                 Ok(())
             },
+            |_| unreachable!("pull runner must not be called for status command"),
             |_| unreachable!("hydrate runner must not be called for status command"),
             |_| unreachable!("dehydrate runner must not be called for status command"),
             |_| unreachable!("gc runner must not be called for status command"),
@@ -1698,6 +1933,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatches_pull_with_cache_root() {
+        let cli =
+            Cli::try_parse_from(["lfs-cloud", "pull", "--cache-root", "/tmp/lfs-cloud-cache"])
+                .expect("pull command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for pull command") },
+            |_| unreachable!("init runner must not be called for pull command"),
+            |_| unreachable!("login runner must not be called for pull command"),
+            |_, _| unreachable!("status runner must not be called for pull command"),
+            move |command| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(command.cache_root);
+                Ok(())
+            },
+            |_| unreachable!("hydrate runner must not be called for pull command"),
+            |_| unreachable!("dehydrate runner must not be called for pull command"),
+            |_| unreachable!("gc runner must not be called for pull command"),
+        )
+        .await
+        .expect("pull dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some(Some(PathBuf::from("/tmp/lfs-cloud-cache")))
+        );
+    }
+
+    #[tokio::test]
     async fn dispatches_hydrate_with_paths() {
         let cli = Cli::try_parse_from(["lfs-cloud", "hydrate", "asset/model.bin"])
             .expect("hydrate command should parse");
@@ -1710,6 +1978,7 @@ mod tests {
             |_| unreachable!("init runner must not be called for hydrate command"),
             |_| unreachable!("login runner must not be called for hydrate command"),
             |_, _| unreachable!("status runner must not be called for hydrate command"),
+            |_| unreachable!("pull runner must not be called for hydrate command"),
             move |command| {
                 *captured_for_runner
                     .lock()
@@ -1741,6 +2010,7 @@ mod tests {
             |_| unreachable!("init runner must not be called for dehydrate command"),
             |_| unreachable!("login runner must not be called for dehydrate command"),
             |_, _| unreachable!("status runner must not be called for dehydrate command"),
+            |_| unreachable!("pull runner must not be called for dehydrate command"),
             |_| unreachable!("hydrate runner must not be called for dehydrate command"),
             move |command| {
                 *captured_for_runner
@@ -1772,6 +2042,7 @@ mod tests {
             |_| unreachable!("init runner must not be called for gc command"),
             |_| unreachable!("login runner must not be called for gc command"),
             |_, _| unreachable!("status runner must not be called for gc command"),
+            |_| unreachable!("pull runner must not be called for gc command"),
             |_| unreachable!("hydrate runner must not be called for gc command"),
             |_| unreachable!("dehydrate runner must not be called for gc command"),
             move |command| {
@@ -2144,6 +2415,142 @@ mod tests {
         assert!(rendered.contains("credentials_ref"));
         assert!(!rendered.contains("LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL"));
         assert!(!rendered.contains("definitely-missing-status-test-env"));
+    }
+
+    #[test]
+    fn pull_fetches_ingests_and_hydrates_current_checkout_pointers() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let worktree_file = repo.join("asset/model.bin");
+        let bytes = b"object already fetched by git lfs";
+        let object = object_for_bytes(bytes);
+        write_file(
+            &worktree_file,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        write_file(&repo.join("README.md"), b"not a pointer");
+        run_git(&repo, &["add", "asset/model.bin", "README.md"]);
+        write_git_lfs_source_object(&repo, &object, bytes);
+        let fetched_root = Arc::new(Mutex::new(None));
+        let fetched_root_for_runner = Arc::clone(&fetched_root);
+        let mut output = Vec::new();
+
+        run_pull_from_dir(
+            PullCommand {
+                cache_root: Some(cache_root.clone()),
+            },
+            &repo,
+            &mut output,
+            move |worktree_root| {
+                *fetched_root_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(worktree_root.to_path_buf());
+                Ok(())
+            },
+        )
+        .expect("pull should hydrate fetched objects");
+
+        assert_eq!(
+            *fetched_root.lock().expect("capture mutex should lock"),
+            Some(repo.canonicalize().expect("repo path should canonicalize"))
+        );
+        assert_eq!(
+            fs::read(&worktree_file).expect("hydrated file should be readable"),
+            bytes
+        );
+        let layout = LocalCacheLayout::new(cache_root);
+        assert_eq!(
+            fs::read(layout.object_path(&object)).expect("cache object should be readable"),
+            bytes
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("lfs-cloud pull"));
+        assert!(rendered.contains("fetched Git LFS objects"));
+        assert!(rendered.contains("pointers: 1"));
+        assert!(rendered.contains("pulled"));
+        assert!(rendered.contains("cached"));
+        assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn pull_propagates_git_lfs_fetch_failure_before_cache_mutation() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let object = object_for_bytes(b"not fetched");
+        write_file(
+            &repo.join("asset/model.bin"),
+            LfsPointer::new(object).to_pointer_file().as_bytes(),
+        );
+        run_git(&repo, &["add", "asset/model.bin"]);
+        let mut output = Vec::new();
+
+        let error = run_pull_from_dir(
+            PullCommand {
+                cache_root: Some(cache_root.clone()),
+            },
+            &repo,
+            &mut output,
+            |_| {
+                Err(CliError::ExternalCommand {
+                    command: "git lfs fetch".to_owned(),
+                    status: "exit status: 2".to_owned(),
+                    stderr: SanitizedMessage::new("git lfs is unavailable"),
+                })
+            },
+        )
+        .expect_err("fetch failure should stop pull");
+
+        assert!(matches!(error, CliError::ExternalCommand { .. }));
+        assert!(output.is_empty());
+        assert!(
+            !cache_root.exists(),
+            "pull should not create cache state after fetch failure"
+        );
+    }
+
+    #[test]
+    fn current_checkout_pointer_scan_uses_tracked_files_only() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let tracked_object = object_for_bytes(b"tracked pointer object");
+        let untracked_object = object_for_bytes(b"untracked pointer object");
+        write_file(
+            &repo.join("asset/tracked.bin"),
+            LfsPointer::new(tracked_object.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        write_file(
+            &repo.join("asset/untracked.bin"),
+            LfsPointer::new(untracked_object)
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        run_git(&repo, &["add", "asset/tracked.bin"]);
+
+        let pointers = current_checkout_lfs_pointer_files(&repo)
+            .expect("pointer scan should inspect tracked files");
+
+        assert_eq!(pointers.len(), 1);
+        assert_eq!(pointers[0].object, tracked_object);
+        assert_eq!(pointers[0].path, repo.join("asset/tracked.bin"));
     }
 
     #[test]
@@ -2788,6 +3195,18 @@ repositories:
             fs::create_dir_all(parent).expect("file parent should be created");
         }
         fs::write(path, contents).expect("test file should be written");
+    }
+
+    fn write_git_lfs_source_object(repo: &Path, object: &LfsObject, contents: &[u8]) {
+        let oid = object.oid.as_hex();
+        let path = repo
+            .join(".git")
+            .join("lfs")
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(oid);
+        write_file(&path, contents);
     }
 
     fn init_git_repo_with_origin(repo: &Path) {

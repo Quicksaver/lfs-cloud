@@ -1166,7 +1166,10 @@ Defer:
 > tests or non-default local cache locations. The `gc` CLI command now scans
 > registered worktrees for Git LFS pointer references, removes unreferenced
 > shared cache objects, prunes missing worktree registrations, and supports
-> `--dry-run` for review before deletion.
+> `--dry-run` for review before deletion. The `pull` CLI command now runs
+> `git lfs fetch`, ingests fetched current-checkout objects from
+> `.git/lfs/objects` into the shared cache, and hydrates tracked Git LFS
+> pointer files with verified cache bytes.
 > Migration discovery support can now inspect an existing Git worktree for
 > local Git LFS installation status, visible LFS filter config, repository LFS
 > endpoint config, and `.gitattributes` patterns that declare `filter=lfs`,
@@ -1182,11 +1185,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 12     | 1         |
+| 6. CLI Commands                          | 13          | 13     | 0         |
 | 7. Migration                             | 12          | 1      | 11        |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **79** | **20**    |
+| **Total**                                | **99**      | **80** | **19**    |
 
 ### Legend
 
@@ -1332,7 +1335,7 @@ Defer:
 #### Epic 6.3: Operations
 
 - [x] [M] Implement `lfs-cloud status` for server reachability, repo mapping, auth, storage, and local cache status. Manual verification: `scripts/manual/verify-status-command.sh`.
-- [ ] [M] Implement `lfs-cloud pull` wrapper for fetch plus CoW materialization. depends: [8.2.1], [8.2.2], [8.2.3].
+- [x] [M] Implement `lfs-cloud pull` wrapper for fetch plus CoW materialization. depends: [8.2.1], [8.2.2], [8.2.3]. Manual verification: `scripts/manual/verify-pull-command.sh`.
 - [x] [M] Implement `lfs-cloud hydrate <path...>`. depends: [8.2.1], [8.2.2], [8.2.3]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
 - [x] [M] Implement `lfs-cloud dehydrate <path...>`. depends: [8.2.4]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
 - [x] [M] Implement `lfs-cloud gc` for local cache cleanup. depends: [8.1.4]. Manual verification: `scripts/manual/verify-local-cache-gc.sh`.
