@@ -1197,7 +1197,10 @@ Defer:
 > includes GitHub source LFS cleanup helper text, the GitHub Support flow, and
 > migrated object IDs/sizes without attempting automatic source deletion.
 > Fixture-repository tests now cover current-checkout, selected-ref, all-ref,
-> missing-object, and CLI dry-run no-op migration behavior.
+> missing-object, and CLI dry-run no-op migration behavior. A local
+> fake-provider end-to-end test now covers repository init routing, fake GitHub
+> authorization, fake Drive upload/download, and checkout hydration through the
+> shared cache.
 
 ### Progress Summary
 
@@ -1212,8 +1215,8 @@ Defer:
 | 6. CLI Commands                          | 13          | 13     | 0         |
 | 7. Migration                             | 12          | 12     | 0         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
-| 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **91** | **8**     |
+| 9. Verification, Docs, And Release Shape | 8           | 1      | 7         |
+| **Total**                                | **99**      | **92** | **7**     |
 
 ### Legend
 
@@ -1407,7 +1410,7 @@ Defer:
 
 #### Epic 9.1: End-To-End Verification
 
-- [ ] [T] Add local end-to-end test for init, upload, download, and checkout using fake GitHub/Drive providers.
+- [x] [T] Add local end-to-end test for init, upload, download, and checkout using fake GitHub/Drive providers.
 - [ ] [M] Add gated GitHub integration test using a disposable repo.
 - [ ] [M] Add gated Google Drive integration test using a disposable folder.
 - [ ] [M] Add manual LAN smoke test checklist.
