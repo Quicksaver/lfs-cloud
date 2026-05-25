@@ -51,6 +51,9 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > whose Git attributes use `filter=lfs`. It can also enumerate Git LFS pointer
 > blobs reachable from selected refs or all fetched refs by evaluating
 > historical `filter=lfs` attributes without checking out those refs.
+> Migration planning can also check discovered object identities against local
+> Git LFS media storage and an optional shared `lfs-cloud` cache, verifying
+> SHA-256 and size before treating local bytes as available.
 > The other commands below are still planned product behavior.
 
 ## Why

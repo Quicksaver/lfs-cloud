@@ -1180,7 +1180,10 @@ Defer:
 > migration pointers. Selected-ref and all-fetched-ref migration scans can now
 > walk Git history, evaluate `filter=lfs` attributes against each historical
 > tree, and parse pointer blobs without checking out refs or mutating local
-> state.
+> state. Migration transfer planning can now check discovered object identities
+> against both repository Git LFS media storage and an optional shared
+> `lfs-cloud` cache, verifying SHA-256 and size before treating local bytes as
+> available.
 
 ### Progress Summary
 
@@ -1193,10 +1196,10 @@ Defer:
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 13     | 0         |
-| 7. Migration                             | 12          | 4      | 8         |
+| 7. Migration                             | 12          | 5      | 7         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **83** | **16**    |
+| **Total**                                | **99**      | **84** | **15**    |
 
 ### Legend
 
@@ -1358,7 +1361,7 @@ Defer:
 
 #### Epic 7.2: Transfer
 
-- [ ] [T] Check which discovered objects already exist locally.
+- [x] [T] Check which discovered objects already exist locally.
 - [ ] [M] Fetch missing objects from the source LFS provider without changing working tree files.
 - [ ] [M] Upload discovered objects to `lfs-cloud` idempotently.
 - [ ] [T] Verify uploaded hashes and sizes against pointers.

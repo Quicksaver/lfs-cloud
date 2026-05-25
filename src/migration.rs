@@ -8,15 +8,22 @@
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs,
+    fs::File,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
 };
 
-use crate::{LfsObject, LfsPointer, MigrationError, MigrationResult, SanitizedMessage};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout, MigrationError,
+    MigrationResult, SanitizedMessage,
+};
 use url::Url;
 
 const DEFAULT_REMOTE_NAME: &str = "origin";
@@ -142,6 +149,100 @@ pub struct GitLfsHistoryPointer {
     pub relative_path: PathBuf,
     /// Object identity referenced by the pointer file.
     pub object: LfsObject,
+}
+
+/// Local availability check for discovered migration objects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct LocalMigrationObjectAvailability {
+    /// Git worktree root whose local object stores were inspected.
+    pub worktree_root: PathBuf,
+    /// Repository-local Git LFS media object directory that was inspected.
+    pub git_lfs_objects_dir: PathBuf,
+    /// Shared LFS Cloud cache root that was inspected, when supplied.
+    pub shared_cache_root: Option<PathBuf>,
+    /// Deduplicated object availability records in stable object order.
+    pub objects: Vec<LocalMigrationObject>,
+}
+
+impl LocalMigrationObjectAvailability {
+    /// Returns objects with at least one verified local copy.
+    #[must_use]
+    pub fn available_objects(&self) -> Vec<&LocalMigrationObject> {
+        self.objects
+            .iter()
+            .filter(|object| object.is_available())
+            .collect()
+    }
+
+    /// Returns objects without any verified local copy.
+    #[must_use]
+    pub fn unavailable_objects(&self) -> Vec<&LocalMigrationObject> {
+        self.objects
+            .iter()
+            .filter(|object| !object.is_available())
+            .collect()
+    }
+}
+
+/// Local availability details for one discovered Git LFS object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct LocalMigrationObject {
+    /// Git LFS object identity being checked.
+    pub object: LfsObject,
+    /// Locations checked for a verified copy of this object.
+    pub locations: Vec<LocalMigrationObjectLocation>,
+}
+
+impl LocalMigrationObject {
+    /// Returns true when any checked location contains verified object bytes.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.locations.iter().any(|location| {
+            matches!(
+                location.status,
+                LocalMigrationObjectLocationStatus::Available
+            )
+        })
+    }
+}
+
+/// One local storage location checked for a migration object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct LocalMigrationObjectLocation {
+    /// Kind of local object store inspected.
+    pub kind: LocalMigrationObjectLocationKind,
+    /// Filesystem path expected to contain the object bytes.
+    pub path: PathBuf,
+    /// Availability status for this location.
+    pub status: LocalMigrationObjectLocationStatus,
+}
+
+/// Kind of local object store inspected during migration planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LocalMigrationObjectLocationKind {
+    /// Repository-local Git LFS media storage, normally `.git/lfs/objects`.
+    GitLfsMedia,
+    /// Shared LFS Cloud content-addressed cache.
+    SharedCache,
+}
+
+/// Availability state for a checked local migration object location.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LocalMigrationObjectLocationStatus {
+    /// The location contains bytes whose SHA-256 and size match the pointer.
+    Available,
+    /// The expected local object path does not exist.
+    Missing,
+    /// The path exists but cannot be used as the requested object.
+    Invalid {
+        /// Safe diagnostic explaining why the local bytes are unusable.
+        message: SanitizedMessage,
+    },
 }
 
 /// Repository-scoped Git LFS source endpoint discovered for migration.
@@ -336,6 +437,65 @@ pub fn enumerate_all_fetched_ref_lfs_pointers(
     })
 }
 
+/// Checks whether discovered migration objects already have verified local bytes.
+///
+/// The repository's stock Git LFS media directory is always checked. When a
+/// shared LFS Cloud cache layout is supplied, that cache is checked too. The
+/// helper is intentionally read-only: missing or corrupt objects are reported
+/// in the returned availability records instead of fetching or rewriting local
+/// state.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree or
+/// Git cannot resolve the repository's local object storage configuration.
+pub fn check_local_migration_objects<I, O>(
+    start_dir: impl AsRef<Path>,
+    objects: I,
+    shared_cache: Option<&LocalCacheLayout>,
+) -> MigrationResult<LocalMigrationObjectAvailability>
+where
+    I: IntoIterator<Item = O>,
+    O: Borrow<LfsObject>,
+{
+    let start_dir = start_dir.as_ref();
+    let worktree_root = detect_worktree_root(start_dir)?;
+    let git_lfs_objects_dir = migration_git_lfs_objects_dir(&worktree_root)?;
+    let shared_cache_root = shared_cache.map(|layout| layout.root().to_path_buf());
+    let objects = objects
+        .into_iter()
+        .map(|object| object.borrow().clone())
+        .collect::<BTreeSet<_>>();
+
+    let objects = objects
+        .into_iter()
+        .map(|object| {
+            let mut locations = vec![check_local_migration_object_location(
+                LocalMigrationObjectLocationKind::GitLfsMedia,
+                git_lfs_object_path(&git_lfs_objects_dir, &object.oid),
+                &object,
+            )?];
+
+            if let Some(layout) = shared_cache {
+                locations.push(check_local_migration_object_location(
+                    LocalMigrationObjectLocationKind::SharedCache,
+                    layout.object_path(&object),
+                    &object,
+                )?);
+            }
+
+            Ok(LocalMigrationObject { object, locations })
+        })
+        .collect::<MigrationResult<Vec<_>>>()?;
+
+    Ok(LocalMigrationObjectAvailability {
+        worktree_root,
+        git_lfs_objects_dir,
+        shared_cache_root,
+        objects,
+    })
+}
+
 fn detect_worktree_root(start_dir: &Path) -> MigrationResult<PathBuf> {
     let output = run_git(start_dir, ["rev-parse", "--show-toplevel"])?;
     if !output.status.success() {
@@ -346,6 +506,120 @@ fn detect_worktree_root(start_dir: &Path) -> MigrationResult<PathBuf> {
 
     let stdout = output_stdout(output, "git rev-parse --show-toplevel")?;
     Ok(PathBuf::from(stdout.trim_end_matches(['\n', '\r'])))
+}
+
+fn migration_git_lfs_objects_dir(worktree_root: &Path) -> MigrationResult<PathBuf> {
+    let git_common_dir = git_absolute_path(
+        worktree_root,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "git rev-parse --path-format=absolute --git-common-dir",
+    )?;
+    let storage_dir = match configured_git_lfs_storage_dir(worktree_root)? {
+        Some(storage_dir) if storage_dir.is_absolute() => storage_dir,
+        Some(storage_dir) => git_common_dir.join(storage_dir),
+        None => git_common_dir.join("lfs"),
+    };
+
+    Ok(storage_dir.join("objects"))
+}
+
+fn git_absolute_path<const N: usize>(
+    worktree_root: &Path,
+    args: [&str; N],
+    command_name: &str,
+) -> MigrationResult<PathBuf> {
+    let output = run_git(worktree_root, args)?;
+    let stdout = required_success_stdout(output, command_name)?;
+
+    Ok(PathBuf::from(stdout.trim_end_matches(['\n', '\r'])))
+}
+
+fn configured_git_lfs_storage_dir(worktree_root: &Path) -> MigrationResult<Option<PathBuf>> {
+    git_config_get(worktree_root, ["config", "--get", "lfs.storage"])
+        .map(|storage| storage.map(PathBuf::from))
+}
+
+fn check_local_migration_object_location(
+    kind: LocalMigrationObjectLocationKind,
+    path: PathBuf,
+    object: &LfsObject,
+) -> MigrationResult<LocalMigrationObjectLocation> {
+    let status = match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            let (actual_oid, actual_size) = hash_migration_object_file(&path)?;
+            if actual_oid == object.oid && actual_size == object.size {
+                LocalMigrationObjectLocationStatus::Available
+            } else {
+                LocalMigrationObjectLocationStatus::Invalid {
+                    message: SanitizedMessage::new(format!(
+                        "expected sha256:{} ({} bytes), got sha256:{} ({} bytes)",
+                        object.oid, object.size, actual_oid, actual_size
+                    )),
+                }
+            }
+        }
+        Ok(_) => LocalMigrationObjectLocationStatus::Invalid {
+            message: SanitizedMessage::new("local object path is not a regular file"),
+        },
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            LocalMigrationObjectLocationStatus::Missing
+        }
+        Err(source) => LocalMigrationObjectLocationStatus::Invalid {
+            message: SanitizedMessage::new(format!("failed to inspect local object: {source}")),
+        },
+    };
+
+    Ok(LocalMigrationObjectLocation { kind, path, status })
+}
+
+fn hash_migration_object_file(path: &Path) -> MigrationResult<(LfsOid, LfsObjectSize)> {
+    let mut file = File::open(path).map_err(|source| MigrationError::Io {
+        context: format!("failed to open local migration object {}", path.display()),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut total_size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| MigrationError::Io {
+                context: format!("failed to read local migration object {}", path.display()),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..read]);
+        total_size = total_size.checked_add(read as u64).ok_or_else(|| {
+            MigrationError::ExternalCommandOutput {
+                command: format!("read {}", path.display()),
+                message: SanitizedMessage::new("local migration object is too large to measure"),
+            }
+        })?;
+    }
+
+    Ok((
+        LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid"),
+        LfsObjectSize::new(total_size),
+    ))
+}
+
+fn git_lfs_object_path(git_lfs_objects_dir: &Path, oid: &LfsOid) -> PathBuf {
+    let hex = oid.as_hex();
+    let first_shard = hex
+        .get(..2)
+        .expect("validated SHA-256 object IDs have a first shard");
+    let second_shard = hex
+        .get(2..4)
+        .expect("validated SHA-256 object IDs have a second shard");
+
+    git_lfs_objects_dir
+        .join(first_shard)
+        .join(second_shard)
+        .join(hex)
 }
 
 fn detect_git_lfs_installation(worktree_root: &Path) -> GitLfsInstallation {
@@ -1679,15 +1953,20 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::{LfsObject, LfsObjectSize, LfsOid, LfsPointer};
+    use sha2::{Digest, Sha256};
+
+    use crate::{LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout};
 
     use super::{
-        GitLfsSourceEndpointSource, MAX_GIT_ATTRIBUTES_BYTES, MAX_MIGRATION_GIT_OUTPUT_BYTES,
-        MigrationError, default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
+        GitLfsSourceEndpointSource, LocalMigrationObjectLocationKind,
+        LocalMigrationObjectLocationStatus, MAX_GIT_ATTRIBUTES_BYTES,
+        MAX_MIGRATION_GIT_OUTPUT_BYTES, MigrationError, check_local_migration_objects,
+        default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
         enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
-        enumerate_selected_ref_lfs_pointers, parse_git_check_attr_filter_stdout,
-        parse_lfs_patterns_from_attributes, parse_ls_tree_blob_output,
-        repo_relative_path_from_git_output, split_gitattributes_line, validate_history_ref_name,
+        enumerate_selected_ref_lfs_pointers, git_lfs_object_path,
+        parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
+        parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
+        validate_history_ref_name,
     };
 
     #[test]
@@ -2346,6 +2625,123 @@ mod tests {
     }
 
     #[test]
+    fn local_object_check_verifies_git_lfs_media_and_deduplicates_objects() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"local object bytes");
+        write_git_lfs_source_object(&repo, &object, b"local object bytes");
+
+        let availability = check_local_migration_objects(repo.path(), [&object, &object], None)
+            .expect("local object check should succeed");
+
+        assert_eq!(availability.objects.len(), 1);
+        assert_eq!(availability.available_objects().len(), 1);
+        assert_eq!(availability.unavailable_objects().len(), 0);
+        assert_eq!(availability.objects[0].object, object);
+        assert!(availability.objects[0].is_available());
+        assert_eq!(availability.objects[0].locations.len(), 1);
+        assert_eq!(
+            availability.objects[0].locations[0].kind,
+            LocalMigrationObjectLocationKind::GitLfsMedia
+        );
+        assert_eq!(
+            availability.objects[0].locations[0].status,
+            LocalMigrationObjectLocationStatus::Available
+        );
+    }
+
+    #[test]
+    fn local_object_check_reports_missing_and_corrupt_git_lfs_media_objects() {
+        let repo = TempRepo::new();
+        let missing = test_lfs_object_from_bytes(b"missing object bytes");
+        let corrupt = test_lfs_object_from_bytes(b"expected object bytes");
+        write_git_lfs_source_object(&repo, &corrupt, b"different object bytes");
+
+        let availability = check_local_migration_objects(repo.path(), [&missing, &corrupt], None)
+            .expect("local object check should succeed");
+
+        let missing_record = availability
+            .objects
+            .iter()
+            .find(|record| record.object == missing)
+            .expect("missing object should be reported");
+        assert!(!missing_record.is_available());
+        assert_eq!(
+            missing_record.locations[0].status,
+            LocalMigrationObjectLocationStatus::Missing
+        );
+
+        let corrupt_record = availability
+            .objects
+            .iter()
+            .find(|record| record.object == corrupt)
+            .expect("corrupt object should be reported");
+        assert!(!corrupt_record.is_available());
+        assert!(matches!(
+            &corrupt_record.locations[0].status,
+            LocalMigrationObjectLocationStatus::Invalid { message }
+                if message.as_str().contains("expected sha256:")
+        ));
+    }
+
+    #[test]
+    fn local_object_check_uses_configured_git_lfs_storage_dir() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"configured storage bytes");
+        repo.git(["config", "lfs.storage", "custom-lfs-storage"]);
+        let storage_objects_dir = repo
+            .path()
+            .join(".git")
+            .join("custom-lfs-storage")
+            .join("objects");
+        write_git_lfs_source_object_in(&storage_objects_dir, &object, b"configured storage bytes");
+
+        let availability = check_local_migration_objects(repo.path(), [&object], None)
+            .expect("local object check should use configured lfs.storage");
+
+        assert_eq!(
+            availability
+                .git_lfs_objects_dir
+                .canonicalize()
+                .expect("reported storage path should canonicalize"),
+            storage_objects_dir
+                .canonicalize()
+                .expect("expected storage path should canonicalize")
+        );
+        assert!(availability.objects[0].is_available());
+    }
+
+    #[test]
+    fn local_object_check_uses_shared_cache_when_supplied() {
+        let repo = TempRepo::new();
+        let cache_root = tempfile::tempdir().expect("temporary cache root should be created");
+        let layout = LocalCacheLayout::new(cache_root.path());
+        let object = test_lfs_object_from_bytes(b"shared cache bytes");
+        write_file(&layout.object_path(&object), b"shared cache bytes");
+
+        let availability = check_local_migration_objects(repo.path(), [&object], Some(&layout))
+            .expect("local object check should inspect shared cache");
+
+        assert_eq!(
+            availability.shared_cache_root.as_deref(),
+            Some(cache_root.path())
+        );
+        assert!(availability.objects[0].is_available());
+        assert_eq!(availability.objects[0].locations.len(), 2);
+        assert_eq!(
+            availability.objects[0].locations[0].status,
+            LocalMigrationObjectLocationStatus::Missing
+        );
+        assert_eq!(
+            availability.objects[0].locations[1].kind,
+            LocalMigrationObjectLocationKind::SharedCache
+        );
+        assert_eq!(
+            availability.objects[0].locations[1].status,
+            LocalMigrationObjectLocationStatus::Available
+        );
+    }
+
+    #[test]
     fn reports_not_git_repository_for_plain_directory() {
         let plain_directory = tempfile::tempdir().expect("temporary directory should be created");
 
@@ -2556,10 +2952,40 @@ mod tests {
         )
     }
 
+    fn test_lfs_object_from_bytes(bytes: &[u8]) -> LfsObject {
+        let oid = format!("{:x}", Sha256::digest(bytes));
+        LfsObject::new(
+            LfsOid::new(oid).expect("test OID should be valid"),
+            LfsObjectSize::new(bytes.len() as u64),
+        )
+    }
+
     fn history_scan_objects(pointers: &[super::GitLfsHistoryPointer]) -> BTreeSet<LfsObject> {
         pointers
             .iter()
             .map(|pointer| pointer.object.clone())
             .collect()
+    }
+
+    fn write_git_lfs_source_object(repo: &TempRepo, object: &LfsObject, contents: &[u8]) {
+        write_git_lfs_source_object_in(&repo.path().join(".git/lfs/objects"), object, contents);
+    }
+
+    fn write_git_lfs_source_object_in(
+        git_lfs_objects_dir: &Path,
+        object: &LfsObject,
+        contents: &[u8],
+    ) {
+        write_file(
+            &git_lfs_object_path(git_lfs_objects_dir, &object.oid),
+            contents,
+        );
+    }
+
+    fn write_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("test file parent should be created");
+        }
+        fs::write(path, contents).expect("test file should be written");
     }
 }
