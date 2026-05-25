@@ -639,17 +639,22 @@ impl LocalCacheLayout {
                 status: LocalCacheDehydrationStatus::AlreadyDehydrated,
             });
         }
-        if let Some(pointer) = existing_pointer {
-            return Err(LocalCacheError::PointerObjectMismatch {
-                path: worktree_path.to_path_buf(),
-                expected_oid: object.oid.clone(),
-                expected_size: object.size,
-                actual_oid: pointer.object.oid,
-                actual_size: pointer.object.size,
-            });
-        }
+        let verified_worktree = match verify_file_object(worktree_path, object) {
+            Ok(verified) => verified,
+            Err(error) => {
+                if let Some(pointer) = existing_pointer {
+                    return Err(LocalCacheError::PointerObjectMismatch {
+                        path: worktree_path.to_path_buf(),
+                        expected_oid: object.oid.clone(),
+                        expected_size: object.size,
+                        actual_oid: pointer.object.oid,
+                        actual_size: pointer.object.size,
+                    });
+                }
 
-        let verified_worktree = verify_file_object(worktree_path, object)?;
+                return Err(error);
+            }
+        };
         let status = if cache_object_path_exists(&cache_path)? {
             self.verify_object(object)?;
             sync_verified_cache_object(&cache_path)?;
@@ -2354,6 +2359,34 @@ mod tests {
             LocalCacheDehydrationStatus::AlreadyDehydrated
         );
         assert!(!layout.object_path(&object).exists());
+    }
+
+    #[test]
+    fn dehydrate_file_accepts_pointer_shaped_object_contents() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let referenced = object_for_bytes(b"referenced object bytes");
+        let pointer_shaped_bytes = LfsPointer::new(referenced).to_pointer_file();
+        let object = object_for_bytes(pointer_shaped_bytes.as_bytes());
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(&worktree_path, pointer_shaped_bytes.as_bytes());
+
+        let dehydration = layout
+            .dehydrate_file(&object, &worktree_path)
+            .expect("pointer-shaped object bytes should dehydrate");
+
+        assert_eq!(
+            dehydration.status,
+            LocalCacheDehydrationStatus::CachedAndReplacedWithPointer
+        );
+        assert_eq!(
+            fs::read(layout.object_path(&object)).expect("cache object should be readable"),
+            pointer_shaped_bytes.as_bytes()
+        );
+        assert_eq!(
+            fs::read_to_string(&worktree_path).expect("pointer file should be readable"),
+            LfsPointer::new(object).to_pointer_file()
+        );
     }
 
     #[test]
