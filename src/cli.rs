@@ -6,6 +6,7 @@
 //! free for focused tests.
 
 use std::{
+    ffi::OsString,
     fs::{self, File},
     future::Future,
     io::{self, BufRead, Read, Write},
@@ -574,11 +575,29 @@ where
 fn local_cache_layout(cache_root: Option<PathBuf>) -> CliResult<LocalCacheLayout> {
     match cache_root {
         Some(cache_root) => Ok(LocalCacheLayout::new(cache_root)),
-        None => match std::env::var_os("HOME") {
+        None => match default_cache_home_dir() {
             Some(home_dir) => Ok(LocalCacheLayout::from_home_dir(home_dir)),
-            None => Err(CliError::InvalidArguments {
-                message: "HOME is not set and --cache-root was not provided".to_owned(),
-            }),
+            None => Err(default_cache_root_error()),
+        },
+    }
+}
+
+fn default_cache_home_dir() -> Option<OsString> {
+    std::env::var_os("HOME").or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+        } else {
+            None
+        }
+    })
+}
+
+fn default_cache_root_error() -> CliError {
+    CliError::InvalidArguments {
+        message: if cfg!(windows) {
+            "HOME or USERPROFILE is not set and --cache-root was not provided".to_owned()
+        } else {
+            "HOME is not set and --cache-root was not provided".to_owned()
         },
     }
 }
@@ -602,47 +621,60 @@ fn object_for_dehydration_path(path: &Path) -> CliResult<LfsObject> {
         });
     }
 
-    if let Some(pointer) = existing_lfs_pointer(path, metadata.len())? {
-        return Ok(pointer.object);
-    }
-
-    hash_file_object(path)
-}
-
-fn existing_lfs_pointer(path: &Path, size: u64) -> CliResult<Option<LfsPointer>> {
-    if size > MAX_CLI_POINTER_CANDIDATE_SIZE {
-        return Ok(None);
-    }
-
-    let file = File::open(path).map_err(|source| CliError::Io {
+    let mut file = File::open(path).map_err(|source| CliError::Io {
         context: format!("failed to open dehydration path {}", path.display()),
         source,
     })?;
+
+    object_for_dehydration_file(path, &mut file, metadata.len())
+}
+
+fn object_for_dehydration_file(path: &Path, file: &mut File, size: u64) -> CliResult<LfsObject> {
+    if size > MAX_CLI_POINTER_CANDIDATE_SIZE {
+        return hash_file_object_from_reader(path, file);
+    }
+
     let mut contents = Vec::new();
-    file.take(MAX_CLI_POINTER_CANDIDATE_SIZE + 1)
+    Read::by_ref(file)
+        .take(MAX_CLI_POINTER_CANDIDATE_SIZE + 1)
         .read_to_end(&mut contents)
         .map_err(|source| CliError::Io {
             context: format!("failed to read dehydration path {}", path.display()),
             source,
         })?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CLI_POINTER_CANDIDATE_SIZE {
-        return Ok(None);
+    if contents.len() as u64 > MAX_CLI_POINTER_CANDIDATE_SIZE {
+        return hash_file_object_with_prefix(path, &contents, file);
     }
-    let Ok(contents) = std::str::from_utf8(&contents) else {
-        return Ok(None);
-    };
 
-    Ok(LfsPointer::parse(contents).ok())
+    // Path-only dehydrate has no separate expected object identity, so small
+    // valid pointer files are accepted as already dehydrated before hashing.
+    // Larger files are treated as content to keep pointer probing bounded.
+    if let Ok(contents) = std::str::from_utf8(&contents)
+        && let Ok(pointer) = LfsPointer::parse(contents)
+    {
+        return Ok(pointer.object);
+    }
+
+    hash_file_object_with_prefix(path, &contents, file)
 }
 
-fn hash_file_object(path: &Path) -> CliResult<LfsObject> {
-    let mut file = File::open(path).map_err(|source| CliError::Io {
-        context: format!("failed to open dehydration path {}", path.display()),
-        source,
-    })?;
+fn hash_file_object_from_reader(path: &Path, file: &mut File) -> CliResult<LfsObject> {
+    hash_file_object_with_prefix(path, &[], file)
+}
+
+fn hash_file_object_with_prefix(
+    path: &Path,
+    prefix: &[u8],
+    file: &mut File,
+) -> CliResult<LfsObject> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
+
+    if !prefix.is_empty() {
+        hasher.update(prefix);
+        size = u64::try_from(prefix.len()).expect("pointer candidate size fits u64");
+    }
 
     loop {
         let bytes_read = file.read(&mut buffer).map_err(|source| CliError::Io {
@@ -654,7 +686,7 @@ fn hash_file_object(path: &Path) -> CliResult<LfsObject> {
         }
         hasher.update(&buffer[..bytes_read]);
         size = size
-            .checked_add(u64::try_from(bytes_read).unwrap_or(u64::MAX))
+            .checked_add(bytes_read as u64)
             .ok_or_else(|| CliError::InvalidArguments {
                 message: format!("file is too large to dehydrate: {}", path.display()),
             })?;
@@ -722,9 +754,7 @@ fn dehydration_status_label(status: LocalCacheDehydrationStatus) -> &'static str
 }
 
 fn local_cache_cli_error(error: crate::LocalCacheError) -> CliError {
-    CliError::InvalidArguments {
-        message: error.to_string(),
-    }
+    CliError::LocalCache { source: error }
 }
 
 #[derive(Debug, Default)]
@@ -809,10 +839,10 @@ struct StatusCheck {
 fn report_cache_status(report: &mut StatusReport, cache_root: Option<PathBuf>) {
     let layout = match cache_root {
         Some(cache_root) => LocalCacheLayout::new(cache_root),
-        None => match std::env::var_os("HOME") {
+        None => match default_cache_home_dir() {
             Some(home_dir) => LocalCacheLayout::from_home_dir(home_dir),
             None => {
-                report.error("cache", "HOME is not set and --cache-root was not provided");
+                report.error("cache", default_cache_root_error().to_string());
                 return;
             }
         },
@@ -1101,7 +1131,7 @@ mod tests {
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
-        LfsOid, LfsPointer, LocalCacheLayout, ServeOptions, StorageProviderConfig,
+        LfsOid, LfsPointer, LocalCacheError, LocalCacheLayout, ServeOptions, StorageProviderConfig,
     };
 
     #[test]
@@ -1927,6 +1957,7 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("hydrated"));
         assert!(rendered.contains("copied") || rendered.contains("copy-on-write-attempted"));
+        assert!(rendered.contains("asset/model.bin"));
         assert!(rendered.contains(object.oid.as_hex()));
     }
 
@@ -1963,6 +1994,7 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("dehydrated"));
         assert!(rendered.contains("cached-and-replaced-with-pointer"));
+        assert!(rendered.contains("asset/model.bin"));
         assert!(rendered.contains(object.oid.as_hex()));
     }
 
@@ -1994,6 +2026,135 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("already-dehydrated"));
         assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn hydrate_rejects_non_pointer_worktree_content_with_local_cache_error() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let worktree_file = repo.join("asset/model.bin");
+        write_file(&worktree_file, b"plain worktree bytes");
+        let mut output = Vec::new();
+
+        let error = run_hydrate_from_dir(
+            HydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![PathBuf::from("asset/model.bin")],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect_err("non-pointer content should not hydrate");
+
+        assert!(matches!(
+            error,
+            CliError::LocalCache {
+                source: LocalCacheError::PointerParse { path, .. }
+            } if path == worktree_file
+        ));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn hydrate_reports_missing_cache_object_as_local_cache_error() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let worktree_file = repo.join("asset/model.bin");
+        let object = object_for_bytes(b"not cached yet");
+        write_file(
+            &worktree_file,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        let mut output = Vec::new();
+
+        let error = run_hydrate_from_dir(
+            HydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![PathBuf::from("asset/model.bin")],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect_err("missing cache object should fail hydration");
+
+        assert!(matches!(
+            error,
+            CliError::LocalCache {
+                source: LocalCacheError::MissingCacheObject { oid, .. }
+            } if oid == object.oid
+        ));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn dehydrate_rejects_non_file_path_before_cache_mutation() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("asset/model.bin")).expect("test directory should be created");
+        let mut output = Vec::new();
+
+        let error = run_dehydrate_from_dir(
+            DehydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![PathBuf::from("asset/model.bin")],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect_err("directory path should not dehydrate");
+
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn hydrate_stops_when_one_of_multiple_paths_fails() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let missing_cache_file = repo.join("asset/missing.bin");
+        let cached_file = repo.join("asset/cached.bin");
+        let missing_object = object_for_bytes(b"missing cache object");
+        let cached_object = object_for_bytes(b"cached object");
+        let layout = LocalCacheLayout::new(&cache_root);
+        write_file(
+            &missing_cache_file,
+            LfsPointer::new(missing_object.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        let cached_pointer = LfsPointer::new(cached_object.clone()).to_pointer_file();
+        write_file(&cached_file, cached_pointer.as_bytes());
+        write_file(&layout.object_path(&cached_object), b"cached object");
+        let mut output = Vec::new();
+
+        let error = run_hydrate_from_dir(
+            HydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![
+                    PathBuf::from("asset/missing.bin"),
+                    PathBuf::from("asset/cached.bin"),
+                ],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect_err("first missing cache object should stop hydration");
+
+        assert!(matches!(
+            error,
+            CliError::LocalCache {
+                source: LocalCacheError::MissingCacheObject { oid, .. }
+            } if oid == missing_object.oid
+        ));
+        assert!(output.is_empty());
+        assert_eq!(
+            fs::read_to_string(&cached_file).expect("second path should remain readable"),
+            cached_pointer
+        );
     }
 
     #[test]

@@ -149,6 +149,14 @@ pub enum CliError {
         source: std::io::Error,
     },
 
+    /// A local shared-cache operation failed.
+    #[error("local cache error: {source}")]
+    LocalCache {
+        /// Underlying local cache failure.
+        #[source]
+        source: crate::local_cache::LocalCacheError,
+    },
+
     /// An external command completed unsuccessfully.
     #[error("{command} failed with status {status}: {stderr}")]
     ExternalCommand {

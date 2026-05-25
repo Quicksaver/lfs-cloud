@@ -5,6 +5,7 @@ project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+# Python 3 is used only to create binary fixtures and compute the expected OID.
 python_bin="$(command -v python3 || command -v python || true)"
 
 if [[ -z "$python_bin" ]] || ! "$python_bin" - <<'PY'
@@ -68,6 +69,8 @@ oid="$(cat "$oid_file")"
 cmp "$payload_file" "$cache_root/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
 grep -F "oid sha256:$oid" "$repo_dir/asset/model.bin" >/dev/null
 grep -F "hydrated" "$tmp_dir/hydrate-output" >/dev/null
+grep -F "asset/model.bin" "$tmp_dir/hydrate-output" >/dev/null
 grep -F "dehydrated" "$tmp_dir/dehydrate-output" >/dev/null
+grep -F "asset/model.bin" "$tmp_dir/dehydrate-output" >/dev/null
 
 echo "lfs-cloud hydrate/dehydrate verified against the shared local cache"
