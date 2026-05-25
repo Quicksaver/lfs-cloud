@@ -59,6 +59,14 @@ fn validate_server_url(value: &str) -> CliResult<String> {
     if value.trim().is_empty() || value.trim().len() != value.len() {
         return invalid_server_url("server URL must not be blank or padded");
     }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control() || character == '\\')
+    {
+        return invalid_server_url(
+            "server URL must not include whitespace, control characters, or backslashes",
+        );
+    }
     if value.ends_with('/') {
         return invalid_server_url("server URL must not end with a trailing slash");
     }
@@ -128,6 +136,9 @@ mod tests {
             "http://user:secret@127.0.0.1:8080",
             "http://127.0.0.1:8080?token=secret",
             "http://127.0.0.1:8080#fragment",
+            "http://127.0.0.1:8080/foo bar",
+            "http://127.0.0.1:8080/foo\nbar",
+            "http://127.0.0.1:8080\\foo",
         ] {
             let remote = GitRemote::parse("origin", "https://github.com/owner/repo.git")
                 .expect("remote should parse");
