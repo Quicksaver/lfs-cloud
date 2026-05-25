@@ -622,7 +622,10 @@ fn validate_absolute_path(field: &'static str, path: &Path) -> LocalCacheResult<
 }
 
 fn normalized_path_key(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    dunce::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn object_shards(hex: &str) -> [&str; OBJECT_SHARD_LEVELS] {
@@ -1211,6 +1214,54 @@ mod tests {
                 .expect("registry should reload")
                 .worktrees(),
             &[updated]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn register_and_remove_worktree_use_canonical_path_keys() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let real_worktree_root = temp.path().join("repo");
+        let symlink_worktree_root = temp.path().join("repo-link");
+        fs::create_dir_all(real_worktree_root.join(".git"))
+            .expect("real worktree should be created");
+        std::os::unix::fs::symlink(&real_worktree_root, &symlink_worktree_root)
+            .expect("worktree symlink should be created");
+
+        let first = LocalCacheWorktreeRegistration::new(
+            "github-main:owner/repo",
+            &symlink_worktree_root,
+            symlink_worktree_root.join(".git"),
+        )
+        .expect("symlink registration should validate");
+        let updated = LocalCacheWorktreeRegistration::new(
+            "github-main:owner/repo",
+            &real_worktree_root,
+            real_worktree_root.join(".git"),
+        )
+        .expect("real path registration should validate");
+
+        layout
+            .register_worktree(first)
+            .expect("first worktree should register");
+        let change = layout
+            .register_worktree(updated.clone())
+            .expect("canonical worktree key should update existing record");
+
+        assert_eq!(change.status, LocalCacheWorktreeRegistrationStatus::Updated);
+        assert_eq!(
+            layout
+                .load_worktree_registry()
+                .expect("registry should reload")
+                .worktrees(),
+            std::slice::from_ref(&updated)
+        );
+        assert_eq!(
+            layout
+                .remove_worktree_registration(&symlink_worktree_root)
+                .expect("canonical worktree key should remove existing record"),
+            Some(updated)
         );
     }
 
