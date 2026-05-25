@@ -21,7 +21,7 @@ const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
 /// A detected Git worktree and selected repository remote.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitRepository {
-    /// Absolute path to the Git worktree root reported by `git rev-parse`.
+    /// Git worktree root path reported by `git rev-parse`.
     pub worktree_root: PathBuf,
     /// Parsed remote selected for route derivation.
     pub remote: GitRemote,
@@ -71,8 +71,7 @@ impl GitRepository {
 pub struct GitRemote {
     /// Git remote name, usually `origin`.
     pub remote_name: String,
-    /// Original remote URL as returned by Git.
-    pub url: String,
+    url: String,
     /// Repository host, such as `github.com`.
     pub host: String,
     /// Repository owner or organization.
@@ -117,6 +116,15 @@ impl GitRemote {
             owner,
             name,
         })
+    }
+
+    /// Returns the original remote URL as returned by Git.
+    ///
+    /// Values returned by this getter have been parsed and validated to reject
+    /// credential-bearing HTTP(S) URLs and unsupported credential-like scp
+    /// forms.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 }
 
@@ -178,7 +186,7 @@ fn git_stdout<const N: usize>(
 }
 
 fn git_command_error(command: &str, status: ExitStatus, stderr: Vec<u8>) -> CliError {
-    let stderr = String::from_utf8_lossy(&stderr);
+    let stderr = truncated_lossy_message(&stderr);
     let message = if stderr.trim().is_empty() {
         "no error output".to_owned()
     } else {
@@ -197,7 +205,7 @@ fn parse_url_remote(value: &str) -> CliResult<(String, String)> {
         message: format!("Git remote URL is not valid: {source}"),
     })?;
 
-    if !matches!(url.scheme(), "http" | "https" | "ssh") {
+    if !matches!(url.scheme(), "https" | "ssh") {
         return invalid_remote("Git remote URL must use HTTPS or SSH");
     }
     if !url.username().is_empty() && url.scheme() != "ssh" {
@@ -232,10 +240,13 @@ fn parse_scp_like_remote(value: &str) -> CliResult<(String, String)> {
         return invalid_remote("Git remote URL must not include a query string or fragment");
     }
 
-    let host = host_part
-        .rsplit_once('@')
-        .map_or(host_part, |(_, host)| host)
-        .trim();
+    let host = if let Some((user, host)) = host_part.rsplit_once('@') {
+        validate_scp_like_user(user)?;
+        host
+    } else {
+        host_part
+    }
+    .trim();
     if host.is_empty() {
         return invalid_remote("Git remote URL must include a host");
     }
@@ -256,6 +267,8 @@ fn parse_repository_path(path: &str) -> CliResult<(String, String)> {
     let name = repo.strip_suffix(".git").unwrap_or(repo);
     let owner = validate_route_component("Git remote owner", owner)?;
     let name = validate_route_component("Git remote repository name", name)?;
+    // A second `.git` suffix means the repository path was double-suffixed,
+    // such as `owner/repo.git.git`.
     if name.ends_with(".git") {
         return invalid_remote("Git remote repository name must not contain a nested .git suffix");
     }
@@ -264,6 +277,8 @@ fn parse_repository_path(path: &str) -> CliResult<(String, String)> {
 }
 
 fn validate_remote_name(value: &str) -> CliResult<String> {
+    // Keep the semantic helper so call sites do not repeat the human-facing
+    // error label for Git remote names.
     validate_remote_component("Git remote name", value)
 }
 
@@ -301,6 +316,8 @@ fn validate_remote_host(value: &str) -> CliResult<String> {
 fn validate_route_component(label: &str, value: &str) -> CliResult<String> {
     let component = validate_remote_component(label, value)?;
     if matches!(component.as_str(), "." | "..")
+        || component.starts_with('.')
+        || component.ends_with('.')
         || component.contains("..")
         || !component
             .bytes()
@@ -314,6 +331,14 @@ fn validate_route_component(label: &str, value: &str) -> CliResult<String> {
     }
 
     Ok(component)
+}
+
+fn validate_scp_like_user(value: &str) -> CliResult<()> {
+    if value != "git" {
+        return invalid_remote("Git scp-like remote user must be git when present");
+    }
+
+    Ok(())
 }
 
 fn invalid_remote<T>(message: impl Into<String>) -> CliResult<T> {
@@ -336,8 +361,27 @@ fn redacted_remote_url(value: &str) -> String {
             let _ = url.set_password(Some("REDACTED"));
             url.to_string()
         }
-        _ => value.to_owned(),
+        _ => redact_scp_like_remote_url(value).unwrap_or_else(|| value.to_owned()),
     }
+}
+
+fn redact_scp_like_remote_url(value: &str) -> Option<String> {
+    let (userinfo, rest) = value.rsplit_once('@')?;
+    if userinfo.is_empty() || rest.is_empty() || !rest.contains(':') {
+        return None;
+    }
+
+    Some(format!("REDACTED@{rest}"))
+}
+
+fn truncated_lossy_message(bytes: &[u8]) -> String {
+    if bytes.len() <= MAX_GIT_OUTPUT_BYTES {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    let mut message = String::from_utf8_lossy(&bytes[..MAX_GIT_OUTPUT_BYTES]).into_owned();
+    message.push_str("\n[truncated]");
+    message
 }
 
 #[cfg(test)]
@@ -358,6 +402,7 @@ mod tests {
         assert_eq!(remote.host, "github.com");
         assert_eq!(remote.owner, "owner");
         assert_eq!(remote.name, "repo");
+        assert_eq!(remote.url(), "https://github.com/owner/repo.git");
     }
 
     #[test]
@@ -378,12 +423,14 @@ mod tests {
     #[test]
     fn rejects_credentials_and_ambiguous_paths() {
         for url in [
+            "http://github.com/owner/repo.git",
             "https://token@github.com/owner/repo.git",
             "https://user:token@github.com/owner/repo.git",
             "https://github.com/owner/repo.git?token=secret",
             "https://github.com/owner/group/repo.git",
             "file:///tmp/repo.git",
             "../repo.git",
+            "token@github.com:owner/repo.git",
         ] {
             let error = GitRemote::parse("origin", url).expect_err("remote should be rejected");
             assert!(matches!(error, CliError::InvalidArguments { .. }));
@@ -394,6 +441,9 @@ mod tests {
     fn rejects_route_unsafe_remote_components() {
         for url in [
             "git@github.com:../repo.git",
+            "git@github.com:.hidden/repo.git",
+            "git@github.com:owner/trailing..git",
+            "git@github.com:owner/repo..git",
             "https://github.com/owner/foo.git.git",
             "https://github.com/owner/re%20po.git",
             "git@github..com:owner/repo.git",
@@ -405,17 +455,24 @@ mod tests {
 
     #[test]
     fn debug_redacts_credentialed_url_defensively() {
-        let remote = GitRemote {
-            remote_name: "origin".to_owned(),
-            url: "https://user:secret@github.com/owner/repo.git".to_owned(),
-            host: "github.com".to_owned(),
-            owner: "owner".to_owned(),
-            name: "repo".to_owned(),
-        };
-        let rendered = format!("{remote:?}");
+        for url in [
+            "https://user:secret@github.com/owner/repo.git",
+            "token@github.com:owner/repo.git",
+            "user:secret@github.com:owner/repo.git",
+        ] {
+            let remote = GitRemote {
+                remote_name: "origin".to_owned(),
+                url: url.to_owned(),
+                host: "github.com".to_owned(),
+                owner: "owner".to_owned(),
+                name: "repo".to_owned(),
+            };
+            let rendered = format!("{remote:?}");
 
-        assert!(rendered.contains("REDACTED"));
-        assert!(!rendered.contains("secret"));
+            assert!(rendered.contains("REDACTED"));
+            assert!(!rendered.contains("secret"));
+            assert!(!rendered.contains("token"));
+        }
     }
 
     #[test]
