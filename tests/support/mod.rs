@@ -2,6 +2,8 @@
 //!
 //! Each integration test crate can import these helpers with `mod support;`.
 
+#![allow(dead_code)]
+
 use std::{
     collections::BTreeMap,
     ffi::OsStr,

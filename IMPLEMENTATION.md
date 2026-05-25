@@ -1196,6 +1196,8 @@ Defer:
 > metadata, or touching storage. `migrate --dry-run --purge-source-lfs` now
 > includes GitHub source LFS cleanup helper text, the GitHub Support flow, and
 > migrated object IDs/sizes without attempting automatic source deletion.
+> Fixture-repository tests now cover current-checkout, selected-ref, all-ref,
+> missing-object, and CLI dry-run no-op migration behavior.
 
 ### Progress Summary
 
@@ -1208,10 +1210,10 @@ Defer:
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 13     | 0         |
-| 7. Migration                             | 12          | 11     | 1         |
+| 7. Migration                             | 12          | 12     | 0         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **90** | **9**     |
+| **Total**                                | **99**      | **91** | **8**     |
 
 ### Legend
 
@@ -1383,7 +1385,7 @@ Defer:
 - [x] [T] Implement `migrate --dry-run` with no filesystem, Git config, DB, or storage writes.
 - [x] [T] `--dry-run` reports refs scanned, files touched, objects fetched, objects uploaded, and access-check results.
 - [x] [T] Implement GitHub-specific `--purge-source-lfs` helper report and support-flow instructions.
-- [ ] [T] Add fixture-repo tests for current checkout, selected refs, all refs, missing objects, and dry-run no-op behavior.
+- [x] [T] Add fixture-repo tests for current checkout, selected refs, all refs, missing objects, and dry-run no-op behavior.
 
 ### Phase 8: Local Cache And Materialization
 
