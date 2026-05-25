@@ -78,7 +78,7 @@ impl GitRepository {
     ///
     /// Returns [`CliError`] when Git cannot resolve its local config path.
     pub fn local_git_config_path(&self) -> CliResult<PathBuf> {
-        let output = git_stdout(
+        git_absolute_path(
             &self.worktree_root,
             [
                 "rev-parse",
@@ -87,14 +87,7 @@ impl GitRepository {
                 "config",
             ],
             "git rev-parse --path-format=absolute --git-path config",
-        )?;
-        let path = PathBuf::from(output.trim_end());
-
-        Ok(if path.is_absolute() {
-            path
-        } else {
-            self.worktree_root.join(path)
-        })
+        )
     }
 
     /// Returns the absolute Git directory path for this worktree.
@@ -108,18 +101,11 @@ impl GitRepository {
     /// Returns [`CliError`] when Git cannot resolve the current worktree's Git
     /// directory.
     pub fn git_dir_path(&self) -> CliResult<PathBuf> {
-        let output = git_stdout(
+        git_absolute_path(
             &self.worktree_root,
             ["rev-parse", "--path-format=absolute", "--git-dir"],
             "git rev-parse --path-format=absolute --git-dir",
-        )?;
-        let path = PathBuf::from(output.trim_end());
-
-        Ok(if path.is_absolute() {
-            path
-        } else {
-            self.worktree_root.join(path)
-        })
+        )
     }
 
     /// Returns the absolute Git common directory path for this repository.
@@ -133,18 +119,11 @@ impl GitRepository {
     /// Returns [`CliError`] when Git cannot resolve the current repository's
     /// common directory.
     pub fn git_common_dir_path(&self) -> CliResult<PathBuf> {
-        let output = git_stdout(
+        git_absolute_path(
             &self.worktree_root,
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             "git rev-parse --path-format=absolute --git-common-dir",
-        )?;
-        let path = PathBuf::from(output.trim_end());
-
-        Ok(if path.is_absolute() {
-            path
-        } else {
-            self.worktree_root.join(path)
-        })
+        )
     }
 
     /// Writes the Git LFS URL either to `.lfsconfig` or to local Git config.
@@ -362,6 +341,21 @@ fn detect_worktree_root(start_dir: &Path) -> CliResult<PathBuf> {
     )?;
 
     Ok(PathBuf::from(output.trim_end()))
+}
+
+fn git_absolute_path<const N: usize>(
+    current_dir: &Path,
+    args: [&str; N],
+    command_name: &str,
+) -> CliResult<PathBuf> {
+    let output = git_stdout(current_dir, args, command_name)?;
+    let path = PathBuf::from(output.trim_end());
+
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        current_dir.join(path)
+    })
 }
 
 fn git_stdout<const N: usize>(
@@ -880,6 +874,81 @@ mod tests {
                 .join(".git/config")
                 .canonicalize()
                 .expect("main config should canonicalize")
+        );
+    }
+
+    #[test]
+    fn git_directory_paths_resolve_main_worktree_common_dir() {
+        let repo = TempGitRepo::new();
+        let repository = GitRepository {
+            worktree_root: repo.path().to_owned(),
+            remote: GitRemote::parse("origin", "git@github.com:owner/repo.git")
+                .expect("remote should parse"),
+        };
+
+        let git_dir = repository
+            .git_dir_path()
+            .expect("main worktree git dir should resolve");
+        let common_dir = repository
+            .git_common_dir_path()
+            .expect("main worktree common dir should resolve");
+
+        assert!(git_dir.is_absolute());
+        assert!(common_dir.is_absolute());
+        assert_eq!(
+            git_dir,
+            repo.path()
+                .join(".git")
+                .canonicalize()
+                .expect("main git dir should canonicalize")
+        );
+        assert_eq!(common_dir, git_dir);
+    }
+
+    #[test]
+    fn git_common_dir_path_resolves_shared_dir_for_linked_worktree() {
+        let repo = TempGitRepo::new();
+        repo.git([
+            "-c",
+            "user.name=LFS Cloud Test",
+            "-c",
+            "user.email=lfs-cloud@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let linked_worktree = repo.path().join("linked-worktree");
+        repo.git([
+            "worktree",
+            "add",
+            "-b",
+            "linked-common-dir-test",
+            linked_worktree.to_str().expect("path should be UTF-8"),
+            "HEAD",
+        ]);
+        let repository = GitRepository {
+            worktree_root: linked_worktree,
+            remote: GitRemote::parse("origin", "git@github.com:owner/repo.git")
+                .expect("remote should parse"),
+        };
+
+        let git_dir = repository
+            .git_dir_path()
+            .expect("linked worktree git dir should resolve");
+        let common_dir = repository
+            .git_common_dir_path()
+            .expect("linked worktree common dir should resolve");
+
+        assert!(git_dir.is_absolute());
+        assert!(common_dir.is_absolute());
+        assert_ne!(common_dir, git_dir);
+        assert_eq!(
+            common_dir,
+            repo.path()
+                .join(".git")
+                .canonicalize()
+                .expect("main common dir should canonicalize")
         );
     }
 

@@ -5,6 +5,8 @@
 //! tracing initialization, while parser and dispatch helpers stay side-effect
 //! free for focused tests.
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::{
     ffi::OsString,
     fs::{self, File},
@@ -598,19 +600,51 @@ where
     fetch_lfs_objects(&repository.worktree_root)?;
     register_current_worktree(&layout, &repository.worktree_root)?;
 
-    let pointer_files = current_checkout_lfs_pointer_files(&repository.worktree_root)?;
+    let pointer_scan = current_checkout_lfs_pointer_scan(&repository.worktree_root)?;
     writeln!(output, "lfs-cloud pull").map_err(output_error)?;
     writeln!(output, "  fetched Git LFS objects").map_err(output_error)?;
-    writeln!(output, "  pointers: {}", pointer_files.len()).map_err(output_error)?;
+    writeln!(
+        output,
+        "  tracked paths: {}",
+        pointer_scan.tracked_path_count
+    )
+    .map_err(output_error)?;
+    writeln!(output, "  pointers: {}", pointer_scan.pointer_files.len()).map_err(output_error)?;
 
-    for pointer_file in pointer_files {
-        let ingest = layout
+    let mut first_failure = None;
+    let mut failure_count = 0;
+    for pointer_file in pointer_scan.pointer_files {
+        let result = layout
             .ingest_git_lfs_object(&git_lfs_objects_dir, &pointer_file.object)
-            .map_err(local_cache_cli_error)?;
-        let materialization = layout
-            .hydrate_pointer_file(&pointer_file.path)
-            .map_err(local_cache_cli_error)?;
-        write_pull_result(output, &ingest, &materialization).map_err(output_error)?;
+            .map_err(local_cache_cli_error)
+            .and_then(|ingest| {
+                layout
+                    .hydrate_pointer_file(&pointer_file.path)
+                    .map_err(local_cache_cli_error)
+                    .map(|materialization| (ingest, materialization))
+            });
+
+        match result {
+            Ok((ingest, materialization)) => {
+                write_pull_result(output, &ingest, &materialization).map_err(output_error)?;
+            }
+            Err(error) => {
+                failure_count += 1;
+                writeln!(output, "failed {}: {}", pointer_file.path.display(), error)
+                    .map_err(output_error)?;
+                first_failure.get_or_insert_with(|| {
+                    (pointer_file.path, SanitizedMessage::new(error.to_string()))
+                });
+            }
+        }
+    }
+
+    if let Some((path, message)) = first_failure {
+        return Err(CliError::PullFailed {
+            failures: failure_count,
+            path,
+            message,
+        });
     }
 
     Ok(())
@@ -760,6 +794,12 @@ struct CurrentCheckoutLfsPointerFile {
     object: LfsObject,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct CurrentCheckoutLfsPointerScan {
+    tracked_path_count: usize,
+    pointer_files: Vec<CurrentCheckoutLfsPointerFile>,
+}
+
 fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
     let output = ProcessCommand::new("git")
         .args(["lfs", "fetch"])
@@ -776,18 +816,25 @@ fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
         Err(CliError::ExternalCommand {
             command: "git lfs fetch".to_owned(),
             status: process_status_text(output.status),
-            stderr: sanitized_external_stderr(&output.stderr),
+            stderr: sanitized_external_failure_output(&output.stderr, &output.stdout),
         })
     }
 }
 
+#[cfg(test)]
 fn current_checkout_lfs_pointer_files(
     worktree_root: &Path,
 ) -> CliResult<Vec<CurrentCheckoutLfsPointerFile>> {
+    Ok(current_checkout_lfs_pointer_scan(worktree_root)?.pointer_files)
+}
+
+fn current_checkout_lfs_pointer_scan(
+    worktree_root: &Path,
+) -> CliResult<CurrentCheckoutLfsPointerScan> {
     let lfs_tracked_paths = current_checkout_lfs_tracked_paths(worktree_root)?;
     let mut pointer_files = Vec::new();
-    for relative_path in lfs_tracked_paths {
-        let path = worktree_root.join(&relative_path);
+    for relative_path in &lfs_tracked_paths {
+        let path = worktree_root.join(relative_path);
         let Some(pointer) = read_current_checkout_pointer_candidate(&path)? else {
             continue;
         };
@@ -798,7 +845,10 @@ fn current_checkout_lfs_pointer_files(
         });
     }
 
-    Ok(pointer_files)
+    Ok(CurrentCheckoutLfsPointerScan {
+        tracked_path_count: lfs_tracked_paths.len(),
+        pointer_files,
+    })
 }
 
 fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> CliResult<Vec<PathBuf>> {
@@ -819,24 +869,18 @@ fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> CliResult<Vec<Pat
         });
     }
 
-    let tracked_paths =
-        String::from_utf8(output.stdout).map_err(|_| CliError::ExternalCommandOutput {
-            command: "git ls-files -z".to_owned(),
-            message: SanitizedMessage::new("git returned non-UTF-8 path output"),
-        })?;
-    let mut pointer_files = Vec::new();
+    let tracked_paths = output.stdout;
+    let mut lfs_tracked_paths = Vec::new();
     if tracked_paths.is_empty() {
-        return Ok(pointer_files);
+        return Ok(lfs_tracked_paths);
     }
 
     let output = git_check_attr_filter(worktree_root, &tracked_paths)?;
-    let attributes =
-        String::from_utf8(output.stdout).map_err(|_| CliError::ExternalCommandOutput {
-            command: "git check-attr -z --stdin filter".to_owned(),
-            message: SanitizedMessage::new("git returned non-UTF-8 attribute output"),
-        })?;
-    let mut fields = attributes.split('\0').collect::<Vec<_>>();
-    if fields.last() == Some(&"") {
+    let mut fields = output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .collect::<Vec<_>>();
+    if fields.last() == Some(&&[][..]) {
         fields.pop();
     }
     let chunks = fields.chunks_exact(3);
@@ -847,20 +891,20 @@ fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> CliResult<Vec<Pat
         let [relative_path, attribute, value] = chunk else {
             unreachable!("chunks_exact yielded a non-triple chunk");
         };
-        if *attribute != "filter" || *value != "lfs" {
+        if *attribute != b"filter" || *value != b"lfs" {
             continue;
         }
 
         let relative_path = safe_git_relative_path(relative_path)?;
-        pointer_files.push(relative_path);
+        lfs_tracked_paths.push(relative_path);
     }
 
-    Ok(pointer_files)
+    Ok(lfs_tracked_paths)
 }
 
 fn git_check_attr_filter(
     worktree_root: &Path,
-    tracked_paths: &str,
+    tracked_paths: &[u8],
 ) -> CliResult<std::process::Output> {
     let mut child = ProcessCommand::new("git")
         .args(["check-attr", "-z", "--stdin", "filter"])
@@ -875,28 +919,38 @@ fn git_check_attr_filter(
         })?;
 
     let mut stdin = child.stdin.take().expect("child stdin should be piped");
-    stdin
-        .write_all(tracked_paths.as_bytes())
-        .map_err(|source| CliError::Io {
-            context: "failed to write git check-attr path input".to_owned(),
-            source,
-        })?;
-    drop(stdin);
+    let tracked_paths = tracked_paths.to_owned();
+    let stdin_writer = std::thread::spawn(move || {
+        let write_result = stdin.write_all(&tracked_paths);
+        drop(stdin);
+
+        write_result
+    });
 
     let output = child.wait_with_output().map_err(|source| CliError::Io {
         context: "failed to wait for git check-attr -z --stdin filter".to_owned(),
         source,
     })?;
 
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(CliError::ExternalCommand {
+    let write_result = stdin_writer.join().map_err(|_| CliError::Io {
+        context: "git check-attr input writer panicked".to_owned(),
+        source: io::Error::other("git check-attr input writer panicked"),
+    })?;
+
+    if !output.status.success() {
+        return Err(CliError::ExternalCommand {
             command: "git check-attr -z --stdin filter".to_owned(),
             status: process_status_text(output.status),
             stderr: sanitized_external_stderr(&output.stderr),
-        })
+        });
     }
+
+    write_result.map_err(|source| CliError::Io {
+        context: "failed to write git check-attr path input".to_owned(),
+        source,
+    })?;
+
+    Ok(output)
 }
 
 fn git_check_attr_parse_error() -> CliError {
@@ -947,21 +1001,37 @@ fn configured_git_lfs_storage_dir(worktree_root: &Path) -> CliResult<Option<Path
     }
 }
 
-fn safe_git_relative_path(relative_path: &str) -> CliResult<PathBuf> {
-    let path = PathBuf::from(relative_path);
+fn safe_git_relative_path(relative_path: &[u8]) -> CliResult<PathBuf> {
+    let path = git_path_bytes_to_path_buf(relative_path, "git check-attr -z --stdin filter")?;
     let valid = !path.is_absolute()
+        && path.components().next().is_some()
         && path
             .components()
-            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
+            .all(|component| matches!(component, Component::Normal(_)));
 
     if valid {
         Ok(path)
     } else {
         Err(CliError::ExternalCommandOutput {
-            command: "git ls-files -z".to_owned(),
+            command: "git check-attr -z --stdin filter".to_owned(),
             message: SanitizedMessage::new("git returned a path outside the worktree"),
         })
     }
+}
+
+#[cfg(unix)]
+fn git_path_bytes_to_path_buf(relative_path: &[u8], _command: &str) -> CliResult<PathBuf> {
+    Ok(PathBuf::from(OsString::from_vec(relative_path.to_owned())))
+}
+
+#[cfg(not(unix))]
+fn git_path_bytes_to_path_buf(relative_path: &[u8], command: &str) -> CliResult<PathBuf> {
+    String::from_utf8(relative_path.to_owned())
+        .map(PathBuf::from)
+        .map_err(|_| CliError::ExternalCommandOutput {
+            command: command.to_owned(),
+            message: SanitizedMessage::new("git returned non-UTF-8 path output"),
+        })
 }
 
 fn read_current_checkout_pointer_candidate(path: &Path) -> CliResult<Option<LfsPointer>> {
@@ -1535,6 +1605,22 @@ fn sanitized_external_stderr(stderr: &[u8]) -> SanitizedMessage {
     }
 }
 
+fn sanitized_external_failure_output(stderr: &[u8], stdout: &[u8]) -> SanitizedMessage {
+    if stdout.is_empty() {
+        return sanitized_external_stderr(stderr);
+    }
+
+    let mut combined = Vec::with_capacity(stderr.len() + stdout.len() + 9);
+    combined.extend_from_slice(stderr);
+    if !stderr.is_empty() {
+        combined.push(b'\n');
+    }
+    combined.extend_from_slice(b"stdout: ");
+    combined.extend_from_slice(stdout);
+
+    sanitized_external_stderr(&combined)
+}
+
 fn output_error(source: io::Error) -> CliError {
     CliError::Io {
         context: "failed to write command output".to_owned(),
@@ -1615,6 +1701,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
     use std::{
         fs, io,
         path::{Path, PathBuf},
@@ -1628,8 +1718,8 @@ mod tests {
 
     use super::{
         Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, PullCommand,
-        StatusCommand, current_checkout_lfs_pointer_files, dispatch,
-        is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
+        StatusCommand, current_checkout_lfs_pointer_files, current_checkout_lfs_pointer_scan,
+        dispatch, is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
         run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
         run_login_from_dir, run_pull_from_dir, run_status_from_dir, sanitize_browser_stderr,
         tracing_config, validate_status_storage, write_init_change,
@@ -2599,6 +2689,7 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("lfs-cloud pull"));
         assert!(rendered.contains("fetched Git LFS objects"));
+        assert!(rendered.contains("tracked paths: 1"));
         assert!(rendered.contains("pointers: 1"));
         assert!(rendered.contains("pulled"));
         assert!(rendered.contains("cached"));
@@ -2760,6 +2851,79 @@ mod tests {
     }
 
     #[test]
+    fn pull_reports_failures_after_attempting_remaining_pointers() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let missing_file = repo.join("asset/missing.bin");
+        let available_file = repo.join("asset/available.bin");
+        let missing_object = object_for_bytes(b"missing fetched object");
+        let available_bytes = b"available fetched object";
+        let available_object = object_for_bytes(available_bytes);
+        write_file(&repo.join(".gitattributes"), b"asset/*.bin filter=lfs\n");
+        write_file(
+            &missing_file,
+            LfsPointer::new(missing_object.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        write_file(
+            &available_file,
+            LfsPointer::new(available_object.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        run_git(
+            &repo,
+            &[
+                "add",
+                ".gitattributes",
+                "asset/available.bin",
+                "asset/missing.bin",
+            ],
+        );
+        write_git_lfs_source_object(&repo, &available_object, available_bytes);
+        let mut output = Vec::new();
+
+        let error = run_pull_from_dir(
+            PullCommand {
+                cache_root: Some(cache_root),
+            },
+            &repo,
+            &mut output,
+            |_| Ok(()),
+        )
+        .expect_err("one missing fetched object should fail pull");
+
+        assert!(matches!(
+            error,
+            CliError::PullFailed {
+                failures: 1,
+                path,
+                ..
+            } if path == missing_file
+                .canonicalize()
+                .unwrap_or_else(|_| missing_file.clone())
+        ));
+        assert_eq!(
+            fs::read(&available_file).expect("available file should be hydrated"),
+            available_bytes
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("tracked paths: 2"));
+        assert!(rendered.contains("pointers: 2"));
+        assert!(rendered.contains("failed"));
+        assert!(rendered.contains("missing.bin"));
+        assert!(rendered.contains("pulled"));
+        assert!(rendered.contains("available.bin"));
+    }
+
+    #[test]
     fn current_checkout_pointer_scan_uses_lfs_tracked_files_only() {
         if !git_is_available() {
             return;
@@ -2806,6 +2970,74 @@ mod tests {
         assert_eq!(pointers.len(), 1);
         assert_eq!(pointers[0].object, tracked_object);
         assert_eq!(pointers[0].path, repo.join("asset/tracked.bin"));
+    }
+
+    #[test]
+    fn current_checkout_pointer_scan_reports_tracked_and_pointer_counts() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let object = object_for_bytes(b"tracked pointer object");
+        write_file(&repo.join(".gitattributes"), b"asset/*.bin filter=lfs\n");
+        write_file(
+            &repo.join("asset/pointer.bin"),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        write_file(&repo.join("asset/hydrated.bin"), b"already hydrated bytes");
+        run_git(
+            &repo,
+            &[
+                "add",
+                ".gitattributes",
+                "asset/pointer.bin",
+                "asset/hydrated.bin",
+            ],
+        );
+
+        let scan = current_checkout_lfs_pointer_scan(&repo)
+            .expect("pointer scan should inspect tracked files");
+
+        assert_eq!(scan.tracked_path_count, 2);
+        assert_eq!(scan.pointer_files.len(), 1);
+        assert_eq!(scan.pointer_files[0].object, object);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_checkout_pointer_scan_accepts_non_utf8_tracked_paths() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let object = object_for_bytes(b"non UTF-8 path object");
+        let non_utf8_name = OsString::from_vec(b"nonutf8-\xff.bin".to_vec());
+        let worktree_file = repo.join("asset").join(PathBuf::from(non_utf8_name));
+        write_file(&repo.join(".gitattributes"), b"asset/*.bin filter=lfs\n");
+        fs::create_dir_all(worktree_file.parent().expect("path should have parent"))
+            .expect("non-UTF-8 path parent should be created");
+        if fs::write(
+            &worktree_file,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        )
+        .is_err()
+        {
+            return;
+        }
+        run_git(&repo, &["add", "-A"]);
+
+        let pointers = current_checkout_lfs_pointer_files(&repo)
+            .expect("pointer scan should accept non-UTF-8 paths");
+
+        assert_eq!(pointers.len(), 1);
+        assert_eq!(pointers[0].object, object);
+        assert_eq!(pointers[0].path, worktree_file);
     }
 
     #[test]

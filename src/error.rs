@@ -157,6 +157,17 @@ pub enum CliError {
         source: crate::local_cache::LocalCacheError,
     },
 
+    /// One or more `pull` pointer hydrations failed after fetch completed.
+    #[error("pull failed for {failures} pointer file(s); first failure at {}: {message}", path.display())]
+    PullFailed {
+        /// Number of pointer files that could not be ingested or hydrated.
+        failures: usize,
+        /// First pointer path that failed.
+        path: PathBuf,
+        /// Sanitized first failure message.
+        message: SanitizedMessage,
+    },
+
     /// An external command completed unsuccessfully.
     #[error("{command} failed with status {status}: {stderr}")]
     ExternalCommand {

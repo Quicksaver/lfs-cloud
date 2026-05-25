@@ -63,11 +63,17 @@ pointer = (
     f"size {size}\n"
 )
 worktree_file = repo_dir / "asset" / "model.bin"
+untracked_file = repo_dir / "asset" / "untracked.bin"
+ordinary_pointer_file = repo_dir / "docs" / "pointer-example.txt"
 source_object = repo_dir / ".git" / "lfs" / "objects" / oid[:2] / oid[2:4] / oid
 
 worktree_file.parent.mkdir(parents=True, exist_ok=True)
+ordinary_pointer_file.parent.mkdir(parents=True, exist_ok=True)
 source_object.parent.mkdir(parents=True, exist_ok=True)
+(repo_dir / ".gitattributes").write_text("asset/*.bin filter=lfs\n", encoding="utf-8")
 worktree_file.write_text(pointer, encoding="utf-8")
+untracked_file.write_text(pointer, encoding="utf-8")
+ordinary_pointer_file.write_text(pointer, encoding="utf-8")
 source_object.write_bytes(payload)
 payload_file.write_bytes(payload)
 oid_file.write_text(oid, encoding="utf-8")
@@ -75,7 +81,7 @@ PY
 
 (
   cd "$repo_dir"
-  git add asset/model.bin
+  git add .gitattributes asset/model.bin docs/pointer-example.txt
   PATH="$fake_bin:$PATH" \
     LFS_CLOUD_FAKE_GIT_LFS_FETCH_LOG="$fetch_log" \
     cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
@@ -87,11 +93,20 @@ cmp "$payload_file" "$repo_dir/asset/model.bin" >/dev/null
 cmp "$payload_file" "$cache_root/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
 grep -F "fetch" "$fetch_log" >/dev/null
 grep -F "lfs-cloud pull" "$tmp_dir/pull-output" >/dev/null
+grep -F "tracked paths: 1" "$tmp_dir/pull-output" >/dev/null
 grep -F "pointers: 1" "$tmp_dir/pull-output" >/dev/null
 grep -F "asset/model.bin" "$tmp_dir/pull-output" >/dev/null
-grep -F "oid sha256:$oid" "$repo_dir/asset/model.bin" >/dev/null && {
+if pointer_match_output="$(grep -F "oid sha256:$oid" "$repo_dir/asset/model.bin" 2>&1)"; then
   echo "pull left a pointer instead of hydrated bytes" >&2
   exit 1
-}
+else
+  grep_status=$?
+  if [[ "$grep_status" -ne 1 ]]; then
+    echo "grep failed while checking hydrated bytes: $pointer_match_output" >&2
+    exit "$grep_status"
+  fi
+fi
+grep -F "oid sha256:$oid" "$repo_dir/asset/untracked.bin" >/dev/null
+grep -F "oid sha256:$oid" "$repo_dir/docs/pointer-example.txt" >/dev/null
 
 echo "lfs-cloud pull verified against fetched Git LFS cache objects"
