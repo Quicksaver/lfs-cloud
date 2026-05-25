@@ -43,6 +43,8 @@ use crate::{
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
+const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
+const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
 const MAX_CLI_POINTER_CANDIDATE_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
@@ -889,6 +891,7 @@ struct MigrationTargetAccess<'a> {
 #[derive(Debug)]
 enum MigrationSourcePurgeReport {
     GitHub,
+    NotConfigured,
     Unsupported { host: String },
 }
 
@@ -1130,9 +1133,7 @@ fn migration_source_purge_report(
             Some(MigrationSourcePurgeReport::GitHub)
         }
         Some(label) => Some(MigrationSourcePurgeReport::Unsupported { host: label }),
-        None => Some(MigrationSourcePurgeReport::Unsupported {
-            host: "<unset>".to_owned(),
-        }),
+        None => Some(MigrationSourcePurgeReport::NotConfigured),
     }
 }
 
@@ -1140,7 +1141,15 @@ fn source_endpoint_provider_label(url: &str) -> String {
     Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_owned))
-        .unwrap_or_else(|| redacted_url_for_display(url))
+        .unwrap_or_else(|| SOURCE_PROVIDER_UNKNOWN_LABEL.to_owned())
+}
+
+fn source_endpoint_display(discovery: &GitLfsMigrationDiscovery) -> String {
+    discovery
+        .source_endpoint
+        .as_ref()
+        .map(|endpoint| redacted_url_for_display(&endpoint.url))
+        .unwrap_or_else(|| SOURCE_ENDPOINT_UNSET_LABEL.to_owned())
 }
 
 fn write_migration_dry_run_report<W>(
@@ -1163,12 +1172,7 @@ where
     writeln!(
         output,
         "  source: {}",
-        report
-            .discovery
-            .source_endpoint
-            .as_ref()
-            .map(|endpoint| redacted_url_for_display(&endpoint.url))
-            .unwrap_or_else(|| "<unset>".to_owned())
+        source_endpoint_display(&report.discovery)
     )?;
     writeln!(
         output,
@@ -1204,7 +1208,12 @@ where
         .iter()
         .take(MIGRATION_OBJECT_REPORT_LIMIT)
     {
-        writeln!(output, "    sha256:{} ({} bytes)", object.oid, object.size)?;
+        writeln!(
+            output,
+            "    sha256:{} ({} bytes)",
+            object.oid,
+            object.size.bytes()
+        )?;
     }
     if report.scan.objects.len() > MIGRATION_OBJECT_REPORT_LIMIT {
         writeln!(
@@ -1254,6 +1263,11 @@ where
         .sum::<u128>();
 
     writeln!(output, "  source purge:")?;
+    writeln!(
+        output,
+        "    source: {}",
+        source_endpoint_display(&report.discovery)
+    )?;
     match source_purge {
         MigrationSourcePurgeReport::GitHub => {
             writeln!(output, "    provider: GitHub")?;
@@ -1269,19 +1283,33 @@ where
                 output,
                 "    support URL: https://support.github.com/contact-next/product-selection/repositories"
             )?;
-            writeln!(output, "    suggested subject: remove git lfs file")?;
+            writeln!(
+                output,
+                "    suggested subject: Purge Git LFS objects after migration"
+            )?;
             writeln!(
                 output,
                 "    instructions: use GitHub's repository support flow or Virtual Agent, then provide the object IDs and sizes from this report if requested."
             )?;
-            writeln!(output, "    purge manifest:")?;
+            writeln!(
+                output,
+                "    purge manifest: complete object list for GitHub Support"
+            )?;
             for object in &report.scan.objects {
                 writeln!(
                     output,
                     "      sha256:{} ({} bytes)",
-                    object.oid, object.size
+                    object.oid,
+                    object.size.bytes()
                 )?;
             }
+        }
+        MigrationSourcePurgeReport::NotConfigured => {
+            writeln!(output, "    provider: {SOURCE_PROVIDER_UNKNOWN_LABEL}")?;
+            writeln!(
+                output,
+                "    automatic purge: unavailable because no source Git LFS endpoint was detected."
+            )?;
         }
         MigrationSourcePurgeReport::Unsupported { host } => {
             writeln!(output, "    provider: {host}")?;
@@ -2543,6 +2571,16 @@ mod tests {
                 .expect_err("migrate should require explicit dry-run planning");
         assert!(missing_dry_run.to_string().contains("--dry-run"));
 
+        let purge_without_dry_run = Cli::try_parse_from([
+            "lfs-cloud",
+            "migrate",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--purge-source-lfs",
+        ])
+        .expect_err("purge helper should require explicit dry-run planning");
+        assert!(purge_without_dry_run.to_string().contains("--dry-run"));
+
         let conflicting_scopes = Cli::try_parse_from([
             "lfs-cloud",
             "migrate",
@@ -2556,6 +2594,20 @@ mod tests {
         .expect_err("migrate should reject conflicting ref scopes");
         assert!(conflicting_scopes.to_string().contains("--ref"));
         assert!(conflicting_scopes.to_string().contains("--all-refs"));
+    }
+
+    #[test]
+    fn source_endpoint_provider_label_uses_host_or_unknown() {
+        assert_eq!(
+            super::source_endpoint_provider_label(
+                "https://lfs.example.com/owner/repo.git/info/lfs"
+            ),
+            "lfs.example.com"
+        );
+        assert_eq!(
+            super::source_endpoint_provider_label("not a url?token=query-secret"),
+            super::SOURCE_PROVIDER_UNKNOWN_LABEL
+        );
     }
 
     #[test]
@@ -3500,6 +3552,7 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("source purge:"));
+        assert!(rendered.contains("    source: https://github.com/owner/repo.git/info/lfs"));
         assert!(rendered.contains("provider: GitHub"));
         assert!(rendered.contains("automatic purge: unsupported"));
         assert!(rendered.contains("GitHub LFS purge requires GitHub Support."));
@@ -3507,8 +3560,8 @@ mod tests {
             rendered
                 .contains("https://support.github.com/contact-next/product-selection/repositories")
         );
-        assert!(rendered.contains("suggested subject: remove git lfs file"));
-        assert!(rendered.contains("purge manifest:"));
+        assert!(rendered.contains("suggested subject: Purge Git LFS objects after migration"));
+        assert!(rendered.contains("purge manifest: complete object list for GitHub Support"));
         assert!(rendered.contains(object.oid.as_hex()));
         assert!(rendered.contains(&format!("{} bytes", object.size.bytes())));
     }
@@ -3565,6 +3618,7 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("source: https://lfs.example.com/owner/repo.git/info/lfs"));
         assert!(rendered.contains("source purge:"));
+        assert!(rendered.contains("    source: https://lfs.example.com/owner/repo.git/info/lfs"));
         assert!(rendered.contains("provider: lfs.example.com"));
         assert!(!rendered.contains("provider: GitHub"));
         assert!(!rendered.contains("GitHub LFS purge requires GitHub Support."));
@@ -3663,12 +3717,17 @@ mod tests {
         .expect("dry-run migration purge helper should be reported");
 
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        let main_listing_count = rendered
+            .lines()
+            .filter(|line| line.starts_with("    sha256:") && !line.starts_with("      sha256:"))
+            .count();
         let manifest_count = rendered
             .lines()
             .filter(|line| line.starts_with("      sha256:"))
             .count();
         assert!(rendered.contains("... 1 more objects omitted"));
-        assert!(rendered.contains("purge manifest:"));
+        assert_eq!(main_listing_count, super::MIGRATION_OBJECT_REPORT_LIMIT);
+        assert!(rendered.contains("purge manifest: complete object list for GitHub Support"));
         assert_eq!(manifest_count, super::MIGRATION_OBJECT_REPORT_LIMIT + 1);
     }
 
