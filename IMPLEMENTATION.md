@@ -1161,6 +1161,9 @@ Defer:
 > Clean hydrated worktree files can now be dehydrated back to canonical Git LFS
 > pointer files only after the full bytes are verified and preserved in the
 > shared cache; dirty or unrelated worktree content is left untouched.
+> The `hydrate` and `dehydrate` CLI commands now expose those local cache
+> operations for explicit path lists, including `--cache-root` overrides for
+> tests or non-default local cache locations.
 
 ### Progress Summary
 
@@ -1172,11 +1175,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 9      | 4         |
+| 6. CLI Commands                          | 13          | 11     | 2         |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **75** | **24**    |
+| **Total**                                | **99**      | **77** | **22**    |
 
 ### Legend
 
@@ -1323,8 +1326,8 @@ Defer:
 
 - [x] [M] Implement `lfs-cloud status` for server reachability, repo mapping, auth, storage, and local cache status. Manual verification: `scripts/manual/verify-status-command.sh`.
 - [ ] [M] Implement `lfs-cloud pull` wrapper for fetch plus CoW materialization. depends: [8.2.1], [8.2.2], [8.2.3].
-- [ ] [M] Implement `lfs-cloud hydrate <path...>`. depends: [8.2.1], [8.2.2], [8.2.3].
-- [ ] [M] Implement `lfs-cloud dehydrate <path...>`. depends: [8.2.4].
+- [x] [M] Implement `lfs-cloud hydrate <path...>`. depends: [8.2.1], [8.2.2], [8.2.3]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
+- [x] [M] Implement `lfs-cloud dehydrate <path...>`. depends: [8.2.4]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
 - [ ] [M] Implement `lfs-cloud gc` for local cache cleanup. depends: [8.1.4].
 
 ### Phase 7: Migration

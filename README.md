@@ -37,8 +37,9 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > copying elsewhere, and hydrate matching Git LFS pointer files from cache
 > without overwriting non-pointer worktree content. Clean hydrated files can be
 > dehydrated back to Git LFS pointers only after their bytes are verified and
-> preserved in the shared cache. The other commands below are still planned
-> product behavior.
+> preserved in the shared cache. `lfs-cloud hydrate <path...>` and
+> `lfs-cloud dehydrate <path...>` expose those local cache operations through
+> the CLI. The other commands below are still planned product behavior.
 
 ## Why
 
@@ -161,6 +162,28 @@ credential reference can be loaded, and reports whether the local cache objects
 directory already exists. Use `--server` to check a different reachable server
 base URL, or `--cache-root` to inspect a non-default local cache root.
 
+### Hydrate Cached Files
+
+```bash
+lfs-cloud hydrate path/to/file.bin
+```
+
+This replaces matching Git LFS pointer files with verified object bytes from
+the shared local cache. It refuses non-pointer worktree content and fails if the
+referenced object is missing or corrupt in the cache. Use `--cache-root` to
+target a non-default local cache root.
+
+### Dehydrate Files To Pointers
+
+```bash
+lfs-cloud dehydrate path/to/file.bin
+```
+
+This hashes clean worktree bytes, preserves them in the shared local cache, and
+replaces the worktree file with a canonical Git LFS pointer. Existing matching
+pointer files are treated as already dehydrated. Use `--cache-root` to target a
+non-default local cache root.
+
 ### Migrate From Existing Git LFS
 
 ```bash
@@ -273,6 +296,6 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfs-cloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, `lfs-cloud login --server` browser handoff and local LFS token credential-helper storage, `lfs-cloud status` readiness diagnostics for server reachability, repository mapping, local auth, storage credential loading, and local cache directory state, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, local cache path helpers for the planned shared object layout under `~/.lfs-cloud/objects`, verified ingest from existing `.git/lfs/objects` into the shared cache, verified cache-to-worktree materialization with macOS copy-on-write cloning and fallback copying, pointer-file hydration from shared cache without overwriting non-pointer worktree content, clean worktree dehydration back to canonical Git LFS pointers after preserving verified bytes in cache, versioned worktree registrations in `~/.lfs-cloud/worktrees.json` for future local cache garbage collection, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through `lfs-cloud`. CLI hydration, dehydration, garbage collection, and most CLI behavior beyond `serve`, `init --server`, `login --server`, and `status` have not been implemented yet.
+This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfs-cloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, `lfs-cloud login --server` browser handoff and local LFS token credential-helper storage, `lfs-cloud status` readiness diagnostics for server reachability, repository mapping, local auth, storage credential loading, and local cache directory state, `lfs-cloud hydrate <path...>` and `lfs-cloud dehydrate <path...>` local cache operations, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, local cache path helpers for the planned shared object layout under `~/.lfs-cloud/objects`, verified ingest from existing `.git/lfs/objects` into the shared cache, verified cache-to-worktree materialization with macOS copy-on-write cloning and fallback copying, pointer-file hydration from shared cache without overwriting non-pointer worktree content, clean worktree dehydration back to canonical Git LFS pointers after preserving verified bytes in cache, versioned worktree registrations in `~/.lfs-cloud/worktrees.json` for future local cache garbage collection, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through `lfs-cloud`. CLI pull, garbage collection, migration, and release packaging behavior have not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.

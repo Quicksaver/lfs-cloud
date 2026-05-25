@@ -6,8 +6,9 @@
 //! free for focused tests.
 
 use std::{
+    fs::{self, File},
     future::Future,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -17,17 +18,21 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitLfsConfigChange,
     GitLfsConfigTarget, GitRepository, GoogleDriveCredentialLoader, GoogleDriveStorageConfig,
-    LfsInitRoute, LfsSessionToken, LocalCacheLayout, ServeOptions, ServerConfig,
+    LfsInitRoute, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
+    LocalCacheDehydration, LocalCacheDehydrationStatus, LocalCacheLayout,
+    LocalCacheMaterialization, LocalCacheMaterializationStatus, ServeOptions, ServerConfig,
     StorageProviderConfig, TracingConfig, init_tracing,
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CLI_POINTER_CANDIDATE_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "lfs-cloud", version, about, propagate_version = true)]
@@ -55,6 +60,10 @@ enum Command {
     Init(InitCommand),
     /// Check repository, server, auth, storage, and local cache readiness.
     Status(StatusCommand),
+    /// Hydrate Git LFS pointer files from the shared local cache.
+    Hydrate(HydrateCommand),
+    /// Dehydrate clean worktree files back to Git LFS pointers.
+    Dehydrate(DehydrateCommand),
 }
 
 #[derive(Debug, Args)]
@@ -101,6 +110,28 @@ struct StatusCommand {
     cache_root: Option<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct HydrateCommand {
+    /// Local cache root to use instead of ~/.lfs-cloud.
+    #[arg(long, value_name = "PATH")]
+    cache_root: Option<PathBuf>,
+
+    /// Git LFS pointer files to replace with cached object bytes.
+    #[arg(value_name = "PATH", required = true)]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DehydrateCommand {
+    /// Local cache root to use instead of ~/.lfs-cloud.
+    #[arg(long, value_name = "PATH")]
+    cache_root: Option<PathBuf>,
+
+    /// Clean hydrated files to replace with Git LFS pointers.
+    #[arg(value_name = "PATH", required = true)]
+    paths: Vec<PathBuf>,
+}
+
 /// Parses process arguments, initializes tracing, and runs the requested command.
 ///
 /// # Errors
@@ -116,16 +147,20 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         run_init_to_stdout,
         run_login_to_stdio,
         run_status_to_stdout,
+        run_hydrate_to_stdout,
+        run_dehydrate_to_stdout,
     )
     .await
 }
 
-async fn dispatch<F, Fut, I, L, S>(
+async fn dispatch<F, Fut, I, L, S, H, D>(
     cli: Cli,
     serve: F,
     init: I,
     login: L,
     status: S,
+    hydrate: H,
+    dehydrate: D,
 ) -> anyhow::Result<()>
 where
     F: FnOnce(ServeOptions) -> Fut,
@@ -133,6 +168,8 @@ where
     I: FnOnce(InitCommand) -> anyhow::Result<()>,
     L: FnOnce(LoginCommand) -> anyhow::Result<()>,
     S: FnOnce(StatusCommand, Option<PathBuf>) -> anyhow::Result<()>,
+    H: FnOnce(HydrateCommand) -> anyhow::Result<()>,
+    D: FnOnce(DehydrateCommand) -> anyhow::Result<()>,
 {
     // Keep command execution injectable only at the command boundary; each new
     // subcommand should add its own runner here rather than hiding side effects
@@ -146,6 +183,8 @@ where
         Command::Status(command) => {
             status(command, cli.config).context("failed to check lfs-cloud status")
         }
+        Command::Hydrate(command) => hydrate(command).context("failed to hydrate paths"),
+        Command::Dehydrate(command) => dehydrate(command).context("failed to dehydrate paths"),
     }
 }
 
@@ -208,6 +247,20 @@ fn run_status_to_stdout_blocking(
         validate_status_storage,
     )
     .map_err(anyhow::Error::from)
+}
+
+fn run_hydrate_to_stdout(command: HydrateCommand) -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+    let mut stdout = io::stdout().lock();
+
+    run_hydrate_from_dir(command, &current_dir, &mut stdout).map_err(anyhow::Error::from)
+}
+
+fn run_dehydrate_to_stdout(command: DehydrateCommand) -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+    let mut stdout = io::stdout().lock();
+
+    run_dehydrate_from_dir(command, &current_dir, &mut stdout).map_err(anyhow::Error::from)
 }
 
 fn run_login<R, W>(command: LoginCommand, input: &mut R, output: &mut W) -> anyhow::Result<()>
@@ -471,6 +524,207 @@ where
     }
 
     Ok(())
+}
+
+fn run_hydrate_from_dir<W>(
+    command: HydrateCommand,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+) -> CliResult<()>
+where
+    W: Write,
+{
+    let layout = local_cache_layout(command.cache_root)?;
+    let start_dir = start_dir.as_ref();
+
+    for path in command.paths {
+        let path = resolve_cli_path(start_dir, &path);
+        let materialization = layout
+            .hydrate_pointer_file(&path)
+            .map_err(local_cache_cli_error)?;
+        write_hydrate_result(output, &materialization).map_err(output_error)?;
+    }
+
+    Ok(())
+}
+
+fn run_dehydrate_from_dir<W>(
+    command: DehydrateCommand,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+) -> CliResult<()>
+where
+    W: Write,
+{
+    let layout = local_cache_layout(command.cache_root)?;
+    let start_dir = start_dir.as_ref();
+
+    for path in command.paths {
+        let path = resolve_cli_path(start_dir, &path);
+        let object = object_for_dehydration_path(&path)?;
+        let dehydration = layout
+            .dehydrate_file(&object, &path)
+            .map_err(local_cache_cli_error)?;
+        write_dehydrate_result(output, &dehydration).map_err(output_error)?;
+    }
+
+    Ok(())
+}
+
+fn local_cache_layout(cache_root: Option<PathBuf>) -> CliResult<LocalCacheLayout> {
+    match cache_root {
+        Some(cache_root) => Ok(LocalCacheLayout::new(cache_root)),
+        None => match std::env::var_os("HOME") {
+            Some(home_dir) => Ok(LocalCacheLayout::from_home_dir(home_dir)),
+            None => Err(CliError::InvalidArguments {
+                message: "HOME is not set and --cache-root was not provided".to_owned(),
+            }),
+        },
+    }
+}
+
+fn resolve_cli_path(start_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        start_dir.join(path)
+    }
+}
+
+fn object_for_dehydration_path(path: &Path) -> CliResult<LfsObject> {
+    let metadata = fs::metadata(path).map_err(|source| CliError::Io {
+        context: format!("failed to inspect dehydration path {}", path.display()),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(CliError::InvalidArguments {
+            message: format!("dehydration path is not a file: {}", path.display()),
+        });
+    }
+
+    if let Some(pointer) = existing_lfs_pointer(path, metadata.len())? {
+        return Ok(pointer.object);
+    }
+
+    hash_file_object(path)
+}
+
+fn existing_lfs_pointer(path: &Path, size: u64) -> CliResult<Option<LfsPointer>> {
+    if size > MAX_CLI_POINTER_CANDIDATE_SIZE {
+        return Ok(None);
+    }
+
+    let file = File::open(path).map_err(|source| CliError::Io {
+        context: format!("failed to open dehydration path {}", path.display()),
+        source,
+    })?;
+    let mut contents = Vec::new();
+    file.take(MAX_CLI_POINTER_CANDIDATE_SIZE + 1)
+        .read_to_end(&mut contents)
+        .map_err(|source| CliError::Io {
+            context: format!("failed to read dehydration path {}", path.display()),
+            source,
+        })?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CLI_POINTER_CANDIDATE_SIZE {
+        return Ok(None);
+    }
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return Ok(None);
+    };
+
+    Ok(LfsPointer::parse(contents).ok())
+}
+
+fn hash_file_object(path: &Path) -> CliResult<LfsObject> {
+    let mut file = File::open(path).map_err(|source| CliError::Io {
+        context: format!("failed to open dehydration path {}", path.display()),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|source| CliError::Io {
+            context: format!("failed to read dehydration path {}", path.display()),
+            source,
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+        size = size
+            .checked_add(u64::try_from(bytes_read).unwrap_or(u64::MAX))
+            .ok_or_else(|| CliError::InvalidArguments {
+                message: format!("file is too large to dehydrate: {}", path.display()),
+            })?;
+    }
+
+    let oid = LfsOid::new(format!("{:x}", hasher.finalize())).map_err(|source| {
+        CliError::InvalidArguments {
+            message: format!(
+                "failed to build SHA-256 object id for {}: {source}",
+                path.display()
+            ),
+        }
+    })?;
+
+    Ok(LfsObject::new(oid, LfsObjectSize::new(size)))
+}
+
+fn write_hydrate_result<W>(
+    output: &mut W,
+    materialization: &LocalCacheMaterialization,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        output,
+        "hydrated {} sha256:{} ({} bytes) {}",
+        materialization.destination_path.display(),
+        materialization.object.oid,
+        materialization.object.size,
+        materialization_status_label(materialization.status)
+    )
+}
+
+fn write_dehydrate_result<W>(output: &mut W, dehydration: &LocalCacheDehydration) -> io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        output,
+        "dehydrated {} sha256:{} ({} bytes) {}",
+        dehydration.pointer_path.display(),
+        dehydration.object.oid,
+        dehydration.object.size,
+        dehydration_status_label(dehydration.status)
+    )
+}
+
+fn materialization_status_label(status: LocalCacheMaterializationStatus) -> &'static str {
+    match status {
+        LocalCacheMaterializationStatus::AlreadyMaterialized => "already-materialized",
+        LocalCacheMaterializationStatus::CopyOnWriteAttempted => "copy-on-write-attempted",
+        LocalCacheMaterializationStatus::Copied => "copied",
+    }
+}
+
+fn dehydration_status_label(status: LocalCacheDehydrationStatus) -> &'static str {
+    match status {
+        LocalCacheDehydrationStatus::AlreadyDehydrated => "already-dehydrated",
+        LocalCacheDehydrationStatus::ReplacedWithPointer => "replaced-with-pointer",
+        LocalCacheDehydrationStatus::CachedAndReplacedWithPointer => {
+            "cached-and-replaced-with-pointer"
+        }
+    }
+}
+
+fn local_cache_cli_error(error: crate::LocalCacheError) -> CliError {
+    CliError::InvalidArguments {
+        message: error.to_string(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -829,23 +1083,25 @@ where
 mod tests {
     use std::{
         fs, io,
-        path::Path,
+        path::{Path, PathBuf},
         process::Command as ProcessCommand,
         sync::{Arc, Mutex},
     };
 
     use clap::{CommandFactory, Parser};
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     use super::{
-        Cli, InitCommand, LoginCommand, StatusCommand, dispatch, login_url_for_server,
-        probe_server_reachable, run_init_from_dir, run_login_from_dir, run_status_from_dir,
-        sanitize_browser_stderr, tracing_config, validate_status_storage, write_init_change,
+        Cli, DehydrateCommand, HydrateCommand, InitCommand, LoginCommand, StatusCommand, dispatch,
+        login_url_for_server, probe_server_reachable, run_dehydrate_from_dir, run_hydrate_from_dir,
+        run_init_from_dir, run_login_from_dir, run_status_from_dir, sanitize_browser_stderr,
+        tracing_config, validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
-        GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig, ServeOptions,
-        StorageProviderConfig,
+        GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
+        LfsOid, LfsPointer, LocalCacheLayout, ServeOptions, StorageProviderConfig,
     };
 
     #[test]
@@ -956,6 +1212,51 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_command_accepts_cache_root_and_paths() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "hydrate",
+            "--cache-root",
+            "/tmp/lfs-cloud-cache",
+            "asset/model.bin",
+            "asset/texture.bin",
+        ])
+        .expect("hydrate command should parse");
+
+        let super::Command::Hydrate(command) = cli.command else {
+            panic!("hydrate subcommand should parse");
+        };
+
+        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert_eq!(
+            command.paths,
+            vec![
+                PathBuf::from("asset/model.bin"),
+                PathBuf::from("asset/texture.bin")
+            ]
+        );
+    }
+
+    #[test]
+    fn dehydrate_command_accepts_cache_root_and_paths() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "dehydrate",
+            "--cache-root",
+            "/tmp/lfs-cloud-cache",
+            "asset/model.bin",
+        ])
+        .expect("dehydrate command should parse");
+
+        let super::Command::Dehydrate(command) = cli.command else {
+            panic!("dehydrate subcommand should parse");
+        };
+
+        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert_eq!(command.paths, vec![PathBuf::from("asset/model.bin")]);
+    }
+
+    #[test]
     fn serve_command_accepts_global_config_before_subcommand() {
         let cli = Cli::try_parse_from([
             "lfs-cloud",
@@ -1061,6 +1362,8 @@ mod tests {
             |_| unreachable!("init runner must not be called for serve command"),
             |_| unreachable!("login runner must not be called for serve command"),
             |_, _| unreachable!("status runner must not be called for serve command"),
+            |_| unreachable!("hydrate runner must not be called for serve command"),
+            |_| unreachable!("dehydrate runner must not be called for serve command"),
         )
         .await
         .expect("serve dispatch should succeed");
@@ -1093,6 +1396,8 @@ mod tests {
             },
             |_| unreachable!("login runner must not be called for init command"),
             |_, _| unreachable!("status runner must not be called for init command"),
+            |_| unreachable!("hydrate runner must not be called for init command"),
+            |_| unreachable!("dehydrate runner must not be called for init command"),
         )
         .await
         .expect("init dispatch should succeed");
@@ -1121,6 +1426,8 @@ mod tests {
                 Ok(())
             },
             |_, _| unreachable!("status runner must not be called for login command"),
+            |_| unreachable!("hydrate runner must not be called for login command"),
+            |_| unreachable!("dehydrate runner must not be called for login command"),
         )
         .await
         .expect("login dispatch should succeed");
@@ -1156,6 +1463,8 @@ mod tests {
                     .expect("capture mutex should lock") = Some((command.server, config_path));
                 Ok(())
             },
+            |_| unreachable!("hydrate runner must not be called for status command"),
+            |_| unreachable!("dehydrate runner must not be called for status command"),
         )
         .await
         .expect("status dispatch should succeed");
@@ -1166,6 +1475,66 @@ mod tests {
                 Some("http://127.0.0.1:8080".to_owned()),
                 Some("lfs-cloud.test.yml".into())
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_hydrate_with_paths() {
+        let cli = Cli::try_parse_from(["lfs-cloud", "hydrate", "asset/model.bin"])
+            .expect("hydrate command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for hydrate command") },
+            |_| unreachable!("init runner must not be called for hydrate command"),
+            |_| unreachable!("login runner must not be called for hydrate command"),
+            |_, _| unreachable!("status runner must not be called for hydrate command"),
+            move |command| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(command.paths);
+                Ok(())
+            },
+            |_| unreachable!("dehydrate runner must not be called for hydrate command"),
+        )
+        .await
+        .expect("hydrate dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some(vec![PathBuf::from("asset/model.bin")])
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_dehydrate_with_paths() {
+        let cli = Cli::try_parse_from(["lfs-cloud", "dehydrate", "asset/model.bin"])
+            .expect("dehydrate command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for dehydrate command") },
+            |_| unreachable!("init runner must not be called for dehydrate command"),
+            |_| unreachable!("login runner must not be called for dehydrate command"),
+            |_, _| unreachable!("status runner must not be called for dehydrate command"),
+            |_| unreachable!("hydrate runner must not be called for dehydrate command"),
+            move |command| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(command.paths);
+                Ok(())
+            },
+        )
+        .await
+        .expect("dehydrate dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some(vec![PathBuf::from("asset/model.bin")])
         );
     }
 
@@ -1526,6 +1895,108 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_replaces_pointer_file_with_verified_cache_object() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let worktree_file = repo.join("asset/model.bin");
+        let bytes = b"cached model bytes";
+        let object = object_for_bytes(bytes);
+        let layout = LocalCacheLayout::new(&cache_root);
+        write_file(&layout.object_path(&object), bytes);
+        write_file(
+            &worktree_file,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        let mut output = Vec::new();
+
+        run_hydrate_from_dir(
+            HydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![PathBuf::from("asset/model.bin")],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect("hydrate should replace pointer with cache bytes");
+
+        assert_eq!(
+            fs::read(&worktree_file).expect("hydrated file should be readable"),
+            bytes
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("hydrated"));
+        assert!(rendered.contains("copied") || rendered.contains("copy-on-write-attempted"));
+        assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn dehydrate_caches_clean_file_and_writes_pointer() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let worktree_file = repo.join("asset/model.bin");
+        let bytes = b"hydrated model bytes";
+        let object = object_for_bytes(bytes);
+        let layout = LocalCacheLayout::new(&cache_root);
+        write_file(&worktree_file, bytes);
+        let mut output = Vec::new();
+
+        run_dehydrate_from_dir(
+            DehydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![PathBuf::from("asset/model.bin")],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect("dehydrate should cache bytes and write pointer");
+
+        assert_eq!(
+            fs::read(layout.object_path(&object)).expect("cached file should be readable"),
+            bytes
+        );
+        assert_eq!(
+            fs::read_to_string(&worktree_file).expect("pointer file should be readable"),
+            LfsPointer::new(object.clone()).to_pointer_file()
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("dehydrated"));
+        assert!(rendered.contains("cached-and-replaced-with-pointer"));
+        assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn dehydrate_accepts_existing_pointer_as_idempotent() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let worktree_file = repo.join("asset/model.bin");
+        let object = object_for_bytes(b"already dehydrated bytes");
+        let pointer = LfsPointer::new(object.clone()).to_pointer_file();
+        write_file(&worktree_file, pointer.as_bytes());
+        let mut output = Vec::new();
+
+        run_dehydrate_from_dir(
+            DehydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![PathBuf::from("asset/model.bin")],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect("existing pointer should be accepted");
+
+        assert_eq!(
+            fs::read_to_string(&worktree_file).expect("pointer file should be readable"),
+            pointer
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("already-dehydrated"));
+        assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
     fn login_url_preserves_server_base_path() {
         assert_eq!(
             login_url_for_server("https://lfs.example.com/custom/base")
@@ -1731,6 +2202,23 @@ repositories:
     storage_provider: drive-user-a
 "#
         )
+    }
+
+    fn object_for_bytes(bytes: &[u8]) -> LfsObject {
+        let oid = LfsOid::new(format!("{:x}", Sha256::digest(bytes)))
+            .expect("test SHA-256 object id should parse");
+
+        LfsObject::new(
+            oid,
+            LfsObjectSize::new(u64::try_from(bytes.len()).expect("test bytes should fit u64")),
+        )
+    }
+
+    fn write_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("file parent should be created");
+        }
+        fs::write(path, contents).expect("test file should be written");
     }
 
     fn git_is_available() -> bool {
