@@ -8,11 +8,12 @@
 
 use std::{
     collections::BTreeSet,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -28,6 +29,7 @@ pub const LOCAL_CACHE_WORKTREES_FILE: &str = "worktrees.json";
 const OBJECT_SHARD_WIDTH: usize = 2;
 const OBJECT_SHARD_LEVELS: usize = 2;
 const OBJECT_SHARD_PREFIX_LENGTH: usize = OBJECT_SHARD_WIDTH * OBJECT_SHARD_LEVELS;
+const WORKTREE_REGISTRY_LOCK_FILE: &str = "worktrees.json.lock";
 const WORKTREE_REGISTRY_VERSION: u32 = 1;
 
 /// Result type for local cache operations.
@@ -509,6 +511,7 @@ impl LocalCacheLayout {
     ) -> LocalCacheResult<LocalCacheWorktreeRegistrationChange> {
         registration.validate()?;
 
+        let _lock = self.lock_worktree_registry()?;
         let mut registry = self.load_worktree_registry()?;
         let status = registry.upsert(registration.clone());
 
@@ -538,6 +541,7 @@ impl LocalCacheLayout {
         let worktree_root = worktree_root.as_ref();
         validate_absolute_path("worktree_root", worktree_root)?;
 
+        let _lock = self.lock_worktree_registry()?;
         let mut registry = self.load_worktree_registry()?;
         let removed = registry.remove(worktree_root);
 
@@ -546,6 +550,39 @@ impl LocalCacheLayout {
         }
 
         Ok(removed)
+    }
+
+    fn worktree_registry_lock_path(&self) -> PathBuf {
+        self.root.join(WORKTREE_REGISTRY_LOCK_FILE)
+    }
+
+    fn lock_worktree_registry(&self) -> LocalCacheResult<File> {
+        fs::create_dir_all(&self.root).map_err(|source| LocalCacheError::Io {
+            context: "failed to create local cache root",
+            path: self.root.clone(),
+            source,
+        })?;
+
+        let path = self.worktree_registry_lock_path();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| LocalCacheError::Io {
+                context: "failed to open local cache worktree registry lock",
+                path: path.clone(),
+                source,
+            })?;
+
+        FileExt::lock(&lock).map_err(|source| LocalCacheError::Io {
+            context: "failed to lock local cache worktree registry",
+            path,
+            source,
+        })?;
+
+        Ok(lock)
     }
 
     fn save_worktree_registry(
@@ -899,6 +936,9 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         str::FromStr,
+        sync::mpsc,
+        thread,
+        time::Duration,
     };
 
     use crate::LfsObjectSize;
@@ -1215,6 +1255,56 @@ mod tests {
                 .worktrees(),
             &[updated]
         );
+    }
+
+    #[test]
+    fn register_worktree_waits_for_registry_lock() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        fs::create_dir_all(layout.root()).expect("cache root should be created");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(layout.worktree_registry_lock_path())
+            .expect("registry lock file should open");
+        FileExt::lock(&lock_file).expect("registry lock should be acquired by test");
+
+        let registration = LocalCacheWorktreeRegistration::new(
+            "github-main:owner/repo",
+            temp.path().join("repo"),
+            temp.path().join("repo/.git"),
+        )
+        .expect("absolute registration should validate");
+        let thread_layout = layout.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test should receive worker start");
+            done_tx
+                .send(thread_layout.register_worktree(registration))
+                .expect("test should receive registration result");
+        });
+
+        started_rx
+            .recv()
+            .expect("worker should report before attempting registration");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "registration should wait while another process holds the registry lock"
+        );
+
+        drop(lock_file);
+        let change = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("registration should finish after lock release")
+            .expect("worktree should register");
+        worker.join().expect("worker should not panic");
+
+        assert_eq!(change.status, LocalCacheWorktreeRegistrationStatus::Added);
     }
 
     #[cfg(unix)]
