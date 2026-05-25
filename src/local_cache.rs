@@ -16,6 +16,8 @@ pub const DEFAULT_LOCAL_CACHE_HOME_DIR: &str = ".lfs-cloud";
 pub const LOCAL_CACHE_OBJECTS_DIR: &str = "objects";
 
 const OBJECT_SHARD_WIDTH: usize = 2;
+const OBJECT_SHARD_LEVELS: usize = 2;
+const OBJECT_SHARD_PREFIX_LENGTH: usize = OBJECT_SHARD_WIDTH * OBJECT_SHARD_LEVELS;
 
 /// Deterministic filesystem layout for local Git LFS object cache paths.
 ///
@@ -23,14 +25,14 @@ const OBJECT_SHARD_WIDTH: usize = 2;
 ///
 /// ```
 /// use std::path::PathBuf;
-/// use std::str::FromStr;
 ///
 /// use lfs_cloud::{LocalCacheLayout, LfsOid};
 ///
 /// let layout = LocalCacheLayout::new("/home/alice/.lfs-cloud");
-/// let oid = LfsOid::from_str(
+/// let oid = LfsOid::new(
 ///     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-/// )?;
+/// )
+/// .expect("example OID should be valid");
 ///
 /// assert_eq!(
 ///     layout.object_path_for_oid(&oid),
@@ -38,7 +40,6 @@ const OBJECT_SHARD_WIDTH: usize = 2;
 ///         "/home/alice/.lfs-cloud/objects/01/23/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 ///     )
 /// );
-/// # Ok::<(), lfs_cloud::LfsObjectError>(())
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalCacheLayout {
@@ -90,8 +91,7 @@ impl LocalCacheLayout {
     #[must_use]
     pub fn object_path_for_oid(&self, oid: &LfsOid) -> PathBuf {
         let hex = oid.as_hex();
-        let first_shard = &hex[..OBJECT_SHARD_WIDTH];
-        let second_shard = &hex[OBJECT_SHARD_WIDTH..OBJECT_SHARD_WIDTH * 2];
+        let [first_shard, second_shard] = object_shards(hex);
 
         self.objects_dir()
             .join(first_shard)
@@ -100,11 +100,28 @@ impl LocalCacheLayout {
     }
 }
 
+fn object_shards(hex: &str) -> [&str; OBJECT_SHARD_LEVELS] {
+    debug_assert!(
+        hex.len() >= OBJECT_SHARD_PREFIX_LENGTH,
+        "validated SHA-256 OID should be long enough for cache sharding"
+    );
+
+    [
+        hex.get(..OBJECT_SHARD_WIDTH)
+            .expect("validated SHA-256 OID should contain the first cache shard"),
+        hex.get(OBJECT_SHARD_WIDTH..OBJECT_SHARD_PREFIX_LENGTH)
+            .expect("validated SHA-256 OID should contain the second cache shard"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, str::FromStr};
+    use std::{
+        path::{Path, PathBuf},
+        str::FromStr,
+    };
 
-    use crate::{LfsObjectSize, local_cache::DEFAULT_LOCAL_CACHE_HOME_DIR};
+    use crate::LfsObjectSize;
 
     use super::*;
 
