@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -168,6 +168,16 @@ pub enum LocalCacheError {
         size: u64,
         /// Maximum pointer file size accepted by hydration.
         max_size: u64,
+    },
+
+    /// A worktree path was small enough to be a pointer but was not UTF-8 text.
+    #[error("Git LFS pointer at {} is not valid UTF-8: {source}", path.display())]
+    PointerFileInvalidUtf8 {
+        /// Pointer file path.
+        path: PathBuf,
+        /// Underlying UTF-8 validation failure.
+        #[source]
+        source: std::str::Utf8Error,
     },
 }
 
@@ -396,8 +406,12 @@ pub struct LocalCacheMaterialization {
 pub enum LocalCacheMaterializationStatus {
     /// Destination already contained the exact verified object bytes.
     AlreadyMaterialized,
-    /// Destination was created using the platform's copy-on-write primitive.
-    CopyOnWriteCloned,
+    /// Destination was created using the platform's copy-on-write path.
+    ///
+    /// Some platform tools may silently fall back to a normal copy while still
+    /// reporting success, so this status records the selected strategy rather
+    /// than a guaranteed backend storage layout.
+    CopyOnWriteAttempted,
     /// Destination was created by copying bytes because CoW was unavailable.
     Copied,
 }
@@ -828,23 +842,31 @@ fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut contents = String::new();
+    let mut contents = Vec::new();
     file.take(MAX_LFS_POINTER_FILE_SIZE + 1)
-        .read_to_string(&mut contents)
+        .read_to_end(&mut contents)
         .map_err(|source| LocalCacheError::Io {
             context: "failed to read Git LFS pointer file",
             path: path.to_path_buf(),
             source,
         })?;
-    if contents.len() as u64 > MAX_LFS_POINTER_FILE_SIZE {
+    let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+    if size > MAX_LFS_POINTER_FILE_SIZE {
         return Err(LocalCacheError::PointerFileTooLarge {
             path: path.to_path_buf(),
-            size: contents.len() as u64,
+            size,
             max_size: MAX_LFS_POINTER_FILE_SIZE,
         });
     }
 
-    LfsPointer::parse(&contents).map_err(|source| LocalCacheError::PointerParse {
+    let contents = std::str::from_utf8(&contents).map_err(|source| {
+        LocalCacheError::PointerFileInvalidUtf8 {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+
+    LfsPointer::parse(contents).map_err(|source| LocalCacheError::PointerParse {
         path: path.to_path_buf(),
         source,
     })
@@ -902,14 +924,13 @@ fn materialize_verified_object(
         source,
     })?;
 
-    let (temp, status) = materialize_to_temporary_file(
-        &verified.path,
-        destination_parent,
-        destination_path,
-        &verified.object,
-    )?;
+    let (temp, status) =
+        materialize_to_temporary_file(&verified.path, destination_parent, &verified.object)?;
 
     publish_materialized_file(temp, destination_path, mode, &verified.object)?;
+    // The final verification proves the path currently contains the expected
+    // object. If an uncoordinated writer races this local worktree path, the
+    // caller may still receive an integrity error after publication.
     let materialized = verify_file_object(destination_path, &verified.object)?;
 
     Ok(LocalCacheMaterialization {
@@ -931,13 +952,19 @@ fn existing_destination_status(
     object: &LfsObject,
 ) -> LocalCacheResult<ExistingDestinationStatus> {
     match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => match verify_file_object(path, object) {
-            Ok(_) => Ok(ExistingDestinationStatus::AlreadyMaterialized),
-            Err(LocalCacheError::IntegrityMismatch { .. }) => {
-                Ok(ExistingDestinationStatus::Different)
+        Ok(metadata) if metadata.is_file() => {
+            if metadata.len() != object.size.bytes() {
+                return Ok(ExistingDestinationStatus::Different);
             }
-            Err(error) => Err(error),
-        },
+
+            match verify_file_object(path, object) {
+                Ok(_) => Ok(ExistingDestinationStatus::AlreadyMaterialized),
+                Err(LocalCacheError::IntegrityMismatch { .. }) => {
+                    Ok(ExistingDestinationStatus::Different)
+                }
+                Err(error) => Err(error),
+            }
+        }
         Ok(_) => Err(LocalCacheError::Io {
             context: "materialization destination is not a file",
             path: path.to_path_buf(),
@@ -957,10 +984,9 @@ fn existing_destination_status(
 fn materialize_to_temporary_file(
     cache_path: &Path,
     destination_parent: &Path,
-    destination_path: &Path,
     object: &LfsObject,
 ) -> LocalCacheResult<(tempfile::NamedTempFile, LocalCacheMaterializationStatus)> {
-    let temp = tempfile::NamedTempFile::new_in(destination_parent).map_err(|source| {
+    let mut temp = tempfile::NamedTempFile::new_in(destination_parent).map_err(|source| {
         LocalCacheError::Io {
             context: "failed to create temporary materialized object",
             path: destination_parent.to_path_buf(),
@@ -970,9 +996,9 @@ fn materialize_to_temporary_file(
 
     let status = if copy_on_write_clone(cache_path, temp.path())? {
         verify_file_object(temp.path(), object)?;
-        LocalCacheMaterializationStatus::CopyOnWriteCloned
+        LocalCacheMaterializationStatus::CopyOnWriteAttempted
     } else {
-        copy_cache_object_to_temporary_file(cache_path, &temp, destination_path, object)?;
+        copy_cache_object_to_temporary_file(cache_path, &mut temp, object)?;
         LocalCacheMaterializationStatus::Copied
     };
 
@@ -981,8 +1007,7 @@ fn materialize_to_temporary_file(
 
 fn copy_cache_object_to_temporary_file(
     cache_path: &Path,
-    temp: &tempfile::NamedTempFile,
-    destination_path: &Path,
+    temp: &mut tempfile::NamedTempFile,
     expected: &LfsObject,
 ) -> LocalCacheResult<()> {
     let mut source = File::open(cache_path).map_err(|source| LocalCacheError::Io {
@@ -990,11 +1015,16 @@ fn copy_cache_object_to_temporary_file(
         path: cache_path.to_path_buf(),
         source,
     })?;
-    let mut destination = File::create(temp.path()).map_err(|source| LocalCacheError::Io {
-        context: "failed to open temporary materialized object",
-        path: temp.path().to_path_buf(),
-        source,
-    })?;
+    let temp_path = temp.path().to_path_buf();
+    let destination = temp.as_file_mut();
+    destination
+        .set_len(0)
+        .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to open temporary materialized object",
+            path: temp_path.clone(),
+            source,
+        })?;
     let mut hasher = Sha256::new();
     let mut total_size = 0u64;
     let mut buffer = [0u8; 64 * 1024];
@@ -1015,7 +1045,7 @@ fn copy_cache_object_to_temporary_file(
             .write_all(&buffer[..read])
             .map_err(|source| LocalCacheError::Io {
                 context: "failed to write temporary materialized object",
-                path: destination_path.to_path_buf(),
+                path: temp_path.clone(),
                 source,
             })?;
         hasher.update(&buffer[..read]);
@@ -1029,7 +1059,7 @@ fn copy_cache_object_to_temporary_file(
     }
     destination.flush().map_err(|source| LocalCacheError::Io {
         context: "failed to flush temporary materialized object",
-        path: destination_path.to_path_buf(),
+        path: temp_path,
         source,
     })?;
 
@@ -1085,6 +1115,9 @@ fn publish_materialized_file(
             }
         }
         MaterializationMode::ReplaceMatchingPointer => {
+            // This second read is a best-effort local race check before the
+            // atomic replacement. Uncoordinated worktree writers can still
+            // change the destination after this point.
             let pointer = read_lfs_pointer_file(destination_path)?;
             if pointer.object != *object {
                 return Err(LocalCacheError::MaterializationTargetExists {
@@ -1152,6 +1185,9 @@ fn set_materialized_file_mode(
 
 #[cfg(target_os = "macos")]
 fn copy_on_write_clone(source_path: &Path, destination_path: &Path) -> LocalCacheResult<bool> {
+    // `NamedTempFile` keeps an open descriptor for cleanup, but this macOS-only
+    // path intentionally operates by pathname and verifies that path before
+    // publication. Fallback copying writes through the open handle.
     let output = std::process::Command::new("/bin/cp")
         .arg("-c")
         .arg(source_path)
@@ -1163,7 +1199,19 @@ fn copy_on_write_clone(source_path: &Path, destination_path: &Path) -> LocalCach
             source,
         })?;
 
-    Ok(output.status.success())
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    tracing::debug!(
+        source = %source_path.display(),
+        destination = %destination_path.display(),
+        status = %output.status,
+        stderr = %String::from_utf8_lossy(&output.stderr),
+        "macOS copy-on-write clone command failed; falling back to verified copy"
+    );
+
+    Ok(false)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1697,7 +1745,7 @@ mod tests {
         assert!(matches!(
             materialization.status,
             LocalCacheMaterializationStatus::Copied
-                | LocalCacheMaterializationStatus::CopyOnWriteCloned
+                | LocalCacheMaterializationStatus::CopyOnWriteAttempted
         ));
         assert_eq!(
             fs::read(&materialization.destination_path)
@@ -1795,7 +1843,7 @@ mod tests {
         assert!(matches!(
             materialization.status,
             LocalCacheMaterializationStatus::Copied
-                | LocalCacheMaterializationStatus::CopyOnWriteCloned
+                | LocalCacheMaterializationStatus::CopyOnWriteAttempted
         ));
         assert_eq!(
             fs::read(&destination).expect("hydrated destination should be readable"),
@@ -1855,6 +1903,28 @@ mod tests {
         assert_eq!(
             fs::read(&destination).expect("destination should remain untouched"),
             b"dirty non-pointer contents"
+        );
+    }
+
+    #[test]
+    fn hydrate_pointer_file_rejects_non_utf8_worktree_content() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let destination = temp.path().join("repo/assets/model.bin");
+        let bytes = b"version https://git-lfs.github.com/spec/v1\noid sha256:\xff\nsize 1\n";
+        write_file(&destination, bytes);
+
+        let error = layout
+            .hydrate_pointer_file(&destination)
+            .expect_err("non-UTF-8 worktree content should not hydrate");
+
+        assert!(matches!(
+            error,
+            LocalCacheError::PointerFileInvalidUtf8 { path, .. } if path == destination
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("destination should remain untouched"),
+            bytes
         );
     }
 
