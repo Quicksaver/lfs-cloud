@@ -1133,7 +1133,10 @@ Defer:
 > before writing, and times out idle client body reads.
 > The binary now uses a testable `clap` root command with shared `--config`
 > and `--log-level` flags, initializes tracing from CLI or `RUST_LOG`, and
-> dispatches `serve` through the server runtime.
+> dispatches `serve` through the server runtime. CLI support code can now
+> detect the current Git worktree and parse GitHub-style HTTPS/SSH remotes
+> into host, owner, and repository name components for future `init` and
+> migration commands.
 
 ### Progress Summary
 
@@ -1145,11 +1148,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 3      | 10        |
+| 6. CLI Commands                          | 13          | 4      | 9         |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **61** | **38**    |
+| **Total**                                | **99**      | **62** | **37**    |
 
 ### Legend
 
@@ -1287,7 +1290,7 @@ Defer:
 #### Epic 6.2: Login And Init
 
 - [ ] [M] Implement `lfs-cloud login` browser flow for GitHub OAuth.
-- [ ] [T] Implement Git repository detection and remote parsing.
+- [x] [T] Implement Git repository detection and remote parsing.
 - [ ] [T] Implement `lfs-cloud init --server` route resolution for the current repo.
 - [ ] [T] Implement `.lfsconfig` write/update with backup or diff output.
 - [ ] [T] Implement local-only `git config lfs.url` option if the user does not want committed `.lfsconfig`.
