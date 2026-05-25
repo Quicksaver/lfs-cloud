@@ -516,29 +516,21 @@ fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> MigrationResult<V
 }
 
 fn parse_git_check_attr_filter_stdout(stdout: &[u8]) -> MigrationResult<Vec<PathBuf>> {
-    if stdout.len() > MAX_MIGRATION_GIT_OUTPUT_BYTES {
-        return Err(MigrationError::ExternalCommandOutput {
-            command: "git check-attr -z --stdin filter".to_owned(),
-            message: SanitizedMessage::new("git returned too much output"),
-        });
-    }
-
-    let mut fields = stdout.split(|byte| *byte == b'\0').collect::<Vec<_>>();
-    if fields.last() == Some(&&[][..]) {
-        fields.pop();
-    }
-
-    let chunks = fields.chunks_exact(3);
-    if !chunks.remainder().is_empty() {
-        return Err(git_check_attr_parse_error());
-    }
-
     let mut paths = Vec::new();
-    for chunk in chunks {
-        let [relative_path, attribute, value] = chunk else {
-            unreachable!("chunks_exact yielded a non-triple chunk");
+    let mut fields = stdout.split(|byte| *byte == b'\0').peekable();
+    while let Some(relative_path) = fields.next() {
+        if relative_path.is_empty() && fields.peek().is_none() {
+            break;
+        }
+
+        let Some(attribute) = fields.next() else {
+            return Err(git_check_attr_parse_error());
         };
-        if *attribute == b"filter" && *value == b"lfs" {
+        let Some(value) = fields.next() else {
+            return Err(git_check_attr_parse_error());
+        };
+
+        if attribute == b"filter" && value == b"lfs" {
             paths.push(safe_git_relative_path(
                 relative_path,
                 "git check-attr -z --stdin filter",
@@ -1293,20 +1285,19 @@ mod tests {
     }
 
     #[test]
-    fn current_checkout_pointer_scan_rejects_oversized_attribute_output() {
-        let stdout = vec![b'a'; MAX_MIGRATION_GIT_OUTPUT_BYTES + 1];
+    fn current_checkout_pointer_scan_accepts_large_attribute_output() {
+        let mut stdout = Vec::new();
+        for index in 0..8_000 {
+            stdout.extend_from_slice(format!("docs/file-{index:05}.txt").as_bytes());
+            stdout.extend_from_slice(b"\0filter\0unspecified\0");
+        }
+        stdout.extend_from_slice(b"asset/model.bin\0filter\0lfs\0");
+        assert!(stdout.len() > MAX_MIGRATION_GIT_OUTPUT_BYTES);
 
-        let error = parse_git_check_attr_filter_stdout(&stdout)
-            .expect_err("oversized check-attr output should fail before parsing");
+        let paths = parse_git_check_attr_filter_stdout(&stdout)
+            .expect("large check-attr output should not fail before parsing");
 
-        assert!(matches!(
-            error,
-            MigrationError::ExternalCommandOutput {
-                ref command,
-                ref message,
-            } if command == "git check-attr -z --stdin filter"
-                && message.as_str() == "git returned too much output"
-        ));
+        assert_eq!(paths, vec![PathBuf::from("asset/model.bin")]);
     }
 
     #[test]
