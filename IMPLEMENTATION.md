@@ -1148,8 +1148,10 @@ Defer:
 > configured storage credential reference, and reports local cache directory
 > readiness.
 > Local cache path helpers now define the shared content-addressed object layout
-> under `~/.lfs-cloud/objects`, using two-level SHA-256 sharding before later
-> ingest, hydration, dehydration, and garbage-collection work.
+> under `~/.lfs-cloud/objects`, using two-level SHA-256 sharding. Existing
+> repository-local Git LFS cache objects can now be ingested into that shared
+> cache only after SHA-256 and byte-size verification, and already cached
+> objects are reverified before reuse.
 
 ### Progress Summary
 
@@ -1163,9 +1165,9 @@ Defer:
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 9      | 4         |
 | 7. Migration                             | 12          | 0      | 12        |
-| 8. Local Cache And Materialization       | 8           | 1      | 7         |
+| 8. Local Cache And Materialization       | 8           | 3      | 5         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **68** | **31**    |
+| **Total**                                | **99**      | **70** | **29**    |
 
 ### Legend
 
@@ -1344,8 +1346,8 @@ Defer:
 #### Epic 8.1: Shared Cache
 
 - [x] [T] Define local cache root and object path layout under `~/.lfs-cloud/objects`.
-- [ ] [T] Implement ingest from existing `.git/lfs/objects`.
-- [ ] [T] Implement cache object hash and size verification.
+- [x] [T] Implement ingest from existing `.git/lfs/objects`.
+- [x] [T] Implement cache object hash and size verification.
 - [ ] [T] Track repo/worktree registrations for safe local cache GC.
 
 #### Epic 8.2: Working Tree Materialization
