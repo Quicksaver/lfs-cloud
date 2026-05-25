@@ -107,6 +107,7 @@ impl GitRemote {
         } else {
             parse_scp_like_remote(trimmed)?
         };
+        let host = validate_remote_host(&host)?;
         let (owner, name) = parse_repository_path(&path)?;
 
         Ok(Self {
@@ -253,8 +254,11 @@ fn parse_repository_path(path: &str) -> CliResult<(String, String)> {
     }
 
     let name = repo.strip_suffix(".git").unwrap_or(repo);
-    let owner = validate_remote_component("Git remote owner", owner)?;
-    let name = validate_remote_component("Git remote repository name", name)?;
+    let owner = validate_route_component("Git remote owner", owner)?;
+    let name = validate_route_component("Git remote repository name", name)?;
+    if name.ends_with(".git") {
+        return invalid_remote("Git remote repository name must not contain a nested .git suffix");
+    }
 
     Ok((owner, name))
 }
@@ -276,6 +280,40 @@ fn validate_remote_component(label: &str, value: &str) -> CliResult<String> {
     }
 
     Ok(value.to_owned())
+}
+
+fn validate_remote_host(value: &str) -> CliResult<String> {
+    let host = validate_remote_component("Git remote host", value)?;
+    if host.split('.').any(|label| {
+        label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return invalid_remote("Git remote host must be a route-safe host made of ASCII labels");
+    }
+
+    Ok(host)
+}
+
+fn validate_route_component(label: &str, value: &str) -> CliResult<String> {
+    let component = validate_remote_component(label, value)?;
+    if matches!(component.as_str(), "." | "..")
+        || component.contains("..")
+        || !component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "{label} must be a route-safe repository component without separators, percent escapes, or traversal segments"
+            ),
+        });
+    }
+
+    Ok(component)
 }
 
 fn invalid_remote<T>(message: impl Into<String>) -> CliResult<T> {
@@ -346,6 +384,19 @@ mod tests {
             "https://github.com/owner/group/repo.git",
             "file:///tmp/repo.git",
             "../repo.git",
+        ] {
+            let error = GitRemote::parse("origin", url).expect_err("remote should be rejected");
+            assert!(matches!(error, CliError::InvalidArguments { .. }));
+        }
+    }
+
+    #[test]
+    fn rejects_route_unsafe_remote_components() {
+        for url in [
+            "git@github.com:../repo.git",
+            "https://github.com/owner/foo.git.git",
+            "https://github.com/owner/re%20po.git",
+            "git@github..com:owner/repo.git",
         ] {
             let error = GitRemote::parse("origin", url).expect_err("remote should be rejected");
             assert!(matches!(error, CliError::InvalidArguments { .. }));
