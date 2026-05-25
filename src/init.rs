@@ -53,7 +53,7 @@ impl LfsInitRoute {
     }
 }
 
-fn validate_server_url(value: &str) -> CliResult<Url> {
+pub(crate) fn validate_server_url(value: &str) -> CliResult<Url> {
     if value.is_empty() {
         return invalid_server_url("server URL must not be blank");
     }

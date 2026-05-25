@@ -132,6 +132,13 @@ pub enum CliError {
         message: String,
     },
 
+    /// One or more CLI readiness checks completed and reported a failed state.
+    #[error("status checks failed: {message}")]
+    StatusFailed {
+        /// Human-readable explanation of the failed checks.
+        message: String,
+    },
+
     /// A filesystem or process I/O operation failed at the CLI boundary.
     #[error("{context}: {source}")]
     Io {

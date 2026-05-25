@@ -8,10 +8,11 @@
 use std::{
     future::Future,
     io::{self, BufRead, Write},
-    net::{TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
-    time::Duration,
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -21,9 +22,9 @@ use url::Url;
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitLfsConfigChange,
-    GitLfsConfigTarget, GitRepository, GoogleDriveCredentialLoader, LfsInitRoute, LfsSessionToken,
-    LocalCacheLayout, ServeOptions, ServerConfig, StorageProviderConfig, TracingConfig,
-    init_tracing,
+    GitLfsConfigTarget, GitRepository, GoogleDriveCredentialLoader, GoogleDriveStorageConfig,
+    LfsInitRoute, LfsSessionToken, LocalCacheLayout, ServeOptions, ServerConfig,
+    StorageProviderConfig, TracingConfig, init_tracing,
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -187,6 +188,13 @@ fn run_status_to_stdout(
     command: StatusCommand,
     config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    tokio::task::block_in_place(|| run_status_to_stdout_blocking(command, config_path))
+}
+
+fn run_status_to_stdout_blocking(
+    command: StatusCommand,
+    config_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let current_dir = std::env::current_dir().context("failed to determine current directory")?;
     let mut stdout = io::stdout().lock();
 
@@ -197,14 +205,7 @@ fn run_status_to_stdout(
         &mut stdout,
         probe_server_reachable,
         |lfs_url| GitCredentialLookup::new(lfs_url).and_then(|lookup| lookup.lookup().map(|_| ())),
-        |storage| match storage {
-            StorageProviderConfig::GoogleDrive(storage) => GoogleDriveCredentialLoader::new()
-                .load_from_environment(storage)
-                .map(|_| ())
-                .map_err(|source| CliError::InvalidArguments {
-                    message: format!("Google Drive credential is not usable: {source}"),
-                }),
-        },
+        validate_status_storage,
     )
     .map_err(anyhow::Error::from)
 }
@@ -464,7 +465,7 @@ where
     report.write(output).map_err(output_error)?;
 
     if report.has_errors() {
-        return Err(CliError::InvalidArguments {
+        return Err(CliError::StatusFailed {
             message: "one or more status checks failed".to_owned(),
         });
     }
@@ -472,14 +473,14 @@ where
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct StatusReport {
     checks: Vec<StatusCheck>,
 }
 
 impl StatusReport {
     fn new() -> Self {
-        Self { checks: Vec::new() }
+        Self::default()
     }
 
     fn ok(&mut self, name: &'static str, message: impl Into<String>) {
@@ -592,14 +593,7 @@ fn report_cache_status(report: &mut StatusReport, cache_root: Option<PathBuf>) {
 }
 
 fn probe_server_reachable(server_url: &str) -> CliResult<()> {
-    let url = Url::parse(server_url).map_err(|source| CliError::InvalidArguments {
-        message: format!("server URL is not valid: {source}"),
-    })?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(CliError::InvalidArguments {
-            message: "server URL must use http or https".to_owned(),
-        });
-    }
+    let url = crate::init::validate_server_url(server_url)?;
     let host = url.host_str().ok_or_else(|| CliError::InvalidArguments {
         message: "server URL must include a host".to_owned(),
     })?;
@@ -608,16 +602,18 @@ fn probe_server_reachable(server_url: &str) -> CliResult<()> {
         .ok_or_else(|| CliError::InvalidArguments {
             message: "server URL must include a port or use a known scheme".to_owned(),
         })?;
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|source| CliError::Io {
-            context: format!("failed to resolve {host}:{port}"),
-            source,
-        })?;
+    let addresses = resolve_socket_addresses_with_timeout(host.to_owned(), port)?;
 
     let mut last_error = None;
+    let connect_deadline = Instant::now() + STATUS_SERVER_CONNECT_TIMEOUT;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, STATUS_SERVER_CONNECT_TIMEOUT) {
+        let remaining = connect_deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
             Ok(_) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -629,6 +625,54 @@ fn probe_server_reachable(server_url: &str) -> CliResult<()> {
             io::Error::new(io::ErrorKind::NotFound, "no socket addresses resolved")
         }),
     })
+}
+
+fn resolve_socket_addresses_with_timeout(host: String, port: u16) -> CliResult<Vec<SocketAddr>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let thread_host = host.clone();
+    std::thread::Builder::new()
+        .name("lfs-cloud-status-resolver".to_owned())
+        .spawn(move || {
+            let result = (thread_host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>())
+                .map_err(|source| CliError::Io {
+                    context: format!("failed to resolve {thread_host}:{port}"),
+                    source,
+                });
+            let _ = sender.send(result);
+        })
+        .map_err(|source| CliError::Io {
+            context: format!("failed to start resolver for {host}:{port}"),
+            source,
+        })?;
+
+    receiver
+        .recv_timeout(STATUS_SERVER_CONNECT_TIMEOUT)
+        .map_err(|_| CliError::Io {
+            context: format!("timed out resolving {host}:{port}"),
+            source: io::Error::new(io::ErrorKind::TimedOut, "DNS resolution timed out"),
+        })?
+}
+
+fn validate_status_storage(storage: &StorageProviderConfig) -> CliResult<()> {
+    match storage {
+        StorageProviderConfig::GoogleDrive(storage) => {
+            validate_google_drive_status_storage(storage)
+        }
+    }
+}
+
+fn validate_google_drive_status_storage(storage: &GoogleDriveStorageConfig) -> CliResult<()> {
+    GoogleDriveCredentialLoader::new()
+        .load_from_environment(storage)
+        .map(|_| ())
+        .map_err(|_| CliError::InvalidArguments {
+            message: format!(
+                "Google Drive credential for {} is not usable; check the configured credentials_ref environment value",
+                storage.id
+            ),
+        })
 }
 
 fn login_url_for_server(server_url: &str) -> CliResult<String> {
@@ -795,12 +839,13 @@ mod tests {
 
     use super::{
         Cli, InitCommand, LoginCommand, StatusCommand, dispatch, login_url_for_server,
-        run_init_from_dir, run_login_from_dir, run_status_from_dir, sanitize_browser_stderr,
-        tracing_config, write_init_change,
+        probe_server_reachable, run_init_from_dir, run_login_from_dir, run_status_from_dir,
+        sanitize_browser_stderr, tracing_config, validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
-        GitLfsConfigChange, GitLfsConfigTarget, ServeOptions,
+        GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig, ServeOptions,
+        StorageProviderConfig,
     };
 
     #[test]
@@ -1392,7 +1437,7 @@ mod tests {
         )
         .expect_err("failed checks should make status fail");
 
-        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        assert!(matches!(error, CliError::StatusFailed { .. }));
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("server     error"));
         assert!(rendered.contains("auth       error"));
@@ -1439,13 +1484,45 @@ mod tests {
         )
         .expect_err("unsafe server URL should make status fail route validation");
 
-        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        assert!(matches!(error, CliError::StatusFailed { .. }));
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("server     ok"));
         assert!(rendered.contains("REDACTED"));
         assert!(!rendered.contains("user:secret"));
         assert!(!rendered.contains("query-secret"));
         assert!(!rendered.contains("fragment-secret"));
+    }
+
+    #[test]
+    fn status_probe_rejects_unsafe_server_url_components() {
+        let error = probe_server_reachable(
+            "http://user:secret@127.0.0.1:8080?token=query-secret#fragment-secret",
+        )
+        .expect_err("unsafe server URL should fail before probing reachability");
+
+        assert!(
+            matches!(error, CliError::InvalidArguments { message } if message.contains("credentials"))
+        );
+    }
+
+    #[test]
+    fn status_storage_validation_uses_generic_credential_error() {
+        let storage = StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig {
+            id: "drive-user-a".to_owned(),
+            credential_ref: "definitely-missing-status-test-env".to_owned(),
+            root_folder_id: "root-folder".to_owned(),
+            display_name: None,
+        });
+
+        let error = validate_status_storage(&storage)
+            .expect_err("missing storage credential should fail validation");
+
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        let rendered = error.to_string();
+        assert!(rendered.contains("drive-user-a"));
+        assert!(rendered.contains("credentials_ref"));
+        assert!(!rendered.contains("LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL"));
+        assert!(!rendered.contains("definitely-missing-status-test-env"));
     }
 
     #[test]

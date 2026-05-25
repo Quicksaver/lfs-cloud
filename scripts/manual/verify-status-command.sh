@@ -3,7 +3,8 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp_dir="$(mktemp -d)"
-trap 'kill "$server_pid" >/dev/null 2>&1 || true; rm -rf "$tmp_dir"' EXIT
+server_pid=""
+trap 'if [[ -n "${server_pid:-}" ]]; then kill "$server_pid" >/dev/null 2>&1 || true; fi; rm -rf "$tmp_dir"' EXIT
 
 repo_dir="$tmp_dir/repo"
 cache_root="$tmp_dir/cache"
@@ -11,8 +12,19 @@ store_file="$tmp_dir/credentials"
 global_config="$tmp_dir/gitconfig"
 port_file="$tmp_dir/server.port"
 token="manual-status-lfs-token"
+python_bin="$(command -v python3 || command -v python || true)"
 
-python3 - "$port_file" <<'PY' &
+if [[ -z "$python_bin" ]] || ! "$python_bin" - <<'PY'
+import sys
+
+sys.exit(0 if sys.version_info[0] >= 3 else 1)
+PY
+then
+  echo "Python 3 is required to run the manual status verifier" >&2
+  exit 1
+fi
+
+"$python_bin" - "$port_file" <<'PY' &
 import socket
 import sys
 
@@ -86,7 +98,17 @@ printf 'protocol=http\nhost=127.0.0.1:%s\npath=github.com/owner/repo.git/info/lf
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
     git credential approve
 
+restore_xtrace=0
+case "$-" in
+  *x*)
+    restore_xtrace=1
+    set +x
+    ;;
+esac
 export LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_DRIVE_USER_A='{"client_id":"client-id","client_secret":"client-secret","refresh_token":"refresh-token"}'
+if [[ "$restore_xtrace" -eq 1 ]]; then
+  set -x
+fi
 
 (
   cd "$repo_dir"
