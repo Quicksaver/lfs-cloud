@@ -333,9 +333,7 @@ fn default_https_lfs_endpoint(host: &str, path: &str) -> Option<String> {
     {
         let mut segments = url.path_segments_mut().ok()?;
         segments.extend(path.split('/').filter(|segment| !segment.is_empty()));
-        if !path_already_ends_with_info_lfs(path) {
-            segments.extend(["info", "lfs"]);
-        }
+        segments.extend(["info", "lfs"]);
     }
 
     Some(url.to_string())
@@ -347,29 +345,12 @@ fn append_info_lfs_to_url(mut url: Url) -> Option<String> {
         return None;
     }
 
-    if path_already_ends_with_info_lfs(url.path()) {
-        return Some(url.to_string());
-    }
-
     {
         let mut segments = url.path_segments_mut().ok()?;
         segments.extend(["info", "lfs"]);
     }
 
     Some(url.to_string())
-}
-
-fn path_already_ends_with_info_lfs(path: &str) -> bool {
-    let mut segments = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .rev();
-
-    matches!(
-        (segments.next(), segments.next()),
-        (Some("lfs"), Some("info"))
-    )
 }
 
 fn discover_lfs_tracked_patterns(
@@ -1069,7 +1050,15 @@ mod tests {
         assert_eq!(
             default_lfs_endpoint_for_remote_url("https://github.com/owner/repo.git/info/lfs")
                 .as_deref(),
-            Some("https://github.com/owner/repo.git/info/lfs")
+            Some("https://github.com/owner/repo.git/info/lfs/info/lfs")
+        );
+        assert_eq!(
+            default_lfs_endpoint_for_remote_url("https://github.com/info/lfs").as_deref(),
+            Some("https://github.com/info/lfs/info/lfs")
+        );
+        assert_eq!(
+            default_lfs_endpoint_for_remote_url("git@github.com:info/lfs").as_deref(),
+            Some("https://github.com/info/lfs/info/lfs")
         );
     }
 
