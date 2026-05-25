@@ -1167,6 +1167,10 @@ Defer:
 > registered worktrees for Git LFS pointer references, removes unreferenced
 > shared cache objects, prunes missing worktree registrations, and supports
 > `--dry-run` for review before deletion.
+> Migration discovery support can now inspect an existing Git worktree for
+> local Git LFS installation status, visible LFS filter config, repository LFS
+> endpoint config, and `.gitattributes` patterns that declare `filter=lfs`,
+> without mutating Git config, worktree files, cache state, or storage.
 
 ### Progress Summary
 
@@ -1179,10 +1183,10 @@ Defer:
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 12     | 1         |
-| 7. Migration                             | 12          | 0      | 12        |
+| 7. Migration                             | 12          | 1      | 11        |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **78** | **21**    |
+| **Total**                                | **99**      | **79** | **20**    |
 
 ### Legend
 
@@ -1337,7 +1341,7 @@ Defer:
 
 #### Epic 7.1: Discovery
 
-- [ ] [T] Detect existing Git LFS installation, filters, tracked patterns, and source LFS endpoint.
+- [x] [T] Detect existing Git LFS installation, filters, tracked patterns, and source LFS endpoint.
 - [ ] [T] Enumerate LFS pointers for current checkout.
 - [ ] [T] Enumerate LFS pointers for selected refs.
 - [ ] [T] Enumerate LFS pointers for all fetched refs.

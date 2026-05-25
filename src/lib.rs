@@ -14,6 +14,7 @@ pub mod lfs;
 pub mod local_cache;
 pub mod logging;
 pub mod metadata;
+pub mod migration;
 pub mod providers;
 pub mod server;
 pub mod server_config;
@@ -69,6 +70,10 @@ pub use logging::{
 pub use metadata::{
     METADATA_SCHEMA_VERSION, MetadataDatabase, MetadataObjectRecord,
     MetadataObjectVerificationStatus,
+};
+pub use migration::{
+    GitLfsFilterConfig, GitLfsInstallation, GitLfsMigrationDiscovery, GitLfsSourceEndpoint,
+    GitLfsSourceEndpointSource, GitLfsTrackedPattern, discover_git_lfs_migration,
 };
 pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,

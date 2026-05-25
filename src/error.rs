@@ -614,6 +614,36 @@ pub enum MigrationError {
         path: PathBuf,
     },
 
+    /// A filesystem or process I/O operation failed at the migration boundary.
+    #[error("{context}: {source}")]
+    Io {
+        /// Operation being attempted when I/O failed.
+        context: String,
+        /// Underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// An external command needed for migration discovery failed.
+    #[error("{command} failed with status {status}: {stderr}")]
+    ExternalCommand {
+        /// Command line being executed, without secret arguments.
+        command: String,
+        /// Process exit status or signal summary.
+        status: String,
+        /// Sanitized stderr emitted by the command.
+        stderr: SanitizedMessage,
+    },
+
+    /// An external command completed but returned malformed or unsafe output.
+    #[error("{command} returned invalid output: {message}")]
+    ExternalCommandOutput {
+        /// Command line being executed, without secret arguments.
+        command: String,
+        /// Sanitized explanation of the invalid output.
+        message: SanitizedMessage,
+    },
+
     /// A repository-provider operation failed during migration.
     #[error("repository provider failed during migration: {source}")]
     RepositoryProvider {

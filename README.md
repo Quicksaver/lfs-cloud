@@ -41,6 +41,10 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > `lfs-cloud dehydrate <path...>` expose those local cache operations through
 > the CLI. `lfs-cloud gc` can remove shared local cache objects that are no
 > longer referenced by any registered worktree, with a dry-run mode for review.
+> Migration support code can inspect an existing Git worktree for local Git LFS
+> installation status, LFS filter config, repository LFS endpoint config, and
+> `.gitattributes` patterns that declare `filter=lfs` without mutating local
+> state.
 > The other commands below are still planned product behavior.
 
 ## Why
