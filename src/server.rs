@@ -32,6 +32,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 
 use crate::{
@@ -201,19 +202,62 @@ pub fn lfs_server_router_with_sessions(
 /// network calls. It does not mount OAuth routes or durable metadata storage;
 /// production serving still uses the configured GitHub and Google Drive
 /// clients. The configured repository provider and storage provider IDs must
-/// match the injected providers.
+/// match the injected providers. Existing-object lookups synthesize backend IDs
+/// because the generic [`StorageProvider`] trait only reports object existence;
+/// the adapter never persists those synthetic IDs to metadata.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] when any configured repository mapping references a
+/// provider ID other than the injected repository or storage provider.
+#[doc(hidden)]
 pub fn lfs_server_router_with_provider_adapters(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
     repository_provider: Arc<dyn RepositoryProvider + Send + Sync>,
     storage_provider: Arc<dyn StorageProvider + Send + Sync>,
-) -> Router {
-    lfs_server_router_with_sessions_authorizer_and_transfer_store(
-        config,
-        session_store,
-        Arc::new(ProviderBatchAuthorizer::new(repository_provider)),
-        Arc::new(StorageProviderTransferStore::new(storage_provider)),
+) -> ServerResult<Router> {
+    validate_provider_adapter_config(
+        &config,
+        repository_provider.provider_id(),
+        storage_provider.provider_id(),
+    )?;
+
+    Ok(
+        lfs_server_router_with_sessions_authorizer_and_transfer_store(
+            config,
+            session_store,
+            Arc::new(ProviderBatchAuthorizer::new(repository_provider)),
+            Arc::new(StorageProviderTransferStore::new(storage_provider)),
+        ),
     )
+}
+
+fn validate_provider_adapter_config(
+    config: &ServerConfig,
+    repository_provider_id: &str,
+    storage_provider_id: &str,
+) -> ServerResult<()> {
+    for repository in &config.repositories {
+        if repository.repo_provider != repository_provider_id {
+            return Err(ServerError::InvalidConfiguration {
+                message: format!(
+                    "repository {} references repository provider {}, but injected provider is {}",
+                    repository.id, repository.repo_provider, repository_provider_id
+                ),
+            });
+        }
+        if repository.storage_provider != storage_provider_id {
+            return Err(ServerError::InvalidConfiguration {
+                message: format!(
+                    "repository {} references storage provider {}, but injected provider is {}",
+                    repository.id, repository.storage_provider, storage_provider_id
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn lfs_server_router_with_sessions_and_authorizer(
@@ -367,9 +411,17 @@ impl LfsBatchAuthorizer for ProviderBatchAuthorizer {
     ) -> ProviderFuture<'a, ServerResult<()>> {
         Box::pin(async move {
             let required = permission_required_for_batch_operation(operation);
-            if self.provider.provider_id() != repository.repo_provider
-                || session.metadata().provider_id != repository.repo_provider
-            {
+            if self.provider.provider_id() != repository.repo_provider {
+                return Err(ServerError::InvalidConfiguration {
+                    message: format!(
+                        "repository {} references repository provider {}, but injected provider is {}",
+                        repository.id,
+                        repository.repo_provider,
+                        self.provider.provider_id()
+                    ),
+                });
+            }
+            if session.metadata().provider_id != repository.repo_provider {
                 return Err(ServerError::RepositoryProvider {
                     source: RepositoryProviderError::PermissionDenied {
                         provider: repository.repo_provider.clone(),
@@ -425,6 +477,14 @@ impl StorageProviderTransferStore {
             ),
         })
     }
+
+    fn synthetic_existing_backend_id(&self, object: &LfsObject) -> String {
+        format!(
+            "lfs-cloud-provider-adapter-existing://{}/objects/{}",
+            self.provider.provider_id(),
+            object.oid.as_hex()
+        )
+    }
 }
 
 impl LfsObjectTransferStore for StorageProviderTransferStore {
@@ -439,7 +499,7 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
                 Ok(Some(StoredObject::new(
                     self.provider.provider_id().to_owned(),
                     object.clone(),
-                    format!("{}:{}", self.provider.provider_id(), object.oid.as_hex()),
+                    self.synthetic_existing_backend_id(object),
                 )))
             } else {
                 Ok(None)
@@ -470,10 +530,18 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
     ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
         Box::pin(async move {
             self.ensure_provider_matches(repository)?;
-            let temp_file =
-                tempfile::NamedTempFile::new().map_err(|source| ServerError::Storage {
+            let provider_id = self.provider.provider_id().to_owned();
+            let temp_file = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
+                .await
+                .map_err(|source| ServerError::Storage {
                     source: StorageError::Retryable {
-                        provider: self.provider.provider_id().to_owned(),
+                        provider: provider_id.clone(),
+                        message: format!("download staging file task could not join: {source}"),
+                    },
+                })?
+                .map_err(|source| ServerError::Storage {
+                    source: StorageError::Retryable {
+                        provider: provider_id.clone(),
                         message: format!("download staging file could not be created: {source}"),
                     },
                 })?;
@@ -481,20 +549,30 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
                 .provider
                 .download_object(object, temp_file.path())
                 .await?;
-            let bytes =
-                tokio::fs::read(temp_file.path())
-                    .await
-                    .map_err(|source| ServerError::Storage {
-                        source: StorageError::Retryable {
-                            provider: self.provider.provider_id().to_owned(),
-                            message: format!("download staging file could not be read: {source}"),
-                        },
-                    })?;
+            let file = tokio::fs::File::open(temp_file.path())
+                .await
+                .map_err(|source| ServerError::Storage {
+                    source: StorageError::Retryable {
+                        provider: provider_id.clone(),
+                        message: format!("download staging file could not be opened: {source}"),
+                    },
+                })?;
+            let content_length = file
+                .metadata()
+                .await
+                .map_err(|source| ServerError::Storage {
+                    source: StorageError::Retryable {
+                        provider: provider_id,
+                        message: format!(
+                            "download staging file metadata could not be read: {source}"
+                        ),
+                    },
+                })?;
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "application/octet-stream")
-                .header(CONTENT_LENGTH, bytes.len().to_string())
-                .body(Body::from(bytes))
+                .header(CONTENT_LENGTH, content_length.len().to_string())
+                .body(Body::from_stream(ReaderStream::new(file)))
                 .map_err(|source| ServerError::Internal {
                     message: format!("download response could not be built: {source}"),
                 })?;
@@ -512,6 +590,8 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
     ) -> ProviderFuture<'a, ServerResult<()>> {
         Box::pin(async move {
             self.ensure_provider_matches(repository)?;
+            // The provider-adapter seam has no durable metadata store; production
+            // serving records verified objects through GoogleDriveTransferStore.
             Ok(())
         })
     }

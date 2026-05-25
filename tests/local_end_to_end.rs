@@ -16,9 +16,9 @@ use axum::{
     },
 };
 use lfs_cloud::{
-    GitLfsConfigTarget, GitRepository, LfsBatchResponse, LfsInitRoute, LocalCacheLayout,
-    LocalLfsSessionStore, RepositoryPermission, RepositoryUser, ServerConfig,
-    lfs_server_router_with_provider_adapters,
+    GitLfsConfigTarget, GitRepository, LfsBatchResponse, LfsInitRoute, LocalCacheDehydrationStatus,
+    LocalCacheLayout, LocalLfsSessionStore, RepositoryPermission, RepositoryUser, ServerConfig,
+    ServerError, lfs_server_router_with_provider_adapters,
 };
 use support::{
     FakeRepositoryProvider, FakeStorageProvider, TempGitRepo, lfs_object_for_bytes,
@@ -26,6 +26,9 @@ use support::{
 };
 use tower::ServiceExt;
 use url::Url;
+
+const TEST_DOWNLOAD_BODY_LIMIT: usize = 4 * 1024 * 1024;
+const TEST_BATCH_BODY_LIMIT: usize = 64 * 1024;
 
 #[tokio::test]
 async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
@@ -78,7 +81,8 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         sessions,
         github,
         drive.clone(),
-    );
+    )
+    .expect("fake-provider router should validate injected provider IDs");
 
     let upload_batch = router
         .clone()
@@ -98,6 +102,7 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         .expect("missing fake object should receive an upload action")
         .href
         .clone();
+    assert_action_href(&upload_href, &object);
 
     let upload = router
         .clone()
@@ -133,6 +138,7 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         .expect("uploaded fake object should receive a download action")
         .href
         .clone();
+    assert_action_href(&download_href, &object);
 
     let download = router
         .oneshot(authenticated_request(
@@ -144,16 +150,20 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         .await
         .expect("download action should route through the server");
     assert_eq!(download.status(), StatusCode::OK);
-    let downloaded_bytes = to_bytes(download.into_body(), usize::MAX)
+    let downloaded_bytes = to_bytes(download.into_body(), TEST_DOWNLOAD_BODY_LIMIT)
         .await
         .expect("downloaded object body should collect");
-    fs::create_dir_all(
-        cached_object_path
-            .parent()
-            .expect("cache object path should have a parent"),
-    )
-    .expect("cache object parent should be created");
-    fs::write(&cached_object_path, &downloaded_bytes).expect("downloaded bytes should be cached");
+    let downloaded_object_path = cache_root.path().join("downloaded-model.bin");
+    fs::write(&downloaded_object_path, &downloaded_bytes)
+        .expect("downloaded bytes should be written for cache ingest");
+    let dehydration = cache
+        .dehydrate_file(&object, &downloaded_object_path)
+        .expect("downloaded bytes should be verified into the shared cache");
+    assert_eq!(
+        dehydration.status,
+        LocalCacheDehydrationStatus::CachedAndReplacedWithPointer
+    );
+    assert_eq!(dehydration.cache_path, cached_object_path);
     assert_eq!(
         fs::read(&cached_object_path).expect("cached object should be readable"),
         bytes
@@ -172,6 +182,47 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         fs::read(repo.path().join("assets/model.bin"))
             .expect("hydrated checkout bytes should be readable"),
         bytes
+    );
+}
+
+#[test]
+fn provider_adapter_router_rejects_mismatched_provider_ids() {
+    let sessions = LocalLfsSessionStore::new();
+    let drive = Arc::new(FakeStorageProvider::new("drive-user-a"));
+    let error = match lfs_server_router_with_provider_adapters(
+        local_server_config(),
+        sessions,
+        Arc::new(FakeRepositoryProvider::new("github-other")),
+        drive,
+    ) {
+        Ok(_) => panic!("mismatched repository provider should fail before routing"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("injected provider is github-other")
+    );
+
+    let sessions = LocalLfsSessionStore::new();
+    let github = Arc::new(FakeRepositoryProvider::new("github-main"));
+    let error = match lfs_server_router_with_provider_adapters(
+        local_server_config(),
+        sessions,
+        github,
+        Arc::new(FakeStorageProvider::new("drive-other")),
+    ) {
+        Ok(_) => panic!("mismatched storage provider should fail before routing"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("injected provider is drive-other")
     );
 }
 
@@ -254,11 +305,28 @@ async fn lfs_batch_response(response: axum::response::Response) -> LfsBatchRespo
             .and_then(|value| value.to_str().ok()),
         Some("application/vnd.git-lfs+json")
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
+    let body = to_bytes(response.into_body(), TEST_BATCH_BODY_LIMIT)
         .await
         .expect("Git LFS batch response body should collect");
 
     serde_json::from_slice(&body).expect("response should be Git LFS batch JSON")
+}
+
+fn assert_action_href(href: &str, object: &lfs_cloud::LfsObject) {
+    let url = Url::parse(href).expect("server action href should be an absolute URL");
+    let expected_query = format!("size={}", object.size.bytes());
+
+    assert_eq!(url.scheme(), "http");
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    assert_eq!(url.port(), Some(8080));
+    assert_eq!(
+        url.path(),
+        format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{}",
+            object.oid.as_hex()
+        )
+    );
+    assert_eq!(url.query(), Some(expected_query.as_str()));
 }
 
 fn action_path_and_query(href: &str) -> String {

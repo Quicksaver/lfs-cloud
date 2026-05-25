@@ -86,10 +86,12 @@ pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,
     RepositoryProvider, RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
 };
+#[doc(hidden)]
+pub use server::lfs_server_router_with_provider_adapters;
 pub use server::{
     AdvertisedServerUrls, LfsRouteEndpoint, LfsRouteResolver, ResolvedLfsRoute, ServeOptions,
-    advertised_server_urls, lfs_server_router, lfs_server_router_with_provider_adapters,
-    lfs_server_router_with_sessions, render_server_startup_message, serve,
+    advertised_server_urls, lfs_server_router, lfs_server_router_with_sessions,
+    render_server_startup_message, serve,
 };
 pub use server_config::{
     DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
