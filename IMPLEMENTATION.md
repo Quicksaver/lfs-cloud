@@ -1210,7 +1210,10 @@ Defer:
 > examples, credential-reference behavior, metadata defaults, and validation
 > rules. The README now distinguishes implemented commands from the remaining
 > full migration execution work, and install/build docs define the current
-> local binary and release-artifact expectations.
+> local binary and release-artifact expectations. Gated external integration
+> checks now cover disposable GitHub repository permission validation and
+> disposable Google Drive folder root validation when explicitly enabled with
+> real provider credentials.
 
 ### Progress Summary
 
@@ -1225,8 +1228,8 @@ Defer:
 | 6. CLI Commands                          | 13          | 13     | 0         |
 | 7. Migration                             | 12          | 12     | 0         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
-| 9. Verification, Docs, And Release Shape | 8           | 6      | 2         |
-| **Total**                                | **99**      | **97** | **2**     |
+| 9. Verification, Docs, And Release Shape | 8           | 8      | 0         |
+| **Total**                                | **99**      | **99** | **0**     |
 
 ### Legend
 
@@ -1421,8 +1424,8 @@ Defer:
 #### Epic 9.1: End-To-End Verification
 
 - [x] [T] Add local end-to-end test for init, upload, download, and checkout using fake GitHub/Drive providers.
-- [ ] [M] Add gated GitHub integration test using a disposable repo.
-- [ ] [M] Add gated Google Drive integration test using a disposable folder.
+- [x] [M] Add gated GitHub integration test using a disposable repo. Manual verification: `scripts/manual/verify-github-integration.sh`.
+- [x] [M] Add gated Google Drive integration test using a disposable folder. Manual verification: `scripts/manual/verify-google-drive-integration.sh`.
 - [x] [M] Add manual LAN smoke test checklist. Manual verification: `scripts/manual/verify-lan-smoke-test.sh`.
 
 #### Epic 9.2: Security And Documentation
