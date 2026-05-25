@@ -1142,6 +1142,11 @@ Defer:
 > command opens or prints the server GitHub OAuth login URL, accepts the
 > returned local `lfs-cloud` token, and stores only that local token in Git's
 > credential helper for the current repository's LFS URL.
+> The `lfs-cloud status` command now checks the current Git repository against
+> loaded server config, probes configured server TCP reachability, verifies a
+> local LFS credential for the derived repository LFS URL, validates the
+> configured storage credential reference, and reports local cache directory
+> readiness.
 > Local cache path helpers now define the shared content-addressed object layout
 > under `~/.lfs-cloud/objects`, using two-level SHA-256 sharding before later
 > ingest, hydration, dehydration, and garbage-collection work.
@@ -1156,11 +1161,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 8      | 5         |
+| 6. CLI Commands                          | 13          | 9      | 4         |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 1      | 7         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **67** | **32**    |
+| **Total**                                | **99**      | **68** | **31**    |
 
 ### Legend
 
@@ -1305,7 +1310,7 @@ Defer:
 
 #### Epic 6.3: Operations
 
-- [ ] [M] Implement `lfs-cloud status` for server reachability, repo mapping, auth, storage, and local cache status.
+- [x] [M] Implement `lfs-cloud status` for server reachability, repo mapping, auth, storage, and local cache status. Manual verification: `scripts/manual/verify-status-command.sh`.
 - [ ] [M] Implement `lfs-cloud pull` wrapper for fetch plus CoW materialization.
 - [ ] [M] Implement `lfs-cloud hydrate <path...>`.
 - [ ] [M] Implement `lfs-cloud dehydrate <path...>`.

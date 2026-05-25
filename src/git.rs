@@ -238,6 +238,12 @@ pub struct GitRemote {
 }
 
 impl GitRemote {
+    /// Returns a concise `host/owner/name` label for user-facing diagnostics.
+    #[must_use]
+    pub fn repository_label(&self) -> String {
+        format!("{}/{}/{}", self.host, self.owner, self.name)
+    }
+
     /// Parses an HTTPS or SSH Git remote URL into host, owner, and repo name.
     ///
     /// Supported forms include `https://github.com/owner/repo.git`,

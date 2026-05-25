@@ -8,8 +8,10 @@
 use std::{
     future::Future,
     io::{self, BufRead, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -18,9 +20,13 @@ use url::Url;
 
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
-    GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitLfsConfigChange, GitLfsConfigTarget,
-    GitRepository, LfsInitRoute, LfsSessionToken, ServeOptions, TracingConfig, init_tracing,
+    GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitLfsConfigChange,
+    GitLfsConfigTarget, GitRepository, GoogleDriveCredentialLoader, LfsInitRoute, LfsSessionToken,
+    LocalCacheLayout, ServeOptions, ServerConfig, StorageProviderConfig, TracingConfig,
+    init_tracing,
 };
+
+const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
 #[command(name = "lfs-cloud", version, about, propagate_version = true)]
@@ -46,6 +52,8 @@ enum Command {
     Login(LoginCommand),
     /// Resolve the Git LFS URL for the current repository.
     Init(InitCommand),
+    /// Check repository, server, auth, storage, and local cache readiness.
+    Status(StatusCommand),
 }
 
 #[derive(Debug, Args)]
@@ -81,6 +89,17 @@ struct InitCommand {
     local: bool,
 }
 
+#[derive(Debug, Args)]
+struct StatusCommand {
+    /// Base URL of the running LFS Cloud server.
+    #[arg(long, value_name = "URL")]
+    server: Option<String>,
+
+    /// Local cache root to inspect instead of ~/.lfs-cloud.
+    #[arg(long, value_name = "PATH")]
+    cache_root: Option<PathBuf>,
+}
+
 /// Parses process arguments, initializes tracing, and runs the requested command.
 ///
 /// # Errors
@@ -90,15 +109,29 @@ struct InitCommand {
 pub async fn run_from_env() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&tracing_config(&cli)).context("failed to initialize tracing")?;
-    dispatch(cli, crate::serve, run_init_to_stdout, run_login_to_stdio).await
+    dispatch(
+        cli,
+        crate::serve,
+        run_init_to_stdout,
+        run_login_to_stdio,
+        run_status_to_stdout,
+    )
+    .await
 }
 
-async fn dispatch<F, Fut, I, L>(cli: Cli, serve: F, init: I, login: L) -> anyhow::Result<()>
+async fn dispatch<F, Fut, I, L, S>(
+    cli: Cli,
+    serve: F,
+    init: I,
+    login: L,
+    status: S,
+) -> anyhow::Result<()>
 where
     F: FnOnce(ServeOptions) -> Fut,
     Fut: Future<Output = crate::ServerResult<()>>,
     I: FnOnce(InitCommand) -> anyhow::Result<()>,
     L: FnOnce(LoginCommand) -> anyhow::Result<()>,
+    S: FnOnce(StatusCommand, Option<PathBuf>) -> anyhow::Result<()>,
 {
     // Keep command execution injectable only at the command boundary; each new
     // subcommand should add its own runner here rather than hiding side effects
@@ -109,6 +142,9 @@ where
             .context("failed to run lfs-cloud server"),
         Command::Login(command) => login(command).context("failed to complete lfs-cloud login"),
         Command::Init(command) => init(command).context("failed to resolve lfs-cloud init route"),
+        Command::Status(command) => {
+            status(command, cli.config).context("failed to check lfs-cloud status")
+        }
     }
 }
 
@@ -145,6 +181,32 @@ fn run_login_to_stdio(command: LoginCommand) -> anyhow::Result<()> {
     let mut stdout = io::stdout().lock();
 
     run_login(command, &mut input, &mut stdout)
+}
+
+fn run_status_to_stdout(
+    command: StatusCommand,
+    config_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+    let mut stdout = io::stdout().lock();
+
+    run_status_from_dir(
+        command,
+        config_path,
+        &current_dir,
+        &mut stdout,
+        probe_server_reachable,
+        |lfs_url| GitCredentialLookup::new(lfs_url).and_then(|lookup| lookup.lookup().map(|_| ())),
+        |storage| match storage {
+            StorageProviderConfig::GoogleDrive(storage) => GoogleDriveCredentialLoader::new()
+                .load_from_environment(storage)
+                .map(|_| ())
+                .map_err(|source| CliError::InvalidArguments {
+                    message: format!("Google Drive credential is not usable: {source}"),
+                }),
+        },
+    )
+    .map_err(anyhow::Error::from)
 }
 
 fn run_login<R, W>(command: LoginCommand, input: &mut R, output: &mut W) -> anyhow::Result<()>
@@ -254,6 +316,315 @@ where
         .context("failed to write Git LFS config")?;
 
     write_init_change(output, &change).context("failed to write init summary")
+}
+
+fn run_status_from_dir<W, P, A, S>(
+    command: StatusCommand,
+    config_path: Option<PathBuf>,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+    mut probe_server: P,
+    mut lookup_credential: A,
+    mut validate_storage: S,
+) -> CliResult<()>
+where
+    W: Write,
+    P: FnMut(&str) -> CliResult<()>,
+    A: FnMut(&str) -> CliResult<()>,
+    S: FnMut(&StorageProviderConfig) -> CliResult<()>,
+{
+    let mut report = StatusReport::new();
+    let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
+    let config = match ServerConfig::load_from_path(&config_path) {
+        Ok(config) => {
+            report.ok("config", format!("loaded {}", config_path.display()));
+            Some(config)
+        }
+        Err(error) => {
+            report.error("config", format!("{error}"));
+            None
+        }
+    };
+    let repository = match GitRepository::discover(start_dir.as_ref()) {
+        Ok(repository) => {
+            report.ok(
+                "repository",
+                format!(
+                    "{} ({})",
+                    repository.worktree_root.display(),
+                    repository.remote.repository_label()
+                ),
+            );
+            Some(repository)
+        }
+        Err(error) => {
+            report.error("repository", format!("{error}"));
+            None
+        }
+    };
+    let server_url = command.server.clone().or_else(|| {
+        config
+            .as_ref()
+            .map(|config| config.server.public_url.clone())
+    });
+
+    if let Some(server_url) = server_url.as_deref() {
+        match probe_server(server_url) {
+            Ok(()) => report.ok("server", format!("{server_url} is reachable")),
+            Err(error) => report.error("server", format!("{server_url} is unreachable: {error}")),
+        }
+    } else {
+        report.error(
+            "server",
+            "missing --server and no server.public_url could be loaded from config",
+        );
+    }
+
+    let route = match (server_url.as_deref(), repository.as_ref()) {
+        (Some(server_url), Some(repository)) => {
+            match LfsInitRoute::resolve(server_url, &repository.remote) {
+                Ok(route) => {
+                    report.ok("route", redacted_url_for_display(&route.lfs_url));
+                    Some(route)
+                }
+                Err(error) => {
+                    report.error("route", format!("{error}"));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let mapping = match (config.as_ref(), repository.as_ref()) {
+        (Some(config), Some(repository)) => {
+            match config.repositories.iter().find(|candidate| {
+                candidate.host == repository.remote.host
+                    && candidate.owner == repository.remote.owner
+                    && candidate.name == repository.remote.name
+            }) {
+                Some(mapping) => {
+                    report.ok(
+                        "mapping",
+                        format!("{} -> {}", mapping.id, mapping.storage_provider),
+                    );
+                    Some(mapping)
+                }
+                None => {
+                    report.error(
+                        "mapping",
+                        format!(
+                            "no server config entry for {}",
+                            repository.remote.repository_label()
+                        ),
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(route) = route.as_ref() {
+        match lookup_credential(&route.lfs_url) {
+            Ok(()) => report.ok("auth", "local LFS credential found"),
+            Err(error) => report.error("auth", format!("{error}")),
+        }
+    }
+
+    if let (Some(config), Some(mapping)) = (config.as_ref(), mapping) {
+        if let Some(storage) = config.storage_providers.get(&mapping.storage_provider) {
+            match validate_storage(storage) {
+                Ok(()) => report.ok(
+                    "storage",
+                    format!(
+                        "{} {} credential is configured",
+                        storage.provider_type(),
+                        storage.id()
+                    ),
+                ),
+                Err(error) => report.error("storage", format!("{error}")),
+            }
+        } else {
+            report.error(
+                "storage",
+                format!(
+                    "mapping {} references unknown storage provider {}",
+                    mapping.id, mapping.storage_provider
+                ),
+            );
+        }
+    }
+
+    report_cache_status(&mut report, command.cache_root);
+    report.write(output).map_err(output_error)?;
+
+    if report.has_errors() {
+        return Err(CliError::InvalidArguments {
+            message: "one or more status checks failed".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct StatusReport {
+    checks: Vec<StatusCheck>,
+}
+
+impl StatusReport {
+    fn new() -> Self {
+        Self { checks: Vec::new() }
+    }
+
+    fn ok(&mut self, name: &'static str, message: impl Into<String>) {
+        self.push(StatusLevel::Ok, name, message);
+    }
+
+    fn warning(&mut self, name: &'static str, message: impl Into<String>) {
+        self.push(StatusLevel::Warning, name, message);
+    }
+
+    fn error(&mut self, name: &'static str, message: impl Into<String>) {
+        self.push(StatusLevel::Error, name, message);
+    }
+
+    fn push(&mut self, level: StatusLevel, name: &'static str, message: impl Into<String>) {
+        self.checks.push(StatusCheck {
+            level,
+            name,
+            message: message.into(),
+        });
+    }
+
+    fn has_errors(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.level == StatusLevel::Error)
+    }
+
+    fn write<W>(&self, output: &mut W) -> io::Result<()>
+    where
+        W: Write,
+    {
+        writeln!(output, "lfs-cloud status")?;
+        for check in &self.checks {
+            writeln!(
+                output,
+                "  {:<10} {:<7} {}",
+                check.name,
+                check.level.label(),
+                check.message
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusLevel {
+    Ok,
+    Warning,
+    Error,
+}
+
+impl StatusLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StatusCheck {
+    level: StatusLevel,
+    name: &'static str,
+    message: String,
+}
+
+fn report_cache_status(report: &mut StatusReport, cache_root: Option<PathBuf>) {
+    let layout = match cache_root {
+        Some(cache_root) => LocalCacheLayout::new(cache_root),
+        None => match std::env::var_os("HOME") {
+            Some(home_dir) => LocalCacheLayout::from_home_dir(home_dir),
+            None => {
+                report.error("cache", "HOME is not set and --cache-root was not provided");
+                return;
+            }
+        },
+    };
+    let root = layout.root();
+    let objects_dir = layout.objects_dir();
+
+    if objects_dir.is_dir() {
+        report.ok(
+            "cache",
+            format!("objects directory exists at {}", objects_dir.display()),
+        );
+    } else if root.exists() && !root.is_dir() {
+        report.error(
+            "cache",
+            format!("cache root is not a directory: {}", root.display()),
+        );
+    } else if objects_dir.exists() {
+        report.error(
+            "cache",
+            format!("objects path is not a directory: {}", objects_dir.display()),
+        );
+    } else {
+        report.warning(
+            "cache",
+            format!(
+                "objects directory will be created on first ingest at {}",
+                objects_dir.display()
+            ),
+        );
+    }
+}
+
+fn probe_server_reachable(server_url: &str) -> CliResult<()> {
+    let url = Url::parse(server_url).map_err(|source| CliError::InvalidArguments {
+        message: format!("server URL is not valid: {source}"),
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(CliError::InvalidArguments {
+            message: "server URL must use http or https".to_owned(),
+        });
+    }
+    let host = url.host_str().ok_or_else(|| CliError::InvalidArguments {
+        message: "server URL must include a host".to_owned(),
+    })?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| CliError::InvalidArguments {
+            message: "server URL must include a port or use a known scheme".to_owned(),
+        })?;
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|source| CliError::Io {
+            context: format!("failed to resolve {host}:{port}"),
+            source,
+        })?;
+
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, STATUS_SERVER_CONNECT_TIMEOUT) {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(CliError::Io {
+        context: format!("failed to connect to {host}:{port}"),
+        source: last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no socket addresses resolved")
+        }),
+    })
 }
 
 fn login_url_for_server(server_url: &str) -> CliResult<String> {
@@ -419,8 +790,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cli, InitCommand, LoginCommand, dispatch, login_url_for_server, run_init_from_dir,
-        run_login_from_dir, sanitize_browser_stderr, tracing_config, write_init_change,
+        Cli, InitCommand, LoginCommand, StatusCommand, dispatch, login_url_for_server,
+        run_init_from_dir, run_login_from_dir, run_status_from_dir, sanitize_browser_stderr,
+        tracing_config, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
@@ -509,6 +881,29 @@ mod tests {
 
         assert_eq!(command.server, "http://127.0.0.1:8080");
         assert!(command.no_open);
+    }
+
+    #[test]
+    fn status_command_accepts_server_and_cache_root_options() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "--config",
+            "lfs-cloud.test.yml",
+            "status",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--cache-root",
+            "/tmp/lfs-cloud-cache",
+        ])
+        .expect("status command should parse");
+
+        let super::Command::Status(command) = cli.command else {
+            panic!("status subcommand should parse");
+        };
+
+        assert_eq!(cli.config, Some("lfs-cloud.test.yml".into()));
+        assert_eq!(command.server, Some("http://127.0.0.1:8080".to_owned()));
+        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
     }
 
     #[test]
@@ -616,6 +1011,7 @@ mod tests {
             },
             |_| unreachable!("init runner must not be called for serve command"),
             |_| unreachable!("login runner must not be called for serve command"),
+            |_, _| unreachable!("status runner must not be called for serve command"),
         )
         .await
         .expect("serve dispatch should succeed");
@@ -647,6 +1043,7 @@ mod tests {
                 Ok(())
             },
             |_| unreachable!("login runner must not be called for init command"),
+            |_, _| unreachable!("status runner must not be called for init command"),
         )
         .await
         .expect("init dispatch should succeed");
@@ -674,6 +1071,7 @@ mod tests {
                     .expect("capture mutex should lock") = Some(command.server);
                 Ok(())
             },
+            |_, _| unreachable!("status runner must not be called for login command"),
         )
         .await
         .expect("login dispatch should succeed");
@@ -681,6 +1079,44 @@ mod tests {
         assert_eq!(
             *captured.lock().expect("capture mutex should lock"),
             Some("http://127.0.0.1:8080".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_status_with_global_config() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "--config",
+            "lfs-cloud.test.yml",
+            "status",
+            "--server",
+            "http://127.0.0.1:8080",
+        ])
+        .expect("status command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for status command") },
+            |_| unreachable!("init runner must not be called for status command"),
+            |_| unreachable!("login runner must not be called for status command"),
+            move |command, config_path| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some((command.server, config_path));
+                Ok(())
+            },
+        )
+        .await
+        .expect("status dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some((
+                Some("http://127.0.0.1:8080".to_owned()),
+                Some("lfs-cloud.test.yml".into())
+            ))
         );
     }
 
@@ -849,6 +1285,116 @@ mod tests {
             !repo.path().join(".lfsconfig").exists(),
             "local-only init should not create .lfsconfig"
         );
+    }
+
+    #[test]
+    fn status_reports_ready_repository_mapping_auth_storage_and_cache() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        let cache_root = temp.path().join("cache");
+        fs::create_dir_all(cache_root.join("objects")).expect("cache objects dir should exist");
+        fs::create_dir_all(&repo).expect("repository directory should be created");
+        run_git(&repo, &["init"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let config_path = temp.path().join("lfs-cloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let mut output = Vec::new();
+
+        run_status_from_dir(
+            StatusCommand {
+                server: None,
+                cache_root: Some(cache_root),
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |_| Ok(()),
+            |lfs_url| {
+                assert_eq!(
+                    lfs_url,
+                    "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs"
+                );
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("status should pass when every check is ready");
+
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("lfs-cloud status"));
+        assert!(rendered.contains("config     ok"));
+        assert!(rendered.contains("repository ok"));
+        assert!(rendered.contains("server     ok"));
+        assert!(rendered.contains("route      ok"));
+        assert!(rendered.contains("mapping    ok      github-main:owner/repo -> drive-user-a"));
+        assert!(rendered.contains("auth       ok      local LFS credential found"));
+        assert!(
+            rendered
+                .contains("storage    ok      google_drive drive-user-a credential is configured")
+        );
+        assert!(rendered.contains("cache      ok"));
+    }
+
+    #[test]
+    fn status_reports_failures_without_leaking_credential_secrets() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repository directory should be created");
+        run_git(&repo, &["init"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let config_path = temp.path().join("lfs-cloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let mut output = Vec::new();
+
+        let error = run_status_from_dir(
+            StatusCommand {
+                server: Some("http://127.0.0.1:8080".to_owned()),
+                cache_root: Some(temp.path().join("cache")),
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |_| {
+                Err(CliError::InvalidArguments {
+                    message: "connection refused".to_owned(),
+                })
+            },
+            |_| {
+                Err(CliError::InvalidArguments {
+                    message: "missing token secret".to_owned(),
+                })
+            },
+            |_| {
+                Err(CliError::InvalidArguments {
+                    message: "credential env var is missing".to_owned(),
+                })
+            },
+        )
+        .expect_err("failed checks should make status fail");
+
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("server     error"));
+        assert!(rendered.contains("auth       error"));
+        assert!(rendered.contains("storage    error"));
+        assert!(rendered.contains("cache      warning"));
+        assert!(!rendered.contains("password="));
     }
 
     #[test]
@@ -1025,6 +1571,38 @@ mod tests {
             "first line second line"
         );
         assert_eq!(sanitize_browser_stderr(b"\n").as_str(), "<no stderr>");
+    }
+
+    fn status_config(public_url: &str) -> String {
+        format!(
+            r#"
+server:
+  host: 127.0.0.1
+  port: 8080
+  public_url: {public_url}
+
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials_ref: drive-user-a
+    root_folder_id: root-folder
+
+repositories:
+  - id: github-main:owner/repo
+    repo_provider: github-main
+    host: github.com
+    owner: owner
+    name: repo
+    storage_provider: drive-user-a
+"#
+        )
     }
 
     fn git_is_available() -> bool {

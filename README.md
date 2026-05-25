@@ -16,6 +16,10 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > `lfs-cloud login --server` can open the server's GitHub OAuth login URL for
 > the current repository, accept the returned local `lfs-cloud` token, and store
 > that local token in Git's credential helper for the repository-scoped LFS URL.
+> `lfs-cloud status` can inspect the current repository against server config,
+> check TCP reachability for the configured server URL, verify that a local LFS
+> credential is available, validate the configured Drive credential reference,
+> and report local cache directory readiness.
 > Git LFS batch request parsing plus download and upload batch response
 > generation are implemented, with GitHub read/write authorization enforced per
 > batch operation. Upload batches now check configured storage availability,
@@ -136,6 +140,20 @@ value into the CLI prompt. The CLI stores that local LFS Cloud token in Git's
 credential helper for the repository-scoped LFS URL. It does not store the
 GitHub OAuth access token in Git credentials.
 
+### Check Repository Status
+
+```bash
+lfs-cloud --config ./lfs-cloud.yml status
+```
+
+This checks the current Git repository's `origin` remote against the server
+configuration, verifies that the configured server URL is reachable at the TCP
+level, confirms that Git's credential helper can return a local `lfs-cloud`
+token for the repository LFS URL, validates that the configured Google Drive
+credential reference can be loaded, and reports whether the local cache objects
+directory already exists. Use `--server` to check a different reachable server
+base URL, or `--cache-root` to inspect a non-default local cache root.
+
 ### Migrate From Existing Git LFS
 
 ```bash
@@ -248,6 +266,6 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfs-cloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, `lfs-cloud login --server` browser handoff and local LFS token credential-helper storage, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, local cache path helpers for the planned shared object layout under `~/.lfs-cloud/objects`, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through `lfs-cloud`. Cache ingest, hydration, dehydration, garbage collection, and most CLI behavior beyond `serve`, `init --server`, and `login --server` configuration have not been implemented yet.
+This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfs-cloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, `lfs-cloud login --server` browser handoff and local LFS token credential-helper storage, `lfs-cloud status` readiness diagnostics for server reachability, repository mapping, local auth, storage credential loading, and local cache directory state, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, local cache path helpers for the planned shared object layout under `~/.lfs-cloud/objects`, and a minimal `lfs-cloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through `lfs-cloud`. Cache ingest, hydration, dehydration, garbage collection, and most CLI behavior beyond `serve`, `init --server`, `login --server`, and `status` have not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
