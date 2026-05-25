@@ -18,6 +18,11 @@ then
   exit 1
 fi
 
+if ! command -v git >/dev/null 2>&1; then
+  echo "git is required to run the manual local-cache GC verifier" >&2
+  exit 1
+fi
+
 repo_dir="$tmp_dir/repo"
 missing_repo_dir="$tmp_dir/missing-repo"
 cache_root="$tmp_dir/cache"
@@ -54,7 +59,6 @@ pointer = (
     f"size {len(keep_payload)}\n"
 )
 
-(repo_dir / ".git").mkdir(parents=True, exist_ok=True)
 (repo_dir / "asset").mkdir(parents=True, exist_ok=True)
 (repo_dir / "asset" / "model.bin").write_text(pointer, encoding="utf-8")
 
@@ -85,13 +89,19 @@ keep_oid_file.write_text(keep_oid, encoding="utf-8")
 remove_oid_file.write_text(remove_oid, encoding="utf-8")
 PY
 
+git -C "$repo_dir" init >/dev/null
+git -C "$repo_dir" remote add origin git@github.com:owner/repo.git
+
 keep_oid="$(cat "$keep_oid_file")"
 remove_oid="$(cat "$remove_oid_file")"
 keep_cache_path="$cache_root/objects/${keep_oid:0:2}/${keep_oid:2:2}/$keep_oid"
 remove_cache_path="$cache_root/objects/${remove_oid:0:2}/${remove_oid:2:2}/$remove_oid"
 
-cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-  gc --cache-root "$cache_root" --dry-run >"$tmp_dir/gc-dry-run-output"
+(
+  cd "$repo_dir"
+  cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
+    gc --cache-root "$cache_root" --dry-run >"$tmp_dir/gc-dry-run-output"
+)
 
 test -f "$keep_cache_path"
 test -f "$remove_cache_path"
@@ -99,8 +109,11 @@ grep -F "would remove" "$tmp_dir/gc-dry-run-output" >/dev/null
 grep -F "$remove_oid" "$tmp_dir/gc-dry-run-output" >/dev/null
 grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null
 
-cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-  gc --cache-root "$cache_root" >"$tmp_dir/gc-output"
+(
+  cd "$repo_dir"
+  cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
+    gc --cache-root "$cache_root" >"$tmp_dir/gc-output"
+)
 
 test -f "$keep_cache_path"
 test ! -e "$remove_cache_path"

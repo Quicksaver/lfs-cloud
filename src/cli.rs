@@ -29,8 +29,8 @@ use crate::{
     LfsInitRoute, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
     LocalCacheDehydration, LocalCacheDehydrationStatus, LocalCacheGarbageCollection,
     LocalCacheGarbageCollectionObject, LocalCacheLayout, LocalCacheMaterialization,
-    LocalCacheMaterializationStatus, ServeOptions, ServerConfig, StorageProviderConfig,
-    TracingConfig, init_tracing,
+    LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration, ServeOptions, ServerConfig,
+    StorageProviderConfig, TracingConfig, init_tracing,
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -288,8 +288,9 @@ fn run_dehydrate_to_stdout(command: DehydrateCommand) -> anyhow::Result<()> {
 
 fn run_gc_to_stdout(command: GcCommand) -> anyhow::Result<()> {
     let mut stdout = io::stdout().lock();
+    let current_dir = std::env::current_dir().context("failed to read current directory")?;
 
-    run_gc(command, &mut stdout).map_err(anyhow::Error::from)
+    run_gc_from_dir(command, &current_dir, &mut stdout).map_err(anyhow::Error::from)
 }
 
 fn run_login<R, W>(command: LoginCommand, input: &mut R, output: &mut W) -> anyhow::Result<()>
@@ -565,6 +566,7 @@ where
 {
     let layout = local_cache_layout(command.cache_root)?;
     let start_dir = start_dir.as_ref();
+    register_current_worktree(&layout, start_dir)?;
 
     for path in command.paths {
         let path = resolve_cli_path(start_dir, &path);
@@ -587,6 +589,7 @@ where
 {
     let layout = local_cache_layout(command.cache_root)?;
     let start_dir = start_dir.as_ref();
+    register_current_worktree(&layout, start_dir)?;
 
     for path in command.paths {
         let path = resolve_cli_path(start_dir, &path);
@@ -600,16 +603,36 @@ where
     Ok(())
 }
 
-fn run_gc<W>(command: GcCommand, output: &mut W) -> CliResult<()>
+fn run_gc_from_dir<W>(
+    command: GcCommand,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+) -> CliResult<()>
 where
     W: Write,
 {
     let layout = local_cache_layout(command.cache_root)?;
+    register_current_worktree(&layout, start_dir.as_ref())?;
     let report = layout
         .garbage_collect(command.dry_run)
         .map_err(local_cache_cli_error)?;
 
     write_gc_result(output, layout.root(), &report).map_err(output_error)
+}
+
+fn register_current_worktree(layout: &LocalCacheLayout, start_dir: &Path) -> CliResult<()> {
+    let repository = GitRepository::discover(start_dir)?;
+    let repository_id = repository.remote.repository_label();
+    let git_dir = repository.git_dir_path()?;
+    let registration =
+        LocalCacheWorktreeRegistration::new(repository_id, repository.worktree_root, git_dir)
+            .map_err(local_cache_cli_error)?;
+
+    layout
+        .register_worktree(registration)
+        .map_err(local_cache_cli_error)?;
+
+    Ok(())
 }
 
 fn local_cache_layout(cache_root: Option<PathBuf>) -> CliResult<LocalCacheLayout> {
@@ -1240,15 +1263,15 @@ mod tests {
 
     use super::{
         Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, StatusCommand,
-        dispatch, login_url_for_server, probe_server_reachable, run_dehydrate_from_dir, run_gc,
-        run_hydrate_from_dir, run_init_from_dir, run_login_from_dir, run_status_from_dir,
-        sanitize_browser_stderr, tracing_config, validate_status_storage, write_init_change,
+        dispatch, login_url_for_server, probe_server_reachable, run_dehydrate_from_dir,
+        run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir, run_login_from_dir,
+        run_status_from_dir, sanitize_browser_stderr, tracing_config, validate_status_storage,
+        write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
-        LfsOid, LfsPointer, LocalCacheError, LocalCacheLayout, LocalCacheWorktreeRegistration,
-        ServeOptions, StorageProviderConfig,
+        LfsOid, LfsPointer, LocalCacheError, LocalCacheLayout, ServeOptions, StorageProviderConfig,
     };
 
     #[test]
@@ -2099,9 +2122,14 @@ mod tests {
 
     #[test]
     fn hydrate_replaces_pointer_file_with_verified_cache_object() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
         let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         let worktree_file = repo.join("asset/model.bin");
         let bytes = b"cached model bytes";
         let object = object_for_bytes(bytes);
@@ -2136,9 +2164,14 @@ mod tests {
 
     #[test]
     fn dehydrate_caches_clean_file_and_writes_pointer() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
         let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         let worktree_file = repo.join("asset/model.bin");
         let bytes = b"hydrated model bytes";
         let object = object_for_bytes(bytes);
@@ -2169,13 +2202,30 @@ mod tests {
         assert!(rendered.contains("cached-and-replaced-with-pointer"));
         assert!(rendered.contains("asset/model.bin"));
         assert!(rendered.contains(object.oid.as_hex()));
+
+        let mut gc_output = Vec::new();
+        run_gc_from_dir(
+            GcCommand {
+                cache_root: Some(layout.root().to_path_buf()),
+                dry_run: false,
+            },
+            &repo,
+            &mut gc_output,
+        )
+        .expect("gc should retain the dehydrated pointer's cached bytes");
+        assert!(layout.object_path(&object).exists());
     }
 
     #[test]
     fn dehydrate_accepts_existing_pointer_as_idempotent() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
         let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         let worktree_file = repo.join("asset/model.bin");
         let object = object_for_bytes(b"already dehydrated bytes");
         let pointer = LfsPointer::new(object.clone()).to_pointer_file();
@@ -2203,9 +2253,14 @@ mod tests {
 
     #[test]
     fn hydrate_rejects_non_pointer_worktree_content_with_local_cache_error() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
         let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         let worktree_file = repo.join("asset/model.bin");
         write_file(&worktree_file, b"plain worktree bytes");
         let mut output = Vec::new();
@@ -2231,9 +2286,14 @@ mod tests {
 
     #[test]
     fn hydrate_reports_missing_cache_object_as_local_cache_error() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
         let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         let worktree_file = repo.join("asset/model.bin");
         let object = object_for_bytes(b"not cached yet");
         write_file(
@@ -2263,9 +2323,14 @@ mod tests {
 
     #[test]
     fn dehydrate_rejects_non_file_path_before_cache_mutation() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
         let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         fs::create_dir_all(repo.join("asset/model.bin")).expect("test directory should be created");
         let mut output = Vec::new();
 
@@ -2285,9 +2350,14 @@ mod tests {
 
     #[test]
     fn hydrate_stops_when_one_of_multiple_paths_fails() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
         let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         let missing_cache_file = repo.join("asset/missing.bin");
         let cached_file = repo.join("asset/cached.bin");
         let missing_object = object_for_bytes(b"missing cache object");
@@ -2332,17 +2402,19 @@ mod tests {
 
     #[test]
     fn gc_removes_unreferenced_cache_objects_and_reports_summary() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
         let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         let keep_bytes = b"gc referenced object";
         let remove_bytes = b"gc unreferenced object";
         let keep_object = object_for_bytes(keep_bytes);
         let remove_object = object_for_bytes(remove_bytes);
         let layout = LocalCacheLayout::new(&cache_root);
-        let registration =
-            LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
-                .expect("registration should validate");
         write_file(&layout.object_path(&keep_object), keep_bytes);
         write_file(&layout.object_path(&remove_object), remove_bytes);
         write_file(
@@ -2351,16 +2423,14 @@ mod tests {
                 .to_pointer_file()
                 .as_bytes(),
         );
-        layout
-            .register_worktree(registration)
-            .expect("worktree should register");
         let mut output = Vec::new();
 
-        run_gc(
+        run_gc_from_dir(
             GcCommand {
                 cache_root: Some(cache_root),
                 dry_run: false,
             },
+            &repo,
             &mut output,
         )
         .expect("gc should remove unreferenced cache objects");
@@ -2376,19 +2446,26 @@ mod tests {
 
     #[test]
     fn gc_dry_run_reports_without_removing_cache_objects() {
+        if !git_is_available() {
+            return;
+        }
+
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
         let bytes = b"gc dry-run unreferenced object";
         let object = object_for_bytes(bytes);
         let layout = LocalCacheLayout::new(&cache_root);
         write_file(&layout.object_path(&object), bytes);
         let mut output = Vec::new();
 
-        run_gc(
+        run_gc_from_dir(
             GcCommand {
                 cache_root: Some(cache_root),
                 dry_run: true,
             },
+            &repo,
             &mut output,
         )
         .expect("gc dry-run should report unreferenced cache objects");
@@ -2623,6 +2700,15 @@ repositories:
             fs::create_dir_all(parent).expect("file parent should be created");
         }
         fs::write(path, contents).expect("test file should be written");
+    }
+
+    fn init_git_repo_with_origin(repo: &Path) {
+        fs::create_dir_all(repo).expect("temporary repository directory should be created");
+        run_git(repo, &["init"]);
+        run_git(
+            repo,
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
     }
 
     fn git_is_available() -> bool {

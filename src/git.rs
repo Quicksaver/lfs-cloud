@@ -97,6 +97,31 @@ impl GitRepository {
         })
     }
 
+    /// Returns the absolute Git directory path for this worktree.
+    ///
+    /// Linked worktrees and repository-local `.git` files can point outside the
+    /// worktree root, so callers should ask Git for the normalized directory
+    /// instead of assuming `.git` is a directory under the checkout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git cannot resolve the current worktree's Git
+    /// directory.
+    pub fn git_dir_path(&self) -> CliResult<PathBuf> {
+        let output = git_stdout(
+            &self.worktree_root,
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+            "git rev-parse --path-format=absolute --git-dir",
+        )?;
+        let path = PathBuf::from(output.trim_end());
+
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            self.worktree_root.join(path)
+        })
+    }
+
     /// Writes the Git LFS URL either to `.lfsconfig` or to local Git config.
     ///
     /// The write is delegated to `git config` so Git's own config parser owns
