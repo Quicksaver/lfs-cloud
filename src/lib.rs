@@ -11,6 +11,7 @@ pub mod github_auth;
 pub mod google_drive;
 pub mod init;
 pub mod lfs;
+pub mod local_cache;
 pub mod logging;
 pub mod metadata;
 pub mod providers;
@@ -52,6 +53,7 @@ pub use lfs::{
     LfsBatchRequestParseError, LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectError,
     LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
 };
+pub use local_cache::{DEFAULT_LOCAL_CACHE_HOME_DIR, LOCAL_CACHE_OBJECTS_DIR, LocalCacheLayout};
 pub use logging::{
     DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, init_tracing,
     tracing_filter,

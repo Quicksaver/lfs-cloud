@@ -1142,6 +1142,9 @@ Defer:
 > command opens or prints the server GitHub OAuth login URL, accepts the
 > returned local `lfs-cloud` token, and stores only that local token in Git's
 > credential helper for the current repository's LFS URL.
+> Local cache path helpers now define the shared content-addressed object layout
+> under `~/.lfs-cloud/objects`, using two-level SHA-256 sharding before later
+> ingest, hydration, dehydration, and garbage-collection work.
 
 ### Progress Summary
 
@@ -1155,9 +1158,9 @@ Defer:
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 8      | 5         |
 | 7. Migration                             | 12          | 0      | 12        |
-| 8. Local Cache And Materialization       | 8           | 0      | 8         |
+| 8. Local Cache And Materialization       | 8           | 1      | 7         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **66** | **33**    |
+| **Total**                                | **99**      | **67** | **32**    |
 
 ### Legend
 
@@ -1335,7 +1338,7 @@ Defer:
 
 #### Epic 8.1: Shared Cache
 
-- [ ] [T] Define local cache root and object path layout under `~/.lfs-cloud/objects`.
+- [x] [T] Define local cache root and object path layout under `~/.lfs-cloud/objects`.
 - [ ] [T] Implement ingest from existing `.git/lfs/objects`.
 - [ ] [T] Implement cache object hash and size verification.
 - [ ] [T] Track repo/worktree registrations for safe local cache GC.
