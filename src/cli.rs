@@ -67,6 +67,10 @@ enum Command {
     /// Dehydrate clean worktree files back to Git LFS pointers.
     Dehydrate(DehydrateCommand),
     /// Remove shared local cache objects with no registered worktree references.
+    ///
+    /// When run inside a Git worktree, the current worktree registration is
+    /// refreshed before collection so its Git LFS pointers are considered
+    /// reachable.
     Gc(GcCommand),
 }
 
@@ -612,12 +616,28 @@ where
     W: Write,
 {
     let layout = local_cache_layout(command.cache_root)?;
-    register_current_worktree(&layout, start_dir.as_ref())?;
+    register_current_worktree_for_gc(&layout, start_dir.as_ref())?;
     let report = layout
         .garbage_collect(command.dry_run)
         .map_err(local_cache_cli_error)?;
 
     write_gc_result(output, layout.root(), &report).map_err(output_error)
+}
+
+fn register_current_worktree_for_gc(layout: &LocalCacheLayout, start_dir: &Path) -> CliResult<()> {
+    match register_current_worktree(layout, start_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if is_git_worktree_discovery_error(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_git_worktree_discovery_error(error: &CliError) -> bool {
+    match error {
+        CliError::ExternalCommand { command, .. } => command == "git rev-parse --show-toplevel",
+        CliError::Io { context, .. } => context == "failed to start git rev-parse --show-toplevel",
+        _ => false,
+    }
 }
 
 fn register_current_worktree(layout: &LocalCacheLayout, start_dir: &Path) -> CliResult<()> {
@@ -2475,6 +2495,34 @@ mod tests {
         assert!(rendered.contains("objects: 0 retained, 1 would remove, 0 skipped"));
         assert!(rendered.contains("would remove"));
         assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn gc_runs_outside_git_worktree() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let start_dir = temp.path().join("outside-repo");
+        let bytes = b"gc outside repo object";
+        let object = object_for_bytes(bytes);
+        let layout = LocalCacheLayout::new(&cache_root);
+        fs::create_dir_all(&start_dir).expect("start directory should be created");
+        write_file(&layout.object_path(&object), bytes);
+        let mut output = Vec::new();
+
+        run_gc_from_dir(
+            GcCommand {
+                cache_root: Some(cache_root),
+                dry_run: false,
+            },
+            &start_dir,
+            &mut output,
+        )
+        .expect("gc should run without a current Git worktree");
+
+        assert!(!layout.object_path(&object).exists());
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("worktrees: 0 active, 0 pruned"));
+        assert!(rendered.contains("objects: 0 retained, 1 removed, 0 skipped"));
     }
 
     #[test]

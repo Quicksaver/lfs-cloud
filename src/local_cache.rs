@@ -466,13 +466,16 @@ pub struct LocalCacheGarbageCollection {
     pub dry_run: bool,
     /// Number of registered worktrees that still existed and were scanned.
     pub active_worktree_count: usize,
-    /// Worktree registrations whose roots were missing and were pruned.
+    /// Worktree registrations whose roots were missing or no longer directories and were pruned.
     pub pruned_worktrees: Vec<LocalCacheWorktreeRegistration>,
     /// Valid cached object files that were still referenced by a worktree.
     pub retained_objects: Vec<LocalCacheGarbageCollectionObject>,
     /// Valid cached object files that were not referenced by any worktree.
     pub unreferenced_objects: Vec<LocalCacheGarbageCollectionObject>,
-    /// Valid cached object files removed from disk.
+    /// Valid cached object files removed from disk during a real run.
+    ///
+    /// This is empty for dry runs even when [`Self::unreferenced_objects`] lists
+    /// objects that would be removed.
     pub deleted_objects: Vec<LocalCacheGarbageCollectionObject>,
     /// Cache paths ignored because they did not match the sharded object layout.
     pub skipped_cache_paths: Vec<PathBuf>,
@@ -847,6 +850,9 @@ impl LocalCacheLayout {
     /// written, a registered worktree cannot be scanned, or a cache object
     /// cannot be removed.
     pub fn garbage_collect(&self, dry_run: bool) -> LocalCacheResult<LocalCacheGarbageCollection> {
+        // Keep registry roots stable while reachability is computed and cache
+        // objects are deleted; otherwise a concurrent worktree registration
+        // could lose cache bytes before its pointers are considered.
         let _lock = self.lock_worktree_registry()?;
         let mut registry = self.load_worktree_registry()?;
         let (active_worktrees, pruned_worktrees) =
@@ -860,6 +866,13 @@ impl LocalCacheLayout {
         cache_objects.sort_by(|left, right| left.path.cmp(&right.path));
         skipped_cache_paths.sort();
 
+        if !dry_run && !pruned_worktrees.is_empty() {
+            for registration in &pruned_worktrees {
+                registry.remove(&registration.worktree_root);
+            }
+            self.save_worktree_registry(&registry)?;
+        }
+
         for object in cache_objects {
             if referenced_oids.contains(&object.oid) {
                 retained_objects.push(object);
@@ -870,13 +883,6 @@ impl LocalCacheLayout {
                 }
                 unreferenced_objects.push(object);
             }
-        }
-
-        if !dry_run && !pruned_worktrees.is_empty() {
-            for registration in &pruned_worktrees {
-                registry.remove(&registration.worktree_root);
-            }
-            self.save_worktree_registry(&registry)?;
         }
 
         Ok(LocalCacheGarbageCollection {
@@ -1028,13 +1034,7 @@ fn partition_existing_worktrees(
     for registration in registrations {
         match fs::metadata(&registration.worktree_root) {
             Ok(metadata) if metadata.is_dir() => active.push(registration.clone()),
-            Ok(_) => {
-                return Err(LocalCacheError::Io {
-                    context: "registered worktree root is not a directory",
-                    path: registration.worktree_root.clone(),
-                    source: io::Error::new(io::ErrorKind::InvalidData, "expected a directory"),
-                });
-            }
+            Ok(_) => missing.push(registration.clone()),
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 missing.push(registration.clone());
             }
@@ -1080,6 +1080,9 @@ fn collect_pointer_oids_from_directory(
             source,
         })?;
         let path = entry.path();
+        if entry.file_name() == OsStr::new(".git") {
+            continue;
+        }
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
@@ -1092,10 +1095,11 @@ fn collect_pointer_oids_from_directory(
             }
         };
 
+        if file_type.is_symlink() {
+            continue;
+        }
         if file_type.is_dir() {
-            if entry.file_name() != OsStr::new(".git") {
-                collect_pointer_oids_from_directory(&path, referenced)?;
-            }
+            collect_pointer_oids_from_directory(&path, referenced)?;
         } else if file_type.is_file() {
             collect_pointer_oid_from_file(&path, referenced)?;
         }
@@ -1175,14 +1179,27 @@ fn collect_cache_object_files(
             continue;
         }
 
-        for second_shard in read_cache_directory(&first_path)? {
+        let second_shards = fs::read_dir(&first_path).map_err(|source| LocalCacheError::Io {
+            context: "failed to read local cache shard directory",
+            path: first_path.clone(),
+            source,
+        })?;
+        for second_shard in second_shards {
+            let second_shard = read_cache_entry(second_shard, &first_path)?;
             let second_path = second_shard.path();
             if !entry_is_directory(&second_shard, "second-level cache shard")? {
                 skipped.push(second_path);
                 continue;
             }
 
-            for object_entry in read_cache_directory(&second_path)? {
+            let object_entries =
+                fs::read_dir(&second_path).map_err(|source| LocalCacheError::Io {
+                    context: "failed to read local cache shard directory",
+                    path: second_path.clone(),
+                    source,
+                })?;
+            for object_entry in object_entries {
+                let object_entry = read_cache_entry(object_entry, &second_path)?;
                 let path = object_entry.path();
                 if !entry_is_file(&object_entry, "cache object path")? {
                     skipped.push(path);
@@ -1209,18 +1226,6 @@ fn read_cache_entry(
         path: directory.to_path_buf(),
         source,
     })
-}
-
-fn read_cache_directory(directory: &Path) -> LocalCacheResult<Vec<fs::DirEntry>> {
-    let entries = fs::read_dir(directory).map_err(|source| LocalCacheError::Io {
-        context: "failed to read local cache shard directory",
-        path: directory.to_path_buf(),
-        source,
-    })?;
-
-    entries
-        .map(|entry| read_cache_entry(entry, directory))
-        .collect()
 }
 
 fn entry_is_directory(entry: &fs::DirEntry, label: &'static str) -> LocalCacheResult<bool> {
@@ -3128,6 +3133,108 @@ mod tests {
                 .worktrees(),
             &[active_registration]
         );
+    }
+
+    #[test]
+    fn garbage_collect_prunes_registered_worktree_that_became_a_file() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let replaced_repo = temp.path().join("replaced-repo");
+        let bytes = b"file-replaced worktree cache object";
+        let object = object_for_bytes(bytes);
+        let registration = LocalCacheWorktreeRegistration::new(
+            "github-main:owner/replaced",
+            &replaced_repo,
+            temp.path().join("replaced-repo/.git"),
+        )
+        .expect("registration should validate");
+
+        write_file(&layout.object_path(&object), bytes);
+        write_file(&replaced_repo, b"not a directory");
+        layout
+            .register_worktree(registration.clone())
+            .expect("worktree should register");
+
+        let report = layout
+            .garbage_collect(false)
+            .expect("file-replaced worktree should prune");
+
+        assert_eq!(report.active_worktree_count, 0);
+        assert_eq!(report.pruned_worktrees, vec![registration]);
+        assert_eq!(report.unreferenced_objects.len(), 1);
+        assert!(!layout.object_path(&object).exists());
+        assert!(
+            layout
+                .load_worktree_registry()
+                .expect("registry should reload")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn garbage_collect_ignores_git_file_when_collecting_pointers() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let repo = temp.path().join("repo");
+        let bytes = b"git file referenced cache object";
+        let object = object_for_bytes(bytes);
+        let registration =
+            LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
+                .expect("active registration should validate");
+
+        fs::create_dir_all(&repo).expect("worktree should be created");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(
+            &repo.join(".git"),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        layout
+            .register_worktree(registration)
+            .expect("worktree should register");
+
+        let report = layout
+            .garbage_collect(false)
+            .expect("garbage collection should finish");
+
+        assert_eq!(report.active_worktree_count, 1);
+        assert_eq!(report.unreferenced_objects.len(), 1);
+        assert_eq!(report.unreferenced_objects[0].oid, object.oid);
+        assert!(!layout.object_path(&object).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn garbage_collect_ignores_symlinked_directory_when_collecting_pointers() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        let bytes = b"symlinked pointer cache object";
+        let object = object_for_bytes(bytes);
+        let registration =
+            LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
+                .expect("active registration should validate");
+
+        fs::create_dir_all(&repo).expect("worktree should be created");
+        fs::create_dir_all(&outside).expect("outside directory should be created");
+        std::os::unix::fs::symlink(&outside, repo.join("linked"))
+            .expect("directory symlink should be created");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(
+            &outside.join("model.bin"),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        layout
+            .register_worktree(registration)
+            .expect("worktree should register");
+
+        let report = layout
+            .garbage_collect(false)
+            .expect("garbage collection should finish");
+
+        assert_eq!(report.unreferenced_objects.len(), 1);
+        assert_eq!(report.unreferenced_objects[0].oid, object.oid);
+        assert!(!layout.object_path(&object).exists());
     }
 
     #[test]
