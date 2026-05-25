@@ -1203,7 +1203,9 @@ Defer:
 > hydration through the shared cache. Security review found and fixed a GitHub
 > OAuth client-secret debug-output leak in loaded server config, and
 > `scripts/manual/verify-secret-redaction.sh` now runs the focused redaction
-> regression checks.
+> regression checks. `scripts/manual/verify-lan-smoke-test.sh` now verifies
+> local LAN-serving preflight behavior and prints the cross-machine smoke test
+> checklist for disposable GitHub/Google Drive validation.
 
 ### Progress Summary
 
@@ -1218,8 +1220,8 @@ Defer:
 | 6. CLI Commands                          | 13          | 13     | 0         |
 | 7. Migration                             | 12          | 12     | 0         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
-| 9. Verification, Docs, And Release Shape | 8           | 2      | 6         |
-| **Total**                                | **99**      | **93** | **6**     |
+| 9. Verification, Docs, And Release Shape | 8           | 3      | 5         |
+| **Total**                                | **99**      | **94** | **5**     |
 
 ### Legend
 
@@ -1416,7 +1418,7 @@ Defer:
 - [x] [T] Add local end-to-end test for init, upload, download, and checkout using fake GitHub/Drive providers.
 - [ ] [M] Add gated GitHub integration test using a disposable repo.
 - [ ] [M] Add gated Google Drive integration test using a disposable folder.
-- [ ] [M] Add manual LAN smoke test checklist.
+- [x] [M] Add manual LAN smoke test checklist. Manual verification: `scripts/manual/verify-lan-smoke-test.sh`.
 
 #### Epic 9.2: Security And Documentation
 
