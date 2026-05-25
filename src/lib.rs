@@ -54,8 +54,10 @@ pub use lfs::{
     LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
 };
 pub use local_cache::{
-    DEFAULT_LOCAL_CACHE_HOME_DIR, LOCAL_CACHE_OBJECTS_DIR, LocalCacheError, LocalCacheIngest,
-    LocalCacheIngestStatus, LocalCacheLayout, LocalCacheResult, VerifiedLocalCacheObject,
+    DEFAULT_LOCAL_CACHE_HOME_DIR, LOCAL_CACHE_OBJECTS_DIR, LOCAL_CACHE_WORKTREES_FILE,
+    LocalCacheError, LocalCacheIngest, LocalCacheIngestStatus, LocalCacheLayout, LocalCacheResult,
+    LocalCacheWorktreeRegistration, LocalCacheWorktreeRegistrationChange,
+    LocalCacheWorktreeRegistrationStatus, LocalCacheWorktreeRegistry, VerifiedLocalCacheObject,
 };
 pub use logging::{
     DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError, init_tracing,

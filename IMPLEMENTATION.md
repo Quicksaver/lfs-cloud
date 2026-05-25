@@ -1151,7 +1151,10 @@ Defer:
 > under `~/.lfs-cloud/objects`, using two-level SHA-256 sharding. Existing
 > repository-local Git LFS cache objects can now be ingested into that shared
 > cache only after SHA-256 and byte-size verification, and already cached
-> objects are reverified before reuse.
+> objects are reverified before reuse. Local cache roots now also track
+> registered repository worktrees in a versioned `worktrees.json` registry so
+> future garbage collection can inspect known cache consumers before deleting
+> shared objects.
 
 ### Progress Summary
 
@@ -1165,9 +1168,9 @@ Defer:
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 9      | 4         |
 | 7. Migration                             | 12          | 0      | 12        |
-| 8. Local Cache And Materialization       | 8           | 3      | 5         |
+| 8. Local Cache And Materialization       | 8           | 4      | 4         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **70** | **29**    |
+| **Total**                                | **99**      | **71** | **28**    |
 
 ### Legend
 
@@ -1313,10 +1316,10 @@ Defer:
 #### Epic 6.3: Operations
 
 - [x] [M] Implement `lfs-cloud status` for server reachability, repo mapping, auth, storage, and local cache status. Manual verification: `scripts/manual/verify-status-command.sh`.
-- [ ] [M] Implement `lfs-cloud pull` wrapper for fetch plus CoW materialization.
-- [ ] [M] Implement `lfs-cloud hydrate <path...>`.
-- [ ] [M] Implement `lfs-cloud dehydrate <path...>`.
-- [ ] [M] Implement `lfs-cloud gc` for local cache cleanup.
+- [ ] [M] Implement `lfs-cloud pull` wrapper for fetch plus CoW materialization. depends: [8.2.1], [8.2.2], [8.2.3].
+- [ ] [M] Implement `lfs-cloud hydrate <path...>`. depends: [8.2.1], [8.2.2], [8.2.3].
+- [ ] [M] Implement `lfs-cloud dehydrate <path...>`. depends: [8.2.4].
+- [ ] [M] Implement `lfs-cloud gc` for local cache cleanup. depends: [8.1.4].
 
 ### Phase 7: Migration
 
@@ -1348,7 +1351,7 @@ Defer:
 - [x] [T] Define local cache root and object path layout under `~/.lfs-cloud/objects`.
 - [x] [T] Implement ingest from existing `.git/lfs/objects`.
 - [x] [T] Implement cache object hash and size verification.
-- [ ] [T] Track repo/worktree registrations for safe local cache GC.
+- [x] [T] Track repo/worktree registrations for safe local cache GC.
 
 #### Epic 8.2: Working Tree Materialization
 
