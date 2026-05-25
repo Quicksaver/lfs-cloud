@@ -31,6 +31,11 @@ const OBJECT_SHARD_LEVELS: usize = 2;
 const OBJECT_SHARD_PREFIX_LENGTH: usize = OBJECT_SHARD_WIDTH * OBJECT_SHARD_LEVELS;
 const WORKTREE_REGISTRY_LOCK_FILE: &str = "worktrees.json.lock";
 const WORKTREE_REGISTRY_VERSION: u32 = 1;
+const MAX_LFS_POINTER_FILE_SIZE: u64 = 64 * 1024;
+#[cfg(unix)]
+const DEFAULT_MATERIALIZED_FILE_MODE: u32 = 0o644;
+#[cfg(not(unix))]
+const DEFAULT_MATERIALIZED_FILE_MODE: () = ();
 
 /// Result type for local cache operations.
 pub type LocalCacheResult<T> = Result<T, LocalCacheError>;
@@ -149,6 +154,20 @@ pub enum LocalCacheError {
         /// Underlying pointer parse failure.
         #[source]
         source: LfsObjectError,
+    },
+
+    /// A worktree path was too large to safely parse as a Git LFS pointer.
+    #[error(
+        "Git LFS pointer at {} is too large to hydrate safely: {size} bytes exceeds {max_size} bytes",
+        path.display()
+    )]
+    PointerFileTooLarge {
+        /// Pointer file path.
+        path: PathBuf,
+        /// Actual file size in bytes.
+        size: u64,
+        /// Maximum pointer file size accepted by hydration.
+        max_size: u64,
     },
 }
 
@@ -791,11 +810,39 @@ enum MaterializationMode {
 }
 
 fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
-    let contents = fs::read_to_string(path).map_err(|source| LocalCacheError::Io {
+    let metadata = fs::metadata(path).map_err(|source| LocalCacheError::Io {
+        context: "failed to inspect Git LFS pointer file",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.len() > MAX_LFS_POINTER_FILE_SIZE {
+        return Err(LocalCacheError::PointerFileTooLarge {
+            path: path.to_path_buf(),
+            size: metadata.len(),
+            max_size: MAX_LFS_POINTER_FILE_SIZE,
+        });
+    }
+
+    let file = File::open(path).map_err(|source| LocalCacheError::Io {
         context: "failed to read Git LFS pointer file",
         path: path.to_path_buf(),
         source,
     })?;
+    let mut contents = String::new();
+    file.take(MAX_LFS_POINTER_FILE_SIZE + 1)
+        .read_to_string(&mut contents)
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to read Git LFS pointer file",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if contents.len() as u64 > MAX_LFS_POINTER_FILE_SIZE {
+        return Err(LocalCacheError::PointerFileTooLarge {
+            path: path.to_path_buf(),
+            size: contents.len() as u64,
+            max_size: MAX_LFS_POINTER_FILE_SIZE,
+        });
+    }
 
     LfsPointer::parse(&contents).map_err(|source| LocalCacheError::PointerParse {
         path: path.to_path_buf(),
@@ -1009,27 +1056,34 @@ fn publish_materialized_file(
     object: &LfsObject,
 ) -> LocalCacheResult<()> {
     match mode {
-        MaterializationMode::NoReplace => match temp.persist_noclobber(destination_path) {
-            Ok(_) => Ok(()),
-            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                match verify_file_object(destination_path, object) {
-                    Ok(_) => Ok(()),
-                    Err(LocalCacheError::IntegrityMismatch { .. }) => {
-                        Err(LocalCacheError::MaterializationTargetExists {
-                            oid: object.oid.clone(),
-                            size: object.size,
-                            path: destination_path.to_path_buf(),
-                        })
+        MaterializationMode::NoReplace => {
+            set_materialized_file_mode(
+                temp.path(),
+                destination_path,
+                DEFAULT_MATERIALIZED_FILE_MODE,
+            )?;
+            match temp.persist_noclobber(destination_path) {
+                Ok(_) => Ok(()),
+                Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                    match verify_file_object(destination_path, object) {
+                        Ok(_) => Ok(()),
+                        Err(LocalCacheError::IntegrityMismatch { .. }) => {
+                            Err(LocalCacheError::MaterializationTargetExists {
+                                oid: object.oid.clone(),
+                                size: object.size,
+                                path: destination_path.to_path_buf(),
+                            })
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
                 }
+                Err(error) => Err(LocalCacheError::Io {
+                    context: "failed to publish materialized object",
+                    path: destination_path.to_path_buf(),
+                    source: error.error,
+                }),
             }
-            Err(error) => Err(LocalCacheError::Io {
-                context: "failed to publish materialized object",
-                path: destination_path.to_path_buf(),
-                source: error.error,
-            }),
-        },
+        }
         MaterializationMode::ReplaceMatchingPointer => {
             let pointer = read_lfs_pointer_file(destination_path)?;
             if pointer.object != *object {
@@ -1039,6 +1093,8 @@ fn publish_materialized_file(
                     path: destination_path.to_path_buf(),
                 });
             }
+            let replacement_mode = existing_file_mode(destination_path)?;
+            set_materialized_file_mode(temp.path(), destination_path, replacement_mode)?;
             temp.persist(destination_path)
                 .map_err(|error| LocalCacheError::Io {
                     context: "failed to publish materialized object",
@@ -1048,6 +1104,50 @@ fn publish_materialized_file(
             Ok(())
         }
     }
+}
+
+#[cfg(unix)]
+fn existing_file_mode(path: &Path) -> LocalCacheResult<u32> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to inspect materialization destination permissions",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn existing_file_mode(_path: &Path) -> LocalCacheResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_materialized_file_mode(
+    temp_path: &Path,
+    destination_path: &Path,
+    mode: u32,
+) -> LocalCacheResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(temp_path, fs::Permissions::from_mode(mode)).map_err(|source| {
+        LocalCacheError::Io {
+            context: "failed to set temporary materialized object permissions",
+            path: destination_path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn set_materialized_file_mode(
+    _temp_path: &Path,
+    _destination_path: &Path,
+    _mode: (),
+) -> LocalCacheResult<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1606,6 +1706,30 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn materialize_object_uses_worktree_file_mode_for_new_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"cache bytes with normal worktree permissions";
+        let object = object_for_bytes(bytes);
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+
+        layout
+            .materialize_object(&object, &destination)
+            .expect("verified cache object should materialize");
+
+        let mode = fs::metadata(&destination)
+            .expect("materialized destination should have metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, DEFAULT_MATERIALIZED_FILE_MODE);
+    }
+
     #[test]
     fn materialize_object_reuses_existing_verified_destination() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -1679,6 +1803,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hydrate_pointer_file_preserves_existing_worktree_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"hydrated executable bytes";
+        let object = object_for_bytes(bytes);
+        let destination = temp.path().join("repo/assets/tool.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(
+            &destination,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        let mut permissions = fs::metadata(&destination)
+            .expect("pointer should have metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&destination, permissions)
+            .expect("pointer mode should be made executable");
+
+        layout
+            .hydrate_pointer_file(&destination)
+            .expect("matching pointer should hydrate from cache");
+
+        let mode = fs::metadata(&destination)
+            .expect("hydrated destination should have metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
     #[test]
     fn hydrate_pointer_file_rejects_non_pointer_worktree_content() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -1698,6 +1856,27 @@ mod tests {
             fs::read(&destination).expect("destination should remain untouched"),
             b"dirty non-pointer contents"
         );
+    }
+
+    #[test]
+    fn hydrate_pointer_file_rejects_oversized_non_pointer_without_unbounded_read() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let destination = temp.path().join("repo/assets/model.bin");
+        let bytes = vec![b'x'; (MAX_LFS_POINTER_FILE_SIZE + 1) as usize];
+        write_file(&destination, &bytes);
+
+        let error = layout
+            .hydrate_pointer_file(&destination)
+            .expect_err("oversized non-pointer worktree content should not hydrate");
+
+        assert!(matches!(
+            error,
+            LocalCacheError::PointerFileTooLarge { path, size, max_size }
+                if path == destination
+                    && size == MAX_LFS_POINTER_FILE_SIZE + 1
+                    && max_size == MAX_LFS_POINTER_FILE_SIZE
+        ));
     }
 
     #[test]
