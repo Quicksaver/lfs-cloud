@@ -72,8 +72,9 @@ pub use metadata::{
     MetadataObjectVerificationStatus,
 };
 pub use migration::{
-    GitLfsFilterConfig, GitLfsInstallation, GitLfsMigrationDiscovery, GitLfsSourceEndpoint,
-    GitLfsSourceEndpointSource, GitLfsTrackedPattern, discover_git_lfs_migration,
+    CurrentCheckoutLfsPointer, CurrentCheckoutLfsPointers, GitLfsFilterConfig, GitLfsInstallation,
+    GitLfsMigrationDiscovery, GitLfsSourceEndpoint, GitLfsSourceEndpointSource,
+    GitLfsTrackedPattern, discover_git_lfs_migration, enumerate_current_checkout_lfs_pointers,
 };
 pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,

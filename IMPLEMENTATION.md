@@ -1173,7 +1173,11 @@ Defer:
 > Migration discovery support can now inspect an existing Git worktree for
 > local Git LFS installation status, visible LFS filter config, repository LFS
 > endpoint config, and `.gitattributes` patterns that declare `filter=lfs`,
-> without mutating Git config, worktree files, cache state, or storage.
+> without mutating Git config, worktree files, cache state, or storage. Current
+> checkout migration scanning can now ask Git for tracked paths with
+> `filter=lfs` and parse small checked-out pointer files into object identities
+> without treating hydrated files or non-LFS pointer-shaped fixtures as
+> migration pointers.
 
 ### Progress Summary
 
@@ -1186,10 +1190,10 @@ Defer:
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 13     | 0         |
-| 7. Migration                             | 12          | 1      | 11        |
+| 7. Migration                             | 12          | 2      | 10        |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **80** | **19**    |
+| **Total**                                | **99**      | **81** | **18**    |
 
 ### Legend
 
@@ -1345,7 +1349,7 @@ Defer:
 #### Epic 7.1: Discovery
 
 - [x] [T] Detect existing Git LFS installation, filters, tracked patterns, and source LFS endpoint.
-- [ ] [T] Enumerate LFS pointers for current checkout.
+- [x] [T] Enumerate LFS pointers for current checkout.
 - [ ] [T] Enumerate LFS pointers for selected refs.
 - [ ] [T] Enumerate LFS pointers for all fetched refs.
 

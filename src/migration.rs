@@ -5,20 +5,26 @@
 //! provider. This module owns that read-only boundary so later migration steps
 //! can build dry-run and transfer plans from one consistent snapshot.
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs,
+    io::{self, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Output},
+    process::{Command, ExitStatus, Output, Stdio},
 };
 
-use crate::{MigrationError, MigrationResult, SanitizedMessage};
+use crate::{LfsObject, LfsPointer, MigrationError, MigrationResult, SanitizedMessage};
 use url::Url;
 
 const DEFAULT_REMOTE_NAME: &str = "origin";
 const MAX_MIGRATION_GIT_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_GIT_ATTRIBUTES_BYTES: u64 = 256 * 1024;
+const MAX_CURRENT_CHECKOUT_POINTER_BYTES: u64 = 64 * 1024;
 
 /// Read-only discovery result for an existing Git LFS repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +80,30 @@ pub struct GitLfsTrackedPattern {
     pub source: PathBuf,
 }
 
+/// Git LFS pointers discovered from the current checkout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct CurrentCheckoutLfsPointers {
+    /// Git worktree root that was inspected.
+    pub worktree_root: PathBuf,
+    /// Number of tracked checkout paths whose Git attributes use `filter=lfs`.
+    pub tracked_path_count: usize,
+    /// Pointer files found among the currently checked-out LFS-tracked paths.
+    pub pointers: Vec<CurrentCheckoutLfsPointer>,
+}
+
+/// A Git LFS pointer file found in the current checkout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct CurrentCheckoutLfsPointer {
+    /// Repository-relative path to the pointer file.
+    pub relative_path: PathBuf,
+    /// Absolute worktree path to the pointer file.
+    pub path: PathBuf,
+    /// Object identity referenced by the pointer file.
+    pub object: LfsObject,
+}
+
 /// Repository-scoped Git LFS source endpoint discovered for migration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -121,6 +151,46 @@ pub fn discover_git_lfs_migration(
         tracked_patterns: discover_lfs_tracked_patterns(&worktree_root)?,
         source_endpoint: discover_source_endpoint(&worktree_root)?,
         worktree_root,
+    })
+}
+
+/// Enumerates Git LFS pointer files in the current checkout.
+///
+/// This function is intentionally read-only. It asks Git which tracked paths
+/// have `filter=lfs`, then parses only small pointer-shaped files in the
+/// current worktree. Hydrated files and ordinary files are reported by their
+/// absence so migration planning can distinguish current checkout coverage from
+/// later history scans.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree,
+/// Git cannot list tracked files or attributes, or Git returns unsafe path data.
+pub fn enumerate_current_checkout_lfs_pointers(
+    start_dir: impl AsRef<Path>,
+) -> MigrationResult<CurrentCheckoutLfsPointers> {
+    let start_dir = start_dir.as_ref();
+    let worktree_root = detect_worktree_root(start_dir)?;
+    let lfs_tracked_paths = current_checkout_lfs_tracked_paths(&worktree_root)?;
+    let mut pointers = Vec::new();
+
+    for relative_path in &lfs_tracked_paths {
+        let path = worktree_root.join(relative_path);
+        let Some(pointer) = read_current_checkout_pointer_candidate(&path)? else {
+            continue;
+        };
+
+        pointers.push(CurrentCheckoutLfsPointer {
+            relative_path: relative_path.clone(),
+            path,
+            object: pointer.object,
+        });
+    }
+
+    Ok(CurrentCheckoutLfsPointers {
+        worktree_root,
+        tracked_path_count: lfs_tracked_paths.len(),
+        pointers,
     })
 }
 
@@ -420,6 +490,173 @@ fn git_attributes_files(worktree_root: &Path) -> MigrationResult<Vec<PathBuf>> {
     Ok(paths.into_iter().collect())
 }
 
+fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> MigrationResult<Vec<PathBuf>> {
+    let output = run_git_os(
+        worktree_root,
+        [
+            OsStr::new("ls-files"),
+            OsStr::new("-z"),
+            OsStr::new("--cached"),
+        ],
+        "git ls-files -z --cached",
+    )?;
+    if !output.status.success() {
+        return Err(command_error(
+            "git ls-files -z --cached",
+            output.status,
+            &output.stderr,
+        ));
+    }
+    if output.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let output = git_check_attr_filter(worktree_root, &output.stdout)?;
+    let mut fields = output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .collect::<Vec<_>>();
+    if fields.last() == Some(&&[][..]) {
+        fields.pop();
+    }
+
+    let chunks = fields.chunks_exact(3);
+    if !chunks.remainder().is_empty() {
+        return Err(git_check_attr_parse_error());
+    }
+
+    let mut paths = Vec::new();
+    for chunk in chunks {
+        let [relative_path, attribute, value] = chunk else {
+            unreachable!("chunks_exact yielded a non-triple chunk");
+        };
+        if *attribute == b"filter" && *value == b"lfs" {
+            paths.push(safe_git_relative_path(
+                relative_path,
+                "git check-attr -z --stdin filter",
+            )?);
+        }
+    }
+
+    Ok(paths)
+}
+
+fn git_check_attr_filter(worktree_root: &Path, tracked_paths: &[u8]) -> MigrationResult<Output> {
+    let mut child = Command::new("git")
+        .args(["check-attr", "-z", "--stdin", "filter"])
+        .current_dir(worktree_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| MigrationError::Io {
+            context: "failed to start git check-attr -z --stdin filter".to_owned(),
+            source,
+        })?;
+
+    let mut stdin = child.stdin.take().expect("child stdin should be piped");
+    let tracked_paths = tracked_paths.to_owned();
+    let stdin_writer = std::thread::spawn(move || {
+        let write_result = stdin.write_all(&tracked_paths);
+        drop(stdin);
+
+        write_result
+    });
+
+    let output = child
+        .wait_with_output()
+        .map_err(|source| MigrationError::Io {
+            context: "failed to wait for git check-attr -z --stdin filter".to_owned(),
+            source,
+        })?;
+
+    let write_result = stdin_writer.join().map_err(|_| MigrationError::Io {
+        context: "git check-attr input writer panicked".to_owned(),
+        source: io::Error::other("git check-attr input writer panicked"),
+    })?;
+
+    if !output.status.success() {
+        return Err(command_error(
+            "git check-attr -z --stdin filter",
+            output.status,
+            &output.stderr,
+        ));
+    }
+
+    write_result.map_err(|source| MigrationError::Io {
+        context: "failed to write git check-attr path input".to_owned(),
+        source,
+    })?;
+
+    Ok(output)
+}
+
+fn git_check_attr_parse_error() -> MigrationError {
+    MigrationError::ExternalCommandOutput {
+        command: "git check-attr -z --stdin filter".to_owned(),
+        message: SanitizedMessage::new("git returned malformed attribute output"),
+    }
+}
+
+fn safe_git_relative_path(relative_path: &[u8], command: &str) -> MigrationResult<PathBuf> {
+    let path = git_path_bytes_to_path_buf(relative_path, command)?;
+    let valid = !path.is_absolute()
+        && path.components().next().is_some()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+
+    if valid {
+        Ok(path)
+    } else {
+        Err(MigrationError::ExternalCommandOutput {
+            command: command.to_owned(),
+            message: SanitizedMessage::new("git returned a path outside the worktree"),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn git_path_bytes_to_path_buf(relative_path: &[u8], _command: &str) -> MigrationResult<PathBuf> {
+    Ok(PathBuf::from(OsString::from_vec(relative_path.to_owned())))
+}
+
+#[cfg(not(unix))]
+fn git_path_bytes_to_path_buf(relative_path: &[u8], command: &str) -> MigrationResult<PathBuf> {
+    String::from_utf8(relative_path.to_owned())
+        .map(PathBuf::from)
+        .map_err(|_| MigrationError::ExternalCommandOutput {
+            command: command.to_owned(),
+            message: SanitizedMessage::new("git returned non-UTF-8 path output"),
+        })
+}
+
+fn read_current_checkout_pointer_candidate(path: &Path) -> MigrationResult<Option<LfsPointer>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(MigrationError::Io {
+                context: format!("failed to inspect checkout path {}", path.display()),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CURRENT_CHECKOUT_POINTER_BYTES {
+        return Ok(None);
+    }
+
+    let contents = fs::read(path).map_err(|source| MigrationError::Io {
+        context: format!("failed to read checkout path {}", path.display()),
+        source,
+    })?;
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return Ok(None);
+    };
+
+    Ok(LfsPointer::parse(contents).ok())
+}
+
 fn parse_lfs_patterns_from_attributes(
     contents: &str,
     source: PathBuf,
@@ -699,6 +936,8 @@ fn repo_relative_path_from_git_output(path: &str) -> MigrationResult<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -707,11 +946,13 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::{LfsObject, LfsObjectSize, LfsOid, LfsPointer};
+
     use super::{
         GitLfsSourceEndpointSource, MAX_GIT_ATTRIBUTES_BYTES, MigrationError,
         default_lfs_endpoint_for_remote_url, discover_git_lfs_migration,
-        parse_lfs_patterns_from_attributes, repo_relative_path_from_git_output,
-        split_gitattributes_line,
+        enumerate_current_checkout_lfs_pointers, parse_lfs_patterns_from_attributes,
+        repo_relative_path_from_git_output, split_gitattributes_line,
     };
 
     #[test]
@@ -939,6 +1180,110 @@ mod tests {
     }
 
     #[test]
+    fn enumerates_current_checkout_lfs_pointer_files() {
+        let repo = TempRepo::new();
+        let pointer_object = test_lfs_object('a', 123);
+        let ordinary_lfs_object = test_lfs_object('b', 456);
+        let non_lfs_pointer_object = test_lfs_object('c', 789);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n*.txt text\n");
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(pointer_object.clone()).to_pointer_file(),
+        );
+        repo.write_file("asset/hydrated.bin", "already hydrated bytes");
+        repo.write_file(
+            "docs/pointer-example.txt",
+            &LfsPointer::new(non_lfs_pointer_object).to_pointer_file(),
+        );
+        repo.git([
+            "add",
+            ".gitattributes",
+            "asset/model.bin",
+            "asset/hydrated.bin",
+            "docs/pointer-example.txt",
+        ]);
+
+        let scan = enumerate_current_checkout_lfs_pointers(repo.path())
+            .expect("current checkout pointer scan should succeed");
+
+        assert_eq!(scan.tracked_path_count, 2);
+        assert_eq!(scan.pointers.len(), 1);
+        assert_eq!(scan.pointers[0].relative_path, Path::new("asset/model.bin"));
+        assert_eq!(
+            scan.pointers[0]
+                .path
+                .canonicalize()
+                .expect("discovered pointer path should canonicalize"),
+            repo.path()
+                .join("asset/model.bin")
+                .canonicalize()
+                .expect("expected pointer path should canonicalize")
+        );
+        assert_eq!(scan.pointers[0].object, pointer_object);
+        assert_ne!(scan.pointers[0].object, ordinary_lfs_object);
+    }
+
+    #[test]
+    fn current_checkout_pointer_scan_ignores_untracked_lfs_files() {
+        let repo = TempRepo::new();
+        let tracked_object = test_lfs_object('a', 123);
+        let untracked_object = test_lfs_object('b', 456);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/tracked.bin",
+            &LfsPointer::new(tracked_object.clone()).to_pointer_file(),
+        );
+        repo.write_file(
+            "asset/untracked.bin",
+            &LfsPointer::new(untracked_object).to_pointer_file(),
+        );
+        repo.git(["add", ".gitattributes", "asset/tracked.bin"]);
+
+        let scan = enumerate_current_checkout_lfs_pointers(repo.path())
+            .expect("current checkout pointer scan should succeed");
+
+        assert_eq!(scan.tracked_path_count, 1);
+        assert_eq!(scan.pointers.len(), 1);
+        assert_eq!(
+            scan.pointers[0].relative_path,
+            Path::new("asset/tracked.bin")
+        );
+        assert_eq!(scan.pointers[0].object, tracked_object);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_checkout_pointer_scan_accepts_non_utf8_lfs_paths() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('d', 321);
+        let relative_path = PathBuf::from(OsString::from_vec(b"asset/nonutf-\xFF.bin".to_vec()));
+        let worktree_file = repo.path().join(&relative_path);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        fs::create_dir_all(worktree_file.parent().expect("path should have parent"))
+            .expect("non-UTF-8 path parent should be created");
+        if fs::write(
+            &worktree_file,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        )
+        .is_err()
+        {
+            return;
+        }
+        repo.git(["add", "-A"]);
+
+        let scan = enumerate_current_checkout_lfs_pointers(repo.path())
+            .expect("current checkout pointer scan should accept non-UTF-8 paths");
+
+        assert_eq!(scan.tracked_path_count, 1);
+        assert_eq!(scan.pointers.len(), 1);
+        assert_eq!(scan.pointers[0].relative_path, relative_path);
+        assert_eq!(scan.pointers[0].object, object);
+    }
+
+    #[test]
     fn reports_not_git_repository_for_plain_directory() {
         let plain_directory = tempfile::tempdir().expect("temporary directory should be created");
 
@@ -1134,5 +1479,13 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    fn test_lfs_object(hex_digit: char, size: u64) -> LfsObject {
+        let oid = hex_digit.to_string().repeat(64);
+        LfsObject::new(
+            LfsOid::new(oid).expect("test OID should be valid"),
+            LfsObjectSize::new(size),
+        )
     }
 }
