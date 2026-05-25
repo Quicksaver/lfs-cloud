@@ -18,7 +18,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{FromRequest, OriginalUri, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -40,11 +40,12 @@ use crate::{
     GoogleDriveCredentialLoader, GoogleDriveObjectStore, GoogleDriveTokenRefresher,
     LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation,
     LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid,
-    LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture, RepositoryIdentity,
-    RepositoryMapping, RepositoryPermission, RepositoryProviderConfig, RepositoryProviderError,
-    RepositoryUser, ServerConfig, ServerError, ServerResult, StorageError, StorageProviderConfig,
-    StoredObject, github_oauth_callback_router, github_oauth_login_router,
-    parse_lfs_batch_request_json, sessions::LfsSessionRecord,
+    LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture, RepositoryHandle,
+    RepositoryIdentity, RepositoryMapping, RepositoryPermission, RepositoryProvider,
+    RepositoryProviderConfig, RepositoryProviderError, RepositoryUser, ServerConfig, ServerError,
+    ServerResult, StorageError, StorageProvider, StorageProviderConfig, StoredObject,
+    github_oauth_callback_router, github_oauth_login_router, parse_lfs_batch_request_json,
+    sessions::LfsSessionRecord,
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
@@ -193,6 +194,28 @@ pub fn lfs_server_router_with_sessions(
     )
 }
 
+/// Builds the Git LFS router with explicit provider-trait adapters.
+///
+/// This is a narrow test seam for exercising the normal route, authentication,
+/// authorization, and transfer handlers without real GitHub or Google Drive
+/// network calls. It does not mount OAuth routes or durable metadata storage;
+/// production serving still uses the configured GitHub and Google Drive
+/// clients. The configured repository provider and storage provider IDs must
+/// match the injected providers.
+pub fn lfs_server_router_with_provider_adapters(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+    repository_provider: Arc<dyn RepositoryProvider + Send + Sync>,
+    storage_provider: Arc<dyn StorageProvider + Send + Sync>,
+) -> Router {
+    lfs_server_router_with_sessions_authorizer_and_transfer_store(
+        config,
+        session_store,
+        Arc::new(ProviderBatchAuthorizer::new(repository_provider)),
+        Arc::new(StorageProviderTransferStore::new(storage_provider)),
+    )
+}
+
 fn lfs_server_router_with_sessions_and_authorizer(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
@@ -321,6 +344,176 @@ impl LfsDownloadResponse {
 
     fn into_response(self) -> Response {
         self.response
+    }
+}
+
+#[derive(Clone)]
+struct ProviderBatchAuthorizer {
+    provider: Arc<dyn RepositoryProvider + Send + Sync>,
+}
+
+impl ProviderBatchAuthorizer {
+    fn new(provider: Arc<dyn RepositoryProvider + Send + Sync>) -> Self {
+        Self { provider }
+    }
+}
+
+impl LfsBatchAuthorizer for ProviderBatchAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        session: &'a LfsSessionRecord,
+        operation: LfsBatchOperation,
+    ) -> ProviderFuture<'a, ServerResult<()>> {
+        Box::pin(async move {
+            let required = permission_required_for_batch_operation(operation);
+            if self.provider.provider_id() != repository.repo_provider
+                || session.metadata().provider_id != repository.repo_provider
+            {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::PermissionDenied {
+                        provider: repository.repo_provider.clone(),
+                        owner: repository.owner.clone(),
+                        repo: repository.name.clone(),
+                        required,
+                    },
+                });
+            }
+
+            let handle = RepositoryHandle::new(
+                repository.repo_provider.clone(),
+                repository.host.clone(),
+                repository.owner.clone(),
+                repository.name.clone(),
+            );
+            let identity = self.provider.repository_identity(&handle).await?;
+            let user = RepositoryUser::new(
+                session.metadata().provider_id.clone(),
+                session.metadata().login.clone(),
+                session.metadata().stable_id.clone(),
+            );
+
+            self.provider
+                .check_permission(&identity, &user, required)
+                .await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct StorageProviderTransferStore {
+    provider: Arc<dyn StorageProvider + Send + Sync>,
+}
+
+impl StorageProviderTransferStore {
+    fn new(provider: Arc<dyn StorageProvider + Send + Sync>) -> Self {
+        Self { provider }
+    }
+
+    fn ensure_provider_matches(&self, repository: &RepositoryMapping) -> ServerResult<()> {
+        if self.provider.provider_id() == repository.storage_provider {
+            return Ok(());
+        }
+
+        Err(ServerError::InvalidConfiguration {
+            message: format!(
+                "repository {} references storage provider {}, but injected provider is {}",
+                repository.id,
+                repository.storage_provider,
+                self.provider.provider_id()
+            ),
+        })
+    }
+}
+
+impl LfsObjectTransferStore for StorageProviderTransferStore {
+    fn lookup_object<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        object: &'a LfsObject,
+    ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
+        Box::pin(async move {
+            self.ensure_provider_matches(repository)?;
+            if self.provider.object_exists(object).await? {
+                Ok(Some(StoredObject::new(
+                    self.provider.provider_id().to_owned(),
+                    object.clone(),
+                    format!("{}:{}", self.provider.provider_id(), object.oid.as_hex()),
+                )))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn upload_object<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        object: &'a LfsObject,
+        source: &'a Path,
+        _created_by: &'a RepositoryUser,
+    ) -> ProviderFuture<'a, ServerResult<StoredObject>> {
+        Box::pin(async move {
+            self.ensure_provider_matches(repository)?;
+            self.provider
+                .upload_object(object, source)
+                .await
+                .map_err(ServerError::from)
+        })
+    }
+
+    fn download_object_response<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        object: &'a LfsObject,
+    ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
+        Box::pin(async move {
+            self.ensure_provider_matches(repository)?;
+            let temp_file =
+                tempfile::NamedTempFile::new().map_err(|source| ServerError::Storage {
+                    source: StorageError::Retryable {
+                        provider: self.provider.provider_id().to_owned(),
+                        message: format!("download staging file could not be created: {source}"),
+                    },
+                })?;
+            let stored_object = self
+                .provider
+                .download_object(object, temp_file.path())
+                .await?;
+            let bytes =
+                tokio::fs::read(temp_file.path())
+                    .await
+                    .map_err(|source| ServerError::Storage {
+                        source: StorageError::Retryable {
+                            provider: self.provider.provider_id().to_owned(),
+                            message: format!("download staging file could not be read: {source}"),
+                        },
+                    })?;
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_LENGTH, bytes.len().to_string())
+                .body(Body::from(bytes))
+                .map_err(|source| ServerError::Internal {
+                    message: format!("download response could not be built: {source}"),
+                })?;
+
+            Ok(LfsDownloadResponse::new(stored_object, response))
+        })
+    }
+
+    fn record_verified_object<'a>(
+        &'a self,
+        repository: &'a RepositoryMapping,
+        _object: &'a LfsObject,
+        _backend_id: &'a str,
+        _created_by: &'a RepositoryUser,
+    ) -> ProviderFuture<'a, ServerResult<()>> {
+        Box::pin(async move {
+            self.ensure_provider_matches(repository)?;
+            Ok(())
+        })
     }
 }
 

@@ -1199,8 +1199,8 @@ Defer:
 > Fixture-repository tests now cover current-checkout, selected-ref, all-ref,
 > missing-object, and CLI dry-run no-op migration behavior. A local
 > fake-provider end-to-end test now covers repository init routing, fake GitHub
-> authorization, fake Drive upload/download, and checkout hydration through the
-> shared cache.
+> authorization, server-routed fake Drive upload/download actions, and checkout
+> hydration through the shared cache.
 
 ### Progress Summary
 

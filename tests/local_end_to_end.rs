@@ -6,16 +6,26 @@
 
 mod support;
 
-use std::fs;
+use std::{fs, sync::Arc};
 
+use axum::{
+    body::{Body, to_bytes},
+    http::{
+        Method, Request, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
+};
 use lfs_cloud::{
-    GitLfsConfigTarget, GitRepository, LfsInitRoute, LocalCacheLayout, RepositoryHandle,
-    RepositoryPermission, RepositoryProvider, RepositoryUser, StorageProvider,
+    GitLfsConfigTarget, GitRepository, LfsBatchResponse, LfsInitRoute, LocalCacheLayout,
+    LocalLfsSessionStore, RepositoryPermission, RepositoryUser, ServerConfig,
+    lfs_server_router_with_provider_adapters,
 };
 use support::{
     FakeRepositoryProvider, FakeStorageProvider, TempGitRepo, lfs_object_for_bytes,
     lfs_pointer_file,
 };
+use tower::ServiceExt;
+use url::Url;
 
 #[tokio::test]
 async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
@@ -45,7 +55,7 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         b"http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs\n"
     );
 
-    let github = FakeRepositoryProvider::new("github-main");
+    let github = Arc::new(FakeRepositoryProvider::new("github-main"));
     github.add_repository("github.com", "owner", "repo", Some("repo-123".to_owned()));
     github.grant_permission(
         "github.com",
@@ -54,47 +64,96 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         "octocat",
         RepositoryPermission::Write,
     );
-    let handle = RepositoryHandle::new("github-main", "github.com", "owner", "repo");
-    let identity = github
-        .repository_identity(&handle)
-        .await
-        .expect("fake GitHub should resolve the repository");
     let user = RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned()));
-
-    github
-        .check_permission(&identity, &user, RepositoryPermission::Write)
-        .await
-        .expect("fake GitHub should authorize object upload");
+    let sessions = LocalLfsSessionStore::new();
+    let session = sessions
+        .issue_session(&user, ["repo"])
+        .expect("local LFS session should be issued");
 
     let bytes = b"large model bytes fetched through lfs-cloud";
     let object = lfs_object_for_bytes(bytes);
-    let staging = tempfile::tempdir().expect("staging tempdir should be created");
-    let staged_object = staging.path().join("model.bin");
-    fs::write(&staged_object, bytes).expect("staged object should be written");
-    let drive = FakeStorageProvider::new("drive-user-a");
+    let drive = Arc::new(FakeStorageProvider::new("drive-user-a"));
+    let router = lfs_server_router_with_provider_adapters(
+        local_server_config(),
+        sessions,
+        github,
+        drive.clone(),
+    );
 
-    let uploaded = drive
-        .upload_object(&object, &staged_object)
+    let upload_batch = router
+        .clone()
+        .oneshot(lfs_json_request(
+            Method::POST,
+            "/github.com/owner/repo.git/info/lfs/objects/batch",
+            session.token.as_str(),
+            lfs_batch_request("upload", &object),
+        ))
         .await
-        .expect("fake Drive should store uploaded bytes");
+        .expect("upload batch request should route through the server");
+    assert_eq!(upload_batch.status(), StatusCode::OK);
+    let upload_batch = lfs_batch_response(upload_batch).await;
+    let upload_href = upload_batch.objects[0]
+        .actions
+        .get("upload")
+        .expect("missing fake object should receive an upload action")
+        .href
+        .clone();
 
-    assert_eq!(uploaded.object, object);
+    let upload = router
+        .clone()
+        .oneshot(authenticated_request(
+            Method::PUT,
+            &action_path_and_query(&upload_href),
+            session.token.as_str(),
+            Body::from(bytes.to_vec()),
+        ))
+        .await
+        .expect("upload action should route through the server");
+    assert_eq!(upload.status(), StatusCode::OK);
     assert_eq!(drive.object_bytes(&object), Some(bytes.to_vec()));
-
-    github
-        .check_permission(&identity, &user, RepositoryPermission::Read)
-        .await
-        .expect("fake GitHub should authorize object download");
 
     let cache_root = tempfile::tempdir().expect("cache tempdir should be created");
     let cache = LocalCacheLayout::new(cache_root.path());
     let cached_object_path = cache.object_path(&object);
-    let downloaded = drive
-        .download_object(&object, &cached_object_path)
+    let download_batch = router
+        .clone()
+        .oneshot(lfs_json_request(
+            Method::POST,
+            "/github.com/owner/repo.git/info/lfs/objects/batch",
+            session.token.as_str(),
+            lfs_batch_request("download", &object),
+        ))
         .await
-        .expect("fake Drive should download bytes into the local cache");
+        .expect("download batch request should route through the server");
+    assert_eq!(download_batch.status(), StatusCode::OK);
+    let download_batch = lfs_batch_response(download_batch).await;
+    let download_href = download_batch.objects[0]
+        .actions
+        .get("download")
+        .expect("uploaded fake object should receive a download action")
+        .href
+        .clone();
 
-    assert_eq!(downloaded.object, object);
+    let download = router
+        .oneshot(authenticated_request(
+            Method::GET,
+            &action_path_and_query(&download_href),
+            session.token.as_str(),
+            Body::empty(),
+        ))
+        .await
+        .expect("download action should route through the server");
+    assert_eq!(download.status(), StatusCode::OK);
+    let downloaded_bytes = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("downloaded object body should collect");
+    fs::create_dir_all(
+        cached_object_path
+            .parent()
+            .expect("cache object path should have a parent"),
+    )
+    .expect("cache object parent should be created");
+    fs::write(&cached_object_path, &downloaded_bytes).expect("downloaded bytes should be cached");
     assert_eq!(
         fs::read(&cached_object_path).expect("cached object should be readable"),
         bytes
@@ -114,4 +173,99 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
             .expect("hydrated checkout bytes should be readable"),
         bytes
     );
+}
+
+fn local_server_config() -> ServerConfig {
+    ServerConfig::load_from_str(
+        r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: test-client
+    oauth_client_secret: test-secret
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials_ref: google-drive-user-a
+    root_folder_id: root
+repositories:
+  - id: github-main:owner/repo
+    repo_provider: github-main
+    host: github.com
+    owner: owner
+    name: repo
+    storage_provider: drive-user-a
+"#,
+    )
+    .expect("local fake-provider server config should load")
+}
+
+fn lfs_batch_request(operation: &str, object: &lfs_cloud::LfsObject) -> String {
+    serde_json::json!({
+        "operation": operation,
+        "transfers": ["basic"],
+        "objects": [
+            {
+                "oid": object.oid.as_hex(),
+                "size": object.size.bytes(),
+            }
+        ],
+    })
+    .to_string()
+}
+
+fn lfs_json_request(
+    method: Method,
+    uri: &str,
+    token: &str,
+    body: impl Into<Body>,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header(CONTENT_TYPE, "application/vnd.git-lfs+json")
+        .body(body.into())
+        .expect("test Git LFS JSON request should build")
+}
+
+fn authenticated_request(
+    method: Method,
+    uri: &str,
+    token: &str,
+    body: impl Into<Body>,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .body(body.into())
+        .expect("test authenticated request should build")
+}
+
+async fn lfs_batch_response(response: axum::response::Response) -> LfsBatchResponse {
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/vnd.git-lfs+json")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("Git LFS batch response body should collect");
+
+    serde_json::from_slice(&body).expect("response should be Git LFS batch JSON")
+}
+
+fn action_path_and_query(href: &str) -> String {
+    let url = Url::parse(href).expect("server action href should be an absolute URL");
+    let query = url
+        .query()
+        .expect("server action href should include object size");
+
+    format!("{}?{query}", url.path())
 }
