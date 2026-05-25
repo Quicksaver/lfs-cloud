@@ -129,6 +129,28 @@ require_file_matches() {
   fi
 }
 
+build_lfs_cloud_binary() {
+  cargo build --quiet --manifest-path "$project_dir/Cargo.toml" --message-format=json |
+    "$python_bin" -c '
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    target = message.get("target") or {}
+    if (
+        message.get("reason") == "compiler-artifact"
+        and target.get("name") == "lfs-cloud"
+        and "bin" in target.get("kind", [])
+        and message.get("executable")
+    ):
+        print(message["executable"])
+        sys.exit(0)
+
+raise SystemExit("Cargo did not report a built lfs-cloud executable")
+'
+}
+
 extract_server_public_url() {
   "$python_bin" - "$1" <<'PY'
 import sys
@@ -237,10 +259,9 @@ fi
 server_log="$tmp_dir/server.log"
 expected_local_url="$(advertised_local_url "$host" "$port")"
 
-cargo build --quiet --manifest-path "$project_dir/Cargo.toml"
+lfs_cloud_bin="$(build_lfs_cloud_binary)"
 
-"$project_dir/target/debug/lfs-cloud" \
-  --config "$config_file" serve --host "$host" --port "$port" \
+"$lfs_cloud_bin" --config "$config_file" serve --host "$host" --port "$port" \
   >"$server_log" 2>&1 &
 server_pid="$!"
 
