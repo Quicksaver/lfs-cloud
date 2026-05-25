@@ -1200,10 +1200,10 @@ Defer:
 > missing-object, and CLI dry-run no-op migration behavior. A local
 > fake-provider end-to-end test now covers repository init routing, fake GitHub
 > authorization, server-routed fake Drive upload/download actions, and checkout
-> hydration through the shared cache. Security review found and fixed a
-> resolved GitHub OAuth client-secret debug-output leak in loaded server config,
-> and `scripts/manual/verify-secret-redaction.sh` now runs the focused
-> redaction regression checks.
+> hydration through the shared cache. Security review found and fixed a GitHub
+> OAuth client-secret debug-output leak in loaded server config, and
+> `scripts/manual/verify-secret-redaction.sh` now runs the focused redaction
+> regression checks.
 
 ### Progress Summary
 

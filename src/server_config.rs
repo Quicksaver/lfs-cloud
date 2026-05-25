@@ -341,8 +341,16 @@ impl fmt::Debug for GitHubProviderConfig {
             .field("id", &self.id)
             .field("api_url", &self.api_url)
             .field("oauth_client_id", &self.oauth_client_id)
-            .field("oauth_client_secret", &"<redacted>")
+            .field("oauth_client_secret", &RedactedSecret)
             .finish()
+    }
+}
+
+struct RedactedSecret;
+
+impl fmt::Debug for RedactedSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("\"<redacted>\"")
     }
 }
 
@@ -535,7 +543,7 @@ impl Default for RawServerSettings {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRepositoryProviderConfig {
     #[serde(default, rename = "type")]
@@ -546,6 +554,18 @@ struct RawRepositoryProviderConfig {
     oauth_client_id: Option<String>,
     #[serde(default)]
     oauth_client_secret: Option<String>,
+}
+
+impl fmt::Debug for RawRepositoryProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawRepositoryProviderConfig")
+            .field("provider_type", &self.provider_type)
+            .field("api_url", &self.api_url)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_client_secret", &RedactedSecret)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,8 +855,8 @@ mod tests {
 
     use super::{
         DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
-        GoogleDriveStorageConfig, RepositoryProviderConfig, ServerConfig, ServerError,
-        StorageProviderConfig,
+        GoogleDriveStorageConfig, RawRepositoryProviderConfig, RepositoryProviderConfig,
+        ServerConfig, ServerError, StorageProviderConfig,
     };
 
     fn valid_yaml() -> &'static str {
@@ -928,12 +948,35 @@ repositories:
     #[test]
     fn server_config_debug_redacts_github_oauth_client_secret() {
         let config = load_with_test_env(valid_yaml());
+        let RepositoryProviderConfig::GitHub(provider) =
+            &config.repository_providers["github-main"];
+        let configured_secret = provider.oauth_client_secret.as_str();
         let rendered = format!("{config:?}");
 
         assert!(rendered.contains("GitHubProviderConfig"));
         assert!(rendered.contains("oauth_client_secret"));
         assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains("client-secret"));
+        assert!(!rendered.contains(configured_secret));
+    }
+
+    #[test]
+    fn raw_repository_provider_debug_redacts_github_oauth_client_secret() {
+        let raw = RawRepositoryProviderConfig {
+            provider_type: Some("github".to_owned()),
+            api_url: Some("https://api.github.com".to_owned()),
+            oauth_client_id: Some("client-id".to_owned()),
+            oauth_client_secret: Some("raw-client-secret".to_owned()),
+        };
+        let configured_secret = raw
+            .oauth_client_secret
+            .as_deref()
+            .expect("fixture should include a secret");
+        let rendered = format!("{raw:?}");
+
+        assert!(rendered.contains("RawRepositoryProviderConfig"));
+        assert!(rendered.contains("oauth_client_secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(configured_secret));
     }
 
     #[test]
