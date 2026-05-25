@@ -1205,7 +1205,12 @@ Defer:
 > `scripts/manual/verify-secret-redaction.sh` now runs the focused redaction
 > regression checks. `scripts/manual/verify-lan-smoke-test.sh` now verifies
 > local LAN-serving preflight behavior and prints the cross-machine smoke test
-> checklist for disposable GitHub/Google Drive validation.
+> checklist for disposable GitHub/Google Drive validation. Server
+> configuration docs now include GitHub plus Google Drive `lfs-cloud.yml`
+> examples, credential-reference behavior, metadata defaults, and validation
+> rules. The README now distinguishes implemented commands from the remaining
+> full migration execution work, and install/build docs define the current
+> local binary and release-artifact expectations.
 
 ### Progress Summary
 
@@ -1220,8 +1225,8 @@ Defer:
 | 6. CLI Commands                          | 13          | 13     | 0         |
 | 7. Migration                             | 12          | 12     | 0         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
-| 9. Verification, Docs, And Release Shape | 8           | 3      | 5         |
-| **Total**                                | **99**      | **94** | **5**     |
+| 9. Verification, Docs, And Release Shape | 8           | 6      | 2         |
+| **Total**                                | **99**      | **97** | **2**     |
 
 ### Legend
 
@@ -1423,6 +1428,6 @@ Defer:
 #### Epic 9.2: Security And Documentation
 
 - [x] [M] Review logs and errors to ensure OAuth tokens, Drive tokens, and object contents are not leaked. Manual verification: `scripts/manual/verify-secret-redaction.sh`.
-- [ ] [M] Document `lfs-cloud.yml` with GitHub + Google Drive examples.
-- [ ] [M] Update README once commands are implemented, removing "planned" wording where appropriate.
-- [ ] [M] Add install/build instructions and release artifact expectations.
+- [x] [M] Document `lfs-cloud.yml` with GitHub + Google Drive examples.
+- [x] [M] Update README once commands are implemented, removing "planned" wording where appropriate.
+- [x] [M] Add install/build instructions and release artifact expectations.

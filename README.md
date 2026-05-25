@@ -1,10 +1,10 @@
 # LFS Cloud
 
-LFS Cloud is a planned Git LFS-compatible server and CLI for storing large Git-tracked files outside the Git host's built-in LFS storage.
+LFS Cloud is an early-stage Git LFS-compatible server and CLI for storing large Git-tracked files outside the Git host's built-in LFS storage.
 
 The initial goal is to keep normal Git version control on GitHub, while routing Git LFS objects through an `lfs-cloud` server to Google Drive storage you control.
 
-> Status: design and scaffold stage. A minimal `serve` command can load config,
+> Status: early implementation stage. A minimal `serve` command can load config,
 > bind an HTTP listener, print reachable URLs, and resolve configured LFS
 > routes, requiring a local LFS Cloud session token before parsing authenticated
 > requests. The binary now uses a `clap` root command with shared `--config`
@@ -65,7 +65,7 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > touching storage. When requested with `--purge-source-lfs`, the dry-run
 > includes a GitHub-specific source LFS cleanup helper report with support-flow
 > instructions and migrated object IDs instead of attempting automatic deletion.
-> The other commands below are still planned product behavior.
+> Full non-dry-run migration execution and release packaging are still planned.
 
 ## Why
 
@@ -116,7 +116,7 @@ repo write access
   may upload LFS objects
 ```
 
-## Planned Commands
+## Commands
 
 ### Run A Local Server
 
@@ -132,7 +132,7 @@ For LAN exposure:
 lfs-cloud serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080
 ```
 
-The CLI should print addresses like:
+The CLI prints addresses like:
 
 ```text
 lfs-cloud server running
@@ -232,10 +232,10 @@ Git LFS media storage into the shared `lfs-cloud` cache, and replaces
 LFS-tracked pointer files in the current checkout with verified cache bytes. Use
 `--cache-root` to target a non-default local cache root.
 
-### Migrate From Existing Git LFS
+### Plan Migration From Existing Git LFS
 
 ```bash
-lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs
+lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 ```
 
 The current migration command supports read-only planning with `--dry-run`:
@@ -253,7 +253,7 @@ Use `--purge-source-lfs` with `--dry-run` to include GitHub Support cleanup
 instructions and object IDs/sizes for a post-migration source LFS purge
 request.
 
-The full migration command should:
+Full non-dry-run migration execution is not implemented yet. It is expected to:
 
 - read existing Git LFS pointer files
 - fetch missing objects from the current LFS provider
@@ -271,9 +271,9 @@ For GitHub, automatic purge is not expected to be possible through a normal API.
 
 ## Server Configuration
 
-The server should use private configuration, not committed repo files, to decide which repository maps to which storage provider.
+The server uses private configuration, not committed repo files, to decide which repository maps to which storage provider.
 
-Example shape:
+Minimal GitHub plus Google Drive example:
 
 ```yaml
 server:
@@ -330,6 +330,39 @@ validate the folder with a non-mutating Drive metadata probe before transfer
 paths depend on it.
 
 The `.lfsconfig` file points only to the LFS Cloud endpoint. It should not contain Google Drive, S3, or other backend credentials.
+
+See [docs/configuration.md](docs/configuration.md) for full `lfs-cloud.yml`
+examples, credential reference behavior, metadata path defaults, and validation
+rules.
+
+## Build And Install
+
+Build and verify locally:
+
+```bash
+cargo build
+cargo test --all-targets
+cargo test --doc
+cargo clippy --all-targets -- -D warnings
+yarn lint:check
+```
+
+Build the optimized binary:
+
+```bash
+cargo build --release
+./target/release/lfs-cloud --help
+```
+
+Install from this checkout for local use:
+
+```bash
+cargo install --path .
+```
+
+Published packages, signed archives, checksums, and installer scripts are not
+defined yet. See [docs/install-release.md](docs/install-release.md) for current
+release artifact expectations.
 
 ## Deployment Notes
 
