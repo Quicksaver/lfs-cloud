@@ -6,7 +6,7 @@
 //! can build dry-run and transfer plans from one consistent snapshot.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
@@ -14,7 +14,9 @@ use std::{
 };
 
 use crate::{MigrationError, MigrationResult, SanitizedMessage};
+use url::Url;
 
+const DEFAULT_REMOTE_NAME: &str = "origin";
 const MAX_MIGRATION_GIT_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Read-only discovery result for an existing Git LFS repository.
@@ -61,7 +63,7 @@ pub struct GitLfsFilterConfig {
 pub struct GitLfsTrackedPattern {
     /// Pattern token from the `.gitattributes` line.
     pub pattern: String,
-    /// Attribute tokens from the same line.
+    /// Attribute tokens from the same line, with known macros expanded.
     pub attributes: Vec<String>,
     /// `.gitattributes` file that declared this pattern.
     pub source: PathBuf,
@@ -81,8 +83,12 @@ pub struct GitLfsSourceEndpoint {
 pub enum GitLfsSourceEndpointSource {
     /// Repository-local `.git/config`.
     LocalGitConfig,
+    /// Repository-local remote-scoped `remote.<name>.lfsurl`.
+    RemoteGitConfig,
     /// Worktree `.lfsconfig`.
     WorktreeLfsConfig,
+    /// Endpoint derived from the selected Git remote URL.
+    RemoteUrlDefault,
 }
 
 /// Discovers existing Git LFS migration inputs for a worktree.
@@ -172,28 +178,136 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
         }));
     }
 
-    let lfsconfig_path = worktree_root.join(".lfsconfig");
-    if !lfsconfig_path.exists() {
-        return Ok(None);
-    }
-
-    git_config_get_os(
+    let remote_lfsurl_key = format!("remote.{DEFAULT_REMOTE_NAME}.lfsurl");
+    if let Some(url) = git_config_get_os(
         worktree_root,
         [
             OsStr::new("config"),
-            OsStr::new("--file"),
-            lfsconfig_path.as_os_str(),
+            OsStr::new("--local"),
             OsStr::new("--get"),
-            OsStr::new("lfs.url"),
+            OsStr::new(&remote_lfsurl_key),
         ],
-        "git config --file .lfsconfig --get lfs.url",
-    )
-    .map(|url| {
-        url.map(|url| GitLfsSourceEndpoint {
+        "git config --local --get remote.origin.lfsurl",
+    )? {
+        return Ok(Some(GitLfsSourceEndpoint {
+            url,
+            source: GitLfsSourceEndpointSource::RemoteGitConfig,
+        }));
+    }
+
+    let lfsconfig_path = worktree_root.join(".lfsconfig");
+    if lfsconfig_path.exists()
+        && let Some(url) = git_config_get_os(
+            worktree_root,
+            [
+                OsStr::new("config"),
+                OsStr::new("--file"),
+                lfsconfig_path.as_os_str(),
+                OsStr::new("--get"),
+                OsStr::new("lfs.url"),
+            ],
+            "git config --file .lfsconfig --get lfs.url",
+        )?
+    {
+        return Ok(Some(GitLfsSourceEndpoint {
             url,
             source: GitLfsSourceEndpointSource::WorktreeLfsConfig,
-        })
-    })
+        }));
+    }
+
+    let remote_url_key = format!("remote.{DEFAULT_REMOTE_NAME}.url");
+    let Some(remote_url) = git_config_get_os(
+        worktree_root,
+        [
+            OsStr::new("config"),
+            OsStr::new("--get"),
+            OsStr::new(&remote_url_key),
+        ],
+        "git config --get remote.origin.url",
+    )?
+    else {
+        return Ok(None);
+    };
+
+    Ok(
+        default_lfs_endpoint_for_remote_url(&remote_url).map(|url| GitLfsSourceEndpoint {
+            url,
+            source: GitLfsSourceEndpointSource::RemoteUrlDefault,
+        }),
+    )
+}
+
+fn default_lfs_endpoint_for_remote_url(remote_url: &str) -> Option<String> {
+    let trimmed = remote_url.trim();
+    if trimmed.is_empty() || trimmed.len() != remote_url.len() {
+        return None;
+    }
+
+    if trimmed.contains("://") {
+        return default_lfs_endpoint_for_url_remote(trimmed);
+    }
+
+    default_lfs_endpoint_for_scp_like_remote(trimmed)
+}
+
+fn default_lfs_endpoint_for_url_remote(remote_url: &str) -> Option<String> {
+    let url = Url::parse(remote_url).ok()?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+
+    match url.scheme() {
+        "http" | "https" => append_info_lfs_to_url(url),
+        "ssh" => {
+            let host = url.host_str()?;
+            let path = url.path().trim_matches('/');
+            default_https_lfs_endpoint(host, path)
+        }
+        _ => None,
+    }
+}
+
+fn default_lfs_endpoint_for_scp_like_remote(remote_url: &str) -> Option<String> {
+    let (host_part, path) = remote_url.split_once(':')?;
+    if host_part.contains('/') || path.starts_with('/') {
+        return None;
+    }
+
+    let host = host_part
+        .rsplit_once('@')
+        .map_or(host_part, |(_, host)| host)
+        .trim();
+
+    default_https_lfs_endpoint(host, path.trim_matches('/'))
+}
+
+fn default_https_lfs_endpoint(host: &str, path: &str) -> Option<String> {
+    if host.is_empty() || path.is_empty() || path.contains('?') || path.contains('#') {
+        return None;
+    }
+
+    let mut url = Url::parse(&format!("https://{host}/")).ok()?;
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.extend(path.split('/').filter(|segment| !segment.is_empty()));
+        segments.extend(["info", "lfs"]);
+    }
+
+    Some(url.to_string())
+}
+
+fn append_info_lfs_to_url(mut url: Url) -> Option<String> {
+    if url.path().trim_matches('/').is_empty() || url.query().is_some() || url.fragment().is_some()
+    {
+        return None;
+    }
+
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.extend(["info", "lfs"]);
+    }
+
+    Some(url.to_string())
 }
 
 fn discover_lfs_tracked_patterns(
@@ -252,13 +366,23 @@ fn parse_lfs_patterns_from_attributes(
     contents: &str,
     source: PathBuf,
 ) -> Vec<GitLfsTrackedPattern> {
-    contents
-        .lines()
-        .filter_map(|line| parse_lfs_pattern_line(line, &source))
-        .collect()
+    let mut attribute_macros = BTreeMap::new();
+    let mut patterns = Vec::new();
+
+    for line in contents.lines() {
+        if let Some(pattern) = parse_lfs_pattern_line(line, &source, &mut attribute_macros) {
+            patterns.push(pattern);
+        }
+    }
+
+    patterns
 }
 
-fn parse_lfs_pattern_line(line: &str, source: &Path) -> Option<GitLfsTrackedPattern> {
+fn parse_lfs_pattern_line(
+    line: &str,
+    source: &Path,
+    attribute_macros: &mut BTreeMap<String, Vec<String>>,
+) -> Option<GitLfsTrackedPattern> {
     let trimmed = line.trim_start();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
@@ -266,15 +390,39 @@ fn parse_lfs_pattern_line(line: &str, source: &Path) -> Option<GitLfsTrackedPatt
 
     let tokens = split_gitattributes_line(trimmed);
     let (pattern, attributes) = tokens.split_first()?;
+    if let Some(macro_name) = pattern.strip_prefix("[attr]") {
+        if !macro_name.is_empty() {
+            attribute_macros.insert(macro_name.to_owned(), attributes.to_vec());
+        }
+        return None;
+    }
+
+    let attributes = expand_attribute_macros(attributes, attribute_macros);
     if !attributes.iter().any(|attribute| attribute == "filter=lfs") {
         return None;
     }
 
     Some(GitLfsTrackedPattern {
         pattern: pattern.clone(),
-        attributes: attributes.to_vec(),
+        attributes,
         source: source.to_path_buf(),
     })
+}
+
+fn expand_attribute_macros(
+    attributes: &[String],
+    attribute_macros: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut expanded = Vec::new();
+
+    for attribute in attributes {
+        expanded.push(attribute.clone());
+        if let Some(macro_attributes) = attribute_macros.get(attribute) {
+            expanded.extend(macro_attributes.iter().cloned());
+        }
+    }
+
+    expanded
 }
 
 fn split_gitattributes_line(line: &str) -> Vec<String> {
@@ -542,6 +690,52 @@ mod tests {
     }
 
     #[test]
+    fn source_endpoint_falls_back_to_remote_lfsurl() {
+        let repo = TempRepo::new();
+        repo.git([
+            "config",
+            "--local",
+            "remote.origin.lfsurl",
+            "https://source.example/from-remote.git/info/lfs",
+        ]);
+
+        let discovery =
+            discover_git_lfs_migration(repo.path()).expect("migration discovery should succeed");
+        let endpoint = discovery
+            .source_endpoint
+            .expect("remote origin lfsurl should be detected");
+
+        assert_eq!(
+            endpoint.url,
+            "https://source.example/from-remote.git/info/lfs"
+        );
+        assert_eq!(endpoint.source, GitLfsSourceEndpointSource::RemoteGitConfig);
+    }
+
+    #[test]
+    fn source_endpoint_falls_back_to_remote_url_default() {
+        let repo = TempRepo::new();
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+
+        let discovery =
+            discover_git_lfs_migration(repo.path()).expect("migration discovery should succeed");
+        let endpoint = discovery
+            .source_endpoint
+            .expect("origin remote URL should provide a default LFS endpoint");
+
+        assert_eq!(endpoint.url, "https://github.com/owner/repo.git/info/lfs");
+        assert_eq!(
+            endpoint.source,
+            GitLfsSourceEndpointSource::RemoteUrlDefault
+        );
+    }
+
+    #[test]
     fn local_endpoint_takes_precedence_over_lfsconfig() {
         let repo = TempRepo::new();
         repo.write_file(
@@ -589,6 +783,21 @@ mod tests {
             vec!["filter=lfs", "diff=lfs", "-text"]
         );
         assert_eq!(patterns[1].pattern, "*.zip");
+    }
+
+    #[test]
+    fn parses_lfs_patterns_declared_with_attribute_macros() {
+        let patterns = parse_lfs_patterns_from_attributes(
+            "[attr]lfs filter=lfs diff=lfs merge=lfs -text\n*.bin lfs\n",
+            Path::new(".gitattributes").to_path_buf(),
+        );
+
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].pattern, "*.bin");
+        assert_eq!(
+            patterns[0].attributes,
+            vec!["lfs", "filter=lfs", "diff=lfs", "merge=lfs", "-text"]
+        );
     }
 
     #[test]
