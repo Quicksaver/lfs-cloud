@@ -55,7 +55,8 @@ pub use lfs::{
 };
 pub use local_cache::{
     DEFAULT_LOCAL_CACHE_HOME_DIR, LOCAL_CACHE_OBJECTS_DIR, LOCAL_CACHE_WORKTREES_FILE,
-    LocalCacheError, LocalCacheIngest, LocalCacheIngestStatus, LocalCacheLayout, LocalCacheResult,
+    LocalCacheError, LocalCacheIngest, LocalCacheIngestStatus, LocalCacheLayout,
+    LocalCacheMaterialization, LocalCacheMaterializationStatus, LocalCacheResult,
     LocalCacheWorktreeRegistration, LocalCacheWorktreeRegistrationChange,
     LocalCacheWorktreeRegistrationStatus, LocalCacheWorktreeRegistry, VerifiedLocalCacheObject,
 };

@@ -17,7 +17,7 @@ use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{LfsObject, LfsObjectSize, LfsOid};
+use crate::{LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer};
 
 /// Default directory name used below a user's home directory for local state.
 pub const DEFAULT_LOCAL_CACHE_HOME_DIR: &str = ".lfs-cloud";
@@ -124,6 +124,31 @@ pub enum LocalCacheError {
         version: u32,
         /// Latest version this binary can read.
         supported_version: u32,
+    },
+
+    /// A worktree path could not be materialized without overwriting content
+    /// that was neither the expected cached object nor a matching pointer.
+    #[error(
+        "refusing to materialize sha256:{oid} ({size} bytes) over non-matching worktree file at {}",
+        path.display()
+    )]
+    MaterializationTargetExists {
+        /// Object that the caller attempted to materialize.
+        oid: LfsOid,
+        /// Expected object size.
+        size: LfsObjectSize,
+        /// Existing destination path.
+        path: PathBuf,
+    },
+
+    /// A worktree path could not be parsed as a Git LFS pointer.
+    #[error("failed to parse Git LFS pointer at {}: {source}", path.display())]
+    PointerParse {
+        /// Pointer file path.
+        path: PathBuf,
+        /// Underlying pointer parse failure.
+        #[source]
+        source: LfsObjectError,
     },
 }
 
@@ -334,6 +359,30 @@ pub enum LocalCacheWorktreeRegistrationStatus {
     Unchanged,
 }
 
+/// Result of materializing one cache object into a worktree path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalCacheMaterialization {
+    /// Git LFS object identity that was materialized.
+    pub object: LfsObject,
+    /// Shared cache object path used as the source of truth.
+    pub cache_path: PathBuf,
+    /// Worktree path that now contains verified bytes.
+    pub destination_path: PathBuf,
+    /// Filesystem strategy used for the materialization.
+    pub status: LocalCacheMaterializationStatus,
+}
+
+/// Filesystem strategy used to materialize a cache object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalCacheMaterializationStatus {
+    /// Destination already contained the exact verified object bytes.
+    AlreadyMaterialized,
+    /// Destination was created using the platform's copy-on-write primitive.
+    CopyOnWriteCloned,
+    /// Destination was created by copying bytes because CoW was unavailable.
+    Copied,
+}
+
 /// Deterministic filesystem layout for local Git LFS object cache paths.
 ///
 /// # Examples
@@ -430,6 +479,57 @@ impl LocalCacheLayout {
 
         ensure_cache_object_file(&path, object)?;
         verify_file_object(&path, object)
+    }
+
+    /// Materializes a verified cache object at a worktree destination.
+    ///
+    /// Existing destination files are accepted only when they already contain
+    /// the exact requested object bytes. This keeps the lower-level helper from
+    /// overwriting dirty worktree contents; pointer-file replacement is handled
+    /// by [`Self::hydrate_pointer_file`], which proves the pointer identity
+    /// before replacing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalCacheError`] when the cache object is missing or corrupt,
+    /// the destination contains different bytes, or the destination cannot be
+    /// written and verified.
+    pub fn materialize_object(
+        &self,
+        object: &LfsObject,
+        destination_path: impl AsRef<Path>,
+    ) -> LocalCacheResult<LocalCacheMaterialization> {
+        let destination_path = destination_path.as_ref();
+        let verified = self.verify_object(object)?;
+
+        materialize_verified_object(&verified, destination_path, MaterializationMode::NoReplace)
+    }
+
+    /// Replaces a Git LFS pointer file with verified cache object bytes.
+    ///
+    /// The existing worktree file must parse as a Git LFS pointer, and the
+    /// pointed object must exist in the shared cache with matching SHA-256 and
+    /// byte size. Non-pointer content is treated as a dirty or unsupported
+    /// worktree state and is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalCacheError`] when the pointer cannot be parsed, the cache
+    /// object is missing or corrupt, or materialization cannot be completed and
+    /// verified.
+    pub fn hydrate_pointer_file(
+        &self,
+        pointer_path: impl AsRef<Path>,
+    ) -> LocalCacheResult<LocalCacheMaterialization> {
+        let pointer_path = pointer_path.as_ref();
+        let pointer = read_lfs_pointer_file(pointer_path)?;
+        let verified = self.verify_object(&pointer.object)?;
+
+        materialize_verified_object(
+            &verified,
+            pointer_path,
+            MaterializationMode::ReplaceMatchingPointer,
+        )
     }
 
     /// Ingests an object from an existing repository `.git/lfs/objects` cache.
@@ -682,6 +782,293 @@ fn normalized_path_key(path: &Path) -> PathBuf {
     // Existing paths compare by canonical identity, while missing paths remain
     // lexical because there is no stable filesystem identity to resolve yet.
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaterializationMode {
+    NoReplace,
+    ReplaceMatchingPointer,
+}
+
+fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
+    let contents = fs::read_to_string(path).map_err(|source| LocalCacheError::Io {
+        context: "failed to read Git LFS pointer file",
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    LfsPointer::parse(&contents).map_err(|source| LocalCacheError::PointerParse {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn materialize_verified_object(
+    verified: &VerifiedLocalCacheObject,
+    destination_path: &Path,
+    mode: MaterializationMode,
+) -> LocalCacheResult<LocalCacheMaterialization> {
+    match existing_destination_status(destination_path, &verified.object)? {
+        ExistingDestinationStatus::Missing => {}
+        ExistingDestinationStatus::AlreadyMaterialized => {
+            return Ok(LocalCacheMaterialization {
+                object: verified.object.clone(),
+                cache_path: verified.path.clone(),
+                destination_path: destination_path.to_path_buf(),
+                status: LocalCacheMaterializationStatus::AlreadyMaterialized,
+            });
+        }
+        ExistingDestinationStatus::Different => match mode {
+            MaterializationMode::NoReplace => {
+                return Err(LocalCacheError::MaterializationTargetExists {
+                    oid: verified.object.oid.clone(),
+                    size: verified.object.size,
+                    path: destination_path.to_path_buf(),
+                });
+            }
+            MaterializationMode::ReplaceMatchingPointer => {
+                let pointer = read_lfs_pointer_file(destination_path)?;
+                if pointer.object != verified.object {
+                    return Err(LocalCacheError::MaterializationTargetExists {
+                        oid: verified.object.oid.clone(),
+                        size: verified.object.size,
+                        path: destination_path.to_path_buf(),
+                    });
+                }
+            }
+        },
+    }
+
+    let destination_parent = destination_path
+        .parent()
+        .ok_or_else(|| LocalCacheError::Io {
+            context: "failed to resolve materialization destination parent",
+            path: destination_path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination path has no parent directory",
+            ),
+        })?;
+    fs::create_dir_all(destination_parent).map_err(|source| LocalCacheError::Io {
+        context: "failed to create materialization destination directory",
+        path: destination_parent.to_path_buf(),
+        source,
+    })?;
+
+    let (temp, status) = materialize_to_temporary_file(
+        &verified.path,
+        destination_parent,
+        destination_path,
+        &verified.object,
+    )?;
+
+    publish_materialized_file(temp, destination_path, mode, &verified.object)?;
+    let materialized = verify_file_object(destination_path, &verified.object)?;
+
+    Ok(LocalCacheMaterialization {
+        object: materialized.object,
+        cache_path: verified.path.clone(),
+        destination_path: materialized.path,
+        status,
+    })
+}
+
+enum ExistingDestinationStatus {
+    Missing,
+    AlreadyMaterialized,
+    Different,
+}
+
+fn existing_destination_status(
+    path: &Path,
+    object: &LfsObject,
+) -> LocalCacheResult<ExistingDestinationStatus> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => match verify_file_object(path, object) {
+            Ok(_) => Ok(ExistingDestinationStatus::AlreadyMaterialized),
+            Err(LocalCacheError::IntegrityMismatch { .. }) => {
+                Ok(ExistingDestinationStatus::Different)
+            }
+            Err(error) => Err(error),
+        },
+        Ok(_) => Err(LocalCacheError::Io {
+            context: "materialization destination is not a file",
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(ExistingDestinationStatus::Missing)
+        }
+        Err(source) => Err(LocalCacheError::Io {
+            context: "failed to inspect materialization destination",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn materialize_to_temporary_file(
+    cache_path: &Path,
+    destination_parent: &Path,
+    destination_path: &Path,
+    object: &LfsObject,
+) -> LocalCacheResult<(tempfile::NamedTempFile, LocalCacheMaterializationStatus)> {
+    let temp = tempfile::NamedTempFile::new_in(destination_parent).map_err(|source| {
+        LocalCacheError::Io {
+            context: "failed to create temporary materialized object",
+            path: destination_parent.to_path_buf(),
+            source,
+        }
+    })?;
+
+    let status = if copy_on_write_clone(cache_path, temp.path())? {
+        verify_file_object(temp.path(), object)?;
+        LocalCacheMaterializationStatus::CopyOnWriteCloned
+    } else {
+        copy_cache_object_to_temporary_file(cache_path, &temp, destination_path, object)?;
+        LocalCacheMaterializationStatus::Copied
+    };
+
+    Ok((temp, status))
+}
+
+fn copy_cache_object_to_temporary_file(
+    cache_path: &Path,
+    temp: &tempfile::NamedTempFile,
+    destination_path: &Path,
+    expected: &LfsObject,
+) -> LocalCacheResult<()> {
+    let mut source = File::open(cache_path).map_err(|source| LocalCacheError::Io {
+        context: "failed to open verified cache object",
+        path: cache_path.to_path_buf(),
+        source,
+    })?;
+    let mut destination = File::create(temp.path()).map_err(|source| LocalCacheError::Io {
+        context: "failed to open temporary materialized object",
+        path: temp.path().to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut total_size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|source| LocalCacheError::Io {
+                context: "failed to read verified cache object",
+                path: cache_path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|source| LocalCacheError::Io {
+                context: "failed to write temporary materialized object",
+                path: destination_path.to_path_buf(),
+                source,
+            })?;
+        hasher.update(&buffer[..read]);
+        total_size = total_size
+            .checked_add(read as u64)
+            .ok_or_else(|| LocalCacheError::Io {
+                context: "object is too large to measure",
+                path: cache_path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::InvalidData, "object size overflow"),
+            })?;
+    }
+    destination.flush().map_err(|source| LocalCacheError::Io {
+        context: "failed to flush temporary materialized object",
+        path: destination_path.to_path_buf(),
+        source,
+    })?;
+
+    let actual_oid =
+        LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid");
+    let actual_size = LfsObjectSize::new(total_size);
+    if actual_oid != expected.oid || actual_size != expected.size {
+        return Err(LocalCacheError::IntegrityMismatch {
+            path: cache_path.to_path_buf(),
+            expected_oid: expected.oid.clone(),
+            expected_size: expected.size,
+            actual_oid,
+            actual_size,
+        });
+    }
+
+    Ok(())
+}
+
+fn publish_materialized_file(
+    temp: tempfile::NamedTempFile,
+    destination_path: &Path,
+    mode: MaterializationMode,
+    object: &LfsObject,
+) -> LocalCacheResult<()> {
+    match mode {
+        MaterializationMode::NoReplace => match temp.persist_noclobber(destination_path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                match verify_file_object(destination_path, object) {
+                    Ok(_) => Ok(()),
+                    Err(LocalCacheError::IntegrityMismatch { .. }) => {
+                        Err(LocalCacheError::MaterializationTargetExists {
+                            oid: object.oid.clone(),
+                            size: object.size,
+                            path: destination_path.to_path_buf(),
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(LocalCacheError::Io {
+                context: "failed to publish materialized object",
+                path: destination_path.to_path_buf(),
+                source: error.error,
+            }),
+        },
+        MaterializationMode::ReplaceMatchingPointer => {
+            let pointer = read_lfs_pointer_file(destination_path)?;
+            if pointer.object != *object {
+                return Err(LocalCacheError::MaterializationTargetExists {
+                    oid: object.oid.clone(),
+                    size: object.size,
+                    path: destination_path.to_path_buf(),
+                });
+            }
+            temp.persist(destination_path)
+                .map_err(|error| LocalCacheError::Io {
+                    context: "failed to publish materialized object",
+                    path: destination_path.to_path_buf(),
+                    source: error.error,
+                })?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn copy_on_write_clone(source_path: &Path, destination_path: &Path) -> LocalCacheResult<bool> {
+    let output = std::process::Command::new("/bin/cp")
+        .arg("-c")
+        .arg(source_path)
+        .arg(destination_path)
+        .output()
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to invoke macOS copy-on-write clone primitive",
+            path: destination_path.to_path_buf(),
+            source,
+        })?;
+
+    Ok(output.status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_on_write_clone(_source_path: &Path, _destination_path: &Path) -> LocalCacheResult<bool> {
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -1189,6 +1576,128 @@ mod tests {
 
         assert!(matches!(error, LocalCacheError::IntegrityMismatch { .. }));
         assert!(!layout.object_path(&object).exists());
+    }
+
+    #[test]
+    fn materialize_object_creates_verified_destination_from_cache() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"cache bytes to materialize";
+        let object = object_for_bytes(bytes);
+        write_file(&layout.object_path(&object), bytes);
+        let destination = temp.path().join("repo/assets/model.bin");
+
+        let materialization = layout
+            .materialize_object(&object, &destination)
+            .expect("verified cache object should materialize");
+
+        assert_eq!(materialization.object, object);
+        assert_eq!(materialization.cache_path, layout.object_path(&object));
+        assert_eq!(materialization.destination_path, destination);
+        assert!(matches!(
+            materialization.status,
+            LocalCacheMaterializationStatus::Copied
+                | LocalCacheMaterializationStatus::CopyOnWriteCloned
+        ));
+        assert_eq!(
+            fs::read(&materialization.destination_path)
+                .expect("materialized destination should be readable"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn materialize_object_reuses_existing_verified_destination() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"already hydrated contents";
+        let object = object_for_bytes(bytes);
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(&destination, bytes);
+
+        let materialization = layout
+            .materialize_object(&object, &destination)
+            .expect("existing verified destination should be reused");
+
+        assert_eq!(
+            materialization.status,
+            LocalCacheMaterializationStatus::AlreadyMaterialized
+        );
+    }
+
+    #[test]
+    fn materialize_object_refuses_to_overwrite_different_destination() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"safe cache contents";
+        let object = object_for_bytes(bytes);
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(&destination, b"dirty worktree contents");
+
+        let error = layout
+            .materialize_object(&object, &destination)
+            .expect_err("different destination content should not be overwritten");
+
+        assert!(matches!(
+            error,
+            LocalCacheError::MaterializationTargetExists { path, .. } if path == destination
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("destination should remain untouched"),
+            b"dirty worktree contents"
+        );
+    }
+
+    #[test]
+    fn hydrate_pointer_file_replaces_matching_pointer_with_cache_bytes() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"hydrated bytes from shared cache";
+        let object = object_for_bytes(bytes);
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(
+            &destination,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+
+        let materialization = layout
+            .hydrate_pointer_file(&destination)
+            .expect("matching pointer should hydrate from cache");
+
+        assert_eq!(materialization.object, object);
+        assert!(matches!(
+            materialization.status,
+            LocalCacheMaterializationStatus::Copied
+                | LocalCacheMaterializationStatus::CopyOnWriteCloned
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("hydrated destination should be readable"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn hydrate_pointer_file_rejects_non_pointer_worktree_content() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&destination, b"dirty non-pointer contents");
+
+        let error = layout
+            .hydrate_pointer_file(&destination)
+            .expect_err("non-pointer worktree content should not hydrate");
+
+        assert!(matches!(
+            error,
+            LocalCacheError::PointerParse { path, .. } if path == destination
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("destination should remain untouched"),
+            b"dirty non-pointer contents"
+        );
     }
 
     #[test]

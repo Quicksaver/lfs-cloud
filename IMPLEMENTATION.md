@@ -1154,7 +1154,10 @@ Defer:
 > objects are reverified before reuse. Local cache roots now also track
 > registered repository worktrees in a versioned `worktrees.json` registry so
 > future garbage collection can inspect known cache consumers before deleting
-> shared objects.
+> shared objects. Verified cache objects can now be materialized into worktree
+> paths with macOS `/bin/cp -c` copy-on-write cloning where available and
+> fallback copying elsewhere; matching Git LFS pointer files can be hydrated
+> from the shared cache while non-pointer worktree content is left untouched.
 
 ### Progress Summary
 
@@ -1168,9 +1171,9 @@ Defer:
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 9      | 4         |
 | 7. Migration                             | 12          | 0      | 12        |
-| 8. Local Cache And Materialization       | 8           | 4      | 4         |
+| 8. Local Cache And Materialization       | 8           | 7      | 1         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **71** | **28**    |
+| **Total**                                | **99**      | **74** | **25**    |
 
 ### Legend
 
@@ -1355,9 +1358,9 @@ Defer:
 
 #### Epic 8.2: Working Tree Materialization
 
-- [ ] [T] Implement copy-on-write clone abstraction with fallback copy.
-- [ ] [M] Add macOS/APFS CoW implementation or shell out to a reliable platform primitive.
-- [ ] [T] Materialize hydrated files from cache and verify final bytes.
+- [x] [T] Implement copy-on-write clone abstraction with fallback copy.
+- [x] [M] Add macOS/APFS CoW implementation or shell out to a reliable platform primitive. Manual verification: `scripts/manual/verify-local-cache-materialization.sh`.
+- [x] [T] Materialize hydrated files from cache and verify final bytes.
 - [ ] [T] Dehydrate files back to pointer/placeholder form without losing dirty changes.
 
 ### Phase 9: Verification, Docs, And Release Shape
