@@ -80,8 +80,13 @@ impl GitRepository {
     pub fn local_git_config_path(&self) -> CliResult<PathBuf> {
         let output = git_stdout(
             &self.worktree_root,
-            ["rev-parse", "--git-path", "config"],
-            "git rev-parse --git-path config",
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "config",
+            ],
+            "git rev-parse --path-format=absolute --git-path config",
         )?;
         let path = PathBuf::from(output.trim_end());
 
@@ -108,6 +113,7 @@ impl GitRepository {
         lfs_url: impl AsRef<str>,
     ) -> CliResult<GitLfsConfigChange> {
         let lfs_url = lfs_url.as_ref();
+        let path = target.path(self)?;
         let previous_url = self.read_lfs_url(target)?;
 
         match target {
@@ -141,7 +147,7 @@ impl GitRepository {
 
         Ok(GitLfsConfigChange {
             target,
-            path: target.path(self)?,
+            path,
             previous_url,
             new_url: lfs_url.to_owned(),
         })
@@ -284,7 +290,7 @@ impl fmt::Debug for GitRemote {
         formatter
             .debug_struct("GitRemote")
             .field("remote_name", &self.remote_name)
-            .field("url", &redacted_remote_url(&self.url))
+            .field("url", &redacted_url_for_display(&self.url))
             .field("host", &self.host)
             .field("owner", &self.owner)
             .field("name", &self.name)
@@ -351,7 +357,7 @@ fn git_config_get<const N: usize>(
         })?;
 
     if !output.status.success() {
-        if output.status.code() == Some(1) {
+        if output.status.code() == Some(1) && output.stderr.iter().all(u8::is_ascii_whitespace) {
             return Ok(None);
         }
 
@@ -598,15 +604,15 @@ pub(crate) fn redacted_url_for_display(value: &str) -> String {
             if redacted {
                 url.to_string()
             } else {
-                value.to_owned()
+                redact_url_parse_fallback_for_display(value)
             }
         }
-        _ => redact_scp_like_remote_url(value).unwrap_or_else(|| value.to_owned()),
+        _ => redact_url_parse_fallback_for_display(value),
     }
 }
 
-fn redacted_remote_url(value: &str) -> String {
-    redacted_url_for_display(value)
+fn redact_url_parse_fallback_for_display(value: &str) -> String {
+    redact_scp_like_remote_url(value).unwrap_or_else(|| redact_query_fragment_for_display(value))
 }
 
 fn redact_scp_like_remote_url(value: &str) -> Option<String> {
@@ -616,6 +622,23 @@ fn redact_scp_like_remote_url(value: &str) -> Option<String> {
     }
 
     Some(format!("REDACTED@{rest}"))
+}
+
+fn redact_query_fragment_for_display(value: &str) -> String {
+    let query_index = value.find('?');
+    let fragment_index = value.find('#');
+    let Some(first_sensitive_index) = query_index.into_iter().chain(fragment_index).min() else {
+        return value.to_owned();
+    };
+
+    let mut redacted = value[..first_sensitive_index].to_owned();
+    if query_index.is_some_and(|index| fragment_index.is_none_or(|fragment| index < fragment)) {
+        redacted.push_str("?REDACTED");
+    }
+    if fragment_index.is_some() {
+        redacted.push_str("#REDACTED");
+    }
+    redacted
 }
 
 fn truncated_lossy_message(bytes: &[u8]) -> String {
@@ -630,11 +653,13 @@ fn truncated_lossy_message(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{fs, path::Path, process::Command};
 
     use tempfile::TempDir;
 
-    use super::{GitRemote, GitRepository};
+    use super::{GitLfsConfigTarget, GitRemote, GitRepository, redacted_url_for_display};
     use crate::CliError;
 
     #[test]
@@ -729,6 +754,15 @@ mod tests {
     }
 
     #[test]
+    fn display_redaction_strips_unparseable_query_and_fragment() {
+        let rendered = redacted_url_for_display("not a url?token=query-secret#fragment-secret");
+
+        assert_eq!(rendered, "not a url?REDACTED#REDACTED");
+        assert!(!rendered.contains("query-secret"));
+        assert!(!rendered.contains("fragment-secret"));
+    }
+
+    #[test]
     fn discovers_worktree_root_and_origin_remote_from_nested_directory() {
         let repo = TempGitRepo::new();
         repo.git(["remote", "add", "origin", "git@github.com:owner/repo.git"]);
@@ -749,6 +783,81 @@ mod tests {
         assert_eq!(detected.remote.host, "github.com");
         assert_eq!(detected.remote.owner, "owner");
         assert_eq!(detected.remote.name, "repo");
+    }
+
+    #[test]
+    fn local_git_config_path_resolves_linked_worktree_gitdir() {
+        let repo = TempGitRepo::new();
+        repo.git([
+            "-c",
+            "user.name=LFS Cloud Test",
+            "-c",
+            "user.email=lfs-cloud@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let linked_worktree = repo.path().join("linked-worktree");
+        repo.git([
+            "worktree",
+            "add",
+            "-b",
+            "linked-test",
+            linked_worktree.to_str().expect("path should be UTF-8"),
+            "HEAD",
+        ]);
+        let repository = GitRepository {
+            worktree_root: linked_worktree.clone(),
+            remote: GitRemote::parse("origin", "git@github.com:owner/repo.git")
+                .expect("remote should parse"),
+        };
+
+        let path = repository
+            .local_git_config_path()
+            .expect("linked worktree config path should resolve");
+
+        assert!(path.is_absolute());
+        assert_eq!(
+            path,
+            repo.path()
+                .join(".git/config")
+                .canonicalize()
+                .expect("main config should canonicalize")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lfsconfig_permission_denial_is_not_treated_as_unset() {
+        let repo = TempGitRepo::new();
+        let lfsconfig = repo.path().join(".lfsconfig");
+        fs::write(&lfsconfig, "[lfs]\n\turl = https://old.example/info/lfs\n")
+            .expect("test .lfsconfig should be written");
+        let mut permissions = fs::metadata(&lfsconfig)
+            .expect("test .lfsconfig metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&lfsconfig, permissions).expect("test .lfsconfig should be locked");
+        let repository = GitRepository {
+            worktree_root: repo.path().to_owned(),
+            remote: GitRemote::parse("origin", "git@github.com:owner/repo.git")
+                .expect("remote should parse"),
+        };
+
+        let error = repository
+            .write_lfs_url(
+                GitLfsConfigTarget::WorktreeFile,
+                "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            )
+            .expect_err("permission denial should be reported");
+
+        let mut permissions = fs::metadata(&lfsconfig)
+            .expect("test .lfsconfig metadata should still be readable")
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&lfsconfig, permissions).expect("test .lfsconfig should be unlocked");
+        assert!(matches!(error, CliError::ExternalCommand { .. }));
     }
 
     #[test]
