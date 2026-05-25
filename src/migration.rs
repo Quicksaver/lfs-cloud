@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout, MigrationError,
-    MigrationResult, SanitizedMessage,
+    MigrationResult, SanitizedMessage, StorageProvider, StoredObject,
 };
 use url::Url;
 
@@ -255,6 +255,18 @@ pub struct MigrationSourceFetch {
     pub fetched_objects: Vec<LfsObject>,
     /// Objects that still have no verified local bytes after the fetch.
     pub unavailable_objects: Vec<LfsObject>,
+}
+
+/// Result of uploading locally available migration objects into LFS Cloud storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct MigrationStorageUpload {
+    /// Configured storage provider ID that received the upload checks.
+    pub storage_provider_id: String,
+    /// Objects skipped because the configured storage provider already has them.
+    pub already_present_objects: Vec<LfsObject>,
+    /// Objects newly uploaded during this migration transfer step.
+    pub uploaded_objects: Vec<StoredObject>,
 }
 
 /// Local availability details for one discovered Git LFS object.
@@ -603,6 +615,111 @@ where
         mode,
         run_git_lfs_fetch_command,
     )
+}
+
+/// Uploads locally available migration objects to configured LFS Cloud storage.
+///
+/// The helper is intentionally idempotent: it checks the destination storage
+/// provider before uploading each object and reports already-present objects
+/// separately. For objects that do need upload, it re-verifies the selected
+/// local source bytes against the pointer OID and size immediately before
+/// delegating to the storage provider.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when a discovered object has no verified local
+/// source bytes, when the local source no longer matches the pointer identity,
+/// or when the storage provider lookup/upload fails.
+pub async fn upload_migration_objects_to_storage(
+    availability: &LocalMigrationObjectAvailability,
+    storage: &dyn StorageProvider,
+) -> MigrationResult<MigrationStorageUpload> {
+    let mut already_present_objects = Vec::new();
+    let mut uploaded_objects = Vec::new();
+
+    for local_object in &availability.objects {
+        let object = &local_object.object;
+        if storage.object_exists(object).await? {
+            already_present_objects.push(object.clone());
+            continue;
+        }
+
+        let source = verified_migration_upload_source_path(local_object)?;
+        verify_migration_upload_source(source, object)?;
+
+        let stored_object = storage.upload_object(object, source).await?;
+        validate_migration_uploaded_object(object, storage.provider_id(), &stored_object)?;
+        uploaded_objects.push(stored_object);
+    }
+
+    Ok(MigrationStorageUpload {
+        storage_provider_id: storage.provider_id().to_owned(),
+        already_present_objects,
+        uploaded_objects,
+    })
+}
+
+fn verified_migration_upload_source_path(
+    local_object: &LocalMigrationObject,
+) -> MigrationResult<&Path> {
+    local_object
+        .locations
+        .iter()
+        .find(|location| {
+            matches!(
+                location.status,
+                LocalMigrationObjectLocationStatus::Available
+            )
+        })
+        .map(|location| location.path.as_path())
+        .ok_or_else(|| MigrationError::SourceObjectMissing {
+            oid: local_object.object.oid.as_hex().to_owned(),
+            size: local_object.object.size.bytes(),
+        })
+}
+
+fn verify_migration_upload_source(path: &Path, object: &LfsObject) -> MigrationResult<()> {
+    let (actual_oid, actual_size) = hash_migration_object_file(path)?;
+    if actual_oid == object.oid && actual_size == object.size {
+        return Ok(());
+    }
+
+    Err(MigrationError::InvalidInput {
+        message: SanitizedMessage::new(format!(
+            "local migration source {} no longer matches sha256:{} ({} bytes): got sha256:{} ({} bytes)",
+            path.display(),
+            object.oid,
+            object.size,
+            actual_oid,
+            actual_size
+        )),
+    })
+}
+
+fn validate_migration_uploaded_object(
+    expected: &LfsObject,
+    expected_provider_id: &str,
+    stored: &StoredObject,
+) -> MigrationResult<()> {
+    if stored.provider_id != expected_provider_id {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new(format!(
+                "storage provider returned provider ID {}, expected {}",
+                stored.provider_id, expected_provider_id
+            )),
+        });
+    }
+
+    if stored.object != *expected {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new(format!(
+                "storage provider returned object sha256:{} ({} bytes), expected sha256:{} ({} bytes)",
+                stored.object.oid, stored.object.size, expected.oid, expected.size
+            )),
+        });
+    }
+
+    Ok(())
 }
 
 fn fetch_missing_migration_objects_with_runner<I, O, F>(
@@ -2435,6 +2552,7 @@ mod tests {
         fs, io,
         path::{Path, PathBuf},
         process::{Command, Stdio},
+        sync::Mutex,
         time::{Duration, Instant},
     };
 
@@ -2442,7 +2560,10 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use crate::{LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout};
+    use crate::{
+        LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout, ProviderFuture,
+        StorageDeleteOutcome, StorageError, StorageProvider, StorageResult, StoredObject,
+    };
 
     use super::{
         GitLfsSourceEndpointSource, LocalMigrationObjectLocationKind,
@@ -2452,11 +2573,154 @@ mod tests {
         discover_git_lfs_migration, display_git_command, enumerate_all_fetched_ref_lfs_pointers,
         enumerate_current_checkout_lfs_pointers, enumerate_selected_ref_lfs_pointers,
         fetch_missing_migration_objects, fetch_missing_migration_objects_with_runner,
-        git_lfs_object_path, migration_source_fetch_command, parse_git_check_attr_filter_stdout,
-        parse_lfs_patterns_from_attributes, parse_ls_tree_blob_output,
-        repo_relative_path_from_git_output, split_gitattributes_line, validate_history_ref_name,
+        git_lfs_object_path, hash_migration_object_file, migration_source_fetch_command,
+        parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
+        parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
+        upload_migration_objects_to_storage, validate_history_ref_name,
         wait_for_git_lfs_fetch_command,
     };
+
+    struct FakeMigrationStorageProvider {
+        provider_id: String,
+        existing: Mutex<BTreeSet<LfsObject>>,
+        uploaded: Mutex<Vec<LfsObject>>,
+        returned_object_override: Mutex<Option<LfsObject>>,
+    }
+
+    impl FakeMigrationStorageProvider {
+        fn new(provider_id: impl Into<String>) -> Self {
+            Self {
+                provider_id: provider_id.into(),
+                existing: Mutex::new(BTreeSet::new()),
+                uploaded: Mutex::new(Vec::new()),
+                returned_object_override: Mutex::new(None),
+            }
+        }
+
+        fn insert_existing(&self, object: LfsObject) {
+            self.existing
+                .lock()
+                .expect("fake storage lock should not poison")
+                .insert(object);
+        }
+
+        fn uploaded_objects(&self) -> Vec<LfsObject> {
+            self.uploaded
+                .lock()
+                .expect("fake upload lock should not poison")
+                .clone()
+        }
+
+        fn override_returned_object(&self, object: LfsObject) {
+            *self
+                .returned_object_override
+                .lock()
+                .expect("fake override lock should not poison") = Some(object);
+        }
+    }
+
+    impl StorageProvider for FakeMigrationStorageProvider {
+        fn provider_id(&self) -> &str {
+            &self.provider_id
+        }
+
+        fn object_exists<'a>(
+            &'a self,
+            object: &'a LfsObject,
+        ) -> ProviderFuture<'a, StorageResult<bool>> {
+            Box::pin(async move {
+                Ok(self
+                    .existing
+                    .lock()
+                    .expect("fake storage lock should not poison")
+                    .contains(object))
+            })
+        }
+
+        fn upload_object<'a>(
+            &'a self,
+            object: &'a LfsObject,
+            source: &'a Path,
+        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+            Box::pin(async move {
+                let (actual_oid, actual_size) =
+                    hash_migration_object_file(source).map_err(|source| {
+                        StorageError::IntegrityMismatch {
+                            expected_oid: object.oid.as_hex().to_owned(),
+                            expected_size: object.size.bytes(),
+                            actual_oid: format!("migration-source-error:{source}"),
+                            actual_size: 0,
+                        }
+                    })?;
+
+                if actual_oid != object.oid || actual_size != object.size {
+                    return Err(StorageError::IntegrityMismatch {
+                        expected_oid: object.oid.as_hex().to_owned(),
+                        expected_size: object.size.bytes(),
+                        actual_oid: actual_oid.as_hex().to_owned(),
+                        actual_size: actual_size.bytes(),
+                    });
+                }
+
+                self.uploaded
+                    .lock()
+                    .expect("fake upload lock should not poison")
+                    .push(object.clone());
+                self.existing
+                    .lock()
+                    .expect("fake storage lock should not poison")
+                    .insert(object.clone());
+
+                let returned_object = self
+                    .returned_object_override
+                    .lock()
+                    .expect("fake override lock should not poison")
+                    .clone()
+                    .unwrap_or_else(|| object.clone());
+
+                Ok(StoredObject::new(
+                    self.provider_id.clone(),
+                    returned_object,
+                    format!("fake-storage-{}", object.oid),
+                ))
+            })
+        }
+
+        fn download_object<'a>(
+            &'a self,
+            object: &'a LfsObject,
+            _destination: &'a Path,
+        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+            Box::pin(async move {
+                if self.object_exists(object).await? {
+                    Ok(StoredObject::new(
+                        self.provider_id.clone(),
+                        object.clone(),
+                        format!("fake-storage-{}", object.oid),
+                    ))
+                } else {
+                    Err(StorageError::ObjectNotFound {
+                        provider: self.provider_id.clone(),
+                        oid: object.oid.as_hex().to_owned(),
+                        size: object.size.bytes(),
+                    })
+                }
+            })
+        }
+
+        fn delete_or_mark_object<'a>(
+            &'a self,
+            object: &'a LfsObject,
+        ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
+            Box::pin(async move {
+                self.existing
+                    .lock()
+                    .expect("fake storage lock should not poison")
+                    .remove(object);
+                Ok(StorageDeleteOutcome::Deleted)
+            })
+        }
+    }
 
     #[test]
     fn discovers_lfs_filters_patterns_and_local_endpoint() {
@@ -3424,6 +3688,77 @@ mod tests {
         assert_eq!(report.command.as_deref(), Some("git lfs fetch --all"));
         assert_eq!(report.fetched_objects, vec![object]);
         assert!(report.unavailable_objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_migration_objects_skips_existing_and_uploads_verified_sources() {
+        let repo = TempRepo::new();
+        let already_present = test_lfs_object_from_bytes(b"already stored migration bytes");
+        let missing = test_lfs_object_from_bytes(b"new migration upload bytes");
+        write_git_lfs_source_object(&repo, &already_present, b"already stored migration bytes");
+        write_git_lfs_source_object(&repo, &missing, b"new migration upload bytes");
+        let availability =
+            check_local_migration_objects(repo.path(), [&already_present, &missing], None)
+                .expect("local migration objects should be available");
+        let storage = FakeMigrationStorageProvider::new("drive-user-a");
+        storage.insert_existing(already_present.clone());
+
+        let report = upload_migration_objects_to_storage(&availability, &storage)
+            .await
+            .expect("available migration objects should upload");
+
+        assert_eq!(report.storage_provider_id, "drive-user-a");
+        assert_eq!(
+            report.already_present_objects,
+            vec![already_present.clone()]
+        );
+        assert_eq!(report.uploaded_objects.len(), 1);
+        assert_eq!(report.uploaded_objects[0].object, missing);
+        assert_eq!(storage.uploaded_objects(), vec![missing]);
+        assert!(
+            storage
+                .object_exists(&already_present)
+                .await
+                .expect("exists check should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_migration_objects_rechecks_source_bytes_before_upload() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"stable source bytes");
+        write_git_lfs_source_object(&repo, &object, b"stable source bytes");
+        let availability = check_local_migration_objects(repo.path(), [&object], None)
+            .expect("local migration object should be available before mutation");
+        write_git_lfs_source_object(&repo, &object, b"corrupt source bytes");
+        let storage = FakeMigrationStorageProvider::new("drive-user-a");
+
+        let error = upload_migration_objects_to_storage(&availability, &storage)
+            .await
+            .expect_err("stale or corrupt local bytes should be rejected");
+
+        assert!(matches!(error, MigrationError::InvalidInput { message }
+            if message.as_str().contains("no longer matches")));
+        assert!(storage.uploaded_objects().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_migration_objects_rejects_provider_identity_mismatch() {
+        let repo = TempRepo::new();
+        let requested = test_lfs_object_from_bytes(b"requested upload bytes");
+        let returned = test_lfs_object_from_bytes(b"different returned object");
+        write_git_lfs_source_object(&repo, &requested, b"requested upload bytes");
+        let availability = check_local_migration_objects(repo.path(), [&requested], None)
+            .expect("local migration object should be available");
+        let storage = FakeMigrationStorageProvider::new("drive-user-a");
+        storage.override_returned_object(returned);
+
+        let error = upload_migration_objects_to_storage(&availability, &storage)
+            .await
+            .expect_err("storage providers must return the requested identity");
+
+        assert!(matches!(error, MigrationError::InvalidInput { message }
+            if message.as_str().contains("returned object")));
     }
 
     #[test]

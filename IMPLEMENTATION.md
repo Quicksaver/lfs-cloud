@@ -1185,7 +1185,10 @@ Defer:
 > `lfs-cloud` cache, verifying SHA-256 and size before treating local bytes as
 > available. Missing migration objects can now be fetched from the source Git
 > LFS provider into local media storage without smudging or changing worktree
-> files.
+> files. Locally available migration objects can now be uploaded idempotently
+> to the configured storage provider, with source bytes rechecked against
+> pointer hashes and sizes before upload and provider-returned identities
+> validated after upload.
 
 ### Progress Summary
 
@@ -1198,10 +1201,10 @@ Defer:
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 13     | 0         |
-| 7. Migration                             | 12          | 6      | 6         |
+| 7. Migration                             | 12          | 8      | 4         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **85** | **14**    |
+| **Total**                                | **99**      | **87** | **12**    |
 
 ### Legend
 
@@ -1365,8 +1368,8 @@ Defer:
 
 - [x] [T] Check which discovered objects already exist locally.
 - [x] [M] Fetch missing objects from the source LFS provider without changing working tree files. Manual verification: `scripts/manual/verify-migration-source-fetch.sh`.
-- [ ] [M] Upload discovered objects to `lfs-cloud` idempotently.
-- [ ] [T] Verify uploaded hashes and sizes against pointers.
+- [x] [M] Upload discovered objects to `lfs-cloud` idempotently. Manual verification: `scripts/manual/verify-migration-upload.sh`.
+- [x] [T] Verify uploaded hashes and sizes against pointers.
 
 #### Epic 7.3: Migration Safety
 
