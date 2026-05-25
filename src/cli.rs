@@ -8,6 +8,7 @@
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     fs::{self, File},
     future::Future,
@@ -27,12 +28,17 @@ use url::Url;
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitLfsConfigChange,
-    GitLfsConfigTarget, GitRepository, GoogleDriveCredentialLoader, GoogleDriveStorageConfig,
-    LfsInitRoute, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
-    LocalCacheDehydration, LocalCacheDehydrationStatus, LocalCacheGarbageCollection,
-    LocalCacheGarbageCollectionObject, LocalCacheIngest, LocalCacheIngestStatus, LocalCacheLayout,
-    LocalCacheMaterialization, LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
-    ServeOptions, ServerConfig, StorageProviderConfig, TracingConfig, init_tracing,
+    GitLfsConfigTarget, GitLfsHistoryPointers, GitLfsMigrationDiscovery,
+    GitLfsSourceEndpointSource, GitRepository, GoogleDriveCredentialLoader,
+    GoogleDriveStorageConfig, LfsInitRoute, LfsObject, LfsObjectSize, LfsOid, LfsPointer,
+    LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
+    LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
+    LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
+    LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
+    LocalMigrationObjectAvailability, ServeOptions, ServerConfig, StorageProviderConfig,
+    TracingConfig, check_local_migration_objects, discover_git_lfs_migration,
+    enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
+    enumerate_selected_ref_lfs_pointers, init_tracing,
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -76,6 +82,8 @@ enum Command {
     /// refreshed before collection so its Git LFS pointers are considered
     /// reachable.
     Gc(GcCommand),
+    /// Plan migration from an existing Git LFS provider.
+    Migrate(MigrateCommand),
 }
 
 #[derive(Debug, Args)]
@@ -162,6 +170,29 @@ struct GcCommand {
     dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+struct MigrateCommand {
+    /// Base URL of the running LFS Cloud server.
+    #[arg(long, value_name = "URL")]
+    server: String,
+
+    /// Local cache root to inspect instead of ~/.lfs-cloud.
+    #[arg(long, value_name = "PATH")]
+    cache_root: Option<PathBuf>,
+
+    /// Scan one selected branch, tag, or ref. Can be repeated.
+    #[arg(long = "ref", value_name = "REF", conflicts_with = "all_refs")]
+    refs: Vec<String>,
+
+    /// Scan every fetched local branch, remote-tracking branch, and tag.
+    #[arg(long, conflicts_with = "refs")]
+    all_refs: bool,
+
+    /// Report the migration plan without fetching, uploading, or writing config.
+    #[arg(long)]
+    dry_run: bool,
+}
+
 /// Parses process arguments, initializes tracing, and runs the requested command.
 ///
 /// # Errors
@@ -181,6 +212,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         run_hydrate_to_stdout,
         run_dehydrate_to_stdout,
         run_gc_to_stdout,
+        run_migrate_to_stdout,
     )
     .await
 }
@@ -189,7 +221,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     clippy::too_many_arguments,
     reason = "command dispatch keeps per-subcommand side effects injectable for focused tests"
 )]
-async fn dispatch<F, Fut, I, L, S, P, H, D, G>(
+async fn dispatch<F, Fut, I, L, S, P, H, D, G, M>(
     cli: Cli,
     serve: F,
     init: I,
@@ -199,6 +231,7 @@ async fn dispatch<F, Fut, I, L, S, P, H, D, G>(
     hydrate: H,
     dehydrate: D,
     gc: G,
+    migrate: M,
 ) -> anyhow::Result<()>
 where
     F: FnOnce(ServeOptions) -> Fut,
@@ -210,6 +243,7 @@ where
     H: FnOnce(HydrateCommand) -> anyhow::Result<()>,
     D: FnOnce(DehydrateCommand) -> anyhow::Result<()>,
     G: FnOnce(GcCommand) -> anyhow::Result<()>,
+    M: FnOnce(MigrateCommand, Option<PathBuf>) -> anyhow::Result<()>,
 {
     // Keep command execution injectable only at the command boundary; each new
     // subcommand should add its own runner here rather than hiding side effects
@@ -227,6 +261,9 @@ where
         Command::Hydrate(command) => hydrate(command).context("failed to hydrate paths"),
         Command::Dehydrate(command) => dehydrate(command).context("failed to dehydrate paths"),
         Command::Gc(command) => gc(command).context("failed to garbage collect local cache"),
+        Command::Migrate(command) => {
+            migrate(command, cli.config).context("failed to plan lfs-cloud migration")
+        }
     }
 }
 
@@ -318,6 +355,24 @@ fn run_gc_to_stdout(command: GcCommand) -> anyhow::Result<()> {
     let current_dir = std::env::current_dir().context("failed to read current directory")?;
 
     run_gc_from_dir(command, &current_dir, &mut stdout).map_err(anyhow::Error::from)
+}
+
+fn run_migrate_to_stdout(
+    command: MigrateCommand,
+    config_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+    let mut stdout = io::stdout().lock();
+
+    run_migrate_from_dir(
+        command,
+        config_path,
+        &current_dir,
+        &mut stdout,
+        |lfs_url| GitCredentialLookup::new(lfs_url).and_then(|lookup| lookup.lookup().map(|_| ())),
+        validate_status_storage,
+    )
+    .map_err(anyhow::Error::from)
 }
 
 fn run_login<R, W>(command: LoginCommand, input: &mut R, output: &mut W) -> anyhow::Result<()>
@@ -712,6 +767,389 @@ where
         .map_err(local_cache_cli_error)?;
 
     write_gc_result(output, layout.root(), &report).map_err(output_error)
+}
+
+fn run_migrate_from_dir<W, A, S>(
+    command: MigrateCommand,
+    config_path: Option<PathBuf>,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+    mut lookup_credential: A,
+    mut validate_storage: S,
+) -> CliResult<()>
+where
+    W: Write,
+    A: FnMut(&str) -> CliResult<()>,
+    S: FnMut(&StorageProviderConfig) -> CliResult<()>,
+{
+    if !command.dry_run {
+        return Err(CliError::InvalidArguments {
+            message: "lfs-cloud migrate currently supports planning with --dry-run only".to_owned(),
+        });
+    }
+
+    let start_dir = start_dir.as_ref();
+    let repository = GitRepository::discover(start_dir)?;
+    let route = LfsInitRoute::resolve(&command.server, &repository.remote)?;
+    let discovery = discover_git_lfs_migration(start_dir)?;
+    let scan = migration_pointer_scan(start_dir, &command)?;
+    let cache_layout = Some(local_cache_layout(command.cache_root.clone())?);
+    let availability =
+        check_local_migration_objects(start_dir, scan.objects.iter(), cache_layout.as_ref())?;
+    let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
+    let access_checks = migration_access_checks(
+        &config_path,
+        &repository,
+        &route.lfs_url,
+        &discovery,
+        &mut lookup_credential,
+        &mut validate_storage,
+    );
+    let report = MigrationDryRunReport {
+        discovery,
+        scan,
+        availability,
+        route,
+        config_path,
+        access_checks,
+        would_touch_files: migration_dry_run_touched_files(&repository),
+    };
+
+    write_migration_dry_run_report(output, &report).map_err(output_error)
+}
+
+#[derive(Debug)]
+struct MigrationPointerScan {
+    mode: MigrationScanMode,
+    refs_scanned: Vec<String>,
+    pointer_file_count: usize,
+    objects: Vec<LfsObject>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrationScanMode {
+    CurrentCheckout,
+    SelectedRefs,
+    AllFetchedRefs,
+}
+
+impl MigrationScanMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CurrentCheckout => "current-checkout",
+            Self::SelectedRefs => "selected-refs",
+            Self::AllFetchedRefs => "all-refs",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MigrationDryRunReport {
+    discovery: GitLfsMigrationDiscovery,
+    scan: MigrationPointerScan,
+    availability: LocalMigrationObjectAvailability,
+    route: LfsInitRoute,
+    config_path: PathBuf,
+    access_checks: Vec<MigrationAccessCheck>,
+    would_touch_files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct MigrationAccessCheck {
+    name: &'static str,
+    level: StatusLevel,
+    message: String,
+}
+
+fn migration_pointer_scan(
+    start_dir: &Path,
+    command: &MigrateCommand,
+) -> CliResult<MigrationPointerScan> {
+    if command.all_refs {
+        let history = enumerate_all_fetched_ref_lfs_pointers(start_dir)?;
+        return Ok(history_pointer_scan(
+            MigrationScanMode::AllFetchedRefs,
+            history,
+        ));
+    }
+
+    if !command.refs.is_empty() {
+        let history = enumerate_selected_ref_lfs_pointers(start_dir, command.refs.iter())?;
+        return Ok(history_pointer_scan(
+            MigrationScanMode::SelectedRefs,
+            history,
+        ));
+    }
+
+    let checkout = enumerate_current_checkout_lfs_pointers(start_dir)?;
+    let objects = dedupe_lfs_objects(checkout.pointers.iter().map(|pointer| &pointer.object));
+
+    Ok(MigrationPointerScan {
+        mode: MigrationScanMode::CurrentCheckout,
+        refs_scanned: vec!["current checkout".to_owned()],
+        pointer_file_count: checkout.pointers.len(),
+        objects,
+    })
+}
+
+fn history_pointer_scan(
+    mode: MigrationScanMode,
+    history: GitLfsHistoryPointers,
+) -> MigrationPointerScan {
+    let objects = dedupe_lfs_objects(history.pointers.iter().map(|pointer| &pointer.object));
+
+    MigrationPointerScan {
+        mode,
+        refs_scanned: history
+            .refs
+            .into_iter()
+            .map(|scanned| scanned.name)
+            .collect(),
+        pointer_file_count: history.pointers.len(),
+        objects,
+    }
+}
+
+fn dedupe_lfs_objects<'a>(objects: impl IntoIterator<Item = &'a LfsObject>) -> Vec<LfsObject> {
+    objects
+        .into_iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn migration_access_checks<A, S>(
+    config_path: &Path,
+    repository: &GitRepository,
+    lfs_url: &str,
+    discovery: &GitLfsMigrationDiscovery,
+    lookup_credential: &mut A,
+    validate_storage: &mut S,
+) -> Vec<MigrationAccessCheck>
+where
+    A: FnMut(&str) -> CliResult<()>,
+    S: FnMut(&StorageProviderConfig) -> CliResult<()>,
+{
+    let mut checks = Vec::new();
+    checks.push(migration_source_access_check(discovery));
+    checks.push(MigrationAccessCheck {
+        name: "target",
+        level: StatusLevel::Ok,
+        message: redacted_url_for_display(lfs_url),
+    });
+
+    checks.push(match lookup_credential(lfs_url) {
+        Ok(()) => MigrationAccessCheck {
+            name: "auth",
+            level: StatusLevel::Ok,
+            message: "local LFS credential found".to_owned(),
+        },
+        Err(error) => MigrationAccessCheck {
+            name: "auth",
+            level: StatusLevel::Warning,
+            message: format!("{error}"),
+        },
+    });
+
+    match ServerConfig::load_from_path(config_path) {
+        Ok(config) => {
+            checks.push(MigrationAccessCheck {
+                name: "config",
+                level: StatusLevel::Ok,
+                message: format!("loaded {}", config_path.display()),
+            });
+            migration_config_access_checks(&mut checks, &config, repository, validate_storage);
+        }
+        Err(error) => checks.push(MigrationAccessCheck {
+            name: "config",
+            level: StatusLevel::Warning,
+            message: format!("{error}"),
+        }),
+    }
+
+    checks
+}
+
+fn migration_source_access_check(discovery: &GitLfsMigrationDiscovery) -> MigrationAccessCheck {
+    match (&discovery.source_endpoint, discovery.installation.installed) {
+        (Some(endpoint), true) => MigrationAccessCheck {
+            name: "source",
+            level: StatusLevel::Ok,
+            message: format!(
+                "{} ({})",
+                redacted_url_for_display(&endpoint.url),
+                source_endpoint_source_label(endpoint.source)
+            ),
+        },
+        (Some(endpoint), false) => MigrationAccessCheck {
+            name: "source",
+            level: StatusLevel::Warning,
+            message: format!(
+                "{} configured, but git lfs is not available for source fetches",
+                redacted_url_for_display(&endpoint.url)
+            ),
+        },
+        (None, _) => MigrationAccessCheck {
+            name: "source",
+            level: StatusLevel::Warning,
+            message: "source Git LFS endpoint is not configured".to_owned(),
+        },
+    }
+}
+
+fn migration_config_access_checks<S>(
+    checks: &mut Vec<MigrationAccessCheck>,
+    config: &ServerConfig,
+    repository: &GitRepository,
+    validate_storage: &mut S,
+) where
+    S: FnMut(&StorageProviderConfig) -> CliResult<()>,
+{
+    let Some(mapping) = config.repositories.iter().find(|candidate| {
+        candidate.host == repository.remote.host
+            && candidate.owner == repository.remote.owner
+            && candidate.name == repository.remote.name
+    }) else {
+        checks.push(MigrationAccessCheck {
+            name: "mapping",
+            level: StatusLevel::Warning,
+            message: format!(
+                "no server config entry for {}",
+                repository.remote.repository_label()
+            ),
+        });
+        return;
+    };
+
+    checks.push(MigrationAccessCheck {
+        name: "mapping",
+        level: StatusLevel::Ok,
+        message: format!("{} -> {}", mapping.id, mapping.storage_provider),
+    });
+
+    let Some(storage) = config.storage_providers.get(&mapping.storage_provider) else {
+        checks.push(MigrationAccessCheck {
+            name: "storage",
+            level: StatusLevel::Warning,
+            message: format!(
+                "mapping {} references unknown storage provider {}",
+                mapping.id, mapping.storage_provider
+            ),
+        });
+        return;
+    };
+
+    checks.push(match validate_storage(storage) {
+        Ok(()) => MigrationAccessCheck {
+            name: "storage",
+            level: StatusLevel::Ok,
+            message: format!(
+                "{} {} credential is configured",
+                storage.provider_type(),
+                storage.id()
+            ),
+        },
+        Err(error) => MigrationAccessCheck {
+            name: "storage",
+            level: StatusLevel::Warning,
+            message: format!("{error}"),
+        },
+    });
+}
+
+fn migration_dry_run_touched_files(repository: &GitRepository) -> Vec<PathBuf> {
+    vec![repository.worktree_root.join(".lfsconfig")]
+}
+
+fn write_migration_dry_run_report<W>(
+    output: &mut W,
+    report: &MigrationDryRunReport,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let available_count = report.availability.available_objects().len();
+    let fetch_count = report.availability.unavailable_objects().len();
+
+    writeln!(output, "lfs-cloud migrate dry-run")?;
+    writeln!(
+        output,
+        "  worktree: {}",
+        report.discovery.worktree_root.display()
+    )?;
+    writeln!(output, "  mode: {}", report.scan.mode.label())?;
+    writeln!(
+        output,
+        "  source: {}",
+        report
+            .discovery
+            .source_endpoint
+            .as_ref()
+            .map(|endpoint| redacted_url_for_display(&endpoint.url))
+            .unwrap_or_else(|| "<unset>".to_owned())
+    )?;
+    writeln!(
+        output,
+        "  target: {}",
+        redacted_url_for_display(&report.route.lfs_url)
+    )?;
+    writeln!(output, "  config: {}", report.config_path.display())?;
+    writeln!(output, "  refs scanned: {}", report.scan.refs_scanned.len())?;
+    for ref_name in &report.scan.refs_scanned {
+        writeln!(output, "    {ref_name}")?;
+    }
+    writeln!(
+        output,
+        "  files touched: {} would update",
+        report.would_touch_files.len()
+    )?;
+    for path in &report.would_touch_files {
+        writeln!(output, "    {}", path.display())?;
+    }
+    writeln!(
+        output,
+        "  pointer files: {}",
+        report.scan.pointer_file_count
+    )?;
+    writeln!(
+        output,
+        "  objects discovered: {}",
+        report.scan.objects.len()
+    )?;
+    for object in &report.scan.objects {
+        writeln!(output, "    sha256:{} ({} bytes)", object.oid, object.size)?;
+    }
+    writeln!(
+        output,
+        "  objects fetched: {fetch_count} would fetch, {available_count} already local"
+    )?;
+    writeln!(
+        output,
+        "  objects uploaded: {} would upload",
+        report.scan.objects.len()
+    )?;
+    writeln!(output, "  access checks:")?;
+    for check in &report.access_checks {
+        writeln!(
+            output,
+            "    {:<10} {:<7} {}",
+            check.name,
+            check.level.label(),
+            check.message
+        )?;
+    }
+
+    Ok(())
+}
+
+fn source_endpoint_source_label(source: GitLfsSourceEndpointSource) -> &'static str {
+    match source {
+        GitLfsSourceEndpointSource::LocalGitConfig => "local Git config",
+        GitLfsSourceEndpointSource::RemoteGitConfig => "remote Git config",
+        GitLfsSourceEndpointSource::WorktreeLfsConfig => ".lfsconfig",
+        GitLfsSourceEndpointSource::RemoteUrlDefault => "remote URL default",
+    }
 }
 
 fn register_current_worktree_for_gc(layout: &LocalCacheLayout, start_dir: &Path) -> CliResult<()> {
@@ -1717,12 +2155,13 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, PullCommand,
-        StatusCommand, current_checkout_lfs_pointer_files, current_checkout_lfs_pointer_scan,
-        dispatch, is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
-        run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
-        run_login_from_dir, run_pull_from_dir, run_status_from_dir, sanitize_browser_stderr,
-        tracing_config, validate_status_storage, write_init_change,
+        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand,
+        MigrateCommand, PullCommand, StatusCommand, current_checkout_lfs_pointer_files,
+        current_checkout_lfs_pointer_scan, dispatch, is_git_worktree_discovery_error,
+        login_url_for_server, probe_server_reachable, run_dehydrate_from_dir, run_gc_from_dir,
+        run_hydrate_from_dir, run_init_from_dir, run_login_from_dir, run_migrate_from_dir,
+        run_pull_from_dir, run_status_from_dir, sanitize_browser_stderr, tracing_config,
+        validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
@@ -1916,6 +2355,34 @@ mod tests {
     }
 
     #[test]
+    fn migrate_command_accepts_dry_run_scope_and_cache_options() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "--config",
+            "lfs-cloud.test.yml",
+            "migrate",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--dry-run",
+            "--all-refs",
+            "--cache-root",
+            "/tmp/lfs-cloud-cache",
+        ])
+        .expect("migrate command should parse");
+
+        let super::Command::Migrate(command) = cli.command else {
+            panic!("migrate subcommand should parse");
+        };
+
+        assert_eq!(cli.config, Some("lfs-cloud.test.yml".into()));
+        assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert!(command.dry_run);
+        assert!(command.all_refs);
+        assert!(command.refs.is_empty());
+        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+    }
+
+    #[test]
     fn serve_command_accepts_global_config_before_subcommand() {
         let cli = Cli::try_parse_from([
             "lfs-cloud",
@@ -2025,6 +2492,7 @@ mod tests {
             |_| unreachable!("hydrate runner must not be called for serve command"),
             |_| unreachable!("dehydrate runner must not be called for serve command"),
             |_| unreachable!("gc runner must not be called for serve command"),
+            |_, _| unreachable!("migrate runner must not be called for serve command"),
         )
         .await
         .expect("serve dispatch should succeed");
@@ -2061,6 +2529,7 @@ mod tests {
             |_| unreachable!("hydrate runner must not be called for init command"),
             |_| unreachable!("dehydrate runner must not be called for init command"),
             |_| unreachable!("gc runner must not be called for init command"),
+            |_, _| unreachable!("migrate runner must not be called for init command"),
         )
         .await
         .expect("init dispatch should succeed");
@@ -2093,6 +2562,7 @@ mod tests {
             |_| unreachable!("hydrate runner must not be called for login command"),
             |_| unreachable!("dehydrate runner must not be called for login command"),
             |_| unreachable!("gc runner must not be called for login command"),
+            |_, _| unreachable!("migrate runner must not be called for login command"),
         )
         .await
         .expect("login dispatch should succeed");
@@ -2132,6 +2602,7 @@ mod tests {
             |_| unreachable!("hydrate runner must not be called for status command"),
             |_| unreachable!("dehydrate runner must not be called for status command"),
             |_| unreachable!("gc runner must not be called for status command"),
+            |_, _| unreachable!("migrate runner must not be called for status command"),
         )
         .await
         .expect("status dispatch should succeed");
@@ -2168,6 +2639,7 @@ mod tests {
             |_| unreachable!("hydrate runner must not be called for pull command"),
             |_| unreachable!("dehydrate runner must not be called for pull command"),
             |_| unreachable!("gc runner must not be called for pull command"),
+            |_, _| unreachable!("migrate runner must not be called for pull command"),
         )
         .await
         .expect("pull dispatch should succeed");
@@ -2200,6 +2672,7 @@ mod tests {
             },
             |_| unreachable!("dehydrate runner must not be called for hydrate command"),
             |_| unreachable!("gc runner must not be called for hydrate command"),
+            |_, _| unreachable!("migrate runner must not be called for hydrate command"),
         )
         .await
         .expect("hydrate dispatch should succeed");
@@ -2232,6 +2705,7 @@ mod tests {
                 Ok(())
             },
             |_| unreachable!("gc runner must not be called for dehydrate command"),
+            |_, _| unreachable!("migrate runner must not be called for dehydrate command"),
         )
         .await
         .expect("dehydrate dispatch should succeed");
@@ -2264,6 +2738,7 @@ mod tests {
                     .expect("capture mutex should lock") = Some(command.dry_run);
                 Ok(())
             },
+            |_, _| unreachable!("migrate runner must not be called for gc command"),
         )
         .await
         .expect("gc dispatch should succeed");
@@ -2271,6 +2746,52 @@ mod tests {
         assert_eq!(
             *captured.lock().expect("capture mutex should lock"),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_migrate_with_global_config() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "--config",
+            "lfs-cloud.test.yml",
+            "migrate",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--dry-run",
+        ])
+        .expect("migrate command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for migrate command") },
+            |_| unreachable!("init runner must not be called for migrate command"),
+            |_| unreachable!("login runner must not be called for migrate command"),
+            |_, _| unreachable!("status runner must not be called for migrate command"),
+            |_| unreachable!("pull runner must not be called for migrate command"),
+            |_| unreachable!("hydrate runner must not be called for migrate command"),
+            |_| unreachable!("dehydrate runner must not be called for migrate command"),
+            |_| unreachable!("gc runner must not be called for migrate command"),
+            move |command, config_path| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") =
+                    Some((command.server, command.dry_run, config_path));
+                Ok(())
+            },
+        )
+        .await
+        .expect("migrate dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some((
+                "http://127.0.0.1:8080".to_owned(),
+                true,
+                Some("lfs-cloud.test.yml".into())
+            ))
         );
     }
 
@@ -2628,6 +3149,150 @@ mod tests {
         assert!(rendered.contains("credentials_ref"));
         assert!(!rendered.contains("LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL"));
         assert!(!rendered.contains("definitely-missing-status-test-env"));
+    }
+
+    #[test]
+    fn migrate_dry_run_reports_current_checkout_plan_without_writes() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        let cache_root = temp.path().join("cache");
+        init_git_repo_with_origin(&repo);
+        let object = object_for_bytes(b"migration object already local");
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(
+            &repo.join("asset/model.bin"),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
+        write_git_lfs_source_object(&repo, &object, b"migration object already local");
+        let config_path = temp.path().join("lfs-cloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let mut output = Vec::new();
+
+        run_migrate_from_dir(
+            MigrateCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                cache_root: Some(cache_root.clone()),
+                refs: Vec::new(),
+                all_refs: false,
+                dry_run: true,
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |lfs_url| {
+                assert_eq!(
+                    lfs_url,
+                    "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs"
+                );
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("dry-run migration plan should be reported");
+
+        assert!(
+            !repo.join(".lfsconfig").exists(),
+            "dry-run must not write Git LFS config"
+        );
+        assert!(
+            !cache_root.exists(),
+            "dry-run must not create local cache state"
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("lfs-cloud migrate dry-run"));
+        assert!(rendered.contains("mode: current-checkout"));
+        assert!(rendered.contains("refs scanned: 1"));
+        assert!(rendered.contains("current checkout"));
+        assert!(rendered.contains("files touched: 1 would update"));
+        assert!(rendered.contains(".lfsconfig"));
+        assert!(rendered.contains("pointer files: 1"));
+        assert!(rendered.contains("objects discovered: 1"));
+        assert!(rendered.contains("objects fetched: 0 would fetch, 1 already local"));
+        assert!(rendered.contains("objects uploaded: 1 would upload"));
+        assert!(rendered.contains("access checks:"));
+        assert!(rendered.contains("auth       ok"));
+        assert!(rendered.contains("storage    ok"));
+        assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn migrate_dry_run_reports_missing_objects_as_would_fetch_without_fetching() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        let cache_root = temp.path().join("cache");
+        init_git_repo_with_origin(&repo);
+        let object = object_for_bytes(b"migration object missing locally");
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(
+            &repo.join("asset/model.bin"),
+            LfsPointer::new(object).to_pointer_file().as_bytes(),
+        );
+        run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
+        let config_path = temp.path().join("lfs-cloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let mut output = Vec::new();
+
+        run_migrate_from_dir(
+            MigrateCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                cache_root: Some(cache_root.clone()),
+                refs: Vec::new(),
+                all_refs: false,
+                dry_run: true,
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("dry-run migration plan should be reported");
+
+        assert!(
+            !cache_root.exists(),
+            "dry-run must not create cache state while planning fetches"
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("objects fetched: 1 would fetch, 0 already local"));
+        assert!(rendered.contains("objects uploaded: 1 would upload"));
+    }
+
+    #[test]
+    fn migrate_without_dry_run_is_rejected_before_writes() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let mut output = Vec::new();
+
+        let error = run_migrate_from_dir(
+            MigrateCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                cache_root: Some(temp.path().join("cache")),
+                refs: Vec::new(),
+                all_refs: false,
+                dry_run: false,
+            },
+            None,
+            temp.path(),
+            &mut output,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect_err("non-dry-run migrate should be rejected");
+
+        assert!(
+            matches!(error, CliError::InvalidArguments { message } if message.contains("--dry-run"))
+        );
+        assert!(output.is_empty());
     }
 
     #[test]

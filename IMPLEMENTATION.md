@@ -1188,7 +1188,12 @@ Defer:
 > files. Locally available migration objects can now be uploaded idempotently
 > to the configured storage provider, with source bytes rechecked against
 > pointer hashes and sizes before upload and provider-returned identities
-> validated after upload.
+> validated after upload. The `migrate --dry-run` CLI command can now build a
+> read-only migration plan for the current checkout, selected refs, or all
+> fetched refs, reporting scanned refs, planned config writes, discovered
+> objects, source fetch/upload counts, and local access-check status without
+> fetching, uploading, writing Git config, creating cache state, opening
+> metadata, or touching storage.
 
 ### Progress Summary
 
@@ -1201,10 +1206,10 @@ Defer:
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
 | 6. CLI Commands                          | 13          | 13     | 0         |
-| 7. Migration                             | 12          | 8      | 4         |
+| 7. Migration                             | 12          | 10     | 2         |
 | 8. Local Cache And Materialization       | 8           | 8      | 0         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **87** | **12**    |
+| **Total**                                | **99**      | **89** | **10**    |
 
 ### Legend
 
@@ -1373,8 +1378,8 @@ Defer:
 
 #### Epic 7.3: Migration Safety
 
-- [ ] [T] Implement `migrate --dry-run` with no filesystem, Git config, DB, or storage writes.
-- [ ] [T] `--dry-run` reports refs scanned, files touched, objects fetched, objects uploaded, and access-check results.
+- [x] [T] Implement `migrate --dry-run` with no filesystem, Git config, DB, or storage writes.
+- [x] [T] `--dry-run` reports refs scanned, files touched, objects fetched, objects uploaded, and access-check results.
 - [ ] [T] Implement GitHub-specific `--purge-source-lfs` helper report and support-flow instructions.
 - [ ] [T] Add fixture-repo tests for current checkout, selected refs, all refs, missing objects, and dry-run no-op behavior.
 

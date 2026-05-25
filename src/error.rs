@@ -157,6 +157,14 @@ pub enum CliError {
         source: crate::local_cache::LocalCacheError,
     },
 
+    /// A migration planning or execution operation failed.
+    #[error("migration error: {source}")]
+    Migration {
+        /// Underlying migration failure.
+        #[from]
+        source: MigrationError,
+    },
+
     /// One or more `pull` pointer hydrations failed after fetch completed.
     #[error("pull failed for {failures} pointer file(s); first failure at {}: {message}", path.display())]
     PullFailed {
