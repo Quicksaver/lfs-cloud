@@ -1508,6 +1508,7 @@ fn copy_verified_object_to_cache(
         object,
         "failed to open Git LFS source object",
         "failed to read Git LFS source object",
+        CachePublishDurability::Recoverable,
     )
 }
 
@@ -1522,8 +1523,15 @@ fn copy_verified_worktree_object_to_cache(
         object,
         "failed to open hydrated worktree object",
         "failed to read hydrated worktree object",
+        CachePublishDurability::Durable,
     )
     .map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CachePublishDurability {
+    Recoverable,
+    Durable,
 }
 
 fn copy_verified_path_to_cache(
@@ -1532,6 +1540,7 @@ fn copy_verified_path_to_cache(
     object: &LfsObject,
     open_context: &'static str,
     read_context: &'static str,
+    durability: CachePublishDurability,
 ) -> LocalCacheResult<LocalCacheIngestStatus> {
     let cache_parent = cache_path.parent().ok_or_else(|| LocalCacheError::Io {
         context: "failed to resolve cache object parent",
@@ -1566,20 +1575,48 @@ fn copy_verified_path_to_cache(
         object,
         read_context,
     )?;
-    // This deliberately stops at `flush()`: the local cache is recoverable
-    // derived state, and every cache reuse revalidates object identity.
-    // Avoiding `sync_all()` keeps large-object ingest from paying a durable
-    // write latency cost on the hot path.
-    temp.as_file_mut()
-        .flush()
-        .map_err(|source| LocalCacheError::Io {
-            context: "failed to flush temporary cache object",
-            path: cache_path.to_path_buf(),
-            source,
-        })?;
+    match durability {
+        CachePublishDurability::Recoverable => {
+            // This deliberately stops at `flush()`: ordinary cache ingest is
+            // recoverable derived state, and every cache reuse revalidates
+            // object identity. Avoiding `sync_all()` keeps large-object ingest
+            // from paying a durable write latency cost on the hot path.
+            temp.as_file_mut()
+                .flush()
+                .map_err(|source| LocalCacheError::Io {
+                    context: "failed to flush temporary cache object",
+                    path: cache_path.to_path_buf(),
+                    source,
+                })?;
+        }
+        CachePublishDurability::Durable => {
+            temp.as_file_mut()
+                .sync_all()
+                .map_err(|source| LocalCacheError::Io {
+                    context: "failed to sync temporary cache object",
+                    path: cache_path.to_path_buf(),
+                    source,
+                })?;
+        }
+    }
 
     match temp.persist_noclobber(cache_path) {
-        Ok(_) => Ok(LocalCacheIngestStatus::Copied),
+        Ok(published) => {
+            if durability == CachePublishDurability::Durable {
+                published.sync_all().map_err(|source| LocalCacheError::Io {
+                    context: "failed to sync published cache object",
+                    path: cache_path.to_path_buf(),
+                    source,
+                })?;
+                sync_directory(cache_parent).map_err(|source| LocalCacheError::Io {
+                    context: "failed to sync cache object directory",
+                    path: cache_parent.to_path_buf(),
+                    source,
+                })?;
+            }
+
+            Ok(LocalCacheIngestStatus::Copied)
+        }
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
             verify_file_object(cache_path, object)?;
             Ok(LocalCacheIngestStatus::AlreadyCached)
