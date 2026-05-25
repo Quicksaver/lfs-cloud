@@ -15,6 +15,8 @@ use lfs_cloud::{
 };
 use support::{TempGitRepo, lfs_object_for_bytes, write_lfs_pointer};
 
+// Deliberately inert: dry-run tests pass this through config and CLI parsing,
+// but must not make network requests to it.
 const SERVER_URL: &str = "http://127.0.0.1:9";
 
 #[test]
@@ -186,7 +188,9 @@ fn fixture_repo_migrate_dry_run_leaves_repo_and_cache_untouched() {
     let stdout = String::from_utf8(output.stdout).expect("dry-run output should be UTF-8");
     assert!(stdout.contains("lfs-cloud migrate dry-run"));
     assert!(stdout.contains("mode: current-checkout"));
-    assert!(stdout.contains("objects fetched: 1 would fetch, 0 already local"));
+    assert!(stdout.contains("objects fetched:"));
+    assert!(stdout.contains("1 would fetch"));
+    assert!(stdout.contains("0 already local"));
     assert_eq!(git_status(repo.path()), before_status);
     assert!(
         !repo.path().join(".lfsconfig").exists(),
@@ -212,14 +216,25 @@ fn history_objects(pointers: &[lfs_cloud::GitLfsHistoryPointer]) -> BTreeSet<Lfs
 }
 
 fn write_git_lfs_media_object(repo: &TempGitRepo, object: &LfsObject, contents: &[u8]) {
+    assert_eq!(
+        object.size.bytes(),
+        contents.len() as u64,
+        "fixture media contents must match the declared LFS object size"
+    );
     let oid = object.oid.as_hex();
+    let first_shard = oid
+        .get(..2)
+        .expect("validated SHA-256 object IDs always have a first shard");
+    let second_shard = oid
+        .get(2..4)
+        .expect("validated SHA-256 object IDs always have a second shard");
     let path = repo
         .path()
         .join(".git")
         .join("lfs")
         .join("objects")
-        .join(&oid[..2])
-        .join(&oid[2..4])
+        .join(first_shard)
+        .join(second_shard)
         .join(oid);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("Git LFS media object parent should be created");
@@ -229,7 +244,7 @@ fn write_git_lfs_media_object(repo: &TempGitRepo, object: &LfsObject, contents: 
 
 fn git_status(repo: &Path) -> String {
     let output = Command::new("git")
-        .args(["status", "--short"])
+        .args(["status", "--porcelain=v1"])
         .current_dir(repo)
         .output()
         .expect("git status should start");
@@ -243,6 +258,7 @@ fn git_status(repo: &Path) -> String {
 }
 
 fn server_config(public_url: &str) -> String {
+    let public_url = yaml_single_quoted(public_url);
     format!(
         r#"
 server:
@@ -270,6 +286,10 @@ repositories:
     owner: owner
     name: repo
     storage_provider: drive-user-a
-"#
+        "#
     )
+}
+
+fn yaml_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }

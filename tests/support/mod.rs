@@ -2,7 +2,10 @@
 //!
 //! Each integration test crate can import these helpers with `mod support;`.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "integration test crates import this shared module independently and use different helper subsets"
+)]
 
 use std::{
     collections::BTreeMap,
