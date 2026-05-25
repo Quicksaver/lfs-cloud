@@ -265,8 +265,8 @@ fn parse_repository_path(path: &str) -> CliResult<(String, String)> {
     }
 
     let name = repo.strip_suffix(".git").unwrap_or(repo);
-    let owner = validate_route_component("Git remote owner", owner)?;
-    let name = validate_route_component("Git remote repository name", name)?;
+    let owner = validate_route_component("Git remote owner", owner, false)?;
+    let name = validate_route_component("Git remote repository name", name, true)?;
     // A second `.git` suffix means the repository path was double-suffixed,
     // such as `owner/repo.git.git`.
     if name.ends_with(".git") {
@@ -313,10 +313,14 @@ fn validate_remote_host(value: &str) -> CliResult<String> {
     Ok(host)
 }
 
-fn validate_route_component(label: &str, value: &str) -> CliResult<String> {
+fn validate_route_component(
+    label: &str,
+    value: &str,
+    allow_leading_dot: bool,
+) -> CliResult<String> {
     let component = validate_remote_component(label, value)?;
     if matches!(component.as_str(), "." | "..")
-        || component.starts_with('.')
+        || (!allow_leading_dot && component.starts_with('.'))
         || component.ends_with('.')
         || component.contains("..")
         || !component
@@ -418,6 +422,15 @@ mod tests {
         assert_eq!(scp.host, "github.com");
         assert_eq!(scp.owner, "owner");
         assert_eq!(scp.name, "repo");
+    }
+
+    #[test]
+    fn parses_dot_prefixed_github_repository_name() {
+        let remote = GitRemote::parse("origin", "https://github.com/owner/.github.git")
+            .expect("dot-prefixed repository should parse");
+
+        assert_eq!(remote.owner, "owner");
+        assert_eq!(remote.name, ".github");
     }
 
     #[test]
