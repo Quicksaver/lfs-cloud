@@ -16,7 +16,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use url::Url;
 
-use crate::{CliError, CliResult, git::redacted_url_for_display};
+use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitLfsConfigChange, GitLfsConfigTarget,
     GitRepository, LfsInitRoute, LfsSessionToken, ServeOptions, TracingConfig, init_tracing,
@@ -141,8 +141,7 @@ fn run_init_to_stdout(command: InitCommand) -> anyhow::Result<()> {
 }
 
 fn run_login_to_stdio(command: LoginCommand) -> anyhow::Result<()> {
-    let stdin = io::stdin().lock();
-    let mut input = io::BufReader::new(stdin);
+    let mut input = io::stdin().lock();
     let mut stdout = io::stdout().lock();
 
     run_login(command, &mut input, &mut stdout)
@@ -180,7 +179,7 @@ where
     O: FnMut(&str) -> CliResult<()>,
     A: FnMut(GitCredentialApproval) -> CliResult<()>,
 {
-    let repository = GitRepository::discover(start_dir.as_ref())?;
+    let repository = GitRepository::discover(start_dir.as_ref()).map_err(login_discovery_error)?;
     let route = LfsInitRoute::resolve(&command.server, &repository.remote)?;
     let login_url = login_url_for_server(&route.server_url)?;
 
@@ -208,12 +207,11 @@ where
         source,
     })?;
     let token =
-        LfsSessionToken::from_secret(token.trim_end_matches(['\r', '\n'])).map_err(|_| {
-            CliError::InvalidArguments {
-                message: "lfs_token was invalid or blank".to_owned(),
-            }
+        LfsSessionToken::from_secret(token.trim()).map_err(|_| CliError::InvalidArguments {
+            message: "lfs_token was invalid or blank".to_owned(),
         })?;
     let approval = GitCredentialApproval::new(&route.lfs_url, token)?;
+    let approval_username = approval.username().to_owned();
     approve_credential(approval)?;
 
     writeln!(output, "stored local LFS credential").map_err(output_error)?;
@@ -223,9 +221,20 @@ where
         redacted_url_for_display(&route.lfs_url)
     )
     .map_err(output_error)?;
-    writeln!(output, "  username: {}", approval_username()).map_err(output_error)?;
+    writeln!(output, "  username: {approval_username}").map_err(output_error)?;
 
     Ok(())
+}
+
+fn login_discovery_error(error: CliError) -> CliError {
+    match error {
+        CliError::ExternalCommand { command, .. } if command == "git remote get-url origin" => {
+            CliError::InvalidArguments {
+                message: "lfs-cloud login requires an origin remote; add the repository remote before logging in".to_owned(),
+            }
+        }
+        error => error,
+    }
 }
 
 fn run_init_from_dir<W>(
@@ -251,13 +260,35 @@ fn login_url_for_server(server_url: &str) -> CliResult<String> {
     let mut login_url = Url::parse(server_url).map_err(|source| CliError::InvalidArguments {
         message: format!("server URL is not valid: {source}"),
     })?;
-    let mut segments = login_url
-        .path_segments_mut()
-        .map_err(|()| CliError::InvalidArguments {
-            message: "server URL cannot be used as a route base".to_owned(),
-        })?;
-    segments.extend(GITHUB_OAUTH_LOGIN_PATH.trim_start_matches('/').split('/'));
-    drop(segments);
+    if !matches!(login_url.scheme(), "http" | "https") || login_url.host_str().is_none() {
+        return Err(CliError::InvalidArguments {
+            message: "server URL must be a valid http or https URL".to_owned(),
+        });
+    }
+    if !login_url.username().is_empty() || login_url.password().is_some() {
+        return Err(CliError::InvalidArguments {
+            message: "server URL must not include credentials".to_owned(),
+        });
+    }
+    if login_url.query().is_some() || login_url.fragment().is_some() {
+        return Err(CliError::InvalidArguments {
+            message: "server URL must not include a query string or fragment".to_owned(),
+        });
+    }
+    if login_url.path().ends_with('/') && login_url.path() != "/" {
+        return Err(CliError::InvalidArguments {
+            message: "server URL must not end with a trailing slash".to_owned(),
+        });
+    }
+    {
+        let mut segments =
+            login_url
+                .path_segments_mut()
+                .map_err(|()| CliError::InvalidArguments {
+                    message: "server URL cannot be used as a route base".to_owned(),
+                })?;
+        segments.extend(GITHUB_OAUTH_LOGIN_PATH.trim_start_matches('/').split('/'));
+    }
 
     Ok(login_url.to_string())
 }
@@ -268,25 +299,25 @@ fn open_url_in_default_browser(url: &str) -> CliResult<()> {
         "windows" => ("rundll32", vec!["url.dll,FileProtocolHandler", url]),
         _ => ("xdg-open", vec![url]),
     };
-    let status = ProcessCommand::new(program)
+    let output = ProcessCommand::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|source| CliError::Io {
             context: format!("failed to start {program}"),
             source,
         })?;
 
-    if status.success() {
+    if output.status.success() {
         return Ok(());
     }
 
     Err(CliError::ExternalCommand {
         command: program.to_owned(),
-        status: process_status_text(status),
-        stderr: crate::SanitizedMessage::new("browser opener exited unsuccessfully"),
+        status: process_status_text(output.status),
+        stderr: sanitize_browser_stderr(&output.stderr),
     })
 }
 
@@ -304,8 +335,26 @@ fn output_error(source: io::Error) -> CliError {
     }
 }
 
-fn approval_username() -> &'static str {
-    crate::DEFAULT_GIT_CREDENTIAL_USERNAME
+fn sanitize_browser_stderr(stderr: &[u8]) -> SanitizedMessage {
+    const MAX_BROWSER_STDERR_LEN: usize = 512;
+
+    let mut message = String::from_utf8_lossy(stderr).into_owned();
+    message = message.replace(['\r', '\n'], " ");
+    if message.len() > MAX_BROWSER_STDERR_LEN {
+        let boundary = (0..=MAX_BROWSER_STDERR_LEN)
+            .rev()
+            .find(|&index| message.is_char_boundary(index))
+            .expect("zero is always a valid string boundary");
+        message.truncate(boundary);
+        message.push_str("...");
+    }
+    let message = message.trim();
+
+    if message.is_empty() {
+        SanitizedMessage::new("<no stderr>")
+    } else {
+        SanitizedMessage::new(message.to_owned())
+    }
 }
 
 impl InitCommand {
@@ -371,11 +420,11 @@ mod tests {
 
     use super::{
         Cli, InitCommand, LoginCommand, dispatch, login_url_for_server, run_init_from_dir,
-        run_login_from_dir, tracing_config, write_init_change,
+        run_login_from_dir, sanitize_browser_stderr, tracing_config, write_init_change,
     };
     use crate::{
-        DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval, GitLfsConfigChange,
-        GitLfsConfigTarget, ServeOptions,
+        CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
+        GitLfsConfigChange, GitLfsConfigTarget, ServeOptions,
     };
 
     #[test]
@@ -812,6 +861,23 @@ mod tests {
     }
 
     #[test]
+    fn login_url_rejects_unsafe_server_url_components() {
+        for server_url in [
+            "https://lfs.example.com/custom/base/",
+            "https://user:secret@lfs.example.com/custom/base",
+            "https://lfs.example.com/custom/base?token=secret",
+            "https://lfs.example.com/custom/base#fragment",
+        ] {
+            let error =
+                login_url_for_server(server_url).expect_err("unsafe server URL should be rejected");
+            assert!(
+                matches!(error, CliError::InvalidArguments { .. }),
+                "unexpected error for {server_url}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn login_opens_browser_and_stores_local_lfs_token_for_current_repo() {
         if !git_is_available() {
             return;
@@ -827,7 +893,7 @@ mod tests {
         let approved = Arc::new(Mutex::new(None));
         let opened_url_for_runner = Arc::clone(&opened_url);
         let approved_for_runner = Arc::clone(&approved);
-        let mut input = io::Cursor::new(b"local-lfs-token\n".to_vec());
+        let mut input = io::Cursor::new(b" \tlocal-lfs-token \r\n".to_vec());
         let mut output = Vec::new();
 
         run_login_from_dir(
@@ -874,6 +940,7 @@ mod tests {
         assert!(rendered.contains("authorize LFS Cloud with GitHub:"));
         assert!(rendered.contains("opened browser for GitHub OAuth"));
         assert!(rendered.contains("stored local LFS credential"));
+        assert!(rendered.contains("username: lfs-cloud"));
         assert!(!rendered.contains("local-lfs-token"));
     }
 
@@ -918,6 +985,46 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("browser open skipped"));
+    }
+
+    #[test]
+    fn login_reports_missing_origin_remote_with_targeted_message() {
+        if !git_is_available() {
+            return;
+        }
+
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), &["init"]);
+        let mut input = io::Cursor::new(b"local-lfs-token\n".to_vec());
+        let mut output = Vec::new();
+
+        let error = run_login_from_dir(
+            LoginCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                no_open: true,
+            },
+            repo.path(),
+            &mut input,
+            &mut output,
+            |_| panic!("browser opener should not be called without a remote"),
+            |_| panic!("credential approval should not run without a remote"),
+        )
+        .expect_err("missing origin remote should fail before login");
+
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments { message }
+                if message.contains("requires an origin remote")
+        ));
+    }
+
+    #[test]
+    fn browser_stderr_sanitizer_cleans_multiline_output() {
+        assert_eq!(
+            sanitize_browser_stderr(b"first line\nsecond line\r\n").as_str(),
+            "first line second line"
+        );
+        assert_eq!(sanitize_browser_stderr(b"\n").as_str(), "<no stderr>");
     }
 
     fn git_is_available() -> bool {

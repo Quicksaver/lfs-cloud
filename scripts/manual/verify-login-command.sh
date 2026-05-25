@@ -33,6 +33,9 @@ if grep -F "$token" "$tmp_dir/login-output" >/dev/null; then
   echo "login output leaked the local LFS token" >&2
   exit 1
 fi
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
+  git config --global --get credential.https://lfs.example.invalid/.useHttpPath |
+  grep -Fx 'true' >/dev/null
 
 approved="$(
   printf 'url=%s\n\n' "$lfs_url" |
@@ -46,9 +49,14 @@ printf '%s\n' "$approved" | grep -Fx 'path=github.com/owner/repo.git/info/lfs' >
 printf '%s\n' "$approved" | grep -Fx 'username=lfs-cloud' >/dev/null
 printf '%s\n' "$approved" | grep -Fx "password=$token" >/dev/null
 
-if printf 'url=%s\n\n' "$other_lfs_url" |
-  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
-    git credential fill >/dev/null 2>&1; then
+other_approved="$(
+  {
+    printf 'url=%s\n\n' "$other_lfs_url" |
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
+        git credential fill
+  } 2>/dev/null || true
+)"
+if printf '%s\n' "$other_approved" | grep -Fx "password=$token" >/dev/null; then
   echo "unexpectedly retrieved repo-scoped token for a different LFS URL" >&2
   exit 1
 fi
