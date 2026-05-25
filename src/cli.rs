@@ -66,7 +66,7 @@ enum Command {
     Hydrate(HydrateCommand),
     /// Dehydrate clean worktree files back to Git LFS pointers.
     Dehydrate(DehydrateCommand),
-    /// Remove shared local cache objects no registered worktree references.
+    /// Remove shared local cache objects with no registered worktree references.
     Gc(GcCommand),
 }
 
