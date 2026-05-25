@@ -264,7 +264,7 @@ Full non-dry-run migration execution is not implemented yet. It is expected to:
 For GitHub LFS cleanup assistance:
 
 ```bash
-lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --purge-source-lfs
+lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run --purge-source-lfs
 ```
 
 For GitHub, automatic purge is not expected to be possible through a normal API. The command should instead produce a report and helper text for GitHub Support.
