@@ -27,6 +27,7 @@ const MAX_CURRENT_CHECKOUT_ATTR_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_REF_LIST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HISTORY_COMMIT_LIST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_TREE_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HISTORY_CHECK_ATTR_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_POINTER_BYTES: u64 = 64 * 1024;
 
 /// Read-only discovery result for an existing Git LFS repository.
@@ -259,6 +260,8 @@ where
     let mut scanned_refs = Vec::new();
     let mut pointers = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut commit_cache = BTreeMap::new();
+    let mut blob_pointer_cache = BTreeMap::new();
 
     for ref_name in refs {
         let ref_name = ref_name.as_ref();
@@ -274,6 +277,8 @@ where
             &commit,
             &mut pointers,
             &mut seen,
+            &mut commit_cache,
+            &mut blob_pointer_cache,
         )?;
     }
 
@@ -304,6 +309,8 @@ pub fn enumerate_all_fetched_ref_lfs_pointers(
     let mut scanned_refs = Vec::new();
     let mut pointers = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut commit_cache = BTreeMap::new();
+    let mut blob_pointer_cache = BTreeMap::new();
 
     for ref_name in refs {
         let commit = resolve_ref_commit(&worktree_root, &ref_name)?;
@@ -317,6 +324,8 @@ pub fn enumerate_all_fetched_ref_lfs_pointers(
             &commit,
             &mut pointers,
             &mut seen,
+            &mut commit_cache,
+            &mut blob_pointer_cache,
         )?;
     }
 
@@ -645,11 +654,17 @@ fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> MigrationResult<V
     }
 
     let output = git_check_attr_filter(worktree_root, output.stdout)?;
-    let lfs_tracked_paths = parse_git_check_attr_filter_stdout(&output.stdout)?;
+    let lfs_tracked_paths = parse_git_check_attr_filter_stdout(
+        &output.stdout,
+        &git_check_attr_filter_command_name(None),
+    )?;
     current_checkout_existing_paths(worktree_root, lfs_tracked_paths)
 }
 
-fn parse_git_check_attr_filter_stdout(stdout: &[u8]) -> MigrationResult<Vec<PathBuf>> {
+fn parse_git_check_attr_filter_stdout(
+    stdout: &[u8],
+    command_name: &str,
+) -> MigrationResult<Vec<PathBuf>> {
     let mut paths = Vec::new();
     let mut fields = stdout.split(|byte| *byte == b'\0').peekable();
     while let Some(relative_path) = fields.next() {
@@ -658,21 +673,18 @@ fn parse_git_check_attr_filter_stdout(stdout: &[u8]) -> MigrationResult<Vec<Path
                 break;
             }
 
-            return Err(git_check_attr_parse_error());
+            return Err(git_check_attr_parse_error(command_name));
         }
 
         let Some(attribute) = fields.next() else {
-            return Err(git_check_attr_parse_error());
+            return Err(git_check_attr_parse_error(command_name));
         };
         let Some(value) = fields.next() else {
-            return Err(git_check_attr_parse_error());
+            return Err(git_check_attr_parse_error(command_name));
         };
 
         if attribute == b"filter" && value == b"lfs" {
-            paths.push(safe_git_relative_path(
-                relative_path,
-                "git check-attr -z --stdin filter",
-            )?);
+            paths.push(safe_git_relative_path(relative_path, command_name)?);
         }
     }
 
@@ -719,12 +731,10 @@ fn git_check_attr_filter_with_source(
         OsString::from("-z"),
         OsString::from("--stdin"),
     ];
-    let command_name = if let Some(source) = source {
+    let command_name = git_check_attr_filter_command_name(source);
+    if let Some(source) = source {
         args.push(OsString::from(format!("--source={source}")));
-        format!("git check-attr -z --stdin --source={source} filter")
-    } else {
-        "git check-attr -z --stdin filter".to_owned()
-    };
+    }
     args.push(OsString::from("filter"));
 
     let mut child = Command::new("git")
@@ -849,9 +859,16 @@ fn read_pipe_with_limit(mut reader: impl Read, limit: usize) -> io::Result<PipeR
     })
 }
 
-fn git_check_attr_parse_error() -> MigrationError {
+fn git_check_attr_filter_command_name(source: Option<&str>) -> String {
+    source.map_or_else(
+        || "git check-attr -z --stdin filter".to_owned(),
+        |source| format!("git check-attr -z --stdin --source={source} filter"),
+    )
+}
+
+fn git_check_attr_parse_error(command_name: &str) -> MigrationError {
     MigrationError::ExternalCommandOutput {
-        command: "git check-attr -z --stdin filter".to_owned(),
+        command: command_name.to_owned(),
         message: SanitizedMessage::new("git returned malformed attribute output"),
     }
 }
@@ -928,14 +945,37 @@ struct GitTreeBlob {
     relative_path_bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitLfsHistoryPointerOccurrence {
+    commit: String,
+    relative_path: PathBuf,
+    object: LfsObject,
+}
+
 fn validate_history_ref_name(ref_name: &str) -> MigrationResult<()> {
-    if !ref_name.is_empty() && !ref_name.contains('\0') {
+    let has_invalid_byte = ref_name.bytes().any(|byte| {
+        byte.is_ascii_control()
+            || matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    });
+    let has_invalid_sequence =
+        ref_name.contains("..") || ref_name.contains("@{") || ref_name.contains("//");
+    let has_invalid_boundary = ref_name.starts_with('/')
+        || ref_name.ends_with('/')
+        || ref_name.ends_with('.')
+        || ref_name.ends_with(".lock");
+
+    if !ref_name.is_empty()
+        && !has_invalid_byte
+        && !has_invalid_sequence
+        && !has_invalid_boundary
+        && ref_name != "@"
+        && ref_name != "HEAD"
+    {
         return Ok(());
     }
 
-    Err(MigrationError::ExternalCommandOutput {
-        command: "git rev-parse --verify --end-of-options <ref>^{commit}".to_owned(),
-        message: SanitizedMessage::new("selected ref name is empty or contains NUL"),
+    Err(MigrationError::InvalidInput {
+        message: SanitizedMessage::new("selected ref name is empty or contains invalid ref syntax"),
     })
 }
 
@@ -1005,49 +1045,73 @@ fn enumerate_ref_history_lfs_pointers(
     ref_name: &str,
     root_commit: &str,
     pointers: &mut Vec<GitLfsHistoryPointer>,
-    seen: &mut BTreeSet<(String, String, PathBuf, LfsObject)>,
+    seen: &mut BTreeSet<(String, PathBuf, LfsObject)>,
+    commit_cache: &mut BTreeMap<String, Vec<GitLfsHistoryPointerOccurrence>>,
+    blob_pointer_cache: &mut BTreeMap<String, Option<LfsPointer>>,
 ) -> MigrationResult<()> {
     for commit in rev_list_commits(worktree_root, root_commit)? {
-        let blobs = tree_blobs_at_commit(worktree_root, &commit)?;
-        if blobs.is_empty() {
-            continue;
+        if !commit_cache.contains_key(&commit) {
+            let occurrences =
+                scan_history_commit_lfs_pointers(worktree_root, &commit, blob_pointer_cache)?;
+            commit_cache.insert(commit.clone(), occurrences);
         }
 
-        let path_input = git_path_input_from_tree_blobs(&blobs);
-        let attributes =
-            git_check_attr_filter_with_source(worktree_root, path_input, Some(&commit))?;
-        let lfs_paths: BTreeSet<PathBuf> = parse_git_check_attr_filter_stdout(&attributes.stdout)?
-            .into_iter()
-            .collect();
-
-        for blob in blobs
-            .into_iter()
-            .filter(|blob| lfs_paths.contains(&blob.relative_path))
+        for occurrence in commit_cache
+            .get(&commit)
+            .expect("history commit cache should contain scanned commit")
         {
-            let Some(pointer) =
-                read_history_pointer_blob_candidate(worktree_root, &blob.object_id)?
-            else {
-                continue;
-            };
-
             let key = (
-                ref_name.to_owned(),
-                commit.clone(),
-                blob.relative_path.clone(),
-                pointer.object.clone(),
+                occurrence.commit.clone(),
+                occurrence.relative_path.clone(),
+                occurrence.object.clone(),
             );
             if seen.insert(key) {
                 pointers.push(GitLfsHistoryPointer {
                     ref_name: ref_name.to_owned(),
-                    commit: commit.clone(),
-                    relative_path: blob.relative_path,
-                    object: pointer.object,
+                    commit: occurrence.commit.clone(),
+                    relative_path: occurrence.relative_path.clone(),
+                    object: occurrence.object.clone(),
                 });
             }
         }
     }
 
     Ok(())
+}
+
+fn scan_history_commit_lfs_pointers(
+    worktree_root: &Path,
+    commit: &str,
+    blob_pointer_cache: &mut BTreeMap<String, Option<LfsPointer>>,
+) -> MigrationResult<Vec<GitLfsHistoryPointerOccurrence>> {
+    let blobs = tree_blobs_at_commit(worktree_root, commit)?;
+    if blobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let lfs_paths = git_check_attr_lfs_paths_for_tree_blobs(worktree_root, &blobs, commit)?;
+    let mut occurrences = Vec::new();
+    for blob in blobs
+        .into_iter()
+        .filter(|blob| lfs_paths.contains(&blob.relative_path))
+    {
+        let Some(pointer) = read_history_pointer_blob_candidate_cached(
+            worktree_root,
+            &blob.object_id,
+            blob_pointer_cache,
+        )?
+        else {
+            continue;
+        };
+
+        occurrences.push(GitLfsHistoryPointerOccurrence {
+            commit: commit.to_owned(),
+            relative_path: blob.relative_path,
+            object: pointer.object,
+        });
+    }
+
+    Ok(occurrences)
 }
 
 fn rev_list_commits(worktree_root: &Path, root_commit: &str) -> MigrationResult<Vec<String>> {
@@ -1168,14 +1232,73 @@ fn parse_ls_tree_blob_output(
     Ok(blobs)
 }
 
-fn git_path_input_from_tree_blobs(blobs: &[GitTreeBlob]) -> Vec<u8> {
-    let mut input = Vec::new();
+fn git_check_attr_lfs_paths_for_tree_blobs(
+    worktree_root: &Path,
+    blobs: &[GitTreeBlob],
+    commit: &str,
+) -> MigrationResult<BTreeSet<PathBuf>> {
+    let mut lfs_paths = BTreeSet::new();
+    let mut path_input = Vec::new();
+
     for blob in blobs {
-        input.extend_from_slice(&blob.relative_path_bytes);
-        input.push(b'\0');
+        let path_entry_len = blob.relative_path_bytes.len() + 1;
+        if path_entry_len > MAX_HISTORY_CHECK_ATTR_INPUT_BYTES {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: format!(
+                    "git ls-tree -r -z --format=%(objecttype)%x00%(objectname)%x00%(path) {commit}"
+                ),
+                message: SanitizedMessage::new(
+                    "git returned an oversized path for attribute lookup",
+                ),
+            });
+        }
+
+        if !path_input.is_empty()
+            && path_input.len() + path_entry_len > MAX_HISTORY_CHECK_ATTR_INPUT_BYTES
+        {
+            append_git_check_attr_lfs_paths(worktree_root, commit, path_input, &mut lfs_paths)?;
+            path_input = Vec::new();
+        }
+
+        path_input.extend_from_slice(&blob.relative_path_bytes);
+        path_input.push(b'\0');
     }
 
-    input
+    if !path_input.is_empty() {
+        append_git_check_attr_lfs_paths(worktree_root, commit, path_input, &mut lfs_paths)?;
+    }
+
+    Ok(lfs_paths)
+}
+
+fn append_git_check_attr_lfs_paths(
+    worktree_root: &Path,
+    commit: &str,
+    path_input: Vec<u8>,
+    lfs_paths: &mut BTreeSet<PathBuf>,
+) -> MigrationResult<()> {
+    let attributes = git_check_attr_filter_with_source(worktree_root, path_input, Some(commit))?;
+    let command_name = git_check_attr_filter_command_name(Some(commit));
+    lfs_paths.extend(parse_git_check_attr_filter_stdout(
+        &attributes.stdout,
+        &command_name,
+    )?);
+
+    Ok(())
+}
+
+fn read_history_pointer_blob_candidate_cached(
+    worktree_root: &Path,
+    object_id: &str,
+    blob_pointer_cache: &mut BTreeMap<String, Option<LfsPointer>>,
+) -> MigrationResult<Option<LfsPointer>> {
+    if let Some(pointer) = blob_pointer_cache.get(object_id) {
+        return Ok(pointer.clone());
+    }
+
+    let pointer = read_history_pointer_blob_candidate(worktree_root, object_id)?;
+    blob_pointer_cache.insert(object_id.to_owned(), pointer.clone());
+    Ok(pointer)
 }
 
 fn read_history_pointer_blob_candidate(
@@ -1564,7 +1687,7 @@ mod tests {
         enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
         enumerate_selected_ref_lfs_pointers, parse_git_check_attr_filter_stdout,
         parse_lfs_patterns_from_attributes, parse_ls_tree_blob_output,
-        repo_relative_path_from_git_output, split_gitattributes_line,
+        repo_relative_path_from_git_output, split_gitattributes_line, validate_history_ref_name,
     };
 
     #[test]
@@ -1941,7 +2064,7 @@ mod tests {
         stdout.extend_from_slice(b"asset/model.bin\0filter\0lfs\0");
         assert!(stdout.len() > MAX_MIGRATION_GIT_OUTPUT_BYTES);
 
-        let paths = parse_git_check_attr_filter_stdout(&stdout)
+        let paths = parse_git_check_attr_filter_stdout(&stdout, "git check-attr test")
             .expect("large check-attr output should not fail before parsing");
 
         assert_eq!(paths, vec![PathBuf::from("asset/model.bin")]);
@@ -1949,15 +2072,54 @@ mod tests {
 
     #[test]
     fn rejects_malformed_check_attr_output() {
-        assert!(parse_git_check_attr_filter_stdout(b"asset/model.bin\0filter").is_err());
-        assert!(parse_git_check_attr_filter_stdout(b"\0filter\0lfs\0").is_err());
+        assert!(parse_git_check_attr_filter_stdout(b"asset/model.bin\0filter", "test").is_err());
+        assert!(parse_git_check_attr_filter_stdout(b"\0filter\0lfs\0", "test").is_err());
+    }
+
+    #[test]
+    fn malformed_check_attr_output_reports_supplied_command() {
+        let error = parse_git_check_attr_filter_stdout(
+            b"asset/model.bin\0filter",
+            "git check-attr -z --stdin --source=abc123 filter",
+        )
+        .expect_err("malformed attribute output should fail");
+
+        assert!(matches!(
+            error,
+            MigrationError::ExternalCommandOutput { command, .. }
+                if command == "git check-attr -z --stdin --source=abc123 filter"
+        ));
     }
 
     #[test]
     fn rejects_check_attr_paths_outside_worktree() {
-        assert!(parse_git_check_attr_filter_stdout(b"/tmp/model.bin\0filter\0lfs\0").is_err());
-        assert!(parse_git_check_attr_filter_stdout(b"../model.bin\0filter\0lfs\0").is_err());
-        assert!(parse_git_check_attr_filter_stdout(b"asset/model.bin\0filter\0lfs\0").is_ok());
+        assert!(
+            parse_git_check_attr_filter_stdout(b"/tmp/model.bin\0filter\0lfs\0", "test").is_err()
+        );
+        assert!(
+            parse_git_check_attr_filter_stdout(b"../model.bin\0filter\0lfs\0", "test").is_err()
+        );
+        assert!(
+            parse_git_check_attr_filter_stdout(b"asset/model.bin\0filter\0lfs\0", "test").is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_revision_syntax_as_history_ref_names() {
+        for ref_name in ["", "main..feature", "HEAD^", "refs/heads/main\n"] {
+            assert!(
+                matches!(
+                    validate_history_ref_name(ref_name),
+                    Err(MigrationError::InvalidInput { .. })
+                ),
+                "{ref_name:?} should be rejected as unsafe revision syntax"
+            );
+        }
+
+        validate_history_ref_name("refs/heads/feature/assets")
+            .expect("normal full ref names should be accepted");
+        validate_history_ref_name("feature/assets")
+            .expect("normal branch names should be accepted");
     }
 
     #[test]
@@ -2036,6 +2198,31 @@ mod tests {
     }
 
     #[test]
+    fn selected_ref_pointer_scan_deduplicates_shared_history() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('8', 888);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/shared.bin",
+            &LfsPointer::new(object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add shared pointer");
+        repo.git(["tag", "v-shared"]);
+
+        let scan = enumerate_selected_ref_lfs_pointers(repo.path(), ["main", "v-shared"])
+            .expect("selected refs with shared history should scan once");
+
+        assert_eq!(scan.refs.len(), 2);
+        assert_eq!(scan.pointers.len(), 1);
+        assert_eq!(
+            scan.pointers[0].relative_path,
+            Path::new("asset/shared.bin")
+        );
+        assert_eq!(scan.pointers[0].object, object);
+    }
+
+    #[test]
     fn all_fetched_ref_pointer_scan_includes_local_branches_and_tags() {
         let repo = TempRepo::new();
         let main_object = test_lfs_object('f', 333);
@@ -2070,6 +2257,38 @@ mod tests {
         assert!(ref_names.contains("refs/tags/v-main"));
         assert!(objects.contains(&main_object));
         assert!(objects.contains(&branch_object));
+    }
+
+    #[test]
+    fn all_fetched_ref_pointer_scan_skips_symbolic_remote_head() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('7', 777);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add model pointer");
+        repo.git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        repo.git([
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+
+        let scan = enumerate_all_fetched_ref_lfs_pointers(repo.path())
+            .expect("all fetched refs scan should skip symbolic remote HEAD");
+        let ref_names = scan
+            .refs
+            .iter()
+            .map(|scanned_ref| scanned_ref.name.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(ref_names.contains("refs/remotes/origin/main"));
+        assert!(!ref_names.contains("refs/remotes/origin/HEAD"));
+        assert_eq!(scan.pointers.len(), 1);
+        assert_eq!(scan.pointers[0].object, object);
     }
 
     #[test]

@@ -618,6 +618,13 @@ pub enum MigrationError {
         size: u64,
     },
 
+    /// The caller supplied invalid migration input.
+    #[error("invalid migration input: {message}")]
+    InvalidInput {
+        /// Human-readable explanation of the invalid input.
+        message: SanitizedMessage,
+    },
+
     /// A dry-run migration path attempted to perform a write.
     #[error("dry-run attempted to write {}", path.display())]
     DryRunWriteAttempt {
