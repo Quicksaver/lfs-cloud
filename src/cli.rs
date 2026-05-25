@@ -5,12 +5,16 @@
 //! tracing initialization, while parser and dispatch helpers stay side-effect
 //! free for focused tests.
 
-use std::{future::Future, path::PathBuf};
+use std::{
+    future::Future,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
-use crate::{ServeOptions, TracingConfig, init_tracing};
+use crate::{GitRepository, LfsInitRoute, ServeOptions, TracingConfig, init_tracing};
 
 #[derive(Debug, Parser)]
 #[command(name = "lfs-cloud", version, about, propagate_version = true)]
@@ -32,6 +36,8 @@ struct Cli {
 enum Command {
     /// Run the local Git LFS-compatible HTTP server.
     Serve(ServeCommand),
+    /// Resolve the Git LFS URL for the current repository.
+    Init(InitCommand),
 }
 
 #[derive(Debug, Args)]
@@ -45,6 +51,13 @@ struct ServeCommand {
     port: Option<u16>,
 }
 
+#[derive(Debug, Args)]
+struct InitCommand {
+    /// Base URL of the running LFS Cloud server.
+    #[arg(long, value_name = "URL")]
+    server: String,
+}
+
 /// Parses process arguments, initializes tracing, and runs the requested command.
 ///
 /// # Errors
@@ -54,13 +67,15 @@ struct ServeCommand {
 pub async fn run_from_env() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&tracing_config(&cli)).context("failed to initialize tracing")?;
-    dispatch(cli, crate::serve).await
+    let mut stdout = io::stdout().lock();
+    dispatch(cli, crate::serve, |command| run_init(command, &mut stdout)).await
 }
 
-async fn dispatch<F, Fut>(cli: Cli, serve: F) -> anyhow::Result<()>
+async fn dispatch<F, Fut, I>(cli: Cli, serve: F, init: I) -> anyhow::Result<()>
 where
     F: FnOnce(ServeOptions) -> Fut,
     Fut: Future<Output = crate::ServerResult<()>>,
+    I: FnOnce(InitCommand) -> anyhow::Result<()>,
 {
     // Keep command execution injectable only at the command boundary; each new
     // subcommand should add its own runner here rather than hiding side effects
@@ -69,6 +84,7 @@ where
         Command::Serve(command) => serve(command.serve_options(cli.config))
             .await
             .context("failed to run lfs-cloud server"),
+        Command::Init(command) => init(command).context("failed to resolve lfs-cloud init route"),
     }
 }
 
@@ -85,13 +101,43 @@ impl ServeCommand {
     }
 }
 
+fn run_init<W>(command: InitCommand, output: &mut W) -> anyhow::Result<()>
+where
+    W: Write,
+{
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+
+    run_init_from_dir(command, &current_dir, output)
+}
+
+fn run_init_from_dir<W>(
+    command: InitCommand,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+) -> anyhow::Result<()>
+where
+    W: Write,
+{
+    let repository = GitRepository::discover(start_dir.as_ref())
+        .context("failed to inspect current Git repository")?;
+    let route = LfsInitRoute::resolve(&command.server, &repository.remote)
+        .context("failed to build Git LFS URL")?;
+
+    writeln!(output, "{}", route.lfs_url).context("failed to write Git LFS URL")
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fs,
+        process::Command as ProcessCommand,
+        sync::{Arc, Mutex},
+    };
 
     use clap::{CommandFactory, Parser};
+    use tempfile::TempDir;
 
-    use super::{Cli, dispatch, tracing_config};
+    use super::{Cli, InitCommand, dispatch, run_init_from_dir, tracing_config};
     use crate::{DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, ServeOptions};
 
     #[test]
@@ -120,6 +166,26 @@ mod tests {
     }
 
     #[test]
+    fn init_command_accepts_required_server_url() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "--config",
+            "custom-lfs-cloud.yml",
+            "init",
+            "--server",
+            "http://127.0.0.1:8080",
+        ])
+        .expect("init command should parse");
+
+        let super::Command::Init(command) = cli.command else {
+            panic!("init subcommand should parse");
+        };
+
+        assert_eq!(cli.config, Some("custom-lfs-cloud.yml".into()));
+        assert_eq!(command.server, "http://127.0.0.1:8080");
+    }
+
+    #[test]
     fn serve_command_accepts_global_config_before_subcommand() {
         let cli = Cli::try_parse_from([
             "lfs-cloud",
@@ -133,7 +199,9 @@ mod tests {
         ])
         .expect("serve command should parse");
 
-        let super::Command::Serve(command) = cli.command;
+        let super::Command::Serve(command) = cli.command else {
+            panic!("serve subcommand should parse");
+        };
         let options = command.serve_options(cli.config);
 
         assert_eq!(
@@ -160,7 +228,9 @@ mod tests {
         ])
         .expect("serve command should parse");
 
-        let super::Command::Serve(command) = cli.command;
+        let super::Command::Serve(command) = cli.command else {
+            panic!("serve subcommand should parse");
+        };
         let options = command.serve_options(cli.config);
 
         assert_eq!(
@@ -209,13 +279,17 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let captured_for_runner = Arc::clone(&captured);
 
-        dispatch(cli, move |options| {
-            let captured = Arc::clone(&captured_for_runner);
-            async move {
-                *captured.lock().expect("capture mutex should lock") = Some(options);
-                Ok(())
-            }
-        })
+        dispatch(
+            cli,
+            move |options| {
+                let captured = Arc::clone(&captured_for_runner);
+                async move {
+                    *captured.lock().expect("capture mutex should lock") = Some(options);
+                    Ok(())
+                }
+            },
+            |_| unreachable!("init runner must not be called for serve command"),
+        )
         .await
         .expect("serve dispatch should succeed");
 
@@ -226,6 +300,73 @@ mod tests {
                 Some("127.0.0.2".to_owned()),
                 Some(8088),
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_init_with_server_url() {
+        let cli = Cli::try_parse_from(["lfs-cloud", "init", "--server", "http://127.0.0.1:8080"])
+            .expect("init command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for init command") },
+            move |command| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(command.server);
+                Ok(())
+            },
+        )
+        .await
+        .expect("init dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some("http://127.0.0.1:8080".to_owned())
+        );
+    }
+
+    #[test]
+    fn init_resolves_lfs_url_from_current_repo_origin() {
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), ["init"]);
+        run_git(
+            repo.path(),
+            ["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let nested = repo.path().join("nested/path");
+        fs::create_dir_all(&nested).expect("nested directory should be created");
+        let mut output = Vec::new();
+
+        run_init_from_dir(
+            InitCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+            },
+            &nested,
+            &mut output,
+        )
+        .expect("init route should resolve");
+
+        assert_eq!(
+            String::from_utf8(output).expect("output should be UTF-8"),
+            "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs\n"
+        );
+    }
+
+    fn run_git<const N: usize>(current_dir: &std::path::Path, args: [&str; N]) {
+        let output = ProcessCommand::new("git")
+            .args(args)
+            .current_dir(current_dir)
+            .output()
+            .expect("git command should start");
+
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

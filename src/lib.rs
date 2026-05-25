@@ -9,6 +9,7 @@ pub mod error;
 pub mod git;
 pub mod github_auth;
 pub mod google_drive;
+pub mod init;
 pub mod lfs;
 pub mod logging;
 pub mod metadata;
@@ -44,6 +45,7 @@ pub use google_drive::{
     GoogleDriveDownloadResponse, GoogleDriveObjectKey, GoogleDriveObjectStore,
     GoogleDriveRootFolder, GoogleDriveRootValidator, GoogleDriveTokenRefresher,
 };
+pub use init::LfsInitRoute;
 pub use lfs::{
     LFS_BASIC_TRANSFER, LFS_POINTER_VERSION, LfsBatchAction, LfsBatchDownloadObject,
     LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation, LfsBatchRef, LfsBatchRequest,

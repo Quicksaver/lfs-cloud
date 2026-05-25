@@ -1135,8 +1135,9 @@ Defer:
 > and `--log-level` flags, initializes tracing from CLI or `RUST_LOG`, and
 > dispatches `serve` through the server runtime. CLI support code can now
 > detect the current Git worktree and parse GitHub-style HTTPS/SSH remotes
-> into host, owner, and repository name components for future `init` and
-> migration commands.
+> into host, owner, and repository name components. `lfs-cloud init --server`
+> now resolves and prints the current repository's intended Git LFS endpoint
+> without writing `.lfsconfig` or local Git config yet.
 
 ### Progress Summary
 
@@ -1148,11 +1149,11 @@ Defer:
 | 3. Google Drive Storage                  | 9           | 9      | 0         |
 | 4. Metadata DB                           | 8           | 8      | 0         |
 | 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 4      | 9         |
+| 6. CLI Commands                          | 13          | 5      | 8         |
 | 7. Migration                             | 12          | 0      | 12        |
 | 8. Local Cache And Materialization       | 8           | 0      | 8         |
 | 9. Verification, Docs, And Release Shape | 8           | 0      | 8         |
-| **Total**                                | **99**      | **62** | **37**    |
+| **Total**                                | **99**      | **63** | **36**    |
 
 ### Legend
 
@@ -1291,7 +1292,7 @@ Defer:
 
 - [ ] [M] Implement `lfs-cloud login` browser flow for GitHub OAuth.
 - [x] [T] Implement Git repository detection and remote parsing.
-- [ ] [T] Implement `lfs-cloud init --server` route resolution for the current repo.
+- [x] [T] Implement `lfs-cloud init --server` route resolution for the current repo.
 - [ ] [T] Implement `.lfsconfig` write/update with backup or diff output.
 - [ ] [T] Implement local-only `git config lfs.url` option if the user does not want committed `.lfsconfig`.
 
