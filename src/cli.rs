@@ -42,6 +42,7 @@ use crate::{
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const MAX_CLI_POINTER_CANDIDATE_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
@@ -189,7 +190,7 @@ struct MigrateCommand {
     all_refs: bool,
 
     /// Report the migration plan without fetching, uploading, or writing config.
-    #[arg(long)]
+    #[arg(long, required = true)]
     dry_run: bool,
 }
 
@@ -369,6 +370,7 @@ fn run_migrate_to_stdout(
         config_path,
         &current_dir,
         &mut stdout,
+        probe_server_reachable,
         |lfs_url| GitCredentialLookup::new(lfs_url).and_then(|lookup| lookup.lookup().map(|_| ())),
         validate_status_storage,
     )
@@ -769,16 +771,18 @@ where
     write_gc_result(output, layout.root(), &report).map_err(output_error)
 }
 
-fn run_migrate_from_dir<W, A, S>(
+fn run_migrate_from_dir<W, P, A, S>(
     command: MigrateCommand,
     config_path: Option<PathBuf>,
     start_dir: impl AsRef<Path>,
     output: &mut W,
+    mut probe_server: P,
     mut lookup_credential: A,
     mut validate_storage: S,
 ) -> CliResult<()>
 where
     W: Write,
+    P: FnMut(&str) -> CliResult<()>,
     A: FnMut(&str) -> CliResult<()>,
     S: FnMut(&StorageProviderConfig) -> CliResult<()>,
 {
@@ -800,8 +804,12 @@ where
     let access_checks = migration_access_checks(
         &config_path,
         &repository,
-        &route.lfs_url,
+        MigrationTargetAccess {
+            server_url: &command.server,
+            lfs_url: &route.lfs_url,
+        },
         &discovery,
+        &mut probe_server,
         &mut lookup_credential,
         &mut validate_storage,
     );
@@ -861,6 +869,12 @@ struct MigrationAccessCheck {
     message: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MigrationTargetAccess<'a> {
+    server_url: &'a str,
+    lfs_url: &'a str,
+}
+
 fn migration_pointer_scan(
     start_dir: &Path,
     command: &MigrateCommand,
@@ -913,33 +927,34 @@ fn history_pointer_scan(
 fn dedupe_lfs_objects<'a>(objects: impl IntoIterator<Item = &'a LfsObject>) -> Vec<LfsObject> {
     objects
         .into_iter()
-        .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .cloned()
         .collect()
 }
 
-fn migration_access_checks<A, S>(
+fn migration_access_checks<P, A, S>(
     config_path: &Path,
     repository: &GitRepository,
-    lfs_url: &str,
+    target: MigrationTargetAccess<'_>,
     discovery: &GitLfsMigrationDiscovery,
+    probe_server: &mut P,
     lookup_credential: &mut A,
     validate_storage: &mut S,
 ) -> Vec<MigrationAccessCheck>
 where
+    P: FnMut(&str) -> CliResult<()>,
     A: FnMut(&str) -> CliResult<()>,
     S: FnMut(&StorageProviderConfig) -> CliResult<()>,
 {
     let mut checks = Vec::new();
     checks.push(migration_source_access_check(discovery));
-    checks.push(MigrationAccessCheck {
-        name: "target",
-        level: StatusLevel::Ok,
-        message: redacted_url_for_display(lfs_url),
-    });
+    checks.push(migration_target_access_check(
+        target.server_url,
+        probe_server,
+    ));
 
-    checks.push(match lookup_credential(lfs_url) {
+    checks.push(match lookup_credential(target.lfs_url) {
         Ok(()) => MigrationAccessCheck {
             name: "auth",
             level: StatusLevel::Ok,
@@ -969,6 +984,25 @@ where
     }
 
     checks
+}
+
+fn migration_target_access_check<P>(server_url: &str, probe_server: &mut P) -> MigrationAccessCheck
+where
+    P: FnMut(&str) -> CliResult<()>,
+{
+    let display = redacted_url_for_display(server_url);
+    match probe_server(server_url) {
+        Ok(()) => MigrationAccessCheck {
+            name: "target",
+            level: StatusLevel::Ok,
+            message: format!("{display} is reachable"),
+        },
+        Err(error) => MigrationAccessCheck {
+            name: "target",
+            level: StatusLevel::Warning,
+            message: format!("{display} is unreachable: {error}"),
+        },
+    }
 }
 
 fn migration_source_access_check(discovery: &GitLfsMigrationDiscovery) -> MigrationAccessCheck {
@@ -1117,8 +1151,20 @@ where
         "  objects discovered: {}",
         report.scan.objects.len()
     )?;
-    for object in &report.scan.objects {
+    for object in report
+        .scan
+        .objects
+        .iter()
+        .take(MIGRATION_OBJECT_REPORT_LIMIT)
+    {
         writeln!(output, "    sha256:{} ({} bytes)", object.oid, object.size)?;
+    }
+    if report.scan.objects.len() > MIGRATION_OBJECT_REPORT_LIMIT {
+        writeln!(
+            output,
+            "    ... {} more objects omitted",
+            report.scan.objects.len() - MIGRATION_OBJECT_REPORT_LIMIT
+        )?;
     }
     writeln!(
         output,
@@ -1126,8 +1172,7 @@ where
     )?;
     writeln!(
         output,
-        "  objects uploaded: {} would upload",
-        report.scan.objects.len()
+        "  objects uploaded: {available_count} ready to upload, {fetch_count} after fetch"
     )?;
     writeln!(output, "  access checks:")?;
     for check in &report.access_checks {
@@ -2383,6 +2428,28 @@ mod tests {
     }
 
     #[test]
+    fn migrate_command_rejects_missing_dry_run_and_conflicting_ref_scopes() {
+        let missing_dry_run =
+            Cli::try_parse_from(["lfs-cloud", "migrate", "--server", "http://127.0.0.1:8080"])
+                .expect_err("migrate should require explicit dry-run planning");
+        assert!(missing_dry_run.to_string().contains("--dry-run"));
+
+        let conflicting_scopes = Cli::try_parse_from([
+            "lfs-cloud",
+            "migrate",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--dry-run",
+            "--ref",
+            "main",
+            "--all-refs",
+        ])
+        .expect_err("migrate should reject conflicting ref scopes");
+        assert!(conflicting_scopes.to_string().contains("--ref"));
+        assert!(conflicting_scopes.to_string().contains("--all-refs"));
+    }
+
+    #[test]
     fn serve_command_accepts_global_config_before_subcommand() {
         let cli = Cli::try_parse_from([
             "lfs-cloud",
@@ -3185,6 +3252,7 @@ mod tests {
             Some(config_path),
             &repo,
             &mut output,
+            |_| Ok(()),
             |lfs_url| {
                 assert_eq!(
                     lfs_url,
@@ -3214,8 +3282,9 @@ mod tests {
         assert!(rendered.contains("pointer files: 1"));
         assert!(rendered.contains("objects discovered: 1"));
         assert!(rendered.contains("objects fetched: 0 would fetch, 1 already local"));
-        assert!(rendered.contains("objects uploaded: 1 would upload"));
+        assert!(rendered.contains("objects uploaded: 1 ready to upload, 0 after fetch"));
         assert!(rendered.contains("access checks:"));
+        assert!(rendered.contains("target     ok"));
         assert!(rendered.contains("auth       ok"));
         assert!(rendered.contains("storage    ok"));
         assert!(rendered.contains(object.oid.as_hex()));
@@ -3254,6 +3323,11 @@ mod tests {
             Some(config_path),
             &repo,
             &mut output,
+            |_| {
+                Err(CliError::InvalidArguments {
+                    message: "probe failed".to_owned(),
+                })
+            },
             |_| Ok(()),
             |_| Ok(()),
         )
@@ -3265,7 +3339,56 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("objects fetched: 1 would fetch, 0 already local"));
-        assert!(rendered.contains("objects uploaded: 1 would upload"));
+        assert!(rendered.contains("objects uploaded: 0 ready to upload, 1 after fetch"));
+        assert!(rendered.contains("target     warning"));
+    }
+
+    #[test]
+    fn migrate_dry_run_caps_object_listing_but_keeps_counts() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        let cache_root = temp.path().join("cache");
+        init_git_repo_with_origin(&repo);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        for index in 0..=super::MIGRATION_OBJECT_REPORT_LIMIT {
+            let bytes = format!("migration object {index}");
+            let object = object_for_bytes(bytes.as_bytes());
+            write_file(
+                &repo.join(format!("asset/model-{index}.bin")),
+                LfsPointer::new(object).to_pointer_file().as_bytes(),
+            );
+        }
+        run_git(&repo, &["add", "."]);
+        let config_path = temp.path().join("lfs-cloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let mut output = Vec::new();
+
+        run_migrate_from_dir(
+            MigrateCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                cache_root: Some(cache_root),
+                refs: Vec::new(),
+                all_refs: false,
+                dry_run: true,
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("dry-run migration plan should be reported");
+
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("objects discovered: 101"));
+        assert!(rendered.contains("... 1 more objects omitted"));
+        assert!(rendered.contains("objects uploaded: 0 ready to upload, 101 after fetch"));
     }
 
     #[test]
@@ -3284,6 +3407,7 @@ mod tests {
             None,
             temp.path(),
             &mut output,
+            |_| Ok(()),
             |_| Ok(()),
             |_| Ok(()),
         )
