@@ -545,19 +545,23 @@ fn check_local_migration_object_location(
     object: &LfsObject,
 ) -> MigrationResult<LocalMigrationObjectLocation> {
     let status = match fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => {
-            let (actual_oid, actual_size) = hash_migration_object_file(&path)?;
-            if actual_oid == object.oid && actual_size == object.size {
-                LocalMigrationObjectLocationStatus::Available
-            } else {
-                LocalMigrationObjectLocationStatus::Invalid {
-                    message: SanitizedMessage::new(format!(
-                        "expected sha256:{} ({} bytes), got sha256:{} ({} bytes)",
-                        object.oid, object.size, actual_oid, actual_size
-                    )),
+        Ok(metadata) if metadata.is_file() => match hash_migration_object_file(&path) {
+            Ok((actual_oid, actual_size)) => {
+                if actual_oid == object.oid && actual_size == object.size {
+                    LocalMigrationObjectLocationStatus::Available
+                } else {
+                    LocalMigrationObjectLocationStatus::Invalid {
+                        message: SanitizedMessage::new(format!(
+                            "expected sha256:{} ({} bytes), got sha256:{} ({} bytes)",
+                            object.oid, object.size, actual_oid, actual_size
+                        )),
+                    }
                 }
             }
-        }
+            Err(_) => LocalMigrationObjectLocationStatus::Invalid {
+                message: SanitizedMessage::new("failed to verify local object bytes"),
+            },
+        },
         Ok(_) => LocalMigrationObjectLocationStatus::Invalid {
             message: SanitizedMessage::new("local object path is not a regular file"),
         },
@@ -1949,7 +1953,10 @@ mod tests {
         process::Command,
     };
     #[cfg(unix)]
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use std::{
+        ffi::OsString,
+        os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    };
 
     use tempfile::TempDir;
 
@@ -2735,6 +2742,50 @@ mod tests {
             availability.objects[0].locations[1].kind,
             LocalMigrationObjectLocationKind::SharedCache
         );
+        assert_eq!(
+            availability.objects[0].locations[1].status,
+            LocalMigrationObjectLocationStatus::Available
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_object_check_keeps_checking_after_unreadable_media_object() {
+        let repo = TempRepo::new();
+        let cache_root = tempfile::tempdir().expect("temporary cache root should be created");
+        let layout = LocalCacheLayout::new(cache_root.path());
+        let object = test_lfs_object_from_bytes(b"shared cache fallback bytes");
+        let media_object_path =
+            git_lfs_object_path(&repo.path().join(".git/lfs/objects"), &object.oid);
+        write_git_lfs_source_object(&repo, &object, b"shared cache fallback bytes");
+        write_file(&layout.object_path(&object), b"shared cache fallback bytes");
+
+        let original_permissions = fs::metadata(&media_object_path)
+            .expect("media object metadata should be readable")
+            .permissions();
+        let mut unreadable_permissions = original_permissions.clone();
+        unreadable_permissions.set_mode(0o000);
+        fs::set_permissions(&media_object_path, unreadable_permissions)
+            .expect("media object should be made unreadable");
+        if fs::File::open(&media_object_path).is_ok() {
+            fs::set_permissions(&media_object_path, original_permissions)
+                .expect("media object permissions should be restored");
+            return;
+        }
+
+        let availability_result =
+            check_local_migration_objects(repo.path(), [&object], Some(&layout));
+        fs::set_permissions(&media_object_path, original_permissions)
+            .expect("media object permissions should be restored");
+        let availability =
+            availability_result.expect("unreadable media should not abort cache inspection");
+
+        assert!(availability.objects[0].is_available());
+        assert!(matches!(
+            &availability.objects[0].locations[0].status,
+            LocalMigrationObjectLocationStatus::Invalid { message }
+                if message.as_str().contains("failed to verify local object bytes")
+        ));
         assert_eq!(
             availability.objects[0].locations[1].status,
             LocalMigrationObjectLocationStatus::Available
