@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
 };
@@ -25,6 +25,7 @@ const DEFAULT_REMOTE_NAME: &str = "origin";
 const MAX_MIGRATION_GIT_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_GIT_ATTRIBUTES_BYTES: u64 = 256 * 1024;
 const MAX_CURRENT_CHECKOUT_POINTER_BYTES: u64 = 64 * 1024;
+const MAX_CURRENT_CHECKOUT_ATTR_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Read-only discovery result for an existing Git LFS repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -511,16 +512,21 @@ fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> MigrationResult<V
         return Ok(Vec::new());
     }
 
-    let output = git_check_attr_filter(worktree_root, &output.stdout)?;
-    parse_git_check_attr_filter_stdout(&output.stdout)
+    let output = git_check_attr_filter(worktree_root, output.stdout)?;
+    let lfs_tracked_paths = parse_git_check_attr_filter_stdout(&output.stdout)?;
+    current_checkout_existing_paths(worktree_root, lfs_tracked_paths)
 }
 
 fn parse_git_check_attr_filter_stdout(stdout: &[u8]) -> MigrationResult<Vec<PathBuf>> {
     let mut paths = Vec::new();
     let mut fields = stdout.split(|byte| *byte == b'\0').peekable();
     while let Some(relative_path) = fields.next() {
-        if relative_path.is_empty() && fields.peek().is_none() {
-            break;
+        if relative_path.is_empty() {
+            if fields.peek().is_none() {
+                break;
+            }
+
+            return Err(git_check_attr_parse_error());
         }
 
         let Some(attribute) = fields.next() else {
@@ -541,7 +547,36 @@ fn parse_git_check_attr_filter_stdout(stdout: &[u8]) -> MigrationResult<Vec<Path
     Ok(paths)
 }
 
-fn git_check_attr_filter(worktree_root: &Path, tracked_paths: &[u8]) -> MigrationResult<Output> {
+fn current_checkout_existing_paths(
+    worktree_root: &Path,
+    paths: Vec<PathBuf>,
+) -> MigrationResult<Vec<PathBuf>> {
+    let mut existing_paths = Vec::with_capacity(paths.len());
+    for relative_path in paths {
+        let path = worktree_root.join(&relative_path);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => existing_paths.push(relative_path),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(MigrationError::Io {
+                    context: format!("failed to inspect checkout path {}", path.display()),
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(existing_paths)
+}
+
+fn git_check_attr_filter(
+    worktree_root: &Path,
+    mut tracked_paths: Vec<u8>,
+) -> MigrationResult<Output> {
+    if !tracked_paths.ends_with(b"\0") {
+        tracked_paths.push(b'\0');
+    }
+
     let mut child = Command::new("git")
         .args(["check-attr", "-z", "--stdin", "filter"])
         .current_dir(worktree_root)
@@ -554,41 +589,118 @@ fn git_check_attr_filter(worktree_root: &Path, tracked_paths: &[u8]) -> Migratio
             source,
         })?;
 
-    let mut stdin = child.stdin.take().expect("child stdin should be piped");
-    let tracked_paths = tracked_paths.to_owned();
+    let mut stdin = child.stdin.take().ok_or_else(|| MigrationError::Io {
+        context: "git check-attr stdin was not piped".to_owned(),
+        source: io::Error::other("git check-attr stdin was not piped"),
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| MigrationError::Io {
+        context: "git check-attr stdout was not piped".to_owned(),
+        source: io::Error::other("git check-attr stdout was not piped"),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| MigrationError::Io {
+        context: "git check-attr stderr was not piped".to_owned(),
+        source: io::Error::other("git check-attr stderr was not piped"),
+    })?;
     let stdin_writer = std::thread::spawn(move || {
         let write_result = stdin.write_all(&tracked_paths);
         drop(stdin);
 
         write_result
     });
+    let stdout_reader = std::thread::spawn(move || {
+        read_pipe_with_limit(stdout, MAX_CURRENT_CHECKOUT_ATTR_OUTPUT_BYTES)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        read_pipe_with_limit(stderr, MAX_MIGRATION_GIT_OUTPUT_BYTES + 1)
+    });
 
-    let output = child
-        .wait_with_output()
-        .map_err(|source| MigrationError::Io {
-            context: "failed to wait for git check-attr -z --stdin filter".to_owned(),
-            source,
-        })?;
+    let status = child.wait().map_err(|source| MigrationError::Io {
+        context: "failed to wait for git check-attr -z --stdin filter".to_owned(),
+        source,
+    })?;
 
     let write_result = stdin_writer.join().map_err(|_| MigrationError::Io {
         context: "git check-attr input writer panicked".to_owned(),
         source: io::Error::other("git check-attr input writer panicked"),
     })?;
 
-    if !output.status.success() {
-        return Err(command_error(
-            "git check-attr -z --stdin filter",
-            output.status,
-            &output.stderr,
-        ));
-    }
-
     write_result.map_err(|source| MigrationError::Io {
         context: "failed to write git check-attr path input".to_owned(),
         source,
     })?;
 
-    Ok(output)
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| MigrationError::Io {
+            context: "git check-attr stdout reader panicked".to_owned(),
+            source: io::Error::other("git check-attr stdout reader panicked"),
+        })?
+        .map_err(|source| MigrationError::Io {
+            context: "failed to read git check-attr stdout".to_owned(),
+            source,
+        })?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| MigrationError::Io {
+            context: "git check-attr stderr reader panicked".to_owned(),
+            source: io::Error::other("git check-attr stderr reader panicked"),
+        })?
+        .map_err(|source| MigrationError::Io {
+            context: "failed to read git check-attr stderr".to_owned(),
+            source,
+        })?;
+
+    if !status.success() {
+        return Err(command_error(
+            "git check-attr -z --stdin filter",
+            status,
+            &stderr.bytes,
+        ));
+    }
+
+    if stdout.exceeded_limit {
+        return Err(MigrationError::ExternalCommandOutput {
+            command: "git check-attr -z --stdin filter".to_owned(),
+            message: SanitizedMessage::new("git returned too much attribute output"),
+        });
+    }
+
+    Ok(Output {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+struct PipeReadResult {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+fn read_pipe_with_limit(mut reader: impl Read, limit: usize) -> io::Result<PipeReadResult> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8192];
+    let mut exceeded_limit = false;
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = limit.saturating_sub(bytes.len());
+        if remaining >= read {
+            bytes.extend_from_slice(&buffer[..read]);
+        } else {
+            bytes.extend_from_slice(&buffer[..remaining]);
+            exceeded_limit = true;
+        }
+    }
+
+    Ok(PipeReadResult {
+        bytes,
+        exceeded_limit,
+    })
 }
 
 fn git_check_attr_parse_error() -> MigrationError {
@@ -646,10 +758,16 @@ fn read_current_checkout_pointer_candidate(path: &Path) -> MigrationResult<Optio
         return Ok(None);
     }
 
-    let contents = fs::read(path).map_err(|source| MigrationError::Io {
-        context: format!("failed to read checkout path {}", path.display()),
-        source,
-    })?;
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(MigrationError::Io {
+                context: format!("failed to read checkout path {}", path.display()),
+                source,
+            });
+        }
+    };
     let Ok(contents) = std::str::from_utf8(&contents) else {
         return Ok(None);
     };
@@ -1254,6 +1372,42 @@ mod tests {
         assert_eq!(scan.pointers[0].object, tracked_object);
     }
 
+    #[test]
+    fn current_checkout_pointer_scan_ignores_missing_tracked_lfs_files() {
+        let repo = TempRepo::new();
+        let present_object = test_lfs_object('a', 123);
+        let missing_object = test_lfs_object('b', 456);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/present.bin",
+            &LfsPointer::new(present_object.clone()).to_pointer_file(),
+        );
+        repo.write_file(
+            "asset/missing.bin",
+            &LfsPointer::new(missing_object).to_pointer_file(),
+        );
+        repo.git([
+            "add",
+            ".gitattributes",
+            "asset/present.bin",
+            "asset/missing.bin",
+        ]);
+        fs::remove_file(repo.path().join("asset/missing.bin"))
+            .expect("tracked checkout file should be removable");
+
+        let scan = enumerate_current_checkout_lfs_pointers(repo.path())
+            .expect("current checkout pointer scan should succeed");
+
+        assert_eq!(scan.tracked_path_count, 1);
+        assert_eq!(scan.pointers.len(), 1);
+        assert_eq!(
+            scan.pointers[0].relative_path,
+            Path::new("asset/present.bin")
+        );
+        assert_eq!(scan.pointers[0].object, present_object);
+    }
+
     #[cfg(unix)]
     #[test]
     fn current_checkout_pointer_scan_accepts_non_utf8_lfs_paths() {
@@ -1298,6 +1452,19 @@ mod tests {
             .expect("large check-attr output should not fail before parsing");
 
         assert_eq!(paths, vec![PathBuf::from("asset/model.bin")]);
+    }
+
+    #[test]
+    fn rejects_malformed_check_attr_output() {
+        assert!(parse_git_check_attr_filter_stdout(b"asset/model.bin\0filter").is_err());
+        assert!(parse_git_check_attr_filter_stdout(b"\0filter\0lfs\0").is_err());
+    }
+
+    #[test]
+    fn rejects_check_attr_paths_outside_worktree() {
+        assert!(parse_git_check_attr_filter_stdout(b"/tmp/model.bin\0filter\0lfs\0").is_err());
+        assert!(parse_git_check_attr_filter_stdout(b"../model.bin\0filter\0lfs\0").is_err());
+        assert!(parse_git_check_attr_filter_stdout(b"asset/model.bin\0filter\0lfs\0").is_ok());
     }
 
     #[test]
