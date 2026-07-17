@@ -41,13 +41,29 @@ independently validated or adjudicated.
    valid finding assessed here and no invalid findings attributable separately,
    this was high-quality, security-relevant feedback.
 
-3. **High — Repository-local Git configuration can override credential path
-   isolation.** Approval writes `useHttpPath=true` only globally and then invokes
-   plain `git credential approve`; a local `useHttpPath=false` can store the
-   token host-wide (`src/credentials.rs:317-320`,
-   `src/credentials.rs:377-404`, `src/credentials.rs:449-455`). Verify the
-   effective setting in repository context and set it at equal or higher
-   precedence, or fail with remediation. Add a real-Git regression test.
+3. **[DONE] Repository-local Git configuration can override credential path
+   isolation** (High, `src/credentials.rs`, `src/cli.rs`, and credential manual
+   verification scripts): **Valid and actionable.** Real Git reproduced the
+   precedence flaw: a repository-local `useHttpPath=false` remained effective
+   despite the previous global `true`, allowing plain credential approval to
+   discard the LFS repository path. Credential approval now accepts an explicit
+   repository context, runs the helper preflight and approval there, and writes
+   the URL-matched `useHttpPath=true` into that repository's local config before
+   exposing the token to the helper. The production login path passes its
+   discovered current repository explicitly. A real-Git regression starts with
+   the hostile local `false`, approves through an isolated `credential-store`
+   file, verifies the effective value became `true`, and proves the persisted
+   credential retains the full repository LFS path. README guidance, the
+   repository learning, and both credential/login manual checks now describe
+   and exercise repository-local path isolation. Verification passed with
+   `cargo fmt`, `yarn lint:fix`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, `cargo test --all-targets`, `cargo test --doc`,
+   `scripts/manual/verify-git-credential-approve.sh`, and
+   `scripts/manual/verify-login-command.sh`. The focused reviewer found a
+   genuine high-severity credential-isolation flaw, correctly identified Git
+   config precedence as the cause, and requested the decisive real-Git
+   regression; with one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, security-relevant feedback.
 
 4. **High — Non-loopback plaintext HTTP can expose authentication secrets and
    LFS object content.** Configuration permits plaintext callback, server, and

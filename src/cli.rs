@@ -400,7 +400,7 @@ where
         input,
         output,
         open_url_in_default_browser,
-        |approval| approval.approve(),
+        |approval| approval.approve_in_dir(&current_dir),
     )
     .map_err(anyhow::Error::from)
 }

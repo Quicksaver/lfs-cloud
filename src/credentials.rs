@@ -292,16 +292,29 @@ impl GitCredentialApproval {
     /// argument, so process listings do not expose the secret. Before storing
     /// the credential, this persists path-aware lookup for the LFS Cloud host so
     /// future Git LFS credential fills also keep repository paths separate.
-    /// This writes `credential.<lfs-host>.useHttpPath=true` to the user's global
-    /// Git config because Git LFS resolves credentials in later processes.
+    /// This writes `credential.<lfs-host>.useHttpPath=true` to the repository's
+    /// local Git config because Git LFS resolves credentials in later processes.
+    /// Repository scope prevents a pre-existing local `false` value from
+    /// overriding path isolation when the helper stores the token.
     ///
     /// # Errors
     ///
     /// Returns [`CliError`] when Git has no configured credential helper, `git`
-    /// cannot be started, stdin cannot be written, or the credential helper
-    /// exits unsuccessfully.
+    /// is not running in a repository, cannot be started, stdin cannot be
+    /// written, or the credential helper exits unsuccessfully.
     pub fn approve(&self) -> CliResult<()> {
-        self.approve_with_git_program(Path::new("git"))
+        self.approve_in_dir(Path::new("."))
+    }
+
+    /// Approves the credential in an explicit repository context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git has no configured credential helper, the
+    /// directory is not in a repository, Git cannot be started, stdin cannot be
+    /// written, or the helper exits unsuccessfully.
+    pub fn approve_in_dir(&self, repository_dir: impl AsRef<Path>) -> CliResult<()> {
+        self.approve_with_git_program_in_dir(Path::new("git"), repository_dir)
     }
 
     /// Approves the credential with a caller-selected Git executable.
@@ -312,15 +325,40 @@ impl GitCredentialApproval {
     /// # Errors
     ///
     /// Returns [`CliError`] when Git has no configured credential helper, the
-    /// process cannot be started, stdin cannot be written, or the helper exits
-    /// unsuccessfully.
+    /// process is not running in a repository, cannot be started, stdin cannot
+    /// be written, or the helper exits unsuccessfully.
     pub fn approve_with_git_program(&self, git_program: impl AsRef<Path>) -> CliResult<()> {
-        self.ensure_credential_helper_configured(git_program.as_ref())?;
-        self.persist_path_aware_lookup(git_program.as_ref())?;
-        self.approve_with_configured_git(git_program.as_ref())
+        self.approve_with_git_program_in_dir(git_program, Path::new("."))
     }
 
-    fn ensure_credential_helper_configured(&self, git_program: &Path) -> CliResult<()> {
+    /// Approves the credential in an explicit repository context with a
+    /// caller-selected Git executable.
+    ///
+    /// This is primarily for callers and tests that already resolved the
+    /// repository independently of the process working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git has no configured credential helper, the
+    /// directory is not in a repository, the process cannot be started, stdin
+    /// cannot be written, or the helper exits unsuccessfully.
+    pub fn approve_with_git_program_in_dir(
+        &self,
+        git_program: impl AsRef<Path>,
+        repository_dir: impl AsRef<Path>,
+    ) -> CliResult<()> {
+        let git_program = git_program.as_ref();
+        let repository_dir = repository_dir.as_ref();
+        self.ensure_credential_helper_configured(git_program, repository_dir)?;
+        self.persist_path_aware_lookup(git_program, repository_dir)?;
+        self.approve_with_configured_git(git_program, repository_dir)
+    }
+
+    fn ensure_credential_helper_configured(
+        &self,
+        git_program: &Path,
+        repository_dir: &Path,
+    ) -> CliResult<()> {
         let command_name = format!(
             "git config --get-urlmatch credential.helper {}",
             self.lfs_url
@@ -333,6 +371,7 @@ impl GitCredentialApproval {
                 "credential.helper",
                 self.lfs_url.as_str(),
             ])
+            .current_dir(repository_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -374,13 +413,18 @@ impl GitCredentialApproval {
         })
     }
 
-    fn persist_path_aware_lookup(&self, git_program: &Path) -> CliResult<()> {
+    fn persist_path_aware_lookup(
+        &self,
+        git_program: &Path,
+        repository_dir: &Path,
+    ) -> CliResult<()> {
         let credential_scope = credential_host_scope(&self.lfs_url);
         let config_key = format!("credential.{credential_scope}.useHttpPath");
-        let command_name = format!("git config --global {config_key} true");
+        let command_name = format!("git config --local {config_key} true");
         let mut command = git_command(git_program);
         let mut child = command
-            .args(["config", "--global", &config_key, "true"])
+            .args(["config", "--local", &config_key, "true"])
+            .current_dir(repository_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -403,11 +447,16 @@ impl GitCredentialApproval {
         })
     }
 
-    fn approve_with_configured_git(&self, git_program: &Path) -> CliResult<()> {
+    fn approve_with_configured_git(
+        &self,
+        git_program: &Path,
+        repository_dir: &Path,
+    ) -> CliResult<()> {
         let command_name = "git credential approve";
         let mut command = git_command(git_program);
         let mut child = command
             .args(["credential", "approve"])
+            .current_dir(repository_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1530,7 +1579,7 @@ if [ "$1" = "config" ] && [ "$2" = "--get-urlmatch" ]; then
   exit 0
 fi
 if [ "$1" = "config" ]; then
-  if [ "$2" != "--global" ] ||
+  if [ "$2" != "--local" ] ||
      [ "$3" != "credential.https://lfs.example.com/.useHttpPath" ] ||
      [ "$4" != "true" ]; then
     echo "unexpected config args: $*" >&2
@@ -1565,8 +1614,90 @@ cat > '{}'
         );
         assert_eq!(
             fs::read_to_string(config_path).expect("config capture should be readable"),
-            "config --global credential.https://lfs.example.com/.useHttpPath true\n"
+            "config --local credential.https://lfs.example.com/.useHttpPath true\n"
         );
+    }
+
+    #[test]
+    fn approve_overrides_repository_local_host_scoping_before_storing_token() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let repo = temp.path().join("repo");
+        let credential_store = temp.path().join("credentials");
+        fs::create_dir(&repo).expect("test repository directory should be created");
+
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init should start");
+        assert!(init.success(), "git init should succeed");
+
+        let reset_helper = Command::new("git")
+            .args(["config", "--local", "--add", "credential.helper", ""])
+            .current_dir(&repo)
+            .status()
+            .expect("credential helper reset should start");
+        assert!(
+            reset_helper.success(),
+            "credential helper reset should succeed"
+        );
+        let helper = format!("store --file={}", credential_store.display());
+        let configure_helper = Command::new("git")
+            .args(["config", "--local", "--add", "credential.helper", &helper])
+            .current_dir(&repo)
+            .status()
+            .expect("credential helper configuration should start");
+        assert!(
+            configure_helper.success(),
+            "credential helper configuration should succeed"
+        );
+        let configure_host_scope = Command::new("git")
+            .args([
+                "config",
+                "--local",
+                "credential.https://lfs.example.com/.useHttpPath",
+                "false",
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("host-scope configuration should start");
+        assert!(
+            configure_host_scope.success(),
+            "host-scope configuration should succeed"
+        );
+
+        let approval = GitCredentialApproval::new(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            token(),
+        )
+        .expect("approval should parse");
+
+        approval
+            .approve_with_git_program_in_dir("git", &repo)
+            .expect("repository-local override should be repaired before approval");
+
+        let effective = Command::new("git")
+            .args([
+                "config",
+                "--bool",
+                "--get-urlmatch",
+                "credential.useHttpPath",
+                approval.lfs_url().as_str(),
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("effective configuration lookup should start");
+        assert!(effective.status.success());
+        assert_eq!(effective.stdout, b"true\n");
+
+        let stored = fs::read_to_string(credential_store)
+            .expect("credential helper should persist the approved token");
+        assert!(stored.contains("/github.com/owner/repo.git/info/lfs"));
+        assert!(!stored.ends_with("@lfs.example.com\n"));
     }
 
     #[test]
@@ -1965,7 +2096,7 @@ exit 0
 
         assert!(matches!(error, CliError::ExternalCommand { .. }));
         assert!(display.contains(
-            "git config --global credential.https://lfs.example.com/.useHttpPath true failed"
+            "git config --local credential.https://lfs.example.com/.useHttpPath true failed"
         ));
         assert!(display.contains("<redacted>"));
         assert!(!display.contains("local-lfs-token"));
