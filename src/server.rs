@@ -826,7 +826,7 @@ impl LfsBatchAuthorizer for GitHubBatchAuthorizer {
 
             let identity = RepositoryIdentity {
                 provider_id: repository.repo_provider.clone(),
-                stable_id: None,
+                stable_id: Some(repository.provider_repository_id.clone()),
                 host: repository.host.clone(),
                 owner: repository.owner.clone(),
                 name: repository.name.clone(),
@@ -2097,6 +2097,7 @@ impl LfsRouteResolver {
     ///     host: github.com
     ///     owner: owner
     ///     name: repo
+    ///     provider_repository_id: "8675309"
     ///     storage_provider: drive-user-a
     /// "#,
     /// )?;
@@ -2382,6 +2383,7 @@ repositories:
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#,
         ))
@@ -4191,6 +4193,7 @@ repositories:
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#,
         )
@@ -4243,14 +4246,23 @@ repositories:
         let address = listener
             .local_addr()
             .expect("permission server address should be available");
-        let router = Router::new().route(
-            "/repos/{owner}/{repo}/collaborators/{username}/permission",
-            get(
-                move |Path((_owner, _repo, _username)): Path<(String, String, String)>| async move {
-                    Json(serde_json::json!({ "permission": permission }))
-                },
-            ),
-        );
+        let router = Router::new()
+            .route(
+                "/repos/{owner}/{repo}",
+                get(|| async { Json(serde_json::json!({ "id": 8675309_u64 })) }),
+            )
+            .route(
+                "/repos/{owner}/{repo}/collaborators/{username}/permission",
+                get(
+                    move |Path((_owner, _repo, _username)): Path<(
+                        String,
+                        String,
+                        String,
+                    )>| async move {
+                        Json(serde_json::json!({ "permission": permission }))
+                    },
+                ),
+            );
 
         tokio::spawn(async move {
             axum::serve(listener, router)

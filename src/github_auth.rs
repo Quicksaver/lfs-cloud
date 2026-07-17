@@ -640,6 +640,8 @@ impl GitHubRepositoryPermissionClient {
         required: RepositoryPermission,
     ) -> ServerResult<RepositoryAuthorization> {
         validate_github_permission_request(provider, repository, user)?;
+        self.verify_repository_identity(provider, token, repository)
+            .await?;
         let endpoint = github_repository_permission_endpoint(provider, repository, user)?;
         let response = self
             .client
@@ -722,6 +724,104 @@ impl GitHubRepositoryPermissionClient {
             required,
             granted,
         })
+    }
+
+    async fn verify_repository_identity(
+        &self,
+        provider: &GitHubProviderConfig,
+        token: &GitHubOAuthAccessToken,
+        repository: &RepositoryIdentity,
+    ) -> ServerResult<()> {
+        let expected_id = repository
+            .stable_id
+            .as_deref()
+            .ok_or_else(|| ServerError::InvalidConfiguration {
+                message: format!(
+                    "github repository {}/{} is missing its stable repository ID",
+                    repository.owner, repository.name
+                ),
+            })?
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| ServerError::InvalidConfiguration {
+                message: format!(
+                    "github repository {}/{} has an invalid stable repository ID",
+                    repository.owner, repository.name
+                ),
+            })?;
+        let endpoint = github_repository_identity_endpoint(provider, repository)?;
+        let response = self
+            .client
+            .get(endpoint)
+            .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
+            .bearer_auth(token.as_str())
+            .timeout(GITHUB_PERMISSION_CHECK_TIMEOUT)
+            .send()
+            .await
+            .map_err(|source| github_permission_request_error(provider, None, source))?;
+        let status = response.status();
+
+        if !status.is_success() {
+            if status == StatusCode::UNAUTHORIZED {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: provider.id.clone(),
+                    },
+                });
+            }
+            if status == StatusCode::NOT_FOUND {
+                return Err(github_repository_not_found(provider, repository));
+            }
+            if status == StatusCode::FORBIDDEN && response.headers().contains_key(GITHUB_SSO_HEADER)
+            {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::SsoRequired {
+                        provider: provider.id.clone(),
+                        organization: repository.owner.clone(),
+                    },
+                });
+            }
+
+            let body = read_github_error_body(response).await.map_err(|source| {
+                github_permission_request_error(provider, Some(status), source)
+            })?;
+            if status == StatusCode::FORBIDDEN && github_forbidden_body_indicates_auth(&body) {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: provider.id.clone(),
+                    },
+                });
+            }
+
+            return Err(github_permission_status_error(
+                provider, status, &body, token,
+            ));
+        }
+
+        let response = response
+            .json::<GitHubRepositoryIdentityResponse>()
+            .await
+            .map_err(|source| github_permission_request_error(provider, Some(status), source))?;
+        let actual_id = response.id.ok_or_else(|| {
+            repository_provider_upstream_error(
+                provider,
+                Some(status.as_u16()),
+                "malformed github repository identity response",
+            )
+        })?;
+
+        if actual_id != expected_id {
+            tracing::warn!(
+                provider = %provider.id,
+                owner = %repository.owner,
+                repo = %repository.name,
+                "github repository stable identity did not match configured mapping"
+            );
+            return Err(github_repository_not_found(provider, repository));
+        }
+
+        Ok(())
     }
 }
 
@@ -1407,6 +1507,11 @@ struct GitHubRepositoryPermissionResponse {
     permission: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubRepositoryIdentityResponse {
+    id: Option<u64>,
+}
+
 enum GitHubBasePermission {
     Granted(RepositoryPermission),
     None,
@@ -1646,6 +1751,19 @@ fn github_permission_denied(
     }
 }
 
+fn github_repository_not_found(
+    provider: &GitHubProviderConfig,
+    repository: &RepositoryIdentity,
+) -> ServerError {
+    ServerError::RepositoryProvider {
+        source: RepositoryProviderError::RepositoryNotFound {
+            provider: provider.id.clone(),
+            owner: repository.owner.clone(),
+            repo: repository.name.clone(),
+        },
+    }
+}
+
 async fn read_github_error_body(mut response: reqwest::Response) -> Result<String, reqwest::Error> {
     let mut body = Vec::new();
     while body.len() < MAX_GITHUB_ERROR_BODY_LEN {
@@ -1754,6 +1872,22 @@ fn github_repository_permission_endpoint(
             user.login.as_str(),
             "permission",
         ],
+    )?;
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+
+    Ok(endpoint)
+}
+
+fn github_repository_identity_endpoint(
+    provider: &GitHubProviderConfig,
+    repository: &RepositoryIdentity,
+) -> ServerResult<Url> {
+    let mut endpoint = Url::parse(&provider.api_url)
+        .map_err(|source| invalid_oauth_url("github api_url", source))?;
+    append_github_api_path(
+        &mut endpoint,
+        ["repos", repository.owner.as_str(), repository.name.as_str()],
     )?;
     endpoint.set_query(None);
     endpoint.set_fragment(None);
@@ -2038,7 +2172,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use axum::{
-        Router,
+        Json, Router,
         body::Body,
         extract::{Path, State},
         http::{
@@ -2640,6 +2774,40 @@ mod tests {
         assert_eq!(request.username, "octocat");
         assert_eq!(request.accept.as_deref(), Some(super::GITHUB_API_ACCEPT));
         assert_eq!(request.authorization.as_deref(), Some("Bearer gho_token"));
+    }
+
+    #[tokio::test]
+    async fn permission_client_denies_reused_repository_name_with_a_different_stable_id() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"admin","role_name":"admin"}"#,
+            None,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let mut repository = repository_identity("renamed-owner", "reused-repo");
+        repository.stable_id = Some("9999999".to_owned());
+        let user = repository_user("octocat");
+        let client = GitHubRepositoryPermissionClient::new().expect("client should build");
+
+        let error = client
+            .check_permission(
+                &provider,
+                &token,
+                &repository,
+                &user,
+                RepositoryPermission::Read,
+            )
+            .await
+            .expect_err("a reused repository name must not authorize the replacement repo");
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::RepositoryNotFound { .. }
+            }
+        ));
     }
 
     #[tokio::test]
@@ -3651,6 +3819,10 @@ mod tests {
         });
         let app = Router::new()
             .route(
+                "/api/v3/repos/{owner}/{repo}",
+                get(|| async { Json(serde_json::json!({ "id": 8675309_u64 })) }),
+            )
+            .route(
                 "/api/v3/repos/{owner}/{repo}/collaborators/{username}/permission",
                 get(capture_permission_request),
             )
@@ -3822,7 +3994,7 @@ mod tests {
     fn repository_identity(owner: &str, repo: &str) -> RepositoryIdentity {
         RepositoryIdentity {
             provider_id: "github-main".to_owned(),
-            stable_id: None,
+            stable_id: Some("8675309".to_owned()),
             host: "github.com".to_owned(),
             owner: owner.to_owned(),
             name: repo.to_owned(),

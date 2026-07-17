@@ -190,6 +190,7 @@ repositories:
     host: github.com
     owner: owner-a
     name: repo-a
+    provider_repository_id: '123456789'
     storage_provider: drive-user-a
 
   - id: github-main:owner-b/repo-b
@@ -197,6 +198,7 @@ repositories:
     host: github.com
     owner: owner-b
     name: repo-b
+    provider_repository_id: '234567890'
     storage_provider: drive-user-b
 
   - id: gitlab-internal:group-c/repo-c
@@ -204,6 +206,7 @@ repositories:
     host: gitlab.example.com
     owner: group-c
     name: repo-c
+    provider_repository_id: 'gitlab-project-345678901'
     storage_provider: s3-user-c
 ```
 
@@ -225,6 +228,12 @@ When a request arrives, the server should:
 ```
 
 If a repository is not listed in the server config, the server should deny it by default. This prevents arbitrary repositories from using the instance and makes storage routing explicit.
+
+Each mapping also persists the repository provider's stable repository ID.
+Authorization resolves the current repository at the configured owner/name and
+denies access unless that provider ID still matches, preventing repository
+rename or name reuse from changing which repository owns an existing LFS
+storage namespace.
 
 ## Deployment Strategy
 

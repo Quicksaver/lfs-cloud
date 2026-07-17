@@ -4792,6 +4792,7 @@ repositories:
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#
         )

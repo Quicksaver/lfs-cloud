@@ -191,6 +191,21 @@ impl ServerConfig {
                     ),
                 );
             }
+            if matches!(
+                self.repository_providers.get(&repository.repo_provider),
+                Some(RepositoryProviderConfig::GitHub(_))
+            ) && repository
+                .provider_repository_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .is_none()
+            {
+                return invalid_config(
+                    format!("{repo_path}.provider_repository_id"),
+                    "must be a positive GitHub numeric repository ID",
+                );
+            }
             if !self
                 .storage_providers
                 .contains_key(&repository.storage_provider)
@@ -440,6 +455,8 @@ pub struct RepositoryMapping {
     pub owner: String,
     /// Repository name without the `.git` suffix.
     pub name: String,
+    /// Provider-stable repository ID used to detect rename and name reuse.
+    pub provider_repository_id: String,
     /// Configured storage-provider ID.
     pub storage_provider: String,
 }
@@ -458,6 +475,7 @@ impl RepositoryMapping {
     ///     host: "github.com".to_owned(),
     ///     owner: "owner".to_owned(),
     ///     name: "repo".to_owned(),
+    ///     provider_repository_id: "123456789".to_owned(),
     ///     storage_provider: "drive-user-a".to_owned(),
     /// };
     ///
@@ -489,6 +507,11 @@ impl RepositoryMapping {
                 "must omit the .git suffix because the route adds it",
             );
         }
+        let provider_repository_id = resolve_required(
+            raw.provider_repository_id,
+            format!("{base_path}.provider_repository_id"),
+            env,
+        )?;
         let storage_provider = resolve_required(
             raw.storage_provider,
             format!("{base_path}.storage_provider"),
@@ -501,6 +524,7 @@ impl RepositoryMapping {
             host,
             owner,
             name,
+            provider_repository_id,
             storage_provider,
         })
     }
@@ -594,6 +618,8 @@ struct RawRepositoryMapping {
     owner: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    provider_repository_id: Option<String>,
     #[serde(default)]
     storage_provider: Option<String>,
 }
@@ -886,6 +912,7 @@ repositories:
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#
     }
@@ -1364,6 +1391,57 @@ repository_providers:
     }
 
     #[test]
+    fn requires_a_persisted_provider_repository_id() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials_ref: drive-credential
+    root_folder_id: drive-root
+repositories:
+  - id: github-main:owner/repo
+    repo_provider: github-main
+    host: github.com
+    owner: owner
+    name: repo
+    storage_provider: drive-user-a
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(&error, "repositories[0].provider_repository_id is required");
+    }
+
+    #[test]
+    fn rejects_non_numeric_github_repository_ids() {
+        let error = ServerConfig::load_from_str_with_env(
+            &valid_yaml().replace(
+                "provider_repository_id: \"8675309\"",
+                "provider_repository_id: not-a-github-id",
+            ),
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "repositories[0].provider_repository_id must be a positive GitHub numeric repository ID",
+        );
+    }
+
+    #[test]
     fn validates_required_google_drive_fields_with_exact_paths() {
         let error = ServerConfig::load_from_str_with_env(
             r#"
@@ -1402,6 +1480,7 @@ repositories:
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#,
             "<test>",
@@ -1433,6 +1512,7 @@ repositories:
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#,
             "<test>",
@@ -1469,12 +1549,14 @@ repositories:
     host: github.com
     owner: owner-a
     name: repo-a
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
   - id: duplicate
     repo_provider: github-main
     host: github.com
     owner: owner-b
     name: repo-b
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#,
             "<test>",
@@ -1511,12 +1593,14 @@ repositories:
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
   - id: two
     repo_provider: github-main
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#,
             "<test>",
@@ -1689,6 +1773,7 @@ repositories:
     host: github.com
     owner: owner/team
     name: repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#,
             "<test>",
@@ -1725,6 +1810,7 @@ repositories:
     host: github.com
     owner: owner
     name: repo.git
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 "#,
             "<test>",

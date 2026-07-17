@@ -296,8 +296,16 @@ repositories:
     host: github.com
     owner: owner
     name: repo
+    provider_repository_id: '123456789'
     storage_provider: drive-user-a
 ```
+
+`provider_repository_id` is GitHub's immutable numeric repository ID. LFS Cloud
+compares it with the current repository at `owner/name` for every authorization
+decision, preventing a deleted or transferred name from granting access to a
+replacement repository. Retrieve it with
+`gh api repos/OWNER/REPOSITORY --jq .id` and keep it unchanged when renaming the
+same repository.
 
 String values may reference environment variables with `${NAME}`. This keeps
 OAuth client settings and backend credential references out of the YAML file

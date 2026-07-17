@@ -41,6 +41,7 @@ repositories:
     host: github.com
     owner: octo-org
     name: assets
+    provider_repository_id: '123456789'
     storage_provider: drive-personal
 ```
 
@@ -51,6 +52,10 @@ http://127.0.0.1:8080/github.com/octo-org/assets.git/info/lfs
 ```
 
 Repository `name` omits the `.git` suffix because the route adds it.
+`provider_repository_id` is GitHub's immutable numeric repository ID, available
+with `gh api repos/OWNER/REPOSITORY --jq .id`. LFS Cloud verifies this value
+before every permission check so a renamed, transferred, deleted, or reused
+`owner/name` cannot silently switch the mapping to another repository.
 
 ## LAN Config
 
@@ -137,6 +142,8 @@ config file.
   only ASCII letters, digits, `_`, or `-`.
 - Repository route components must be safe path segments. Repository names must
   not include `.git`.
+- GitHub repository mappings must include a positive numeric
+  `provider_repository_id` matching GitHub's stable repository ID.
 - Every repository mapping must reference configured repository and storage
   providers.
 - Duplicate repository IDs and duplicate generated route paths are rejected.

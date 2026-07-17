@@ -6,13 +6,22 @@ independently validated or adjudicated.
 
 ## Authentication and credential security
 
-1. **High — Repository name reuse can expose the original repository's LFS
-   objects.** Production authorization constructs a repository identity without
-   a stable ID and authorizes solely by mutable `owner/repo` names
-   (`src/server.rs:827-833`, `src/github_auth.rs:634-715`,
-   `src/github_auth.rs:1729-1761`). Resolve and persist GitHub's numeric
-   repository ID, verify it during every authorization decision, deny
-   mismatches, and add rename/name-reuse tests.
+1. **[DONE] Repository name reuse can expose the original repository's LFS
+   objects** (High, `src/server_config.rs`, `src/server.rs`, and
+   `src/github_auth.rs`): **Valid and actionable.** Production previously built
+   `RepositoryIdentity` with no stable ID and authorized the mutable
+   `owner/name` directly. Repository mappings now require the provider's stable
+   repository ID; GitHub mappings validate it as a positive numeric ID, the
+   production authorizer carries it into `RepositoryIdentity`, and every GitHub
+   permission decision first resolves `/repos/{owner}/{repo}` and denies a
+   missing or mismatched ID as repository-not-found. Configuration examples and
+   operator guidance now document how to persist the ID and preserve it across
+   renames. Regression coverage proves that a replacement repository with an
+   admin permission response is still denied when its numeric ID differs, and
+   config tests cover missing and malformed IDs. The focused reviewer found a
+   genuine high-severity authorization boundary flaw and prescribed the right
+   stable-identity defense; with one valid finding assessed here and no invalid
+   finding attributable separately, this was high-quality, relevant feedback.
 
 2. **High — OAuth tokens are not bound to the session user's stable identity.**
    Permission checks use the mutable login, ignore the user's stable ID, and do
