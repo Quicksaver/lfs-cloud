@@ -4036,6 +4036,32 @@ repositories:
     }
 
     #[tokio::test]
+    async fn default_batch_authorizer_denies_session_user_identity_mismatch() {
+        let github_api_url = start_permission_server_for_user("admin", 99).await;
+        let config = test_config_with_github_api_url(&github_api_url);
+        let store = LocalLfsSessionStore::new();
+        let user = RepositoryUser::new("github-main", "octocat", Some("42".to_owned()));
+        let github_token =
+            GitHubOAuthAccessToken::from_secret("gho_authorization").expect("token should parse");
+        let issued = store
+            .issue_session_with_github_token(&user, ["read:user", "repo"], github_token)
+            .expect("session should be issued");
+        let router = lfs_server_router_with_sessions(config, store);
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {}", issued.token.as_str())),
+                VALID_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn batch_route_rejects_invalid_json_after_authentication() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
         let router = lfs_server_router_with_sessions(test_config(), store);
@@ -4240,6 +4266,10 @@ repositories:
     }
 
     async fn start_permission_server(permission: &'static str) -> String {
+        start_permission_server_for_user(permission, 42).await
+    }
+
+    async fn start_permission_server_for_user(permission: &'static str, user_id: u64) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("permission server should bind");
@@ -4259,7 +4289,10 @@ repositories:
                         String,
                         String,
                     )>| async move {
-                        Json(serde_json::json!({ "permission": permission }))
+                        Json(serde_json::json!({
+                            "permission": permission,
+                            "user": { "login": "octocat", "id": user_id }
+                        }))
                     },
                 ),
             );

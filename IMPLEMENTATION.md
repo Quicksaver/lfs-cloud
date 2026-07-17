@@ -436,6 +436,11 @@ Preferred flow:
 6. Git LFS uses that credential for batch/upload/download requests.
 ```
 
+GitHub login must return the authenticated account's immutable numeric user ID.
+The local session retains that ID, and repository permission checks compare it
+with the collaborator response's nested user ID before granting access. The
+mutable login remains useful for the API path but is not sufficient identity.
+
 Avoid asking users to paste personal access tokens into the LFS server if possible. That can work for a quick prototype, but it means `lfs-cloud` receives and handles powerful user repository-host credentials.
 
 Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service can use one Google account's OAuth refresh token to access the backing Drive folder. For a multi-tenant or shared instance, each configured storage provider should have its own credential reference and policy boundary.

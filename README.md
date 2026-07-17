@@ -172,7 +172,9 @@ This opens the running server's GitHub OAuth login URL for the current
 repository. After the browser callback returns JSON, paste the `lfs_token`
 value into the CLI prompt. The CLI stores that local LFS Cloud token in Git's
 credential helper for the repository-scoped LFS URL. It does not store the
-GitHub OAuth access token in Git credentials.
+GitHub OAuth access token in Git credentials. The server binds the local
+session to GitHub's immutable numeric user ID and rejects repository permission
+responses for a different account, even if the mutable login was reused.
 
 ### Check Repository Status
 

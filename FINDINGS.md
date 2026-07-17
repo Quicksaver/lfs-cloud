@@ -23,12 +23,23 @@ independently validated or adjudicated.
    stable-identity defense; with one valid finding assessed here and no invalid
    finding attributable separately, this was high-quality, relevant feedback.
 
-2. **High — OAuth tokens are not bound to the session user's stable identity.**
-   Permission checks use the mutable login, ignore the user's stable ID, and do
-   not parse the permission response's nested user ID
-   (`src/github_auth.rs:634-715`, `src/github_auth.rs:1381-1408`). Require and
-   compare GitHub numeric user IDs, and add mismatched-token/user and
-   username-reuse tests.
+2. **[DONE] OAuth tokens are not bound to the session user's stable identity**
+   (High, `src/github_auth.rs` and `src/server.rs`): **Valid and actionable.**
+   Login already retained GitHub's numeric user ID when present, but accepted
+   identity responses without it; repository authorization then used only the
+   mutable login and ignored the permission response's nested `user.id`.
+   GitHub login now requires a positive numeric ID, permission checks require a
+   valid numeric session ID, and access is granted only when the collaborator
+   response identifies the same stable user. Missing response identity is
+   treated as malformed upstream data, while a mismatched ID is denied without
+   exposing either ID. Regression coverage verifies missing login IDs, login
+   reuse by a different stable user, and the production batch-authorizer path
+   with a token/session user mismatch. The GitHub REST collaborator schema was
+   checked to confirm that successful permission responses include nested user
+   identity. The focused reviewer found a genuine high-severity identity
+   binding flaw and recommended the correct stable-ID comparison; with one
+   valid finding assessed here and no invalid findings attributable separately,
+   this was high-quality, security-relevant feedback.
 
 3. **High — Repository-local Git configuration can override credential path
    isolation.** Approval writes `useHttpPath=true` only globally and then invokes

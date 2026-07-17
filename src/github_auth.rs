@@ -639,7 +639,7 @@ impl GitHubRepositoryPermissionClient {
         user: &RepositoryUser,
         required: RepositoryPermission,
     ) -> ServerResult<RepositoryAuthorization> {
-        validate_github_permission_request(provider, repository, user)?;
+        let expected_user_id = validate_github_permission_request(provider, repository, user)?;
         self.verify_repository_identity(provider, token, repository)
             .await?;
         let endpoint = github_repository_permission_endpoint(provider, repository, user)?;
@@ -715,6 +715,24 @@ impl GitHubRepositoryPermissionClient {
         };
 
         if !github_permission_satisfies(granted, required) {
+            return Err(github_permission_denied(provider, repository, required));
+        }
+
+        let actual_user_id = response.stable_user_id().ok_or_else(|| {
+            repository_provider_upstream_error(
+                provider,
+                Some(status.as_u16()),
+                "malformed github repository permission user identity",
+            )
+        })?;
+        if actual_user_id != expected_user_id {
+            tracing::warn!(
+                provider = %provider.id,
+                owner = %repository.owner,
+                repo = %repository.name,
+                login = %user.login,
+                "github repository permission user identity did not match the authenticated session"
+            );
             return Err(github_permission_denied(provider, repository, required));
         }
 
@@ -1494,10 +1512,15 @@ impl GitHubUserResponse {
                 malformed_github_user_response_error(provider, &format!("invalid login: {error}"))
             })?;
 
+        let id = self
+            .id
+            .filter(|id| *id > 0)
+            .ok_or_else(|| malformed_github_user_response_error(provider, "missing id"))?;
+
         Ok(RepositoryUser::new(
             provider.id.clone(),
             login,
-            self.id.map(|id| id.to_string()),
+            Some(id.to_string()),
         ))
     }
 }
@@ -1505,6 +1528,12 @@ impl GitHubUserResponse {
 #[derive(Debug, Deserialize)]
 struct GitHubRepositoryPermissionResponse {
     permission: Option<String>,
+    user: Option<GitHubRepositoryPermissionUserResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRepositoryPermissionUserResponse {
+    id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1527,6 +1556,10 @@ impl GitHubRepositoryPermissionResponse {
             Some("none") | None => GitHubBasePermission::None,
             Some(permission) => GitHubBasePermission::Unknown(permission.to_owned()),
         }
+    }
+
+    fn stable_user_id(&self) -> Option<u64> {
+        self.user.as_ref()?.id.filter(|id| *id > 0)
     }
 }
 
@@ -1913,7 +1946,7 @@ fn validate_github_permission_request(
     provider: &GitHubProviderConfig,
     repository: &RepositoryIdentity,
     user: &RepositoryUser,
-) -> ServerResult<()> {
+) -> ServerResult<u64> {
     if repository.provider_id != provider.id {
         return Err(ServerError::InvalidRequest {
             message: format!(
@@ -1934,7 +1967,16 @@ fn validate_github_permission_request(
     validate_github_permission_path_segment(&repository.name, "repository name")?;
     validate_github_permission_path_segment(&user.login, "repository user login")?;
 
-    Ok(())
+    user.stable_id
+        .as_deref()
+        .and_then(|id| id.parse::<u64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| ServerError::InvalidRequest {
+            message: format!(
+                "github repository user {} is missing a valid stable numeric ID",
+                user.login
+            ),
+        })
 }
 
 fn validate_github_permission_path_segment(value: &str, label: &str) -> ServerResult<()> {
@@ -2740,10 +2782,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_client_rejects_identity_without_stable_id() {
+        let (api_url, _user_server) = user_server(StatusCode::OK, r#"{"login":"octocat"}"#).await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let client = GitHubUserClient::new().expect("client should build");
+
+        let error = client
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("missing stable user ID should fail");
+
+        assert!(matches!(error, ServerError::RepositoryProvider { .. }));
+        assert!(error.to_string().contains("missing id"));
+        assert!(!error.to_string().contains("gho_token"));
+    }
+
+    #[tokio::test]
     async fn permission_client_allows_public_read_repo_download() {
         let (api_url, permission_server) = permission_server(
             StatusCode::OK,
-            r#"{"permission":"read","role_name":"triage"}"#,
+            r#"{"permission":"read","role_name":"triage","user":{"login":"octocat","id":583231}}"#,
             None,
         )
         .await;
@@ -2811,10 +2870,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_client_denies_reused_login_with_a_different_stable_id() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"admin","role_name":"admin","user":{"login":"octocat","id":999999}}"#,
+            None,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let repository = repository_identity("private-owner", "private-repo");
+        let user = repository_user("octocat");
+        let client = GitHubRepositoryPermissionClient::new().expect("client should build");
+
+        let error = client
+            .check_permission(
+                &provider,
+                &token,
+                &repository,
+                &user,
+                RepositoryPermission::Read,
+            )
+            .await
+            .expect_err("a reused login must not authorize a different stable user");
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::PermissionDenied { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_client_rejects_grant_without_stable_user_identity() {
+        let (api_url, _permission_server) = permission_server(
+            StatusCode::OK,
+            r#"{"permission":"admin","role_name":"admin"}"#,
+            None,
+        )
+        .await;
+        let provider = provider_config_with_api_url(api_url);
+        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
+        let repository = repository_identity("private-owner", "private-repo");
+        let user = repository_user("octocat");
+        let client = GitHubRepositoryPermissionClient::new().expect("client should build");
+
+        let error = client
+            .check_permission(
+                &provider,
+                &token,
+                &repository,
+                &user,
+                RepositoryPermission::Read,
+            )
+            .await
+            .expect_err("a granted permission must include stable user identity");
+
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::Upstream { .. }
+            }
+        ));
+        assert!(error.to_string().contains("permission user identity"));
+    }
+
+    #[tokio::test]
     async fn permission_client_allows_private_write_repo_upload() {
         let (api_url, _permission_server) = permission_server(
             StatusCode::OK,
-            r#"{"permission":"write","role_name":"write"}"#,
+            r#"{"permission":"write","role_name":"write","user":{"login":"octocat","id":583231}}"#,
             None,
         )
         .await;
@@ -2842,7 +2968,7 @@ mod tests {
     async fn permission_client_allows_org_admin_repo_upload() {
         let (api_url, _permission_server) = permission_server(
             StatusCode::OK,
-            r#"{"permission":"admin","role_name":"admin"}"#,
+            r#"{"permission":"admin","role_name":"admin","user":{"login":"octocat","id":583231}}"#,
             None,
         )
         .await;
