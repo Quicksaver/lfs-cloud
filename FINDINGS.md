@@ -1,0 +1,647 @@
+# Implementation Review Findings
+
+These findings were consolidated directly from focused subagent reviews and
+deduplicated by merging reports of the same underlying issue. They have not been
+independently validated or adjudicated.
+
+## Authentication and credential security
+
+1. **High — Repository name reuse can expose the original repository's LFS
+   objects.** Production authorization constructs a repository identity without
+   a stable ID and authorizes solely by mutable `owner/repo` names
+   (`src/server.rs:827-833`, `src/github_auth.rs:634-715`,
+   `src/github_auth.rs:1729-1761`). Resolve and persist GitHub's numeric
+   repository ID, verify it during every authorization decision, deny
+   mismatches, and add rename/name-reuse tests.
+
+2. **High — OAuth tokens are not bound to the session user's stable identity.**
+   Permission checks use the mutable login, ignore the user's stable ID, and do
+   not parse the permission response's nested user ID
+   (`src/github_auth.rs:634-715`, `src/github_auth.rs:1381-1408`). Require and
+   compare GitHub numeric user IDs, and add mismatched-token/user and
+   username-reuse tests.
+
+3. **High — Repository-local Git configuration can override credential path
+   isolation.** Approval writes `useHttpPath=true` only globally and then invokes
+   plain `git credential approve`; a local `useHttpPath=false` can store the
+   token host-wide (`src/credentials.rs:317-320`,
+   `src/credentials.rs:377-404`, `src/credentials.rs:449-455`). Verify the
+   effective setting in repository context and set it at equal or higher
+   precedence, or fail with remediation. Add a real-Git regression test.
+
+4. **High — Non-loopback plaintext HTTP can expose authentication secrets and
+   LFS object content.** Configuration permits plaintext callback, server, and
+   GitHub API URLs that can expose OAuth codes, local LFS tokens, Basic/Bearer
+   credentials, GitHub access tokens, and transferred objects
+   (`src/server.rs:117-132`, `src/server.rs:313-317`,
+   `src/server_config.rs:244`, `src/server_config.rs:302-315`,
+   `src/server_config.rs:626-635`, `src/server_config.rs:805-827`,
+   `src/github_auth.rs:207-217`, `src/github_auth.rs:537-550`,
+   `src/github_auth.rs:634-650`, `src/credentials.rs:570-600`). Require HTTPS or
+   trusted TLS termination except for exact loopback development endpoints,
+   reject HTTPS-to-HTTP redirects, and gate any LAN exception behind an explicit
+   unsafe opt-in.
+
+5. **High — Server restarts invalidate every issued LFS credential despite the
+   SQLite session contract.** Production always creates a fresh in-memory
+   session store, while the metadata `sessions` table is unused and cannot
+   restore the private GitHub token needed for authorization
+   (`src/server.rs:105-116`, `src/sessions.rs:201-208`,
+   `src/metadata.rs:96-107`, `README.md:306-309`). Implement durable sessions
+   with token hashes, expiry and identity data, and protected upstream-token
+   state, or explicitly define restart revocation and remove the contradictory
+   schema and documentation. Add restart/reopen coverage.
+
+6. **Medium — OAuth callback responses containing credentials are cacheable.**
+   Successful GET responses return `lfs_token` without defensive cache or
+   referrer headers (`src/github_auth.rs:338-359`). Add `Cache-Control: no-store,
+private`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer` to success
+   and error responses, with header assertions.
+
+7. **Medium — Unauthenticated login flooding can evict legitimate CSRF
+   states.** Each login GET registers state and the 1,025th pending entry evicts
+   the oldest; callback lookup also scans all states under a global mutex
+   (`src/github_auth.rs:327-335`, `src/github_auth.rs:992-1019`,
+   `src/server.rs:318-330`). Rate-limit the endpoints, return 429 on overload,
+   and use cookie-bound or signed state with keyed lookup. Inject a clock and
+   test before, at, and after expiry, eviction order, and that unrelated
+   requests cannot evict an active attempt.
+
+8. **Medium — Successful logins can evict unrelated active sessions.** At the
+   global 1,024-session cap, issuance silently removes the soonest-expiring
+   active session (`src/sessions.rs:23`, `src/sessions.rs:291-313`,
+   `src/sessions.rs:422-429`). Add per-principal issuance limits and rate
+   limiting, and reject new issuance at the cap instead of evicting another
+   user. Inject clocks and token generation, then test exact expiry boundaries,
+   pruning, cross-user capacity, and concurrent issue/verify/revoke behavior
+   without wall-clock sleeps.
+
+9. **Medium — Token-endpoint error handling can reflect submitted secrets and
+   accepts unbounded bodies.** OAuth client secrets or authorization codes
+   echoed by the provider can enter server errors and logs
+   (`src/github_auth.rs:823-843`, `src/github_auth.rs:1468-1503`,
+   `src/github_auth.rs:1685-1706`). Bound response bodies and redact both
+   secrets before truncation or error construction. Add JSON, form, and
+   unstructured reflection tests.
+
+10. **Medium — Failed credential lookup can disclose a stored token.** A failing
+    helper's raw stderr is surfaced before the code knows the password to redact
+    (`src/credentials.rs:195-203`, `src/credentials.rs:723-745`). Suppress raw
+    helper stderr or redact credential/password-shaped content, and test a
+    helper that echoes the token before failing.
+
+11. **Medium — Credential lookup is not non-interactive.** A cache miss can
+    invoke terminal prompting, askpass, or credential-manager UI
+    (`src/credentials.rs:166-196`, `src/credentials.rs:877-879`). Set
+    `GIT_TERMINAL_PROMPT=0` and appropriate askpass/GCM controls, then add a
+    cache-miss regression test.
+
+12. **Medium — The OAuth authorization flow omits PKCE.** Authorization requests
+    send state and use a client secret but no code challenge or verifier
+    (`src/github_auth.rs:794-818`, `src/github_auth.rs:922-951`). Generate an S256
+    verifier per attempt, retain it with state, send the challenge, and require
+    the verifier during exchange. Add replay/interception tests.
+
+13. **Medium — Session revocation has no user-facing route or CLI flow.** The
+    `revoke` operation is only exercised by unit tests, so a stolen token remains
+    usable until expiry or restart (`src/sessions.rs:342-355`). Expose
+    authenticated logout/revocation, erase the Git credential entry, and revoke
+    local sessions when upstream authentication is definitively invalid.
+
+14. **Low — Authentication performs a serialized O(n) session scan and clones
+    OAuth-bearing records.** Every request locks the map and prunes all sessions
+    (`src/sessions.rs:329-340`, `src/sessions.rs:415-420`). Check only the
+    requested entry, maintain an expiry index or background pruning task, and
+    share records through `Arc`.
+
+15. **Low — GitHub REST requests do not pin an API version.** Requests set
+    `Accept` but omit `X-GitHub-Api-Version`
+    (`src/github_auth.rs:543-549`, `src/github_auth.rs:644-650`). Configure a
+    supported version header centrally and assert it in mocked requests.
+
+16. **Low — Credential-helper descendants can leave blocked reader threads.** A
+    successful direct child can exit while a descendant retains stdout or
+    stderr, causing drain timeouts and detached blocked threads
+    (`src/credentials.rs:832-846`, `src/credentials.rs:983-1020`,
+    `src/credentials.rs:1117-1145`). Use cancellable/nonblocking reads or
+    deterministic process-group cleanup, and test a pipe-holding descendant.
+
+## Server and metadata
+
+1. **High — Unbounded batches and per-object authorization can amplify into
+   thousands of GitHub, OAuth, and Drive API calls.** Object count and duplicates
+   are not bounded; each lookup reloads credentials, refreshes a Google token,
+   and queries Drive, while a batch and each subsequent GET or PUT can perform
+   separate GitHub permission checks, sometimes before cheap local validation
+   (`src/server.rs:682-703`, `src/server.rs:840-842`,
+   `src/server.rs:976-986`, `src/server.rs:1038-1064`,
+   `src/server.rs:1105-1135`, `src/server.rs:1593-1616`,
+   `src/server.rs:1656-1707`, `src/lfs.rs:568`). Enforce a configurable object
+   count, deduplicate identities, validate locally first, cache Google tokens
+   with single-flight refresh, add a server-wide provider-call semaphore, and
+   use a short-lived scoped authorization grant or conservative permission
+   cache. Test provider-call counts for malformed and multi-object requests.
+
+2. **High — Authenticated batch bodies have no read timeout or global request
+   limit.** `Bytes::from_request` can wait indefinitely for a valid session
+   slowly dripping a body (`src/server.rs:958-1004`). Add batch-body idle and
+   total timeouts plus global connection/request limits, and exercise them
+   through the actual router.
+
+3. **High — Upload free-space checks race and do not reserve aggregate
+   capacity.** Concurrent uploads can all pass the same preflight and then fill
+   the staging filesystem (`src/server.rs:1134-1150`,
+   `src/server.rs:1358-1385`, `src/server.rs:1464-1506`). Add global/per-user
+   concurrency limits and an atomic weighted byte reservation released with the
+   tempfile; retain the filesystem check as a secondary guard.
+
+4. **Medium — Startup does not validate Drive credentials or root-folder
+   usability.** The server binds successfully and discovers invalid storage only
+   during the first batch lookup (`src/server.rs:93-116`,
+   `src/server.rs:672-704`). Validate each provider before declaring readiness,
+   or expose readiness that remains unhealthy until validation succeeds.
+
+5. **Medium — Per-object upload locks leak permanently.** Every distinct
+   repository/provider/OID inserts a lock that is never removed
+   (`src/server.rs:849-891`, `src/server.rs:1149-1151`). Use a race-safe keyed
+   lock manager with weak or bounded entries, and test that completed uploads do
+   not retain locks.
+
+6. **Medium — Graceful shutdown and transfer draining are absent.** The server
+   does not use `with_graceful_shutdown`, so termination can interrupt large
+   staged transfers and leave incomplete backend/metadata state
+   (`src/server.rs:117-133`). Handle SIGINT/SIGTERM, stop accepting requests,
+   and drain transfers for a documented bounded interval.
+
+7. **Medium — Metadata config synchronization retains stale routes and can block
+   legitimate renames.** Synchronization only upserts, so a removed mapping can
+   retain the unique route and make a renamed mapping fail startup
+   (`src/metadata.rs:394-417`, `src/metadata.rs:602-641`). Reconcile active and
+   persisted configuration transactionally, using an active/generation marker
+   if historical rows must remain.
+
+8. **Medium — Idempotent verification rewrites original uploader attribution.**
+   The conflict update preserves `created_at` while replacing every
+   `created_by` field (`src/metadata.rs:447-490`,
+   `src/server.rs:1163-1190`). Preserve original creator fields and use separate
+   last-verified or updated attribution where needed.
+
+9. **Medium — Newer metadata schemas are silently accepted and may be
+   modified.** Initial schema statements execute before the code validates
+   `PRAGMA user_version`, and versions above the supported version are not
+   rejected (`src/metadata.rs:333-367`). Read and validate the version before
+   mutation and add a future-version regression test.
+
+10. **Medium — Synchronous SQLite and a standard mutex block async request
+    workers.** Upload completion directly performs serialized synchronous
+    database work on Tokio workers (`src/metadata.rs:266-269`,
+    `src/metadata.rs:429-521`, `src/server.rs:750-765`). Move operations to
+    `spawn_blocking`, `tokio-rusqlite`, or a bounded connection pool.
+
+11. **Low — Size-only integrity failures incorrectly report a SHA-256
+    mismatch.** A correct OID with the wrong size receives a misleading hash
+    error (`src/server.rs:1799-1806`, `src/server.rs:3474-3503`). Report OID and
+    size generically or classify them separately, and fix the assertion.
+
+12. **Low — Transfer-attempt metadata is declared but never recorded.** The
+    schema and documentation promise transfer state, but production inserts no
+    lifecycle rows (`src/metadata.rs:109-129`, `src/server.rs:105-106`,
+    `src/server.rs:758-764`). Record sanitized start/success/failure rows or
+    remove the table and claim until implemented.
+
+13. **Low — Public server documentation and the base-route error are stale.**
+    They still claim transfer handling is for later work even though batch and
+    transfer endpoints exist (`src/server.rs:3-8`, `src/server.rs:82-87`,
+    `src/server.rs:951-954`). Update the docs and return a base-endpoint-specific
+    response.
+
+## Google Drive storage
+
+1. **High — Concurrent or retried uploads can create duplicate Drive files and
+   make an object permanently unreadable.** The upload flow has no durable
+   idempotency boundary, serialization works only within one server process, and
+   lookup treats multiple matching files as a conflict
+   (`src/google_drive.rs:840`, `src/google_drive.rs:2103`,
+   `src/google_drive.rs:3276`, `src/server.rs:856-890`,
+   `src/server.rs:1158-1229`). Enforce and document single-writer operation with
+   a durable lock for the MVP, or introduce durable claims/reservations and
+   deterministic duplicate reconciliation for multi-instance operation. Test
+   concurrent and retried uploads across independent server states.
+
+2. **High — Downloads described as streaming are fully staged before the first
+   response byte.** This increases disk use and time to first byte and conflicts
+   with the user-facing streaming description. Staging also has no size,
+   free-space, timeout, or concurrency guardrails and accepts objects above the
+   upload limit (`src/google_drive.rs:977`, `src/google_drive.rs:1003`,
+   `src/google_drive.rs:1121`, `src/server.rs:1031-1084`,
+   `src/server.rs:3374-3412`, `src/google_drive.rs:3746`,
+   `src/server.rs:3249`, `README.md:31`, `IMPLEMENTATION.md:753`). Implement a
+   bounded integrity-verified stream or a managed verified cache with weighted
+   staging admission, quotas, backend idle timeouts, and concurrency limits.
+   Add chunked large-transfer tests covering slow peers, interruption, disk
+   exhaustion, tempfile cleanup, and bounded memory; align the documentation.
+
+3. **High — Drive upload and download clients lack connect and per-read idle
+   timeouts.** Network stalls can leave token-bearing operations awaiting
+   indefinitely (`src/google_drive.rs:853`, `src/google_drive.rs:903`,
+   `src/google_drive.rs:1015`, `src/google_drive.rs:1537`,
+   `src/google_drive.rs:1558`). Configure connect timeouts and per-read idle
+   watchdogs without imposing an inappropriate total timeout on large streams.
+
+4. **Medium — Valid repository IDs can exceed Drive app-property limits.** The
+   configuration accepts IDs that, combined with the property key, exceed
+   Drive's 124-byte key-plus-value limit (`src/google_drive.rs:596`,
+   `src/google_drive.rs:1870`, `src/google_drive.rs:1907`,
+   `src/google_drive.rs:2947`). Store a fixed-size digest or validate the true
+   boundary and add maximum-length tests. See the [Drive custom-properties
+   limits](https://developers.google.com/workspace/drive/api/guides/properties).
+
+5. **Medium — Paginated Drive lookup results are mishandled as conflicts.** The
+   lookup URL omits page tokens and does not follow `nextPageToken`
+   (`src/google_drive.rs:1682`, `src/google_drive.rs:2103`). Iterate all pages
+   before deciding whether the object is missing, unique, or duplicated.
+
+6. **Medium — The resumable upload implementation does not actually resume.** A
+   failed upload starts over instead of querying or continuing the existing
+   session (`src/google_drive.rs:827`, `src/google_drive.rs:901`,
+   `src/google_drive.rs:2307`, `src/google_drive.rs:3589`). Upload in chunks,
+   probe the committed offset, retry with bounded backoff, and test interrupted
+   sessions.
+
+7. **Medium — Drive error classification omits important quota and permission
+   reasons.** Errors that should drive retry, denial, or operator remediation can
+   collapse into generic upstream failures (`src/google_drive.rs:2358`,
+   `src/google_drive.rs:3911`). Expand classification for documented Drive
+   reason codes and add representative tests.
+
+8. **Medium — Flat root-folder storage creates a scaling ceiling and expensive
+   list queries.** Every object shares one folder and lookup relies on list
+   queries (`src/google_drive.rs:784`, `src/google_drive.rs:1870`). Prefer stored
+   backend IDs with direct `files.get`, add deterministic sharding, and define a
+   repair path for stale metadata.
+
+## CLI, configuration, and Git integration
+
+1. **High — URL redaction can leak credentials in combined malformed or
+   scp-style inputs.** The redactor does not safely compose userinfo, query, and
+   scp-like sanitization (`src/git.rs:633-665`, `src/git.rs:785-813`,
+   `src/cli.rs:3250-3300`). Parse and redact all sensitive components before
+   truncation or display, and add cases combining userinfo, query, fragment, and
+   scp-like syntax.
+
+2. **Medium — GitHub owner and repository matching is case-sensitive.** Route
+   and configuration identity can diverge for names GitHub treats
+   case-insensitively (`src/server_config.rs:175-219`, `src/cli.rs:581-587`,
+   `src/cli.rs:1055-1067`, `src/git.rs:529-548`). Normalize GitHub identities for
+   comparison while preserving a display form, and add mixed-case tests.
+
+3. **Medium — `pull` can hang and buffers unbounded command output.** Child
+   process output is fully captured before truncation or timeout handling
+   (`src/cli.rs:1421-1439`, `src/cli.rs:2204-2239`). Read stdout/stderr
+   concurrently with hard caps and deterministic process-tree termination.
+
+4. **Medium — The login prompt echoes tokens and reads input without a bound.**
+   Secret input can appear on the terminal and an unbounded line can consume
+   memory (`src/cli.rs:436-450`). Disable terminal echo for secret entry, cap
+   input length, trim safely, and test both terminal and piped-input behavior.
+
+5. **Medium — URL safety rules differ between `init` and server configuration.**
+   An endpoint accepted in one path can be rejected or interpreted differently
+   in another (`src/init.rs:56-88`, `src/server_config.rs:805-827`). Centralize a
+   single URL validation policy with explicit context-specific exceptions and
+   a shared test matrix.
+
+6. **Medium — The manual hydrate/dehydrate verification script cannot exercise
+   the workflow.** Its fixture is not initialized as a Git repository, while the
+   CLI requires worktree registration (`scripts/manual/verify-local-cache-cli.sh:21-52`,
+   `src/cli.rs:728-753`). Build a real temporary Git/LFS repository and make the
+   script fail on unmet prerequisites instead of reporting misleading success.
+
+7. **Low — Browser launch during login can block the CLI.** The browser command
+   is invoked synchronously and may not return on some desktop integrations
+   (`src/cli.rs:2169-2184`). Spawn it in a detached, bounded manner and always
+   print the URL as a reliable fallback.
+
+## Local cache
+
+1. **High — Concurrent GC can delete the only preserved bytes during
+   dehydration.** Dehydration publishes the cache object before replacing the
+   worktree file, but it does not share GC's registry/operation lock, allowing GC
+   to delete the new object in between (`src/local_cache.rs:692-701`,
+   `src/local_cache.rs:852-881`). Coordinate GC and mutations through
+   shared/exclusive operation locks or per-object pins held through pointer
+   publication, and add a barrier-based race test.
+
+2. **High — CLI cleanliness verification is tautological, accepts unrelated
+   files, and preserves bytes only in the private cache.** The current bytes
+   define the expected identity, so dirty edits, untracked files, outside paths,
+   and non-LFS files all pass. A later `git lfs push` can then report the object
+   missing, and losing the private cache loses the only preserved bytes
+   (`src/cli.rs:665-690`, `src/cli.rs:743-760`, `src/cli.rs:1401-1406`,
+   `src/cli.rs:1681-1772`, `src/cli.rs:4216-4267`,
+   `IMPLEMENTATION.md:1161-1163`, `IMPLEMENTATION.md:1420`). Require a contained,
+   Git-tracked `filter=lfs` path and derive expected identity from the index
+   pointer. If intentional new-content ingestion is supported, make it an
+   explicit mode that publishes into Git LFS media or upload state. Add a
+   dehydrate-to-real-`git lfs push` test.
+
+3. **Medium — Hydration and dehydration can overwrite a concurrent edit after
+   their final check.** Each checks a path and then performs an unconditional
+   replacing rename (`src/local_cache.rs:1457-1466`,
+   `src/local_cache.rs:1723-1742`). Add per-path coordination and use conditional
+   or exchange rename semantics where supported, retaining displaced data until
+   its identity is verified. Add synchronized race tests.
+
+4. **Medium — Temporarily unavailable worktrees are immediately pruned and
+   their cache objects deleted.** `NotFound` is treated as permanent removal, so
+   a disconnected volume or transient rename can cause data loss in the same GC
+   run (`src/local_cache.rs:869-885`, `src/local_cache.rs:1025-1051`). Mark roots
+   stale with a grace period or require explicit pruning; conservatively skip
+   destructive collection when roots are unavailable.
+
+5. **Medium — GC scans the raw filesystem instead of Git LFS tracked paths.** It
+   recursively reads small files in ignored, generated, vendor, or dependency
+   trees, and untracked pointer-shaped text can pin objects indefinitely
+   (`src/local_cache.rs:1054-1155`). Enumerate NUL-safe tracked paths and evaluate
+   `filter=lfs`; track any intentionally local-only dehydrated references
+   explicitly.
+
+6. **Medium — Worktree symlinks are followed and then replaced.** Dehydration
+   can hash an outside-repository symlink target and replace the symlink with a
+   pointer; hydration can similarly replace a symlink whose target is a pointer
+   (`src/local_cache.rs:1336-1423`, `src/local_cache.rs:1556-1587`,
+   `src/cli.rs:1681-1697`). Use `symlink_metadata`, no-follow opens where
+   supported, canonical parent containment, and explicit symlink rejection.
+
+7. **Medium — Dehydration performs three to four full reads of large files.**
+   CLI hashing, library verification, cache copying, and the final race check
+   each traverse the data (`src/cli.rs:1700-1772`,
+   `src/local_cache.rs:671-701`, `src/local_cache.rs:1461`,
+   `src/local_cache.rs:2032-2050`). Derive identity during a single staged copy,
+   validate source metadata around it, and minimize final checks under the
+   operation lock. Add read-count instrumentation or benchmarks.
+
+8. **Medium — New materialized files bypass a restrictive process umask.** The
+   implementation explicitly sets mode `0644`, potentially exposing private
+   repository content to other local users (`src/local_cache.rs:30`,
+   `src/local_cache.rs:1695-1701`, `src/local_cache.rs:2470-2489`). Respect the
+   process umask or default to `0600`, then apply only appropriate Git-index mode
+   bits. Test in a subprocess with umask `077`.
+
+9. **Low — The worktree registry cannot represent valid non-UTF-8 Unix roots.**
+   Direct JSON serialization of `PathBuf` rejects such paths
+   (`src/local_cache.rs:232-244`, `src/local_cache.rs:978-1008`). Introduce a
+   versioned platform-safe encoding, or explicitly reject and document the
+   limitation with a targeted error and Unix-only test.
+
+## Migration
+
+1. **High — Current-checkout discovery misses hydrated and sparse LFS files.** It
+   reads worktree files and only recognizes pointer placeholders, so hydrated
+   content and paths absent from a sparse checkout are skipped
+   (`src/migration.rs:394-418`, `src/cli.rs:918-925`,
+   `tests/migration_fixture_repos.rs:23-50`). Read pointer blobs from the Git
+   index for the current checkout and add hydrated/sparse fixtures.
+
+2. **High — A migration dry run can lazy-fetch missing partial-clone objects.**
+   `git cat-file` helpers inherit the environment, so supposedly read-only
+   discovery can trigger network transfer (`src/migration.rs:2217-2267`,
+   `src/migration.rs:2414-2452`). Set `GIT_NO_LAZY_FETCH=1`, detect promisor
+   objects, and report unavailable data explicitly.
+
+3. **High — Source and target repository identities can silently diverge.** The
+   target comes from `origin`, current-checkout source selection can follow the
+   current branch remote, and all-ref scans include every remote
+   (`src/cli.rs:805-824`, `src/migration.rs:1323-1405`,
+   `src/migration.rs:1921-1953`). Define an explicit source-remote contract,
+   display it in the plan, and require confirmation or a flag for cross-remote
+   migration.
+
+4. **High — Shallow clones are treated as complete migration inventories.** The
+   history scan does not reject or prominently qualify truncated history
+   (`src/migration.rs:1956-2055`). Detect shallow repositories and block complete
+   modes or require an explicit incomplete-history override with warnings and
+   tests.
+
+5. **High — Purge-manifest candidates are labeled complete without a verified
+   migration receipt.** The CLI can present a destructive follow-up inventory
+   based on planning rather than confirmed upload state (`src/cli.rs:1250-1305`,
+   `src/cli.rs:3510-3566`, `README.md:247-249`). Generate purge input only from a
+   durable, integrity-verified completion receipt and distinguish planned from
+   uploaded objects.
+
+6. **High — Migration access checks can report success without checking
+   repository or storage access.** Target readiness is TCP-only and storage
+   readiness can stop at credential parsing (`src/cli.rs:1009-1053`,
+   `src/cli.rs:1097-1112`, `IMPLEMENTATION.md:498-501`). Rename these checks to
+   their actual scope or add real read-only GitHub permission, server readiness,
+   and Drive root probes.
+
+7. **Medium — Dry-run upload counts ignore objects already present at the
+   destination.** Planning reports every available source object as an upload,
+   although execution skips existing targets (`src/cli.rs:1162-1232`,
+   `src/migration.rs:646-650`). Perform bounded target existence checks and
+   report new, existing, missing, and unknown counts separately.
+
+8. **High — History discovery is O(commits × full tree) and launches many Git
+   subprocesses.** Large repositories can make all-ref migration impractical
+   (`src/migration.rs:1956-2267`). Batch object and attribute queries, stream
+   results, cache across commits, and add representative scale benchmarks.
+
+9. **High — Git command output limits are applied only after unbounded
+   allocation.** Helpers use `Command::output` and truncate after capture,
+   including tree enumeration (`src/migration.rs:2058-2082`,
+   `src/migration.rs:2414-2509`). Pipe and drain stdout/stderr concurrently with
+   hard byte caps, aborting and cleaning up the process tree on overflow.
+
+10. **Medium — Default checkout migration gives no warning about objects on
+    other refs.** The report can appear complete even though only the current
+    checkout is inventoried (`src/cli.rs:898-926`, `src/cli.rs:1155-1247`,
+    `IMPLEMENTATION.md:542`). State the scope prominently and report that other
+    refs were not scanned.
+
+11. **Medium — Migration silently requires Git 2.40 or newer.** Historical
+    attribute discovery uses `git check-attr --source`, but installation docs do
+    not declare or preflight the version (`src/migration.rs:1633-1651`,
+    `README.md:9-13`). Add a version check, document the minimum, and return an
+    actionable compatibility error.
+
+12. **Medium — Source fetch scope can expand through
+    `lfs.fetchrecentalways=true`.** Migration fetch commands do not override the
+    setting, allowing unexpected extra downloads (`src/migration.rs:821-860`).
+    Set the relevant Git LFS recent-fetch options explicitly and test hostile
+    repository configuration.
+
+13. **Medium — Required dry-run report fields are missing.** Reports omit
+    tracked LFS patterns, Git LFS/filter readiness, quota or missing-object
+    warnings, and byte totals (`src/cli.rs:1155-1247`). Add the fields defined by
+    the implementation plan and make unknown values explicit.
+
+14. **Medium — The manual migration-upload script exercises only fake stores.**
+    It does not validate the live Drive upload path
+    (`scripts/manual/verify-migration-upload.sh:9-16`). Add a gated disposable
+    Drive scenario or rename and document the script as simulated verification.
+
+15. **Medium — Large migration uploads are serialized and lose accumulated
+    progress on failure.** One failed object aborts the run without a durable
+    per-object result ledger (`src/migration.rs:639-665`). Add bounded
+    concurrency, checkpoint completed objects, and return structured outcomes
+    for retry.
+
+16. **Low — Availability and upload paths repeatedly rehash the same object.**
+    Both Git LFS media and shared-cache candidates can be hashed, followed by
+    another upload verification pass (`src/migration.rs:558-573`,
+    `src/migration.rs:653-656`). Short-circuit after a verified source and carry
+    trusted verification metadata through the upload pipeline.
+
+## Git LFS protocol and provider abstractions
+
+1. **Medium — Batch parsing ignores `hash_algo` and accepts prefixed OIDs.** The
+   protocol parser can accept identities outside the intended Git LFS SHA-256
+   shape (`src/lfs.rs:128-146`, `src/lfs.rs:200-207`,
+   `src/lfs.rs:507-520`, `src/lfs.rs:568-573`). Require the supported hash
+   algorithm, accept only the canonical 64-hex OID representation, and add
+   compatibility tests against the [Git LFS batch
+   API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md).
+
+2. **Medium — The empty canonical Git LFS pointer representation is wrong.** The
+   pointer parser/rendering path does not match the specification's canonical
+   empty representation (`src/lfs.rs:325-328`, `src/lfs.rs:401-413`,
+   `src/local_cache.rs:1426-1444`). Correct parsing/rendering and add fixture
+   round trips from the upstream pointer specification.
+
+3. **Medium — Pointer detection uses a 64 KiB cutoff instead of Git LFS's 1,024
+   byte limit.** Multiple call sites will treat larger pointer-shaped files as
+   valid pointers (`src/lfs.rs:325-399`, `src/cli.rs:48`,
+   `src/local_cache.rs:35`, `src/migration.rs:34-40`). Centralize the canonical
+   limit and test the 1,024/1,025-byte boundary.
+
+4. **Medium — Pointer parsing accepts non-canonical uppercase and whitespace.**
+   Lenient OID/version parsing can diverge from Git LFS clients
+   (`src/lfs.rs:128-162`, `src/lfs.rs:200-207`, `src/lfs.rs:416-423`,
+   `src/lfs.rs:456-473`, `src/lfs.rs:980-990`, `src/lfs.rs:1065-1085`). Enforce
+   canonical lowercase and line syntax, or explicitly separate tolerant input
+   from canonical output with interoperability tests.
+
+5. **Medium — Duplicate extension priorities are accepted.** Multiple
+   extensions can claim the same order, making interpretation ambiguous
+   (`src/lfs.rs:294-305`, `src/lfs.rs:344-382`). Reject duplicate priorities and
+   add upstream-compatible pointer fixtures.
+
+6. **Low — Historical Git LFS version aliases are rejected without an explicit
+   compatibility decision.** The version parser accepts only the current URL
+   (`src/lfs.rs:335-342`). Verify intended client compatibility, then either
+   support documented historical aliases or document and test the rejection.
+
+7. **High — Storage-provider abstractions and test fakes do not consistently
+   enforce repository namespace.** The generic trait addresses objects only by
+   OID/size, while integration and server fakes key objects only by LFS identity
+   or ignore the repository argument, masking cross-repository isolation
+   failures (`src/providers.rs:137-216`, `src/lib.rs:89-90`,
+   `src/server.rs:198-231`, `src/server.rs:490-550`, `src/server.rs:2600`,
+   `tests/support/mod.rs:364`). Include repository/storage namespace in the
+   contract before adding providers or migration callers. Add two-repository
+   contract tests sharing a provider and OID, proving upload and authorization
+   for one repository do not expose the other.
+
+8. **Medium — The repository-provider trait lacks authentication context and is
+   bypassed by production authorization.** Its shape cannot express the
+   per-session credential checks the server needs (`src/providers.rs:117-135`,
+   `src/server.rs:770-847`). Redesign the abstraction around explicit actor/token
+   context or remove the misleading unused boundary.
+
+9. **Medium — Upload batch lookups are sequential while downloads are bounded
+   concurrent.** Large upload batches incur avoidable provider latency
+   (`src/server.rs:1656-1677`, `src/server.rs:1687-1707`). Use the same bounded
+   concurrency and stable result ordering for both operations.
+
+10. **Low — Provider tests are tautological and fake an inaccurate permission
+    hierarchy.** Tests mostly restate mock behavior rather than enforce a
+    production contract (`src/providers.rs:234-364`,
+    `src/providers.rs:373-485`, `tests/support/mod.rs:29-230`). Replace them with
+    contract tests shared by real and fake providers, including denial and
+    repository-isolation cases.
+
+## Test suite
+
+1. **High — No test exercises Git LFS through the real HTTP boundary.** The
+   nominal end-to-end test explicitly excludes Git LFS, uses `Router::oneshot`,
+   and manually sends Bearer authentication; Basic authentication is tested only
+   through a helper (`tests/local_end_to_end.rs:1`,
+   `tests/local_end_to_end.rs:87`, `tests/local_end_to_end.rs:271-297`,
+   `src/server.rs:2860`). Bind an ephemeral TCP listener, configure a temporary
+   credential helper, and run real `git lfs push/fetch/checkout` commands.
+
+2. **High — Tests bypass the production server composition path.** The tested
+   router omits production configuration loading, SQLite synchronization, OAuth
+   routes, Drive store construction, listener binding, and shutdown
+   (`src/server.rs:93`, `src/server.rs:198`, `tests/local_end_to_end.rs:79`).
+   Refactor assembly into an injectable server builder and exercise the complete
+   production composition.
+
+3. **High — Live-provider tests stop before object transfer.** GitHub coverage
+   checks identity and permission, while Drive coverage checks only root-folder
+   validation (`tests/external_integrations.rs:29`,
+   `tests/external_integrations.rs:98`). Add a disposable live scenario covering
+   server upload, Drive properties, SQLite metadata, action download, integrity,
+   and cleanup.
+
+4. **Medium — Redaction tests do not inspect emitted tracing events.** Server
+   failure paths interpolate errors into tracing fields, but tests inspect only
+   values and error strings (`src/server.rs:902`, `src/server.rs:976`). Capture
+   tracing output and assert sentinel OAuth, credential, Drive, URL, and helper
+   secrets never appear.
+
+5. **Medium — Missing prerequisites are reported as successful tests.** Many CLI
+   tests silently return without Git, and explicitly selected gated tests can
+   also return without their enable flag or Git LFS
+   (`src/cli.rs:3026`, `tests/external_integrations.rs:27`,
+   `src/migration.rs:4016`). Make CI prerequisites fail clearly; keep external
+   tests ignored by default but fail an explicitly requested run that lacks its
+   required tool or flag.
+
+6. **Medium — macOS copy-on-write tests accept ordinary copying.** The assertions
+   allow either result even on environments intended to protect the CoW feature
+   (`src/local_cache.rs:2440`, `src/cli.rs:4173`). Assert CoW on supported APFS
+   fixtures and test fallback copying separately on unsupported filesystems.
+
+7. **Medium — Platform-specific process handling is not tested across supported
+   operating systems.** Windows timeout cleanup uses `taskkill`, while relevant
+   helper and timeout tests are Unix-only (`src/credentials.rs:970`,
+   `src/migration.rs:1019`, `src/credentials.rs:1313`). Run CI on Linux, macOS,
+   and Windows with platform-native fake helpers and process-tree cases.
+
+8. **Low — A project-shape test enforces a redundant dependency roster.** It
+   requires every originally planned dependency even if unused
+   (`tests/project_shape.rs:96`). Replace it with actionable policy checks such
+   as forbidden TLS backends, unwanted default features, advisory scanning, and
+   unused dependency detection.
+
+9. **Low — Hostile-input parsers lack generative robustness coverage.** Batch
+   rejection and other parsers rely on finite example tables
+   (`src/lfs.rs:1434`). Add fuzz/property targets for panics, bounded work,
+   oversized/deep inputs, parse/render round trips, and redaction invariants.
+
+10. **Low — Test-only unsafe environment mutation has an invalid safety
+    rationale.** The logging tests mutate process-global environment state under
+    assumptions that are not enforced across the entire test process
+    (`src/logging.rs:212`, `src/logging.rs:222`, `src/logging.rs:237`). Move
+    environment-sensitive cases to subprocess tests or globally serialize them
+    with an enforceable mechanism.
+
+## Release readiness
+
+1. **High — The repository's licensing state blocks public release.** Both Rust
+   and JavaScript package metadata declare the project unlicensed/private
+   (`Cargo.toml:6`, `package.json:6-7`). Choose and add a license, update package
+   metadata, and confirm third-party license compatibility before publication.
+
+2. **Medium — CI lacks an explicit dependency-advisory gate.** The repository
+   does not enforce ongoing vulnerability review, and `cargo audit` is not
+   available in the documented workflow (`README.md:67`). Add a pinned
+   `cargo-audit` or equivalent supply-chain job, define update ownership, and
+   fail on applicable advisories. Track relevant RustSec advisories, including
+   [RUSTSEC-2026-0048](https://rustsec.org/advisories/RUSTSEC-2026-0048.html),
+   [RUSTSEC-2026-0049](https://rustsec.org/advisories/RUSTSEC-2026-0049.html),
+   and
+   [RUSTSEC-2025-0047](https://rustsec.org/advisories/RUSTSEC-2025-0047.html).
