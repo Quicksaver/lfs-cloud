@@ -125,6 +125,20 @@ The configured `root_folder_id` must be a folder that the app credential can
 access and create children in. Git users never receive Drive tokens or direct
 Drive access.
 
+## Durable LFS Sessions
+
+Production `serve` processes persist unexpired local LFS sessions in the
+configured metadata database so Git credentials continue to work across server
+restarts. The database contains only the local token's SHA-256 digest. The
+private GitHub OAuth token and the session identity, scopes, and timestamps are
+authenticated together with AES-256-GCM before persistence.
+
+The dedicated encryption key is derived from the configured GitHub
+`oauth_client_secret`; the secret itself is never stored in SQLite. Keep that
+secret stable while sessions are active. Rotating it intentionally makes
+existing rows unreadable, so allow current sessions to expire or intentionally
+remove them before changing it.
+
 ## Metadata Path
 
 If `server.metadata_path` is omitted, the server stores SQLite metadata at:

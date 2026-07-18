@@ -935,6 +935,7 @@ dependencies = [
  "futures-util",
  "oauth2",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

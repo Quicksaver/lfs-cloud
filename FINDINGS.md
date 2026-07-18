@@ -93,15 +93,34 @@ independently validated or adjudicated.
    invalid finding attributable separately, this was high-quality,
    security-relevant feedback.
 
-5. **High — Server restarts invalidate every issued LFS credential despite the
-   SQLite session contract.** Production always creates a fresh in-memory
-   session store, while the metadata `sessions` table is unused and cannot
-   restore the private GitHub token needed for authorization
-   (`src/server.rs:105-116`, `src/sessions.rs:201-208`,
-   `src/metadata.rs:96-107`, `README.md:306-309`). Implement durable sessions
-   with token hashes, expiry and identity data, and protected upstream-token
-   state, or explicitly define restart revocation and remove the contradictory
-   schema and documentation. Add restart/reopen coverage.
+5. **[DONE] Server restarts invalidate every issued LFS credential despite the
+   SQLite session contract** (High, `src/server.rs`, `src/sessions.rs`,
+   `src/metadata.rs`, and session documentation): **Valid and actionable.**
+   Production previously created a fresh in-memory session store even after it
+   opened the metadata database, so every restart invalidated the local token
+   already stored by Git and discarded the private GitHub token required for
+   authorization. Production now opens a durable session store on the shared
+   metadata database, persists only the local token's SHA-256 digest, restores
+   unexpired identity/scope/expiry data, and protects the GitHub token with
+   AES-256-GCM using a dedicated key derived from the configured GitHub OAuth
+   client secret. Identity, scopes, and timestamps are authenticated as AEAD
+   associated data, so tampering or a different secret fails restoration
+   without exposing either token. Metadata schema version 3 adds the protected
+   token fields and durable load/record/delete/prune operations; in-memory
+   stores remain available only for isolated tests and injected routers.
+   Restart/reopen coverage exercises both the store and production composition,
+   proves neither token appears as plaintext in SQLite, rejects the wrong key,
+   and rejects tampered identity metadata. README, configuration,
+   implementation, dependency, and repository-learning documentation now state
+   the persistence and key-stability contract. Verification passed with
+   `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, `cargo test --all-targets`, `cargo test --doc`,
+   `yarn lint:fix`, and `git diff --check`. The focused reviewer found a genuine
+   high-severity availability and contract flaw, identified the unused schema
+   and missing private-token persistence precisely, and requested the decisive
+   restart/reopen regression; with one valid finding assessed here and no
+   invalid finding attributable separately, this was high-quality,
+   security-relevant feedback.
 
 6. **Medium — OAuth callback responses containing credentials are cacheable.**
    Successful GET responses return `lfs_token` without defensive cache or

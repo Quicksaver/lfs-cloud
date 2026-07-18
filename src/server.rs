@@ -108,7 +108,7 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
     config.server.host = bind.host.clone();
     config.server.port = bind.port;
 
-    let session_store = LocalLfsSessionStore::new();
+    let session_store = production_session_store(&config, metadata_database.clone())?;
     let transfer_store = Arc::new(GoogleDriveTransferStore::new(
         config.clone(),
         metadata_database.clone(),
@@ -132,6 +132,30 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
     axum::serve(listener, router)
         .await
         .map_err(|source| ServerError::Serve { source })
+}
+
+fn production_session_store(
+    config: &ServerConfig,
+    metadata_database: Arc<MetadataDatabase>,
+) -> ServerResult<LocalLfsSessionStore> {
+    let github_providers = config
+        .repository_providers
+        .values()
+        .map(|provider| match provider {
+            RepositoryProviderConfig::GitHub(provider) => provider,
+        })
+        .collect::<Vec<_>>();
+
+    match github_providers.as_slice() {
+        [] => Ok(LocalLfsSessionStore::new()),
+        [provider] => LocalLfsSessionStore::open_durable(
+            metadata_database,
+            provider.oauth_client_secret.as_bytes(),
+        ),
+        _ => Err(ServerError::InvalidConfiguration {
+            message: "multiple GitHub repository providers are not yet supported by durable session storage".to_owned(),
+        }),
+    }
 }
 
 /// Builds the Axum router for configured Git LFS paths.
@@ -2334,7 +2358,7 @@ mod tests {
         MAX_UPLOAD_OBJECT_BYTES, ServerBind, UploadStagingGuardrails, advertised_server_urls,
         authenticate_lfs_session, ensure_temp_space_for_upload_with_available_space,
         lfs_server_router_with_sessions,
-        lfs_server_router_with_sessions_authorizer_and_transfer_store,
+        lfs_server_router_with_sessions_authorizer_and_transfer_store, production_session_store,
         render_server_startup_message, server_router_with_sessions, stage_upload_request_body,
         stage_upload_request_body_with_guardrails, stage_upload_request_body_with_limit,
         upload_staging_file_io_error, upload_staging_preflight_size,
@@ -2345,9 +2369,9 @@ mod tests {
 
     use crate::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, LfsBatchOperation,
-        LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LocalLfsSessionStore, ProviderFuture,
-        RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
-        ServerConfig, ServerError, ServerResult, StorageError, StoredObject,
+        LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LocalLfsSessionStore, MetadataDatabase,
+        ProviderFuture, RepositoryMapping, RepositoryPermission, RepositoryProviderError,
+        RepositoryUser, ServerConfig, ServerError, ServerResult, StorageError, StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -2964,6 +2988,46 @@ repositories:
                 .expect_err("expired token should be denied");
             assert!(matches!(error, ServerError::Unauthorized { .. }));
         }
+    }
+
+    #[test]
+    fn production_session_store_restores_credentials_after_database_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let database_path = directory.path().join("metadata.sqlite3");
+        let config = test_config();
+        let issued = {
+            let database =
+                Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should open"));
+            let store = production_session_store(&config, database)
+                .expect("production session store should open");
+            let github_token = GitHubOAuthAccessToken::from_secret("gho_production_restart")
+                .expect("GitHub token should parse");
+
+            store
+                .issue_session_with_github_token(
+                    &RepositoryUser::new("github-main", "octocat", Some("42".to_owned())),
+                    ["repo"],
+                    github_token,
+                )
+                .expect("session should be issued")
+        };
+
+        let reopened_database =
+            Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should reopen"));
+        let reopened = production_session_store(&config, reopened_database)
+            .expect("production session store should reopen");
+        let restored = reopened
+            .verify_record(&issued.token)
+            .expect("production credential should survive restart");
+
+        assert_eq!(restored.metadata().stable_id.as_deref(), Some("42"));
+        assert_eq!(
+            restored
+                .github_access_token()
+                .expect("GitHub token should be restored")
+                .as_str(),
+            "gho_production_restart"
+        );
     }
 
     #[tokio::test]

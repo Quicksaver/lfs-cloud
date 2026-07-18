@@ -445,6 +445,13 @@ The local session retains that ID, and repository permission checks compare it
 with the collaborator response's nested user ID before granting access. The
 mutable login remains useful for the API path but is not sufficient identity.
 
+Production sessions persist in SQLite until their short-lived expiry so a
+server restart does not invalidate credentials already stored by Git. Persist
+only a SHA-256 digest of the local bearer token. Authenticated-encrypt the
+private GitHub token together with the session identity, scopes, and timestamps
+using a dedicated key derived from the configured GitHub OAuth client secret;
+never store either token in plaintext.
+
 Avoid asking users to paste personal access tokens into the LFS server if possible. That can work for a quick prototype, but it means `lfs-cloud` receives and handles powerful user repository-host credentials.
 
 Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service can use one Google account's OAuth refresh token to access the backing Drive folder. For a multi-tenant or shared instance, each configured storage provider should have its own credential reference and policy boundary.
@@ -869,6 +876,7 @@ areas:
 | Serialization/config        | `serde`, `config`               | Typed `lfs-cloud.yml` loading                 |
 | SQLite metadata             | `rusqlite`                      | Local MVP object/session metadata             |
 | OAuth and provider HTTP     | `oauth2`, `reqwest`             | OAuth request construction and HTTP calls     |
+| Session encryption          | `ring`                          | Protect durable upstream-token state at rest  |
 | Temporary files             | `tempfile`                      | Upload staging before hash/size verification  |
 | Manifest architecture tests | `toml`                          | Parse `Cargo.toml` in project-shape tests     |
 

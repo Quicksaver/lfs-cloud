@@ -182,6 +182,11 @@ credential helper for the repository-scoped LFS URL. It does not store the
 GitHub OAuth access token in Git credentials. The server binds the local
 session to GitHub's immutable numeric user ID and rejects repository permission
 responses for a different account, even if the mutable login was reused.
+Unexpired local sessions survive server restarts through the configured SQLite
+metadata database. SQLite stores only a SHA-256 digest of the local bearer
+token; the private GitHub token and authenticated session metadata are
+protected with authenticated encryption derived from the configured GitHub
+OAuth client secret.
 Before storing the token, login enables Git credential path matching in the
 repository's local config so another repository on the same LFS host cannot
 reuse it through host-only credential matching.
@@ -327,6 +332,11 @@ while still letting validation report the exact missing key.
 SQLite metadata database to `.lfs-cloud/metadata.sqlite3` beside the config
 file, keeping routing, object, session, and transfer-attempt state in
 server-owned local storage.
+
+Keep `oauth_client_secret` stable while issued sessions remain active. LFS
+Cloud uses it as the root secret for a dedicated durable-session encryption
+key; changing it makes existing protected sessions unreadable, so rotate it
+only after those sessions expire or are intentionally removed.
 
 For the current server-side Google Drive credential loader, a bare
 `credentials_ref` such as `google-drive-user-a` maps to an environment variable
