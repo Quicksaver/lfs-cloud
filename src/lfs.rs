@@ -1106,6 +1106,8 @@ impl LfsBatchObjectError {
 mod tests {
     use std::str::FromStr;
 
+    use proptest::prelude::*;
+
     use super::{
         LFS_POINTER_VERSION, LfsBatchDownloadObject, LfsBatchHashAlgorithm, LfsBatchObjectError,
         LfsBatchObjectResponse, LfsBatchOperation, LfsBatchResponse, LfsBatchUploadObject,
@@ -1113,6 +1115,80 @@ mod tests {
     };
 
     const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    proptest! {
+        #[test]
+        fn arbitrary_pointer_text_never_panics(contents in ".{0,2048}") {
+            let _ = LfsPointer::parse(&contents);
+        }
+
+        #[test]
+        fn canonical_pointers_survive_parse_render_round_trips(
+            oid in "[0-9a-f]{64}",
+            size in 1_u64..=u64::MAX,
+        ) {
+            let contents = format!(
+                "version {LFS_POINTER_VERSION}\noid sha256:{oid}\nsize {size}\n"
+            );
+
+            let parsed = LfsPointer::parse(&contents).expect("generated pointer should parse");
+            let rendered = parsed.to_pointer_file();
+            let reparsed = LfsPointer::parse(&rendered)
+                .expect("rendered generated pointer should parse");
+
+            prop_assert_eq!(parsed, reparsed);
+            prop_assert_eq!(rendered, contents);
+        }
+
+        #[test]
+        fn arbitrary_batch_bytes_never_panic(body in prop::collection::vec(any::<u8>(), 0..16_384)) {
+            let _ = parse_lfs_batch_request_json(body);
+        }
+
+        #[test]
+        fn canonical_batch_requests_survive_json_round_trips(
+            upload in any::<bool>(),
+            oid in "[0-9a-f]{64}",
+            size in any::<u64>(),
+        ) {
+            let operation = if upload { "upload" } else { "download" };
+            let body = format!(
+                r#"{{"operation":"{operation}","hash_algo":"sha256","objects":[{{"oid":"{oid}","size":{size}}}]}}"#
+            );
+
+            let parsed = parse_lfs_batch_request_json(body.as_bytes())
+                .expect("generated batch request should parse");
+            let rendered = serde_json::to_vec(&parsed)
+                .expect("generated batch request should serialize");
+            let reparsed = parse_lfs_batch_request_json(rendered)
+                .expect("serialized generated batch request should parse");
+
+            prop_assert_eq!(parsed, reparsed);
+        }
+
+        #[test]
+        fn deeply_nested_unknown_batch_fields_never_panic(depth in 128_usize..512) {
+            let body = format!(
+                "{{\"operation\":\"download\",\"objects\":[],\"unknown\":{}0{}}}",
+                "[".repeat(depth),
+                "]".repeat(depth),
+            );
+
+            let _ = parse_lfs_batch_request_json(body);
+        }
+
+        #[test]
+        fn oversized_pointer_inputs_are_rejected_before_line_parsing(
+            contents in ".{1024,4096}",
+        ) {
+            let rejected = matches!(
+                LfsPointer::parse(&contents),
+                Err(LfsObjectError::PointerTooLarge { .. })
+            );
+
+            prop_assert!(rejected);
+        }
+    }
 
     #[test]
     fn oid_accepts_raw_or_prefixed_sha256_and_normalizes_case() {

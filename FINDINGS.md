@@ -2461,10 +2461,32 @@ independently validated or adjudicated.
    invalid finding attributable separately, this was high-quality, directly
    actionable feedback.
 
-9. **Low — Hostile-input parsers lack generative robustness coverage.** Batch
-   rejection and other parsers rely on finite example tables
-   (`src/lfs.rs:1434`). Add fuzz/property targets for panics, bounded work,
-   oversized/deep inputs, parse/render round trips, and redaction invariants.
+9. **[DONE] Hostile-input parsers lacked generative robustness coverage** (Low,
+   `src/lfs.rs`, `src/git.rs`, `Cargo.toml`, and `Cargo.lock`): **Valid and
+   actionable.** The existing example tables covered many protocol edge cases,
+   but they exercised only fixed inputs and did not continuously generate new
+   combinations around the public Git LFS parsing and diagnostic-redaction
+   boundaries. The test suite now uses `proptest` to feed arbitrary bytes to
+   batch JSON parsing, arbitrary text to pointer parsing, 1,024-4,095 byte
+   pointer inputs to the early size cutoff, and 128-511 levels of nested JSON
+   in an ignored batch field. Valid generated pointer and batch requests must
+   also survive parse/render/parse round trips. Separate URL and scp-like
+   generators prove that password, query, and fragment secrets never survive
+   display redaction, while arbitrary display input remains panic-free. Deep
+   unknown JSON is intentionally allowed by the typed batch schema, so its
+   property asserts bounded-input panic freedom rather than incorrectly
+   requiring rejection; endpoint body-size and read-deadline tests remain the
+   request-level resource boundary. Verification passed with focused LFS and
+   redaction property tests, `cargo fmt --all --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (632 unit tests passed with
+   five helper/manual tests ignored; all integration targets passed with the
+   expected three credential-gated tests ignored), `cargo test --doc` (39
+   passed), `yarn lint:fix`, `yarn lint:check`, and `git diff --check`. The
+   reviewer identified a genuine low-severity robustness gap and gave a
+   precise, proportionate list of invariants that mapped cleanly to persistent
+   property tests. With one valid finding and no invalid finding attributable
+   separately, this was high-quality, directly actionable feedback.
 
 10. **Low — Test-only unsafe environment mutation has an invalid safety
     rationale.** The logging tests mutate process-global environment state under

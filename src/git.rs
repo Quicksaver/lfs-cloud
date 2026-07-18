@@ -699,10 +699,54 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::{fs, path::Path, process::Command};
 
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     use super::{GitLfsConfigTarget, GitRemote, GitRepository, redacted_url_for_display};
     use crate::CliError;
+
+    proptest! {
+        #[test]
+        fn display_redaction_never_panics_for_arbitrary_text(value in ".{0,2048}") {
+            let _ = redacted_url_for_display(&value);
+        }
+
+        #[test]
+        fn display_redaction_never_retains_generated_url_secrets(
+            password in "secret-[A-Za-z0-9]{1,32}",
+            query in "query-[A-Za-z0-9]{1,32}",
+            fragment in "fragment-[A-Za-z0-9]{1,32}",
+        ) {
+            let value = format!(
+                "https://user:{password}@example.invalid/owner/repo.git?token={query}#{fragment}"
+            );
+
+            let rendered = redacted_url_for_display(&value);
+
+            prop_assert!(!rendered.contains(&password));
+            prop_assert!(!rendered.contains(&query));
+            prop_assert!(!rendered.contains(&fragment));
+            prop_assert!(rendered.contains("REDACTED"));
+        }
+
+        #[test]
+        fn display_redaction_never_retains_generated_scp_secrets(
+            userinfo in "secret-[A-Za-z0-9]{1,32}",
+            query in "query-[A-Za-z0-9]{1,32}",
+            fragment in "fragment-[A-Za-z0-9]{1,32}",
+        ) {
+            let value = format!(
+                "{userinfo}@example.invalid:owner/repo.git?token={query}#{fragment}"
+            );
+
+            let rendered = redacted_url_for_display(&value);
+
+            prop_assert!(!rendered.contains(&userinfo));
+            prop_assert!(!rendered.contains(&query));
+            prop_assert!(!rendered.contains(&fragment));
+            prop_assert!(rendered.contains("REDACTED"));
+        }
+    }
 
     #[test]
     fn parses_https_github_remote() {

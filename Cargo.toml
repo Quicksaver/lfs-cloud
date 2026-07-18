@@ -34,5 +34,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5.8"
 
 [dev-dependencies]
+proptest = "1.11.0"
 toml = "1.1.2"
 tower = { version = "0.5.2", features = ["util"] }
