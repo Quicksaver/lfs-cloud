@@ -12,7 +12,7 @@ use std::{
     io::{self, ErrorKind},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -1081,6 +1081,7 @@ struct LfsServerState {
     authorization_cache: Arc<std::sync::Mutex<HashMap<AuthorizationCacheKey, Instant>>>,
     authorization_locks: Arc<std::sync::Mutex<HashMap<AuthorizationCacheKey, Arc<AsyncMutex<()>>>>>,
     upload_locks: Arc<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    upload_staging: UploadStagingCoordinator,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -1100,6 +1101,10 @@ impl LfsServerState {
     ) -> Self {
         let max_batch_objects = config.server.max_batch_objects;
         let max_provider_calls = config.server.max_provider_calls;
+        let upload_staging = UploadStagingCoordinator::new(
+            config.server.max_concurrent_uploads,
+            config.server.max_concurrent_uploads_per_user,
+        );
         Self {
             routes: LfsRouteResolver::new(&config),
             session_store,
@@ -1112,6 +1117,7 @@ impl LfsServerState {
             authorization_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             authorization_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            upload_staging,
         }
     }
 
@@ -1302,6 +1308,14 @@ impl AuthenticatedLfsSession {
 
     fn metadata(&self) -> &crate::LfsSessionMetadata {
         self.record.metadata()
+    }
+
+    fn upload_staging_principal(&self) -> String {
+        let metadata = self.metadata();
+        match metadata.stable_id.as_deref() {
+            Some(stable_id) => format!("{}:id:{stable_id}", metadata.provider_id),
+            None => format!("{}:login:{}", metadata.provider_id, metadata.login),
+        }
     }
 }
 
@@ -1683,7 +1697,35 @@ async fn handle_lfs_upload_request(
         }
     }
 
-    let staged_upload = match stage_upload_request_body(&oid, Some(expected_size), request).await {
+    let staging_lease = match state
+        .upload_staging
+        .try_acquire(&session.upload_staging_principal())
+    {
+        Ok(lease) => lease,
+        Err(UploadStagingError::ConcurrencyLimit) => {
+            return upload_staging_overloaded_response();
+        }
+        Err(error) => {
+            let error = error.into_storage_error();
+            tracing::debug!(
+                repo_id = repository.id.as_str(),
+                oid = oid.as_hex(),
+                %error,
+                "Git LFS upload staging admission failed"
+            );
+            return git_lfs_storage_error_response(ServerError::from(error));
+        }
+    };
+
+    let staged_upload = match stage_upload_request_body_with_lease(
+        &oid,
+        Some(expected_size),
+        request,
+        UploadStagingGuardrails::default(),
+        staging_lease,
+    )
+    .await
+    {
         Ok(staged_upload) => staged_upload,
         Err(UploadStagingError::PayloadTooLarge) => {
             return upload_payload_too_large_response();
@@ -1693,6 +1735,9 @@ async fn handle_lfs_upload_request(
         }
         Err(UploadStagingError::TimedOut) => {
             return upload_staging_timeout_response();
+        }
+        Err(UploadStagingError::ConcurrencyLimit) => {
+            return upload_staging_overloaded_response();
         }
         Err(error) => {
             let error = error.into_storage_error();
@@ -1777,7 +1822,19 @@ fn upload_staging_timeout_response() -> Response {
     )
 }
 
+fn upload_staging_overloaded_response() -> Response {
+    let mut response = git_lfs_json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Git LFS upload staging has reached its concurrency limit",
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
 struct StagedUpload {
+    _lease: UploadStagingLease,
     temp_file: tempfile::NamedTempFile,
 }
 
@@ -1787,6 +1844,7 @@ impl StagedUpload {
     }
 }
 
+#[cfg(test)]
 async fn stage_upload_request_body(
     expected_oid: &LfsOid,
     expected_size: Option<u64>,
@@ -1801,13 +1859,16 @@ async fn stage_upload_request_body(
     .await
 }
 
+#[cfg(test)]
 async fn stage_upload_request_body_with_limit(
     expected_oid: &LfsOid,
     expected_size: Option<u64>,
     request: Request,
     max_upload_bytes: u64,
 ) -> Result<StagedUpload, UploadStagingError> {
-    stage_upload_request_body_with_guardrails(
+    let coordinator = UploadStagingCoordinator::new(1, 1);
+    let lease = coordinator.try_acquire("standalone")?;
+    stage_upload_request_body_with_lease(
         expected_oid,
         expected_size,
         request,
@@ -1815,6 +1876,7 @@ async fn stage_upload_request_body_with_limit(
             max_upload_bytes,
             ..UploadStagingGuardrails::default()
         },
+        lease,
     )
     .await
 }
@@ -1836,11 +1898,25 @@ impl Default for UploadStagingGuardrails {
     }
 }
 
+#[cfg(test)]
 async fn stage_upload_request_body_with_guardrails(
     expected_oid: &LfsOid,
     expected_size: Option<u64>,
     request: Request,
     guardrails: UploadStagingGuardrails,
+) -> Result<StagedUpload, UploadStagingError> {
+    let coordinator = UploadStagingCoordinator::new(1, 1);
+    let lease = coordinator.try_acquire("standalone")?;
+    stage_upload_request_body_with_lease(expected_oid, expected_size, request, guardrails, lease)
+        .await
+}
+
+async fn stage_upload_request_body_with_lease(
+    expected_oid: &LfsOid,
+    expected_size: Option<u64>,
+    request: Request,
+    guardrails: UploadStagingGuardrails,
+    lease: UploadStagingLease,
 ) -> Result<StagedUpload, UploadStagingError> {
     let preflight_size = upload_staging_preflight_size(expected_size, guardrails.max_upload_bytes)?;
     let temp_file = tempfile::Builder::new()
@@ -1862,7 +1938,9 @@ async fn stage_upload_request_body_with_guardrails(
         })?;
     // Unknown-size helper callers reserve the full effective upload limit so
     // they cannot skip the temp-space guardrail before streaming begins.
-    ensure_temp_space_for_upload(staging_dir, preflight_size, guardrails.min_free_bytes).await?;
+    let lease = lease
+        .reserve(staging_dir, preflight_size, guardrails.min_free_bytes)
+        .await?;
 
     let std_file = temp_file
         .reopen()
@@ -1927,7 +2005,10 @@ async fn stage_upload_request_body_with_guardrails(
         .into());
     }
 
-    Ok(StagedUpload { temp_file })
+    Ok(StagedUpload {
+        _lease: lease,
+        temp_file,
+    })
 }
 
 fn upload_staging_preflight_size(
@@ -1942,30 +2023,196 @@ fn upload_staging_preflight_size(
     Ok(size)
 }
 
-async fn ensure_temp_space_for_upload(
-    staging_dir: &Path,
-    expected_size: u64,
-    min_free_bytes: u64,
-) -> Result<(), UploadStagingError> {
-    let staging_dir = staging_dir.to_path_buf();
-    let available = tokio::task::spawn_blocking(move || fs4::available_space(staging_dir))
-        .await
-        .map_err(|source| StorageError::Retryable {
-            provider: "lfs-cloud".to_owned(),
-            message: format!(
-                "upload staging directory free-space check did not complete: {source}"
-            ),
-        })?
-        .map_err(|source| StorageError::Retryable {
-            provider: "lfs-cloud".to_owned(),
-            message: format!(
-                "upload staging directory free space could not be inspected: {source}"
-            ),
-        })?;
-
-    ensure_temp_space_for_upload_with_available_space(expected_size, min_free_bytes, available)
+#[derive(Clone)]
+struct UploadStagingCoordinator {
+    global_slots: Arc<Semaphore>,
+    per_user_limit: usize,
+    per_user_slots: Arc<std::sync::Mutex<HashMap<String, Weak<Semaphore>>>>,
+    reservations: Arc<std::sync::Mutex<UploadStagingReservationState>>,
 }
 
+#[derive(Default)]
+struct UploadStagingReservationState {
+    available_space_snapshot: Option<u64>,
+    reserved_bytes: u64,
+}
+
+impl UploadStagingCoordinator {
+    fn new(global_limit: usize, per_user_limit: usize) -> Self {
+        Self {
+            global_slots: Arc::new(Semaphore::new(global_limit)),
+            per_user_limit,
+            per_user_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reservations: Arc::new(std::sync::Mutex::new(
+                UploadStagingReservationState::default(),
+            )),
+        }
+    }
+
+    fn try_acquire(&self, principal: &str) -> Result<UploadStagingLease, UploadStagingError> {
+        let global_permit = self
+            .global_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| UploadStagingError::ConcurrencyLimit)?;
+        let user_slots = {
+            let mut slots = self
+                .per_user_slots
+                .lock()
+                .expect("upload staging user-slot map should not be poisoned");
+            // Weak entries avoid turning one-off authenticated users into a
+            // process-lifetime map while preserving one semaphore per active
+            // principal across concurrent admission attempts.
+            slots.retain(|_, semaphore| semaphore.strong_count() > 0);
+            match slots.get(principal).and_then(Weak::upgrade) {
+                Some(semaphore) => semaphore,
+                None => {
+                    let semaphore = Arc::new(Semaphore::new(self.per_user_limit));
+                    slots.insert(principal.to_owned(), Arc::downgrade(&semaphore));
+                    semaphore
+                }
+            }
+        };
+        let user_permit = user_slots
+            .try_acquire_owned()
+            .map_err(|_| UploadStagingError::ConcurrencyLimit)?;
+
+        Ok(UploadStagingLease {
+            coordinator: self.clone(),
+            _global_permit: global_permit,
+            _user_permit: user_permit,
+            reservation: None,
+        })
+    }
+
+    fn reserve_with_available_space(
+        &self,
+        expected_size: u64,
+        min_free_bytes: u64,
+        available_space: u64,
+    ) -> Result<UploadStagingDiskReservation, UploadStagingError> {
+        let mut state = self
+            .reservations
+            .lock()
+            .expect("upload staging reservation state should not be poisoned");
+        let request_required = expected_size.checked_add(min_free_bytes).ok_or(
+            UploadStagingError::InsufficientTempSpace {
+                required_space: None,
+                available_space: Some(available_space),
+            },
+        )?;
+        if available_space < request_required {
+            return Err(UploadStagingError::InsufficientTempSpace {
+                required_space: Some(request_required),
+                available_space: Some(available_space),
+            });
+        }
+
+        // Freeze one capacity snapshot while any managed staging file is
+        // alive. Every declared size spends that shared budget atomically;
+        // the per-request live check above remains a secondary signal for
+        // unrelated filesystem pressure.
+        let snapshot = *state
+            .available_space_snapshot
+            .get_or_insert(available_space);
+        let aggregate_required = state
+            .reserved_bytes
+            .checked_add(expected_size)
+            .and_then(|reserved| reserved.checked_add(min_free_bytes))
+            .ok_or(UploadStagingError::InsufficientTempSpace {
+                required_space: None,
+                available_space: Some(snapshot),
+            })?;
+        if snapshot < aggregate_required {
+            return Err(UploadStagingError::InsufficientTempSpace {
+                required_space: Some(aggregate_required),
+                available_space: Some(snapshot),
+            });
+        }
+
+        state.reserved_bytes = state
+            .reserved_bytes
+            .checked_add(expected_size)
+            .expect("validated upload staging reservation should not overflow");
+        Ok(UploadStagingDiskReservation {
+            bytes: expected_size,
+            reservations: self.reservations.clone(),
+        })
+    }
+}
+
+struct UploadStagingLease {
+    coordinator: UploadStagingCoordinator,
+    _global_permit: OwnedSemaphorePermit,
+    _user_permit: OwnedSemaphorePermit,
+    reservation: Option<UploadStagingDiskReservation>,
+}
+
+impl UploadStagingLease {
+    async fn reserve(
+        self,
+        staging_dir: &Path,
+        expected_size: u64,
+        min_free_bytes: u64,
+    ) -> Result<Self, UploadStagingError> {
+        let staging_dir = staging_dir.to_path_buf();
+        let available_space =
+            tokio::task::spawn_blocking(move || fs4::available_space(staging_dir))
+                .await
+                .map_err(|source| StorageError::Retryable {
+                    provider: "lfs-cloud".to_owned(),
+                    message: format!(
+                        "upload staging directory free-space check did not complete: {source}"
+                    ),
+                })?
+                .map_err(|source| StorageError::Retryable {
+                    provider: "lfs-cloud".to_owned(),
+                    message: format!(
+                        "upload staging directory free space could not be inspected: {source}"
+                    ),
+                })?;
+
+        self.reserve_with_available_space(expected_size, min_free_bytes, available_space)
+    }
+
+    fn reserve_with_available_space(
+        mut self,
+        expected_size: u64,
+        min_free_bytes: u64,
+        available_space: u64,
+    ) -> Result<Self, UploadStagingError> {
+        let reservation = self.coordinator.reserve_with_available_space(
+            expected_size,
+            min_free_bytes,
+            available_space,
+        )?;
+        self.reservation = Some(reservation);
+        Ok(self)
+    }
+}
+
+struct UploadStagingDiskReservation {
+    bytes: u64,
+    reservations: Arc<std::sync::Mutex<UploadStagingReservationState>>,
+}
+
+impl Drop for UploadStagingDiskReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .reservations
+            .lock()
+            .expect("upload staging reservation state should not be poisoned");
+        state.reserved_bytes = state
+            .reserved_bytes
+            .checked_sub(self.bytes)
+            .expect("upload staging reservations should release exactly once");
+        if state.reserved_bytes == 0 {
+            state.available_space_snapshot = None;
+        }
+    }
+}
+
+#[cfg(test)]
 fn ensure_temp_space_for_upload_with_available_space(
     expected_size: u64,
     min_free_bytes: u64,
@@ -2016,6 +2263,7 @@ fn is_temp_space_exhausted(source: &io::Error) -> bool {
 #[derive(Debug)]
 enum UploadStagingError {
     PayloadTooLarge,
+    ConcurrencyLimit,
     InsufficientTempSpace {
         required_space: Option<u64>,
         available_space: Option<u64>,
@@ -2030,6 +2278,10 @@ impl UploadStagingError {
             Self::PayloadTooLarge => StorageError::QuotaExceeded {
                 provider: "lfs-cloud".to_owned(),
                 message: "upload object exceeded request size limit".to_owned(),
+            },
+            Self::ConcurrencyLimit => StorageError::Retryable {
+                provider: "lfs-cloud".to_owned(),
+                message: "upload staging concurrency limit reached".to_owned(),
             },
             Self::InsufficientTempSpace {
                 required_space,
@@ -2842,7 +3094,9 @@ mod tests {
         extract::Path,
         http::{
             HeaderMap, HeaderValue, Method, Request, StatusCode,
-            header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
+            header::{
+                ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE,
+            },
         },
         response::Response,
         routing::get,
@@ -2854,8 +3108,9 @@ mod tests {
         BASE64_STANDARD, BatchBodyGuardrails, GoogleDriveAccessTokenCache, LFS_AUTH_CHALLENGE,
         LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore,
         LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind,
-        UploadStagingGuardrails, advertised_server_urls, authenticate_lfs_session,
-        ensure_temp_space_for_upload_with_available_space, lfs_server_router_with_sessions,
+        UploadStagingCoordinator, UploadStagingGuardrails, advertised_server_urls,
+        authenticate_lfs_session, ensure_temp_space_for_upload_with_available_space,
+        lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
         lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails,
         production_session_store, render_server_startup_message, server_router_with_sessions,
@@ -4646,6 +4901,101 @@ repositories:
     }
 
     #[test]
+    fn upload_staging_concurrency_is_bounded_globally_and_per_user() {
+        let coordinator = UploadStagingCoordinator::new(2, 1);
+        let first_user = coordinator
+            .try_acquire("github-main:42")
+            .expect("first user should acquire a staging slot");
+
+        assert!(matches!(
+            coordinator.try_acquire("github-main:42"),
+            Err(super::UploadStagingError::ConcurrencyLimit)
+        ));
+
+        let second_user = coordinator
+            .try_acquire("github-main:84")
+            .expect("another user should acquire the second global slot");
+        assert!(matches!(
+            coordinator.try_acquire("github-main:126"),
+            Err(super::UploadStagingError::ConcurrencyLimit)
+        ));
+
+        drop(first_user);
+        coordinator
+            .try_acquire("github-main:126")
+            .expect("dropping a lease should release its global slot");
+        drop(second_user);
+    }
+
+    #[test]
+    fn upload_staging_reservations_admit_only_aggregate_capacity() {
+        let coordinator = UploadStagingCoordinator::new(3, 3);
+        let first = coordinator
+            .try_acquire("github-main:42")
+            .expect("first upload should acquire concurrency")
+            .reserve_with_available_space(60, 10, 100)
+            .expect("first upload should reserve capacity");
+
+        let rejected = coordinator
+            .try_acquire("github-main:84")
+            .expect("second upload should acquire concurrency")
+            .reserve_with_available_space(31, 10, 100);
+        assert!(matches!(
+            rejected,
+            Err(super::UploadStagingError::InsufficientTempSpace {
+                required_space: Some(101),
+                available_space: Some(100)
+            })
+        ));
+
+        let second = coordinator
+            .try_acquire("github-main:84")
+            .expect("second upload should reacquire concurrency")
+            .reserve_with_available_space(30, 10, 100)
+            .expect("exact aggregate capacity should be accepted");
+        drop(first);
+
+        coordinator
+            .try_acquire("github-main:126")
+            .expect("third upload should acquire concurrency")
+            .reserve_with_available_space(60, 10, 100)
+            .expect("released capacity should be reusable");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn concurrent_upload_staging_reservations_are_atomic() {
+        let coordinator = UploadStagingCoordinator::new(2, 2);
+        let barrier = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let mut tasks = Vec::new();
+
+        for principal in ["github-main:42", "github-main:84"] {
+            let coordinator = coordinator.clone();
+            let barrier = barrier.clone();
+            let release = release.clone();
+            tasks.push(tokio::spawn(async move {
+                let lease = coordinator
+                    .try_acquire(principal)
+                    .expect("concurrency should allow both contenders");
+                barrier.wait().await;
+                let reservation = lease.reserve_with_available_space(60, 0, 100);
+                release.wait().await;
+                reservation.is_ok()
+            }));
+        }
+
+        barrier.wait().await;
+        release.wait().await;
+        let mut admitted = 0;
+        for task in tasks {
+            admitted += usize::from(task.await.expect("reservation task should join"));
+        }
+
+        assert_eq!(admitted, 1, "only one weighted reservation should fit");
+    }
+
+    #[test]
     fn temp_space_write_errors_map_to_insufficient_temp_space() {
         let error =
             upload_staging_file_io_error(io::Error::from(ErrorKind::StorageFull), "written");
@@ -4702,6 +5052,18 @@ repositories:
             super::upload_staging_timeout_response(),
             StatusCode::REQUEST_TIMEOUT,
             "Git LFS upload request timed out while reading the object body",
+        )
+        .await;
+
+        let overloaded = super::upload_staging_overloaded_response();
+        assert_eq!(
+            overloaded.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        assert_lfs_json_error(
+            overloaded,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Git LFS upload staging has reached its concurrency limit",
         )
         .await;
     }

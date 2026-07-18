@@ -156,6 +156,8 @@ server:
   max_batch_objects: 100
   max_provider_calls: 16
   max_concurrent_requests: 64
+  max_concurrent_uploads: 8
+  max_concurrent_uploads_per_user: 2
 
 repository_providers:
   github-main:
@@ -244,6 +246,13 @@ The server also admits at most the configured number of active HTTP requests
 across all routes, rejecting overload instead of queueing it. Authenticated
 batch bodies have separate 15-second idle and 60-second total read deadlines,
 so continuing to drip bytes cannot evade the overall bound.
+
+Upload staging has dedicated process-wide and stable-provider-user concurrency
+limits because each upload retains a temporary file while backend I/O
+completes. Before reading a body, the server atomically reserves its declared
+size against aggregate staging capacity and keeps that weighted reservation
+with the temporary file. A live filesystem free-space check with reserved
+headroom remains a secondary defense against non-server disk use.
 
 Each mapping also persists the repository provider's stable repository ID.
 Authorization resolves the current repository at the configured owner/name and
@@ -1191,8 +1200,9 @@ Defer:
 > through `lfs-cloud`. LFS route, authentication, method, body-size, parse,
 > authorization, upload-integrity, and storage failures now use Git LFS JSON
 > error payloads with matching HTTP statuses. Upload staging now rejects object
-> sizes over the configured server cap, checks local temp-directory capacity
-> before writing, and times out idle client body reads.
+> sizes over the configured server cap, atomically reserves aggregate local
+> temp-directory capacity, bounds process-wide and per-user staging
+> concurrency, and times out idle client body reads.
 > Authenticated batch bodies now have idle and total read deadlines, while a
 > process-wide request admission limit rejects overload without queueing.
 > The binary now uses a testable `clap` root command with shared `--config`

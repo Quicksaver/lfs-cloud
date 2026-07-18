@@ -28,6 +28,8 @@ const DEFAULT_BIND_PORT: u16 = 8080;
 const DEFAULT_MAX_BATCH_OBJECTS: usize = 100;
 const DEFAULT_MAX_PROVIDER_CALLS: usize = 16;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 8;
+const DEFAULT_MAX_CONCURRENT_UPLOADS_PER_USER: usize = 2;
 
 /// Loaded and validated server configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -278,6 +280,17 @@ pub struct ServerSettings {
     /// Admission is process-wide and rejects excess requests immediately,
     /// preventing slow request bodies from creating an unbounded waiter queue.
     pub max_concurrent_requests: usize,
+    /// Maximum number of uploads holding local staging resources.
+    ///
+    /// The process-wide limit is separate from general HTTP admission because
+    /// staged uploads retain temporary disk capacity while provider I/O
+    /// completes.
+    pub max_concurrent_uploads: usize,
+    /// Maximum staged uploads retained by one repository-provider user.
+    ///
+    /// Stable provider user IDs define this boundary when available, keeping
+    /// one principal from consuming every process-wide upload slot.
+    pub max_concurrent_uploads_per_user: usize,
     /// Local SQLite database file path for server-owned metadata.
     ///
     /// Relative configuration values are resolved against the server config
@@ -318,6 +331,21 @@ impl ServerSettings {
                 "must be greater than zero",
             );
         }
+        if raw.max_concurrent_uploads == 0 {
+            return invalid_config("server.max_concurrent_uploads", "must be greater than zero");
+        }
+        if raw.max_concurrent_uploads_per_user == 0 {
+            return invalid_config(
+                "server.max_concurrent_uploads_per_user",
+                "must be greater than zero",
+            );
+        }
+        if raw.max_concurrent_uploads_per_user > raw.max_concurrent_uploads {
+            return invalid_config(
+                "server.max_concurrent_uploads_per_user",
+                "must not exceed server.max_concurrent_uploads",
+            );
+        }
 
         Ok(Self {
             host,
@@ -327,6 +355,8 @@ impl ServerSettings {
             max_batch_objects: raw.max_batch_objects,
             max_provider_calls: raw.max_provider_calls,
             max_concurrent_requests: raw.max_concurrent_requests,
+            max_concurrent_uploads: raw.max_concurrent_uploads,
+            max_concurrent_uploads_per_user: raw.max_concurrent_uploads_per_user,
             metadata_path,
         })
     }
@@ -622,6 +652,10 @@ struct RawServerSettings {
     max_provider_calls: usize,
     #[serde(default = "default_max_concurrent_requests")]
     max_concurrent_requests: usize,
+    #[serde(default = "default_max_concurrent_uploads")]
+    max_concurrent_uploads: usize,
+    #[serde(default = "default_max_concurrent_uploads_per_user")]
+    max_concurrent_uploads_per_user: usize,
     #[serde(default)]
     metadata_path: Option<String>,
 }
@@ -636,6 +670,8 @@ impl Default for RawServerSettings {
             max_batch_objects: default_max_batch_objects(),
             max_provider_calls: default_max_provider_calls(),
             max_concurrent_requests: default_max_concurrent_requests(),
+            max_concurrent_uploads: default_max_concurrent_uploads(),
+            max_concurrent_uploads_per_user: default_max_concurrent_uploads_per_user(),
             metadata_path: None,
         }
     }
@@ -716,6 +752,14 @@ const fn default_max_provider_calls() -> usize {
 
 const fn default_max_concurrent_requests() -> usize {
     DEFAULT_MAX_CONCURRENT_REQUESTS
+}
+
+const fn default_max_concurrent_uploads() -> usize {
+    DEFAULT_MAX_CONCURRENT_UPLOADS
+}
+
+const fn default_max_concurrent_uploads_per_user() -> usize {
+    DEFAULT_MAX_CONCURRENT_UPLOADS_PER_USER
 }
 
 fn resolve_required(
@@ -1037,6 +1081,8 @@ repositories:
         assert_eq!(config.server.max_batch_objects, 100);
         assert_eq!(config.server.max_provider_calls, 16);
         assert_eq!(config.server.max_concurrent_requests, 64);
+        assert_eq!(config.server.max_concurrent_uploads, 8);
+        assert_eq!(config.server.max_concurrent_uploads_per_user, 2);
         assert_eq!(
             config.server.metadata_path,
             PathBuf::from(DEFAULT_METADATA_DIR).join(DEFAULT_METADATA_DB_FILE)
@@ -1074,12 +1120,14 @@ repositories:
     fn parses_server_provider_work_limits() {
         let config = load_with_test_env(&valid_yaml().replace(
             "  public_url: http://127.0.0.1:8081",
-            "  public_url: http://127.0.0.1:8081\n  max_batch_objects: 25\n  max_provider_calls: 4\n  max_concurrent_requests: 8",
+            "  public_url: http://127.0.0.1:8081\n  max_batch_objects: 25\n  max_provider_calls: 4\n  max_concurrent_requests: 8\n  max_concurrent_uploads: 6\n  max_concurrent_uploads_per_user: 3",
         ));
 
         assert_eq!(config.server.max_batch_objects, 25);
         assert_eq!(config.server.max_provider_calls, 4);
         assert_eq!(config.server.max_concurrent_requests, 8);
+        assert_eq!(config.server.max_concurrent_uploads, 6);
+        assert_eq!(config.server.max_concurrent_uploads_per_user, 3);
     }
 
     #[test]
@@ -1097,6 +1145,14 @@ repositories:
                 "max_concurrent_requests",
                 "server.max_concurrent_requests must be greater than zero",
             ),
+            (
+                "max_concurrent_uploads",
+                "server.max_concurrent_uploads must be greater than zero",
+            ),
+            (
+                "max_concurrent_uploads_per_user",
+                "server.max_concurrent_uploads_per_user must be greater than zero",
+            ),
         ] {
             let contents = valid_yaml().replace(
                 "  public_url: http://127.0.0.1:8081",
@@ -1107,6 +1163,21 @@ repositories:
 
             assert_error_contains(&error, expected);
         }
+    }
+
+    #[test]
+    fn rejects_per_user_upload_limit_above_global_limit() {
+        let contents = valid_yaml().replace(
+            "  public_url: http://127.0.0.1:8081",
+            "  public_url: http://127.0.0.1:8081\n  max_concurrent_uploads: 2\n  max_concurrent_uploads_per_user: 3",
+        );
+        let error = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", test_env)
+            .expect_err("per-user upload limit above global limit should be rejected");
+
+        assert_error_contains(
+            &error,
+            "server.max_concurrent_uploads_per_user must not exceed server.max_concurrent_uploads",
+        );
     }
 
     #[test]

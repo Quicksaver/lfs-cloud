@@ -22,6 +22,8 @@ server:
   max_batch_objects: 100
   max_provider_calls: 16
   max_concurrent_requests: 64
+  max_concurrent_uploads: 8
+  max_concurrent_uploads_per_user: 2
   metadata_path: ./.lfs-cloud/metadata.sqlite3
 
 repository_providers:
@@ -107,6 +109,15 @@ authenticated Git LFS batch body also has a 15-second idle timeout and a
 60-second total read deadline, so a slow-dripping client cannot retain a
 request slot indefinitely.
 
+`server.max_concurrent_uploads` bounds uploads that retain local staging
+resources across body ingestion and backend storage. The default is `8`.
+`server.max_concurrent_uploads_per_user` applies a second limit, defaulting to
+`2`, keyed by stable repository-provider user ID when available. Excess upload
+staging receives HTTP 503 with `Retry-After: 1`. Each admitted upload also
+reserves its declared bytes atomically against aggregate temp-directory
+capacity until its temporary file is released. The live filesystem check and
+64 MiB free-space headroom remain in effect as secondary guardrails.
+
 ## Google Drive Credentials
 
 `credentials_ref` is not the credential itself. It tells the server which
@@ -181,8 +192,11 @@ config file.
   credentials, query strings, or fragments. They must use HTTPS unless the
   host is an exact IPv4/IPv6 loopback address. Non-loopback HTTP requires the
   explicit development-only `server.allow_insecure_http: true` setting.
-- `server.max_batch_objects`, `server.max_provider_calls`, and
-  `server.max_concurrent_requests` must be greater than zero when configured.
+- `server.max_batch_objects`, `server.max_provider_calls`,
+  `server.max_concurrent_requests`, `server.max_concurrent_uploads`, and
+  `server.max_concurrent_uploads_per_user` must be greater than zero when
+  configured. The per-user upload limit cannot exceed the process-wide upload
+  limit.
 - Google credential JSON `token_uri` values, and custom Google Drive API base
   URLs used by embedded runtimes or tests, follow the same URL rules and must
   use HTTPS except for loopback HTTP endpoints.

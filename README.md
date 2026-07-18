@@ -320,6 +320,8 @@ server:
   max_batch_objects: 100
   max_provider_calls: 16
   max_concurrent_requests: 64
+  max_concurrent_uploads: 8
+  max_concurrent_uploads_per_user: 2
   metadata_path: ./.lfs-cloud/metadata.sqlite3
 
 repository_providers:
@@ -364,9 +366,15 @@ server-owned local storage.
 `server.max_batch_objects` defaults to 100 object entries per Git LFS batch,
 `server.max_provider_calls` defaults to 16 concurrent GitHub or storage
 operations, and `server.max_concurrent_requests` defaults to 64 active HTTP
-requests across the process. Requests above that admission limit receive HTTP
-503 with `Retry-After` instead of waiting in an unbounded queue. Authenticated
-batch bodies have a 15-second idle timeout and a 60-second total read deadline.
+requests across the process. Upload staging separately defaults to eight
+concurrent uploads process-wide and two per stable provider user through
+`server.max_concurrent_uploads` and
+`server.max_concurrent_uploads_per_user`. Staging reserves each upload's
+declared bytes atomically until its temporary file and backend transfer are
+released, while retaining the live filesystem free-space check and 64 MiB
+headroom. Requests above a concurrency limit receive HTTP 503 with
+`Retry-After` instead of waiting in an unbounded queue. Authenticated batch
+bodies have a 15-second idle timeout and a 60-second total read deadline.
 Duplicate batch identities count toward the batch limit but share one storage
 lookup. Successful permission checks are reused briefly for the same local
 session, repository, and operation so an advertised transfer does not

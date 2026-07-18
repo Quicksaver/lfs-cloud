@@ -480,12 +480,38 @@ independently validated or adjudicated.
    finding assessed here and no invalid finding attributable separately, this
    was high-quality, security- and availability-relevant feedback.
 
-3. **High — Upload free-space checks race and do not reserve aggregate
-   capacity.** Concurrent uploads can all pass the same preflight and then fill
-   the staging filesystem (`src/server.rs:1134-1150`,
-   `src/server.rs:1358-1385`, `src/server.rs:1464-1506`). Add global/per-user
-   concurrency limits and an atomic weighted byte reservation released with the
-   tempfile; retain the filesystem check as a secondary guard.
+3. **[DONE] Upload free-space checks race and do not reserve aggregate
+   capacity** (High, `src/server.rs`, `src/server_config.rs`, and server
+   configuration documentation): **Valid and actionable.** Upload staging
+   previously checked each request against an independent temp-filesystem
+   free-space snapshot, so concurrent uploads could all pass while their
+   aggregate declared sizes exceeded available capacity. Staging admission now
+   has configurable process-wide and per-user concurrency limits, defaulting to
+   eight and two respectively. Stable repository-provider user IDs define the
+   per-user boundary when available, and overload is rejected immediately with
+   HTTP 503 plus `Retry-After: 1`. Each admitted upload atomically reserves its
+   declared byte weight under a shared lock before reading the body. The
+   concurrency permits and byte reservation live in the staged-upload lease,
+   which remains attached to the temporary file through backend storage and is
+   released on every success, error, or drop path. The live filesystem check,
+   64 MiB headroom, upload-size limit, idle body timeout, and write-time
+   ENOSPC/quota classification remain independent secondary guardrails.
+   Configuration parsing rejects zero limits and per-user limits above the
+   process-wide limit. Deterministic coverage proves global and per-user slot
+   enforcement, aggregate weighted admission and release, simultaneous
+   reservation atomicity, overload response shape, and configuration defaults
+   and validation. README, implementation, configuration, and repository
+   learning documentation now describe the staging-capacity contract.
+   Verification passed with `cargo fmt --all --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`,
+   `yarn lint:fix`, and `git diff --check`. The focused reviewer identified a
+   genuine high-severity aggregate resource-exhaustion race, correctly
+   distinguished a free-space observation from a reservation, and prescribed
+   both weighted capacity accounting and fairness limits plus the secondary
+   filesystem defense. With one valid finding assessed here and no invalid
+   finding attributable separately, this was high-quality, security- and
+   availability-relevant feedback.
 
 4. **Medium — Startup does not validate Drive credentials or root-folder
    usability.** The server binds successfully and discovers invalid storage only
