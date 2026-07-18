@@ -373,7 +373,13 @@ write to the same Google Drive root must share this metadata location; the
 filesystem locks then serialize the existence check and backend write across
 processes. Exact duplicate Drive objects left by an interrupted historical
 race remain readable because lookup selects the smallest matching Drive file
-ID deterministically after validating every returned match.
+ID deterministically after validating every returned match. New uploads use
+one of 256 deterministic `lfs-cloud-sha256-<first-2>` folders below the root;
+objects written directly under the root by older versions remain readable.
+Normal server lookups use the Drive file ID stored in SQLite with `files.get`
+instead of listing the folder. If that ID is stale, root-and-shard discovery
+repairs the metadata row when it finds the object, or marks the unchanged row
+stale when it does not.
 
 `server.max_batch_objects` defaults to 100 object entries per Git LFS batch,
 `server.max_provider_calls` defaults to 16 concurrent GitHub or storage

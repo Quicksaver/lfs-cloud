@@ -933,11 +933,42 @@ independently validated or adjudicated.
    `src/google_drive.rs:3911`). Expand classification for documented Drive
    reason codes and add representative tests.
 
-8. **Medium — Flat root-folder storage creates a scaling ceiling and expensive
-   list queries.** Every object shares one folder and lookup relies on list
-   queries (`src/google_drive.rs:784`, `src/google_drive.rs:1870`). Prefer stored
-   backend IDs with direct `files.get`, add deterministic sharding, and define a
-   repair path for stale metadata.
+8. **[DONE] Flat root-folder storage creates a scaling ceiling and expensive
+   list queries** (Medium, `src/google_drive.rs`, `src/server.rs`,
+   `src/metadata.rs`, and Drive storage documentation): **Valid and
+   actionable.** Uploads previously placed every object directly under the
+   configured root, despite Drive's per-folder item limit, and production
+   existence/download checks ignored SQLite's stored backend ID in favor of a
+   paginated `files.list` query. New uploads now use one of 256 deterministic
+   `lfs-cloud-sha256-<first-2>` folders. Private folder properties distinguish
+   application shards from same-named operator folders; discovery validates
+   every matching physical shard, tolerates concurrent duplicate shard-folder
+   creation, and retains lookup for objects written directly under the root by
+   older releases. Production first verifies SQLite's file ID with direct
+   `files.get`; legacy root children remain root-scoped in one request, while a
+   sharded child requires a second direct metadata request proving its folder
+   belongs to the configured root and matches the expected SHA-256 prefix.
+   Missing or mismatched IDs fall back to root-and-shard discovery. A found
+   replacement repairs the backend ID without rewriting original creator
+   attribution; absence conditionally marks only the unchanged mapping stale,
+   so a concurrent upload cannot be overwritten. Regression coverage proves
+   direct-ID lookup without list queries, shard-parent root validation,
+   deterministic folder lookup/creation and upload placement, legacy root
+   discovery, stale-ID repair, and race-safe stale marking. README,
+   implementation guidance, manual verification instructions, and the
+   repository learning now document the layout and repair contract.
+   Verification passed with `yarn lint:fix`, `cargo fmt --all --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (576 passed, 3 ignored across
+   targets), `cargo test --doc` (38 passed), and `git diff --check`. The focused
+   reviewer identified a genuine medium-severity scalability and request-cost
+   flaw and prescribed all three necessary boundaries: indexed direct reads,
+   deterministic sharding, and stale-index repair. With one valid finding and
+   no invalid finding attributable separately, this was high-quality, relevant
+   feedback. See Google's [`files.get`
+   reference](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/get)
+   and [folder-limit
+   guidance](https://developers.google.com/workspace/drive/api/guides/folder#file_and_folder_limits).
 
 ## CLI, configuration, and Git integration
 

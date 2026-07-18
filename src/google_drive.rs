@@ -60,6 +60,9 @@ const GOOGLE_DRIVE_REPO_NAMESPACE_FORMAT_PROPERTY: &str = "lfsCloudRepoNamespace
 const GOOGLE_DRIVE_REPO_NAMESPACE_SHA256_FORMAT: &str = "sha256";
 const GOOGLE_DRIVE_OBJECT_OID_PROPERTY: &str = "lfsCloudOid";
 const GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY: &str = "lfsCloudSize";
+const GOOGLE_DRIVE_SHARD_KIND_PROPERTY: &str = "lfsCloudFolderKind";
+const GOOGLE_DRIVE_SHARD_KIND: &str = "objectShard";
+const GOOGLE_DRIVE_SHARD_PREFIX_PROPERTY: &str = "lfsCloudShard";
 
 static DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -590,20 +593,19 @@ impl GoogleDriveObjectKey {
         )
     }
 
+    /// Returns the deterministic Drive folder name for this object's shard.
+    #[must_use]
+    fn shard_folder_name(&self) -> String {
+        format!("lfs-cloud-sha256-{}", self.shard_prefix())
+    }
+
     /// Returns the human-readable object path below the configured Drive root.
     ///
     /// Google Drive addresses files by ID, not POSIX paths. This value is a
     /// deterministic convention for upload placement and operator inspection.
     #[must_use]
     pub fn display_path(&self) -> String {
-        let oid = self.object.oid.as_hex();
-        format!(
-            "objects/{}/sha256/{}/{}/{}",
-            percent_encode_drive_path_segment(&self.repo_namespace),
-            &oid[..2],
-            &oid[2..4],
-            self.file_name()
-        )
+        format!("{}/{}", self.shard_folder_name(), self.file_name())
     }
 
     fn expected_app_properties(&self) -> GoogleDriveObjectProperties {
@@ -612,6 +614,10 @@ impl GoogleDriveObjectKey {
             oid: self.object.oid.as_hex().to_owned(),
             size: self.object.size.bytes().to_string(),
         }
+    }
+
+    fn shard_prefix(&self) -> &str {
+        &self.object.oid.as_hex()[..2]
     }
 }
 
@@ -842,6 +848,159 @@ impl GoogleDriveObjectStore {
         let key = self.object_key(object)?;
         let expected_properties = key.expected_app_properties();
         let mut stored_objects = Vec::new();
+
+        stored_objects.extend(
+            self.lookup_objects_in_parent(&self.storage.root_folder_id, &key, &expected_properties)
+                .await?,
+        );
+        for shard_folder_id in self.lookup_shard_folder_ids(&key).await? {
+            stored_objects.extend(
+                self.lookup_objects_in_parent(&shard_folder_id, &key, &expected_properties)
+                    .await?,
+            );
+        }
+
+        stored_objects.sort_unstable_by(|left, right| left.backend_id.cmp(&right.backend_id));
+        Ok(stored_objects.into_iter().next())
+    }
+
+    /// Resolves a stored Drive file ID without scanning a folder.
+    ///
+    /// A missing ID or one that no longer identifies the expected immutable
+    /// object returns `None`, allowing the caller to perform indexed discovery
+    /// and repair its metadata mapping.
+    pub(crate) async fn lookup_object_by_backend_id(
+        &self,
+        object: &LfsObject,
+        backend_id: &str,
+    ) -> StorageResult<Option<StoredObject>> {
+        let key = self.object_key(object)?;
+        let expected_properties = key.expected_app_properties();
+        let response = self
+            .metadata_client
+            .get(drive_object_metadata_url(
+                self.api_base_url.clone(),
+                backend_id,
+            )?)
+            .header(ACCEPT, "application/json")
+            .header(
+                AUTHORIZATION,
+                self.token.authorization_header_value(&self.storage.id)?,
+            )
+            .header(ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        let status = response.status();
+        let response_body = read_google_response_body(response)
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(parse_drive_object_lookup_error(
+                &self.storage,
+                &self.token,
+                status,
+                &response_body,
+            ));
+        }
+        let file = serde_json::from_str::<GoogleDriveObjectFile>(&response_body).map_err(|_| {
+            StorageError::Upstream {
+                provider: self.storage.id.clone(),
+                status: Some(status.as_u16()),
+                message: SanitizedMessage::new(
+                    "Google Drive object metadata response was invalid JSON",
+                ),
+            }
+        })?;
+        let parents = file.parents.clone();
+        let stored_object =
+            match verify_drive_object_file(&self.storage, &key, &expected_properties, status, file)
+            {
+                Ok(stored_object) if stored_object.backend_id == backend_id => stored_object,
+                Ok(_) | Err(StorageError::Conflict { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        if parents.as_slice() == [self.storage.root_folder_id.as_str()] {
+            return Ok(Some(stored_object));
+        }
+        let [parent_folder_id] = parents.as_slice() else {
+            return Ok(None);
+        };
+        if self
+            .shard_folder_id_matches_key(parent_folder_id, &key)
+            .await?
+        {
+            Ok(Some(stored_object))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn shard_folder_id_matches_key(
+        &self,
+        folder_id: &str,
+        key: &GoogleDriveObjectKey,
+    ) -> StorageResult<bool> {
+        let response = self
+            .metadata_client
+            .get(drive_shard_folder_metadata_url(
+                self.api_base_url.clone(),
+                folder_id,
+            )?)
+            .header(ACCEPT, "application/json")
+            .header(
+                AUTHORIZATION,
+                self.token.authorization_header_value(&self.storage.id)?,
+            )
+            .header(ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        let status = response.status();
+        let response_body = read_google_response_body(response)
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            return Err(parse_drive_object_lookup_error(
+                &self.storage,
+                &self.token,
+                status,
+                &response_body,
+            ));
+        }
+        let file = serde_json::from_str::<GoogleDriveObjectFile>(&response_body).map_err(|_| {
+            StorageError::Upstream {
+                provider: self.storage.id.clone(),
+                status: Some(status.as_u16()),
+                message: SanitizedMessage::new(
+                    "Google Drive shard-folder metadata response was invalid JSON",
+                ),
+            }
+        })?;
+
+        match verify_drive_shard_folder(&self.storage, key, status, file) {
+            Ok(returned_id) => Ok(returned_id == folder_id),
+            Err(StorageError::Upstream {
+                status: Some(200), ..
+            }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn lookup_objects_in_parent(
+        &self,
+        parent_folder_id: &str,
+        key: &GoogleDriveObjectKey,
+        expected_properties: &GoogleDriveObjectProperties,
+    ) -> StorageResult<Vec<StoredObject>> {
+        let mut stored_objects = Vec::new();
         let mut page_token = None;
         let mut seen_page_tokens = BTreeSet::new();
 
@@ -850,9 +1009,9 @@ impl GoogleDriveObjectStore {
                 .metadata_client
                 .get(drive_object_lookup_url(
                     self.api_base_url.clone(),
-                    &self.storage.root_folder_id,
-                    &key,
-                    &expected_properties,
+                    parent_folder_id,
+                    key,
+                    expected_properties,
                     page_token.as_deref(),
                 )?)
                 .header(ACCEPT, "application/json")
@@ -880,8 +1039,8 @@ impl GoogleDriveObjectStore {
 
             let page = parse_drive_object_lookup_success(
                 &self.storage,
-                &key,
-                &expected_properties,
+                key,
+                expected_properties,
                 status,
                 &response_body,
             )?;
@@ -899,8 +1058,108 @@ impl GoogleDriveObjectStore {
             page_token = Some(next_page_token);
         }
 
-        stored_objects.sort_unstable_by(|left, right| left.backend_id.cmp(&right.backend_id));
-        Ok(stored_objects.into_iter().next())
+        Ok(stored_objects)
+    }
+
+    async fn lookup_shard_folder_ids(
+        &self,
+        key: &GoogleDriveObjectKey,
+    ) -> StorageResult<Vec<String>> {
+        let mut folder_ids = Vec::new();
+        let mut page_token = None;
+        let mut seen_page_tokens = BTreeSet::new();
+
+        loop {
+            let response = self
+                .metadata_client
+                .get(drive_shard_folder_lookup_url(
+                    self.api_base_url.clone(),
+                    &self.storage.root_folder_id,
+                    key,
+                    page_token.as_deref(),
+                )?)
+                .header(ACCEPT, "application/json")
+                .header(
+                    AUTHORIZATION,
+                    self.token.authorization_header_value(&self.storage.id)?,
+                )
+                .header(ACCEPT_ENCODING, "identity")
+                .send()
+                .await
+                .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+            let status = response.status();
+            let response_body = read_google_response_body(response)
+                .await
+                .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+            if !status.is_success() {
+                return Err(parse_drive_object_lookup_error(
+                    &self.storage,
+                    &self.token,
+                    status,
+                    &response_body,
+                ));
+            }
+            let page = parse_drive_shard_folder_lookup_success(
+                &self.storage,
+                key,
+                status,
+                &response_body,
+            )?;
+            folder_ids.extend(page.folder_ids);
+            let Some(next_page_token) = page.next_page_token else {
+                break;
+            };
+            if !seen_page_tokens.insert(next_page_token.clone()) {
+                return Err(StorageError::Retryable {
+                    provider: self.storage.id.clone(),
+                    message: "Google Drive shard-folder lookup repeated a page token".to_owned(),
+                });
+            }
+            page_token = Some(next_page_token);
+        }
+
+        folder_ids.sort_unstable();
+        folder_ids.dedup();
+        Ok(folder_ids)
+    }
+
+    async fn upload_parent_folder_id(&self, key: &GoogleDriveObjectKey) -> StorageResult<String> {
+        if let Some(folder_id) = self.lookup_shard_folder_ids(key).await?.into_iter().next() {
+            return Ok(folder_id);
+        }
+
+        let response = self
+            .metadata_client
+            .post(drive_file_create_url(self.api_base_url.clone())?)
+            .timeout(GOOGLE_DRIVE_OBJECT_METADATA_TIMEOUT)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                AUTHORIZATION,
+                self.token.authorization_header_value(&self.storage.id)?,
+            )
+            .json(&drive_shard_folder_metadata(
+                &self.storage.root_folder_id,
+                key,
+            ))
+            .send()
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        let status = response.status();
+        let response_body = read_google_response_body(response)
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        if !status.is_success() {
+            return Err(parse_drive_upload_error(
+                &self.storage,
+                &self.token,
+                key.object(),
+                DriveUploadPhase::Initiate,
+                status,
+                &response_body,
+            ));
+        }
+        parse_drive_shard_folder_create_success(&self.storage, key, status, &response_body)
     }
 
     /// Uploads a staged and locally verified object file through Drive resumable upload.
@@ -928,7 +1187,8 @@ impl GoogleDriveObjectStore {
 
         let key = self.object_key(object)?;
         let expected_properties = key.expected_app_properties();
-        let metadata = drive_upload_metadata(&self.storage.root_folder_id, &key);
+        let upload_parent_folder_id = self.upload_parent_folder_id(&key).await?;
+        let metadata = drive_upload_metadata(&upload_parent_folder_id, &key);
         let initiate_response = self
             .upload_client
             .post(drive_resumable_upload_url(self.api_base_url.clone())?)
@@ -1133,6 +1393,22 @@ impl GoogleDriveObjectStore {
                     oid: object.oid.as_hex().to_owned(),
                     size: object.size.bytes(),
                 })?;
+        self.download_object_response_for_stored_object(object, stored_object)
+            .await
+    }
+
+    /// Streams an object whose Drive file ID was already metadata-verified.
+    pub(crate) async fn download_object_response_for_stored_object(
+        &self,
+        object: &LfsObject,
+        stored_object: StoredObject,
+    ) -> StorageResult<GoogleDriveDownloadResponse> {
+        if stored_object.provider_id != self.storage.id || stored_object.object != *object {
+            return Err(StorageError::Conflict {
+                provider: self.storage.id.clone(),
+                oid: object.oid.as_hex().to_owned(),
+            });
+        }
         let download_response = self
             .download_client
             .get(drive_media_download_url(
@@ -1830,7 +2106,12 @@ struct GoogleDriveFileList {
 struct GoogleDriveObjectFile {
     id: Option<String>,
     name: Option<String>,
+    mime_type: Option<String>,
     size: Option<String>,
+    #[serde(default)]
+    parents: Vec<String>,
+    #[serde(default)]
+    trashed: bool,
     #[serde(default)]
     app_properties: BTreeMap<String, String>,
 }
@@ -2203,6 +2484,78 @@ fn drive_file_metadata_url(mut api_base_url: Url, root_folder_id: &str) -> Stora
     Ok(api_base_url)
 }
 
+fn drive_object_metadata_url(mut api_base_url: Url, file_id: &str) -> StorageResult<Url> {
+    if file_id.trim().is_empty() {
+        return Err(StorageError::Upstream {
+            provider: "google_drive".to_owned(),
+            status: None,
+            message: SanitizedMessage::new("Google Drive file ID must not be blank"),
+        });
+    }
+    let base_path_already_targets_drive_api =
+        drive_api_base_path_already_targets_drive_api(&api_base_url);
+    {
+        let mut segments =
+            api_base_url
+                .path_segments_mut()
+                .map_err(|_| StorageError::Upstream {
+                    provider: "google_drive".to_owned(),
+                    status: None,
+                    message: SanitizedMessage::new(
+                        "Google Drive API base URL cannot be used for path construction",
+                    ),
+                })?;
+        segments.pop_if_empty();
+        if base_path_already_targets_drive_api {
+            segments.extend(["files", file_id]);
+        } else {
+            segments.extend(["drive", "v3", "files", file_id]);
+        }
+    }
+    api_base_url
+        .query_pairs_mut()
+        .append_pair("fields", "id,name,size,parents,trashed,appProperties")
+        .append_pair("supportsAllDrives", "true");
+
+    Ok(api_base_url)
+}
+
+fn drive_shard_folder_metadata_url(mut api_base_url: Url, folder_id: &str) -> StorageResult<Url> {
+    if folder_id.trim().is_empty() {
+        return Err(StorageError::Upstream {
+            provider: "google_drive".to_owned(),
+            status: None,
+            message: SanitizedMessage::new("Google Drive folder ID must not be blank"),
+        });
+    }
+    let base_path_already_targets_drive_api =
+        drive_api_base_path_already_targets_drive_api(&api_base_url);
+    {
+        let mut segments =
+            api_base_url
+                .path_segments_mut()
+                .map_err(|_| StorageError::Upstream {
+                    provider: "google_drive".to_owned(),
+                    status: None,
+                    message: SanitizedMessage::new(
+                        "Google Drive API base URL cannot be used for path construction",
+                    ),
+                })?;
+        segments.pop_if_empty();
+        if base_path_already_targets_drive_api {
+            segments.extend(["files", folder_id]);
+        } else {
+            segments.extend(["drive", "v3", "files", folder_id]);
+        }
+    }
+    api_base_url
+        .query_pairs_mut()
+        .append_pair("fields", "id,name,mimeType,parents,trashed,appProperties")
+        .append_pair("supportsAllDrives", "true");
+
+    Ok(api_base_url)
+}
+
 fn drive_object_lookup_url(
     mut api_base_url: Url,
     root_folder_id: &str,
@@ -2259,6 +2612,89 @@ fn drive_object_lookup_url(
             .query_pairs_mut()
             .append_pair("pageToken", page_token);
     }
+
+    Ok(api_base_url)
+}
+
+fn drive_shard_folder_lookup_url(
+    mut api_base_url: Url,
+    root_folder_id: &str,
+    key: &GoogleDriveObjectKey,
+    page_token: Option<&str>,
+) -> StorageResult<Url> {
+    if root_folder_id.trim().is_empty() {
+        return Err(StorageError::Upstream {
+            provider: "google_drive".to_owned(),
+            status: None,
+            message: SanitizedMessage::new("Google Drive root_folder_id must not be blank"),
+        });
+    }
+    let base_path_already_targets_drive_api =
+        drive_api_base_path_already_targets_drive_api(&api_base_url);
+    {
+        let mut segments =
+            api_base_url
+                .path_segments_mut()
+                .map_err(|_| StorageError::Upstream {
+                    provider: "google_drive".to_owned(),
+                    status: None,
+                    message: SanitizedMessage::new(
+                        "Google Drive API base URL cannot be used for path construction",
+                    ),
+                })?;
+        segments.pop_if_empty();
+        if base_path_already_targets_drive_api {
+            segments.push("files");
+        } else {
+            segments.extend(["drive", "v3", "files"]);
+        }
+    }
+    api_base_url
+        .query_pairs_mut()
+        .append_pair(
+            "fields",
+            "files(id,name,mimeType,parents,trashed,appProperties),nextPageToken,incompleteSearch",
+        )
+        .append_pair("pageSize", "100")
+        .append_pair("spaces", "drive")
+        .append_pair("corpora", "user")
+        .append_pair("includeItemsFromAllDrives", "true")
+        .append_pair("supportsAllDrives", "true")
+        .append_pair("q", &drive_shard_folder_lookup_query(root_folder_id, key));
+    if let Some(page_token) = page_token {
+        api_base_url
+            .query_pairs_mut()
+            .append_pair("pageToken", page_token);
+    }
+
+    Ok(api_base_url)
+}
+
+fn drive_file_create_url(mut api_base_url: Url) -> StorageResult<Url> {
+    let base_path_already_targets_drive_api =
+        drive_api_base_path_already_targets_drive_api(&api_base_url);
+    {
+        let mut segments =
+            api_base_url
+                .path_segments_mut()
+                .map_err(|_| StorageError::Upstream {
+                    provider: "google_drive".to_owned(),
+                    status: None,
+                    message: SanitizedMessage::new(
+                        "Google Drive API base URL cannot be used for path construction",
+                    ),
+                })?;
+        segments.pop_if_empty();
+        if base_path_already_targets_drive_api {
+            segments.push("files");
+        } else {
+            segments.extend(["drive", "v3", "files"]);
+        }
+    }
+    api_base_url
+        .query_pairs_mut()
+        .append_pair("fields", "id,name,mimeType,parents,trashed,appProperties")
+        .append_pair("supportsAllDrives", "true");
 
     Ok(api_base_url)
 }
@@ -2412,6 +2848,21 @@ fn drive_upload_metadata(root_folder_id: &str, key: &GoogleDriveObjectKey) -> se
     })
 }
 
+fn drive_shard_folder_metadata(
+    root_folder_id: &str,
+    key: &GoogleDriveObjectKey,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": key.shard_folder_name(),
+        "mimeType": GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+        "parents": [root_folder_id],
+        "appProperties": {
+            (GOOGLE_DRIVE_SHARD_KIND_PROPERTY): GOOGLE_DRIVE_SHARD_KIND,
+            (GOOGLE_DRIVE_SHARD_PREFIX_PROPERTY): key.shard_prefix(),
+        },
+    })
+}
+
 fn drive_object_lookup_query(
     root_folder_id: &str,
     key: &GoogleDriveObjectKey,
@@ -2434,6 +2885,19 @@ fn drive_object_lookup_query(
     query
 }
 
+fn drive_shard_folder_lookup_query(root_folder_id: &str, key: &GoogleDriveObjectKey) -> String {
+    format!(
+        "'{}' in parents and trashed = false and name = '{}' and mimeType = '{}' and appProperties has {{ key='{}' and value='{}' }} and appProperties has {{ key='{}' and value='{}' }}",
+        escape_drive_query_string(root_folder_id),
+        escape_drive_query_string(&key.shard_folder_name()),
+        GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+        GOOGLE_DRIVE_SHARD_KIND_PROPERTY,
+        GOOGLE_DRIVE_SHARD_KIND,
+        GOOGLE_DRIVE_SHARD_PREFIX_PROPERTY,
+        key.shard_prefix(),
+    )
+}
+
 fn validate_repo_namespace(value: &str) -> StorageResult<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2454,31 +2918,6 @@ fn validate_repo_namespace(value: &str) -> StorageResult<String> {
     }
 
     Ok(trimmed.to_owned())
-}
-
-fn percent_encode_drive_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => {
-                encoded.push('%');
-                encoded.push(hex_digit(byte >> 4));
-                encoded.push(hex_digit(byte & 0x0f));
-            }
-        }
-    }
-    encoded
-}
-
-fn hex_digit(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'A' + value - 10) as char,
-        _ => unreachable!("hex digit nibble should be in range"),
-    }
 }
 
 fn escape_drive_query_string(value: &str) -> String {
@@ -2662,6 +3101,134 @@ struct VerifiedGoogleDriveObjectPage {
     next_page_token: Option<String>,
 }
 
+fn parse_drive_shard_folder_lookup_success(
+    storage: &GoogleDriveStorageConfig,
+    key: &GoogleDriveObjectKey,
+    status: StatusCode,
+    body: &str,
+) -> StorageResult<VerifiedGoogleDriveShardFolderPage> {
+    let response =
+        serde_json::from_str::<GoogleDriveFileList>(body).map_err(|_| StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive shard-folder lookup response was invalid JSON",
+            ),
+        })?;
+    if response.incomplete_search {
+        return Err(StorageError::Retryable {
+            provider: storage.id.clone(),
+            message: "Google Drive shard-folder lookup returned incomplete search results"
+                .to_owned(),
+        });
+    }
+    let next_page_token = validated_drive_page_token(
+        storage,
+        status,
+        response.next_page_token,
+        "Google Drive shard-folder lookup",
+    )?;
+    let folder_ids = response
+        .files
+        .into_iter()
+        .map(|file| verify_drive_shard_folder(storage, key, status, file))
+        .collect::<StorageResult<Vec<_>>>()?;
+
+    Ok(VerifiedGoogleDriveShardFolderPage {
+        folder_ids,
+        next_page_token,
+    })
+}
+
+fn parse_drive_shard_folder_create_success(
+    storage: &GoogleDriveStorageConfig,
+    key: &GoogleDriveObjectKey,
+    status: StatusCode,
+    body: &str,
+) -> StorageResult<String> {
+    let file = serde_json::from_str::<GoogleDriveObjectFile>(body).map_err(|_| {
+        StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive shard-folder creation response was invalid JSON",
+            ),
+        }
+    })?;
+    verify_drive_shard_folder(storage, key, status, file)
+}
+
+fn verify_drive_shard_folder(
+    storage: &GoogleDriveStorageConfig,
+    key: &GoogleDriveObjectKey,
+    status: StatusCode,
+    file: GoogleDriveObjectFile,
+) -> StorageResult<String> {
+    let id = file
+        .id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new("Google Drive shard-folder response did not include id"),
+        })?;
+    let valid = file.name.as_deref() == Some(key.shard_folder_name().as_str())
+        && file.mime_type.as_deref() == Some(GOOGLE_DRIVE_FOLDER_MIME_TYPE)
+        && !file.trashed
+        && file
+            .parents
+            .iter()
+            .any(|parent| parent == &storage.root_folder_id)
+        && file
+            .app_properties
+            .get(GOOGLE_DRIVE_SHARD_KIND_PROPERTY)
+            .map(String::as_str)
+            == Some(GOOGLE_DRIVE_SHARD_KIND)
+        && file
+            .app_properties
+            .get(GOOGLE_DRIVE_SHARD_PREFIX_PROPERTY)
+            .map(String::as_str)
+            == Some(key.shard_prefix());
+    if !valid {
+        return Err(StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive shard-folder response did not match its deterministic identity",
+            ),
+        });
+    }
+
+    Ok(id)
+}
+
+fn validated_drive_page_token(
+    storage: &GoogleDriveStorageConfig,
+    status: StatusCode,
+    page_token: Option<String>,
+    operation: &str,
+) -> StorageResult<Option<String>> {
+    page_token
+        .map(|token| {
+            if token.trim().is_empty() {
+                return Err(StorageError::Upstream {
+                    provider: storage.id.clone(),
+                    status: Some(status.as_u16()),
+                    message: SanitizedMessage::new(format!(
+                        "{operation} returned a blank page token"
+                    )),
+                });
+            }
+            Ok(token)
+        })
+        .transpose()
+}
+
+struct VerifiedGoogleDriveShardFolderPage {
+    folder_ids: Vec<String>,
+    next_page_token: Option<String>,
+}
+
 fn verify_drive_object_file(
     storage: &GoogleDriveStorageConfig,
     key: &GoogleDriveObjectKey,
@@ -2680,6 +3247,12 @@ fn verify_drive_object_file(
             ),
         })?;
     if file.name.as_deref() != Some(&key.file_name()) {
+        return Err(StorageError::Conflict {
+            provider: storage.id.clone(),
+            oid: key.object.oid.as_hex().to_owned(),
+        });
+    }
+    if file.trashed {
         return Err(StorageError::Conflict {
             provider: storage.id.clone(),
             oid: key.object.oid.as_hex().to_owned(),
@@ -3155,7 +3728,7 @@ mod tests {
         StorageError, StorageProvider,
     };
     use axum::{
-        Router,
+        Json, Router,
         body::{Body, Bytes, to_bytes},
         extract::{Path, State},
         http::{
@@ -3366,11 +3939,10 @@ mod tests {
         assert_eq!(key.repo_namespace(), "github.com/Owner Repo/repo.git");
         assert_eq!(key.object(), &lfs_object());
         assert_eq!(key.file_name(), format!("sha256-{OBJECT_OID}-42.lfs"));
+        assert_eq!(key.shard_folder_name(), "lfs-cloud-sha256-aa");
         assert_eq!(
             key.display_path(),
-            format!(
-                "objects/github.com%2FOwner%20Repo%2Frepo.git/sha256/aa/aa/sha256-{OBJECT_OID}-42.lfs"
-            )
+            format!("lfs-cloud-sha256-aa/sha256-{OBJECT_OID}-42.lfs")
         );
     }
 
@@ -3484,6 +4056,39 @@ mod tests {
     }
 
     #[test]
+    fn drive_shard_folder_lookup_is_root_scoped_and_deterministic() {
+        let key = GoogleDriveObjectKey::new("github.com/owner/repo", lfs_object())
+            .expect("key should build");
+        let url = super::drive_shard_folder_lookup_url(
+            url::Url::parse("http://localhost/proxy/drive/v3").expect("base URL should parse"),
+            "drive-root",
+            &key,
+            None,
+        )
+        .expect("shard lookup URL should build");
+        let query = form_pairs(url.query().expect("shard lookup URL should include query"));
+
+        assert_eq!(url.path(), "/proxy/drive/v3/files");
+        assert!(query["q"].contains("'drive-root' in parents"));
+        assert!(query["q"].contains("name = 'lfs-cloud-sha256-aa'"));
+        assert!(
+            query["q"]
+                .contains("appProperties has { key='lfsCloudFolderKind' and value='objectShard' }")
+        );
+        assert!(query["q"].contains("appProperties has { key='lfsCloudShard' and value='aa' }"));
+
+        let metadata = super::drive_shard_folder_metadata("drive-root", &key);
+        assert_eq!(metadata["name"], "lfs-cloud-sha256-aa");
+        assert_eq!(metadata["mimeType"], "application/vnd.google-apps.folder");
+        assert_eq!(metadata["parents"], serde_json::json!(["drive-root"]));
+        assert_eq!(
+            metadata["appProperties"]["lfsCloudFolderKind"],
+            "objectShard"
+        );
+        assert_eq!(metadata["appProperties"]["lfsCloudShard"], "aa");
+    }
+
+    #[test]
     fn drive_resumable_upload_url_does_not_duplicate_existing_drive_api_path() {
         let url = super::drive_resumable_upload_url(
             url::Url::parse("http://localhost/proxy/drive/v3").expect("base URL should parse"),
@@ -3538,6 +4143,23 @@ mod tests {
             StorageError::Upstream { ref message, .. }
                 if message.as_str().contains("Google Drive file ID must not be blank")
         ));
+    }
+
+    #[test]
+    fn drive_object_metadata_url_targets_stored_backend_id_directly() {
+        let url = super::drive_object_metadata_url(
+            url::Url::parse("http://localhost/proxy/drive/v3").expect("base URL should parse"),
+            "drive-file-123/opaque",
+        )
+        .expect("metadata URL should build");
+
+        assert_eq!(url.path(), "/proxy/drive/v3/files/drive-file-123%2Fopaque");
+        let query = form_pairs(url.query().expect("metadata URL should include query"));
+        assert_eq!(
+            query["fields"],
+            "id,name,size,parents,trashed,appProperties"
+        );
+        assert_eq!(query["supportsAllDrives"], "true");
     }
 
     #[test]
@@ -3888,7 +4510,7 @@ mod tests {
         );
 
         let requests = server.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 4);
         assert_eq!(
             requests[0].headers.get(AUTHORIZATION).unwrap(),
             "Bearer access-token"
@@ -3901,6 +4523,222 @@ mod tests {
         assert!(query["q"].contains(
             "appProperties has { key='lfsCloudRepoNamespace' and value='github.com/owner/repo' }"
         ));
+    }
+
+    #[tokio::test]
+    async fn object_store_resolves_stored_backend_id_without_a_list_query() {
+        let server = DriveMetadataServer::start(
+            StatusCode::OK,
+            drive_object_json("drive-file-123", OBJECT_OID, 42),
+        )
+        .await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let stored_object = store
+            .lookup_object_by_backend_id(&lfs_object(), "drive-file-123")
+            .await
+            .expect("direct backend lookup should succeed")
+            .expect("stored backend should match");
+
+        assert_eq!(stored_object.backend_id, "drive-file-123");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].file_id, "drive-file-123");
+        assert_eq!(
+            requests[0].headers.get(AUTHORIZATION).unwrap(),
+            "Bearer access-token"
+        );
+        let query = form_pairs(&requests[0].query);
+        assert_eq!(
+            query["fields"],
+            "id,name,size,parents,trashed,appProperties"
+        );
+        assert_eq!(query["supportsAllDrives"], "true");
+    }
+
+    #[tokio::test]
+    async fn object_store_treats_missing_stored_backend_id_as_repairable() {
+        let server = DriveMetadataServer::start(
+            StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"not found"}}"#,
+        )
+        .await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        assert!(
+            store
+                .lookup_object_by_backend_id(&lfs_object(), "drive-file-missing")
+                .await
+                .expect("missing backend lookup should remain repairable")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_verifies_stored_backend_shard_belongs_to_root() {
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new().route(
+            "/drive/v3/files/{file_id}",
+            get({
+                let requests = requests.clone();
+                move |Path(file_id): Path<String>| {
+                    let requests = requests.clone();
+                    async move {
+                        requests
+                            .lock()
+                            .expect("direct metadata requests lock should not poison")
+                            .push(file_id.clone());
+                        if file_id == "drive-file-123" {
+                            return Json(serde_json::json!({
+                                "id": "drive-file-123",
+                                "name": format!("sha256-{OBJECT_OID}-42.lfs"),
+                                "size": "42",
+                                "parents": ["drive-shard-aa"],
+                                "trashed": false,
+                                "appProperties": {
+                                    "lfsCloudVersion": "1",
+                                    "lfsCloudRepoNamespace": "github.com/owner/repo",
+                                    "lfsCloudOid": OBJECT_OID,
+                                    "lfsCloudSize": "42"
+                                }
+                            }));
+                        }
+                        Json(serde_json::json!({
+                            "id": "drive-shard-aa",
+                            "name": "lfs-cloud-sha256-aa",
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": ["drive-root"],
+                            "trashed": false,
+                            "appProperties": {
+                                "lfsCloudFolderKind": "objectShard",
+                                "lfsCloudShard": "aa"
+                            }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("direct metadata server should bind");
+        let address = listener
+            .local_addr()
+            .expect("direct metadata server address should be available");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("direct metadata server should run");
+        });
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            format!("http://{address}"),
+        )
+        .expect("object store should build");
+
+        let found = store
+            .lookup_object_by_backend_id(&lfs_object(), "drive-file-123")
+            .await
+            .expect("sharded direct lookup should succeed")
+            .expect("sharded object should remain root-scoped");
+        server_task.abort();
+
+        assert_eq!(found.backend_id, "drive-file-123");
+        assert_eq!(
+            requests
+                .lock()
+                .expect("direct metadata requests lock should not poison")
+                .as_slice(),
+            ["drive-file-123", "drive-shard-aa"]
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_creates_missing_deterministic_shard_folder() {
+        let create_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new().route(
+            "/drive/v3/files",
+            get(|| async { Json(serde_json::json!({ "files": [] })) }).post({
+                let create_bodies = create_bodies.clone();
+                move |body: Bytes| {
+                    let create_bodies = create_bodies.clone();
+                    async move {
+                        create_bodies
+                            .lock()
+                            .expect("shard create bodies lock should not poison")
+                            .push(
+                                String::from_utf8(body.to_vec())
+                                    .expect("shard create body should be UTF-8"),
+                            );
+                        Json(serde_json::json!({
+                            "id": "drive-shard-aa",
+                            "name": "lfs-cloud-sha256-aa",
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": ["drive-root"],
+                            "trashed": false,
+                            "appProperties": {
+                                "lfsCloudFolderKind": "objectShard",
+                                "lfsCloudShard": "aa"
+                            }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("shard create server should bind");
+        let address = listener
+            .local_addr()
+            .expect("shard create server address should be available");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("shard create server should run");
+        });
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            format!("http://{address}"),
+        )
+        .expect("object store should build");
+        let key = store
+            .object_key(&lfs_object())
+            .expect("object key should build");
+
+        let folder_id = store
+            .upload_parent_folder_id(&key)
+            .await
+            .expect("missing shard should be created");
+        server_task.abort();
+
+        assert_eq!(folder_id, "drive-shard-aa");
+        let bodies = create_bodies
+            .lock()
+            .expect("shard create bodies lock should not poison");
+        assert_eq!(bodies.len(), 1);
+        let metadata: serde_json::Value =
+            serde_json::from_str(&bodies[0]).expect("shard create body should be JSON");
+        assert_eq!(metadata["name"], "lfs-cloud-sha256-aa");
+        assert_eq!(metadata["parents"], serde_json::json!(["drive-root"]));
     }
 
     #[tokio::test]
@@ -3990,7 +4828,7 @@ mod tests {
 
         assert_eq!(stored_object.backend_id, "drive-file-a");
         let requests = server.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         let first_query = form_pairs(&requests[0].query);
         let second_query = form_pairs(&requests[1].query);
         assert!(!first_query.contains_key("pageToken"));
@@ -4207,7 +5045,10 @@ mod tests {
             metadata["name"],
             format!("sha256-{}-{}.lfs", object.oid.as_hex(), object.size.bytes())
         );
-        assert_eq!(metadata["parents"], serde_json::json!(["drive-root"]));
+        assert_eq!(
+            metadata["parents"],
+            serde_json::json!([format!("drive-shard-{}", &object.oid.as_hex()[..2])])
+        );
         assert_eq!(
             metadata["appProperties"]["lfsCloudRepoNamespace"],
             "github.com/owner/repo"
@@ -4690,7 +5531,7 @@ mod tests {
         assert_eq!(&body[..], object_bytes);
 
         let list_requests = server.list_requests();
-        assert_eq!(list_requests.len(), 1);
+        assert_eq!(list_requests.len(), 2);
         assert_eq!(
             list_requests[0].headers.get(AUTHORIZATION).unwrap(),
             "Bearer access-token"
@@ -5361,6 +6202,8 @@ mod tests {
                 "id":"{file_id}",
                 "name":"sha256-{oid}-{size}.lfs",
                 "size":"{size}",
+                "parents":["drive-root"],
+                "trashed":false,
                 "appProperties":{{
                     "lfsCloudVersion":"1",
                     "lfsCloudRepoNamespace":"github.com/owner/repo",
@@ -5474,15 +6317,20 @@ mod tests {
             });
         let page_token = url::form_urlencoded::parse(query.as_bytes())
             .find_map(|(key, value)| (key == "pageToken").then(|| value.into_owned()));
-        let body = page_token
-            .as_deref()
-            .and_then(|token| state.paginated_bodies.get(token))
-            .unwrap_or(&state.body);
+        let folder_query = is_shard_folder_query(query);
+        let body = if folder_query {
+            r#"{"files":[]}"#
+        } else {
+            page_token
+                .as_deref()
+                .and_then(|token| state.paginated_bodies.get(token))
+                .unwrap_or(&state.body)
+        };
 
         (
             state.status,
             [(CONTENT_TYPE, "application/json")],
-            body.clone(),
+            body.to_owned(),
         )
             .into_response()
     }
@@ -5651,12 +6499,12 @@ mod tests {
                 query: uri.query().unwrap_or_default().to_owned(),
             });
 
-        (
-            StatusCode::OK,
-            [(CONTENT_TYPE, "application/json")],
-            state.list_body.clone(),
-        )
-            .into_response()
+        let body = if is_shard_folder_query(uri.query().unwrap_or_default()) {
+            r#"{"files":[]}"#.to_owned()
+        } else {
+            state.list_body.clone()
+        };
+        (StatusCode::OK, [(CONTENT_TYPE, "application/json")], body).into_response()
     }
 
     async fn drive_download_media_handler(
@@ -5977,6 +6825,7 @@ mod tests {
                 upload_requests: Mutex::new(Vec::new()),
             });
             let app = Router::new()
+                .route("/drive/v3/files", get(drive_upload_shard_list_handler))
                 .route(
                     "/upload/drive/v3/files",
                     post(drive_upload_initiate_handler),
@@ -6029,6 +6878,50 @@ mod tests {
         upload_responses: Vec<StubDriveUploadResponse>,
         initiate_requests: Mutex<Vec<CapturedDriveUploadInitiateRequest>>,
         upload_requests: Mutex<Vec<CapturedDriveUploadRequest>>,
+    }
+
+    async fn drive_upload_shard_list_handler(uri: Uri) -> Response {
+        let query = uri.query().unwrap_or_default();
+        let Some(shard_prefix) = shard_prefix_from_query(query) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(CONTENT_TYPE, "application/json")],
+                r#"{"error":{"message":"missing shard query"}}"#.to_owned(),
+            )
+                .into_response();
+        };
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            format!(
+                r#"{{"files":[{{
+                    "id":"drive-shard-{shard_prefix}",
+                    "name":"lfs-cloud-sha256-{shard_prefix}",
+                    "mimeType":"application/vnd.google-apps.folder",
+                    "parents":["drive-root"],
+                    "trashed":false,
+                    "appProperties":{{
+                        "lfsCloudFolderKind":"objectShard",
+                        "lfsCloudShard":"{shard_prefix}"
+                    }}
+                }}]}}"#
+            ),
+        )
+            .into_response()
+    }
+
+    fn is_shard_folder_query(query: &str) -> bool {
+        form_pairs(query)
+            .get("q")
+            .is_some_and(|query| query.contains("lfsCloudFolderKind"))
+    }
+
+    fn shard_prefix_from_query(query: &str) -> Option<String> {
+        let query = form_pairs(query).remove("q")?;
+        let marker = "key='lfsCloudShard' and value='";
+        let prefix = query.split_once(marker)?.1.split_once('\'')?.0;
+        // Test requests use the exact two-character SHA-256 prefix contract.
+        (prefix.len() == 2).then(|| prefix.to_owned())
     }
 
     #[derive(Clone)]

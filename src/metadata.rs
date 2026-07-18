@@ -674,6 +674,87 @@ impl MetadataDatabase {
         )
     }
 
+    /// Looks up object metadata without blocking an async runtime worker.
+    pub(crate) async fn lookup_object_async(
+        self: &Arc<Self>,
+        repo_id: String,
+        storage_provider_id: String,
+        object: LfsObject,
+    ) -> ServerResult<Option<MetadataObjectRecord>> {
+        let database = Arc::clone(self);
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            database.lookup_object(&repo_id, &storage_provider_id, &object)
+        })
+        .await
+        .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
+    }
+
+    /// Marks a backend mapping stale if it still points at the expected ID.
+    ///
+    /// Comparing the backend ID makes repair safe against a concurrent upload
+    /// that has already installed a newer verified mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when SQLite cannot update the metadata row.
+    pub(crate) fn mark_object_stale(
+        &self,
+        repo_id: &str,
+        storage_provider_id: &str,
+        object: &LfsObject,
+        expected_backend_id: &str,
+    ) -> ServerResult<bool> {
+        let size_bytes = sqlite_size_bytes(object)?;
+        let connection = self.lock_connection()?;
+        let updated = connection
+            .execute(
+                "UPDATE objects
+                 SET verification_status = ?1,
+                     last_verified_at_unix_seconds = NULL
+                 WHERE repo_id = ?2
+                   AND storage_provider_id = ?3
+                   AND oid = ?4
+                   AND size_bytes = ?5
+                   AND backend_id = ?6",
+                params![
+                    MetadataObjectVerificationStatus::Stale.as_database_str(),
+                    repo_id,
+                    storage_provider_id,
+                    object.oid.as_hex(),
+                    size_bytes,
+                    expected_backend_id,
+                ],
+            )
+            .map_err(|source| ServerError::MetadataOperation {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(updated == 1)
+    }
+
+    /// Marks a missing backend mapping stale off the async runtime worker.
+    pub(crate) async fn mark_object_stale_async(
+        self: &Arc<Self>,
+        repo_id: String,
+        storage_provider_id: String,
+        object: LfsObject,
+        expected_backend_id: String,
+    ) -> ServerResult<bool> {
+        let database = Arc::clone(self);
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            database.mark_object_stale(
+                &repo_id,
+                &storage_provider_id,
+                &object,
+                &expected_backend_id,
+            )
+        })
+        .await
+        .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
+    }
+
     /// Inserts or repairs object metadata after a successful verified upload.
     ///
     /// The operation is idempotent for the repository/storage/object key: it
@@ -2118,6 +2199,59 @@ repositories:
         );
         assert!(repaired.last_verified_at_unix_seconds.is_some());
         assert_eq!(object_row_count(&database), 1);
+    }
+
+    #[test]
+    fn missing_backend_id_is_marked_stale_only_while_mapping_is_unchanged() {
+        let database = MetadataDatabase::open_in_memory().expect("metadata DB should open");
+        insert_storage_provider_and_repository_mapping(
+            &database
+                .connection
+                .lock()
+                .expect("metadata connection should lock"),
+        );
+        let object = lfs_object('a', 42);
+        let user = RepositoryUser::new("github-main", "octocat", Some("user-1".to_owned()));
+        database
+            .record_verified_object(
+                "github-main:owner/repo",
+                "drive-user-a",
+                &object,
+                "drive-file-current",
+                &user,
+            )
+            .expect("verified object should record");
+
+        assert!(
+            !database
+                .mark_object_stale(
+                    "github-main:owner/repo",
+                    "drive-user-a",
+                    &object,
+                    "drive-file-replaced",
+                )
+                .expect("obsolete repair should be ignored")
+        );
+        assert!(
+            database
+                .mark_object_stale(
+                    "github-main:owner/repo",
+                    "drive-user-a",
+                    &object,
+                    "drive-file-current",
+                )
+                .expect("current missing backend should become stale")
+        );
+
+        let record = database
+            .lookup_object("github-main:owner/repo", "drive-user-a", &object)
+            .expect("stale object lookup should succeed")
+            .expect("stale object should remain recorded");
+        assert_eq!(
+            record.verification_status,
+            MetadataObjectVerificationStatus::Stale
+        );
+        assert_eq!(record.last_verified_at_unix_seconds, None);
     }
 
     #[test]

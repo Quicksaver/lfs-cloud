@@ -1043,25 +1043,31 @@ Drive folder, and verifies that the credential can add child objects there.
 The refreshed access token remains cached for transfer use. Resumable upload
 and download paths remain responsible for transfer-level verification.
 
-Drive object placement uses deterministic repository-scoped keys below the
+New Drive objects are placed in deterministic SHA-256 prefix folders below the
 configured root folder:
 
 ```text
-objects/<percent-encoded-repo-namespace>/sha256/<first-2>/<next-2>/sha256-<oid>-<size>.lfs
+lfs-cloud-sha256-<first-2>/sha256-<oid>-<size>.lfs
 ```
 
-Google Drive file IDs remain the backend address. The display path is for
-operator inspection and cleanup, while lookup verifies private Drive
-`appProperties` for the object-key version, repository namespace, SHA-256 OID,
-and byte size. Repository namespaces remain raw while their UTF-8 value plus
-the property key fits Drive's 124-byte property-string limit. Oversized
-namespaces use a SHA-256 value plus an explicit format property, keeping the
-backend identity bounded without making a digest-shaped raw namespace
-ambiguous. The binary `size` returned by Drive must also match the LFS pointer
-size before an object is accepted. Lookup follows every Drive list page and
-validates every candidate before deciding absence or selecting the
-lexicographically smallest exact-match file ID. Repeated page tokens are
-rejected as retryable provider failures rather than allowed to loop forever.
+The 256 logical shard names bound each new object's folder population while
+private `appProperties` retain repository namespace, object-key version,
+SHA-256 OID, and byte size identity. Concurrent creators may leave duplicate
+physical folders for one logical shard; discovery checks every matching folder
+and reconciles exact object duplicates by the smallest Drive file ID. Objects
+written by older releases directly under the configured root remain readable.
+
+Google Drive file IDs remain the backend address and SQLite is the hot-path
+index. Server lookups first issue `files.get` for a stored backend ID and
+verify its private properties plus binary size. A missing or mismatched ID
+falls back to root and shard discovery. If discovery finds a replacement, the
+metadata row is repaired while preserving original creator attribution; if it
+does not, the unchanged mapping is marked stale. Repository namespaces remain
+raw while their UTF-8 value plus the property key fits Drive's 124-byte
+property-string limit. Oversized namespaces use a SHA-256 value plus an
+explicit format property, keeping the backend identity bounded without making
+a digest-shaped raw namespace ambiguous. Discovery follows every Drive list
+page and rejects repeated page tokens rather than looping forever.
 
 Use Google Drive resumable uploads for large object writes. Stage uploads to a
 local temp file so SHA-256 and size are verified before opening a Drive session.
@@ -1444,7 +1450,7 @@ Defer:
 
 - [x] [T] Define Drive object naming/path convention under the configured root folder.
 - [x] [T] Implement object existence lookup by repo namespace, OID, and size.
-- [x] [M] Implement resumable upload from staged temp file. Manual verification: with a real app-accessible Drive root folder and `drive.file` credential, upload a staged file whose SHA-256 and size match an `LfsObject`, then confirm Drive contains `sha256-<oid>-<size>.lfs` under the configured root with matching private app properties and binary size.
+- [x] [M] Implement resumable upload from staged temp file. Manual verification: with a real app-accessible Drive root folder and `drive.file` credential, upload a staged file whose SHA-256 and size match an `LfsObject`, then confirm Drive contains `sha256-<oid>-<size>.lfs` in the matching `lfs-cloud-sha256-<first-2>` folder with matching private app properties and binary size.
 - [x] [M] Implement download streaming from Drive to HTTP response. Manual verification: with a real app-accessible Drive root folder and `drive.file` credential, upload or locate a verified object, request it through `GoogleDriveObjectStore::download_object_response`, and confirm the streamed HTTP body length and SHA-256 match the requested `LfsObject` without exposing a Drive URL to the client.
 - [x] [T] Implement provider error classification for auth, quota, not found, conflict, and retryable failures.
 
