@@ -278,6 +278,20 @@ pub enum ServerError {
         source: rusqlite::Error,
     },
 
+    /// The metadata database was created by a newer, incompatible binary.
+    #[error(
+        "metadata database {} uses schema version {found}, but this binary supports up to version {supported}",
+        path.display()
+    )]
+    MetadataSchemaTooNew {
+        /// SQLite database path whose schema cannot be safely opened.
+        path: PathBuf,
+        /// Schema version found in the database.
+        found: u32,
+        /// Newest schema version this binary understands.
+        supported: u32,
+    },
+
     /// The server could not apply metadata database migrations.
     #[error("failed to migrate metadata database {}: {source}", path.display())]
     MetadataMigration {

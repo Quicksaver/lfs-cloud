@@ -1062,6 +1062,10 @@ Direct signed URLs are not part of the MVP. They are a future optimization for S
 
 Use SQLite for MVP metadata.
 
+The migration runner reads and validates SQLite's `user_version` before any
+schema statement. A database created by a newer binary is rejected without
+modification so an older binary cannot partially rewrite an unknown schema.
+
 Startup reconciles the current repository configuration transactionally.
 Mappings removed from configuration remain as inactive historical parents for
 object and transfer records, while their route keys are tombstoned before the

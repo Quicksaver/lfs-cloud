@@ -640,11 +640,27 @@ independently validated or adjudicated.
    behavior; with one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, relevant feedback.
 
-9. **Medium — Newer metadata schemas are silently accepted and may be
-   modified.** Initial schema statements execute before the code validates
-   `PRAGMA user_version`, and versions above the supported version are not
-   rejected (`src/metadata.rs:333-367`). Read and validate the version before
-   mutation and add a future-version regression test.
+9. **[DONE] Newer metadata schemas were silently accepted and could be
+   modified** (Medium, `src/metadata.rs`, `src/error.rs`,
+   `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and actionable.** The
+   migration runner previously executed its initial schema batch before reading
+   `PRAGMA user_version`, and a version above the
+   binary's supported version skipped every known migration without producing
+   an error. It now reads the version before starting a transaction or
+   executing schema SQL and returns a typed error containing the database path,
+   found version, and supported version when the schema is newer. A regression
+   creates a version-5 database with an unknown table and sentinel row, proves
+   opening it fails, and then reopens it directly to prove the version, table
+   set, and data remain unchanged. Implementation guidance and the repository
+   learning now document the forward-schema guard. Verification passed with
+   `cargo fmt`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+   focused reviewer identified a genuine medium-severity forward-compatibility
+   and data-integrity flaw, pinpointed the unsafe operation ordering, and
+   requested the decisive non-mutation regression. With one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, relevant feedback.
 
 10. **Medium — Synchronous SQLite and a standard mutex block async request
     workers.** Upload completion directly performs serialized synchronous

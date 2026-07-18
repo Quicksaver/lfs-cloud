@@ -383,6 +383,19 @@ impl MetadataDatabase {
 
     fn run_migrations(&self) -> ServerResult<()> {
         let mut connection = self.lock_connection()?;
+        let schema_version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .map_err(|source| ServerError::MetadataMigration {
+                path: self.path.clone(),
+                source,
+            })?;
+        if schema_version > METADATA_SCHEMA_VERSION {
+            return Err(ServerError::MetadataSchemaTooNew {
+                path: self.path.clone(),
+                found: schema_version,
+                supported: METADATA_SCHEMA_VERSION,
+            });
+        }
         let transaction =
             connection
                 .transaction()
@@ -392,12 +405,6 @@ impl MetadataDatabase {
                 })?;
         transaction
             .execute_batch(INITIAL_SCHEMA)
-            .map_err(|source| ServerError::MetadataMigration {
-                path: self.path.clone(),
-                source,
-            })?;
-        let schema_version = transaction
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .map_err(|source| ServerError::MetadataMigration {
                 path: self.path.clone(),
                 source,
@@ -1118,6 +1125,55 @@ PRAGMA user_version = 1;
                 .expect("schema version should load"),
             METADATA_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn migration_rejects_future_schema_without_modifying_it() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let db_path = directory.path().join("future-metadata.sqlite3");
+        let future_schema_version = METADATA_SCHEMA_VERSION + 1;
+        let future_connection =
+            rusqlite::Connection::open(&db_path).expect("future metadata DB should open");
+        future_connection
+            .execute_batch(
+                "CREATE TABLE future_metadata(value TEXT NOT NULL) STRICT;
+                 INSERT INTO future_metadata(value) VALUES ('preserve-me');",
+            )
+            .expect("future metadata schema should be created");
+        future_connection
+            .pragma_update(None, "user_version", future_schema_version)
+            .expect("future schema version should be set");
+        drop(future_connection);
+
+        let error = MetadataDatabase::open(&db_path)
+            .expect_err("future metadata schema should be rejected");
+
+        assert!(matches!(
+            error,
+            ServerError::MetadataSchemaTooNew {
+                path,
+                found,
+                supported: METADATA_SCHEMA_VERSION,
+            } if path == db_path && found == future_schema_version
+        ));
+        let unchanged_connection =
+            rusqlite::Connection::open(&db_path).expect("future metadata DB should reopen");
+        let schema_version: u32 = unchanged_connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("future schema version should load");
+        assert_eq!(schema_version, future_schema_version);
+        let table_names = unchanged_connection
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+            .expect("table query should prepare")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("table query should run")
+            .collect::<Result<BTreeSet<_>, _>>()
+            .expect("table names should load");
+        assert_eq!(table_names, BTreeSet::from(["future_metadata".to_owned()]));
+        let preserved_value: String = unchanged_connection
+            .query_row("SELECT value FROM future_metadata", [], |row| row.get(0))
+            .expect("future metadata value should load");
+        assert_eq!(preserved_value, "preserve-me");
     }
 
     #[test]

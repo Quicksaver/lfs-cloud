@@ -451,6 +451,7 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
             | ServerError::MetadataDirectoryCreate { .. }
             | ServerError::MetadataOpen { .. }
             | ServerError::MetadataConfigure { .. }
+            | ServerError::MetadataSchemaTooNew { .. }
             | ServerError::MetadataMigration { .. }
             | ServerError::MetadataOperation { .. }
             | ServerError::MetadataConnectionPoisoned { .. }
