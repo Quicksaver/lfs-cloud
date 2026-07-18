@@ -39,18 +39,21 @@ use tokio_util::io::ReaderStream;
 use url::{Url, form_urlencoded};
 
 use crate::{
-    DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
-    GitHubOAuthStateRegistry, GitHubProviderConfig, GitHubRepositoryPermissionClient,
-    GoogleDriveAccessToken, GoogleDriveCredential, GoogleDriveCredentialLoader,
-    GoogleDriveObjectStore, GoogleDriveRootValidator, GoogleDriveStorageConfig,
-    GoogleDriveTokenRefresher, LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError,
-    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject,
-    LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture,
-    RepositoryHandle, RepositoryIdentity, RepositoryMapping, RepositoryPermission,
-    RepositoryProvider, RepositoryProviderConfig, RepositoryProviderError, RepositoryUser,
-    ServerConfig, ServerError, ServerResult, StorageError, StorageProvider, StorageProviderConfig,
-    StorageResult, StoredObject, github_oauth_callback_router, github_oauth_login_router,
-    parse_lfs_batch_request_json, sessions::LfsSessionRecord,
+    DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GITHUB_OAUTH_CALLBACK_PATH,
+    GitHubOAuthCallbackRouteState, GitHubOAuthStateRegistry, GitHubProviderConfig,
+    GitHubRepositoryPermissionClient, GoogleDriveAccessToken, GoogleDriveCredential,
+    GoogleDriveCredentialLoader, GoogleDriveObjectStore, GoogleDriveRootValidator,
+    GoogleDriveStorageConfig, GoogleDriveTokenRefresher, LFS_BASIC_TRANSFER,
+    LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation, LfsBatchRequest,
+    LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken,
+    LocalLfsSessionStore, MetadataDatabase, ProviderFuture, RepositoryHandle, RepositoryIdentity,
+    RepositoryMapping, RepositoryPermission, RepositoryProvider, RepositoryProviderConfig,
+    RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerConfig, ServerError,
+    ServerResult, StorageError, StorageProvider, StorageProviderConfig, StorageResult,
+    StoredObject, github_oauth_callback_router, github_oauth_login_router,
+    metadata::{MetadataTransferOperation, MetadataTransferResult},
+    parse_lfs_batch_request_json,
+    sessions::LfsSessionRecord,
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
@@ -133,8 +136,12 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
         metadata_database.clone(),
     )?);
     transfer_store.validate_storage_providers().await?;
-    let router =
-        server_router_with_sessions_and_transfer_store(config, session_store, transfer_store)?;
+    let router = server_router_with_sessions_and_transfer_store(
+        config,
+        session_store,
+        transfer_store,
+        metadata_database,
+    )?;
     let listener = tokio::net::TcpListener::bind((bind.host.as_str(), bind.port))
         .await
         .map_err(|source| ServerError::Bind {
@@ -282,6 +289,7 @@ pub fn server_router_with_sessions(
         Arc::new(GitHubBatchAuthorizer::new(&config)),
         Arc::new(PendingLfsObjectTransferStore),
         BatchBodyGuardrails::default(),
+        None,
     );
     let session_router = lfs_session_revoke_router(session_store.clone());
     let Some(auth_router) = github_oauth_router(config, session_store)? else {
@@ -301,6 +309,7 @@ fn server_router_with_sessions_and_transfer_store(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
+    metadata_database: Arc<MetadataDatabase>,
 ) -> ServerResult<Router> {
     let max_concurrent_requests = config.server.max_concurrent_requests;
     let lfs_router = build_lfs_server_router(
@@ -309,6 +318,7 @@ fn server_router_with_sessions_and_transfer_store(
         Arc::new(GitHubBatchAuthorizer::new(&config)),
         transfer_store,
         BatchBodyGuardrails::default(),
+        Some(metadata_database),
     );
     let session_router = lfs_session_revoke_router(session_store.clone());
     let Some(auth_router) = github_oauth_router(config, session_store)? else {
@@ -484,6 +494,7 @@ fn lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrail
             authorizer,
             transfer_store,
             batch_body_guardrails,
+            None,
         ),
         max_concurrent_requests,
     )
@@ -495,6 +506,7 @@ fn build_lfs_server_router(
     authorizer: Arc<dyn LfsBatchAuthorizer>,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
     batch_body_guardrails: BatchBodyGuardrails,
+    metadata_database: Option<Arc<MetadataDatabase>>,
 ) -> Router {
     let state = Arc::new(LfsServerState::new(
         config,
@@ -502,6 +514,7 @@ fn build_lfs_server_router(
         authorizer,
         transfer_store,
         batch_body_guardrails,
+        metadata_database,
     ));
 
     Router::new().fallback(handle_lfs_request).with_state(state)
@@ -1212,6 +1225,7 @@ struct LfsServerState {
     batch_body_guardrails: BatchBodyGuardrails,
     authorizer: Arc<dyn LfsBatchAuthorizer>,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
+    metadata_database: Option<Arc<MetadataDatabase>>,
     provider_calls: Arc<Semaphore>,
     authorization_cache: Arc<std::sync::Mutex<HashMap<AuthorizationCacheKey, Instant>>>,
     authorization_locks: Arc<std::sync::Mutex<HashMap<AuthorizationCacheKey, Arc<AsyncMutex<()>>>>>,
@@ -1233,6 +1247,7 @@ impl LfsServerState {
         authorizer: Arc<dyn LfsBatchAuthorizer>,
         transfer_store: Arc<dyn LfsObjectTransferStore>,
         batch_body_guardrails: BatchBodyGuardrails,
+        metadata_database: Option<Arc<MetadataDatabase>>,
     ) -> Self {
         let max_batch_objects = config.server.max_batch_objects;
         let max_provider_calls = config.server.max_provider_calls;
@@ -1248,6 +1263,7 @@ impl LfsServerState {
             batch_body_guardrails,
             authorizer,
             transfer_store,
+            metadata_database,
             provider_calls: Arc::new(Semaphore::new(max_provider_calls)),
             authorization_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             authorization_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1429,6 +1445,43 @@ impl LfsServerState {
         let _provider_permit = self.provider_call_permit().await?;
         self.transfer_store
             .record_verified_object(repository, object, backend_id, created_by)
+            .await
+    }
+
+    async fn start_transfer_attempt(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+        operation: MetadataTransferOperation,
+        user: &RepositoryUser,
+    ) -> ServerResult<Option<i64>> {
+        let Some(database) = &self.metadata_database else {
+            return Ok(None);
+        };
+
+        database
+            .start_transfer_attempt_async(
+                repository.id.clone(),
+                repository.storage_provider.clone(),
+                object.clone(),
+                operation,
+                user.clone(),
+            )
+            .await
+            .map(Some)
+    }
+
+    async fn finish_transfer_attempt(
+        &self,
+        attempt_id: Option<i64>,
+        result: MetadataTransferResult,
+    ) -> ServerResult<()> {
+        let (Some(database), Some(attempt_id)) = (&self.metadata_database, attempt_id) else {
+            return Ok(());
+        };
+
+        database
+            .finish_transfer_attempt_async(attempt_id, result)
             .await
     }
 }
@@ -1714,8 +1767,45 @@ async fn handle_lfs_download_request(
     }
 
     let object = LfsObject::new(oid, LfsObjectSize::new(expected_size));
+    let transfer_user = repository_user_from_session(&session);
+    let attempt_id = match state
+        .start_transfer_attempt(
+            &repository,
+            &object,
+            MetadataTransferOperation::Download,
+            &transfer_user,
+        )
+        .await
+    {
+        Ok(attempt_id) => attempt_id,
+        Err(error) => {
+            tracing::error!(
+                repo_id = repository.id.as_str(),
+                oid = object.oid.as_hex(),
+                %error,
+                "failed to record Git LFS download transfer start"
+            );
+            return git_lfs_download_storage_error_response(error);
+        }
+    };
     match state.download_object_response(&repository, &object).await {
         Ok(download) => {
+            let backend_id = download.stored_object().backend_id.clone();
+            if let Err(error) = state
+                .finish_transfer_attempt(
+                    attempt_id,
+                    MetadataTransferResult::succeeded(Some(backend_id)),
+                )
+                .await
+            {
+                tracing::error!(
+                    repo_id = repository.id.as_str(),
+                    oid = object.oid.as_hex(),
+                    %error,
+                    "failed to record Git LFS download transfer success"
+                );
+                return git_lfs_download_storage_error_response(error);
+            }
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 storage_provider = download.stored_object().provider_id.as_str(),
@@ -1727,6 +1817,7 @@ async fn handle_lfs_download_request(
             download.into_response()
         }
         Err(error) => {
+            finish_failed_transfer_attempt(state, attempt_id, &error, true).await;
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = object.oid.as_hex(),
@@ -1789,14 +1880,30 @@ async fn handle_lfs_upload_request(
         return git_lfs_authorization_error_response(error);
     }
 
+    let object = LfsObject::new(oid.clone(), LfsObjectSize::new(expected_size));
+    let created_by = repository_user_from_session(&session);
+    let attempt_id = match state
+        .start_transfer_attempt(
+            &repository,
+            &object,
+            MetadataTransferOperation::Upload,
+            &created_by,
+        )
+        .await
+    {
+        Ok(attempt_id) => attempt_id,
+        Err(error) => {
+            tracing::error!(
+                repo_id = repository.id.as_str(),
+                oid = object.oid.as_hex(),
+                %error,
+                "failed to record Git LFS upload transfer start"
+            );
+            return git_lfs_storage_error_response(error);
+        }
+    };
     let upload_lock = state.upload_lock_for(&repository, &oid);
     let _upload_lock_guard = upload_lock.lock().await;
-    let object = LfsObject::new(oid.clone(), LfsObjectSize::new(expected_size));
-    let created_by = RepositoryUser::new(
-        session.metadata().provider_id.clone(),
-        session.metadata().login.clone(),
-        session.metadata().stable_id.clone(),
-    );
 
     match state.lookup_object(&repository, &object).await {
         Ok(Some(stored_object)) => {
@@ -1817,6 +1924,7 @@ async fn handle_lfs_upload_request(
                 )
                 .await
             {
+                finish_failed_transfer_attempt(state, attempt_id, &error, false).await;
                 tracing::debug!(
                     repo_id = repository.id.as_str(),
                     oid = object.oid.as_hex(),
@@ -1825,10 +1933,26 @@ async fn handle_lfs_upload_request(
                 );
                 return git_lfs_storage_error_response(error);
             }
+            if let Err(error) = state
+                .finish_transfer_attempt(
+                    attempt_id,
+                    MetadataTransferResult::succeeded(Some(stored_object.backend_id.clone())),
+                )
+                .await
+            {
+                tracing::error!(
+                    repo_id = repository.id.as_str(),
+                    oid = object.oid.as_hex(),
+                    %error,
+                    "failed to record Git LFS upload transfer success"
+                );
+                return git_lfs_storage_error_response(error);
+            }
             return StatusCode::OK.into_response();
         }
         Ok(None) => {}
         Err(error) => {
+            finish_failed_transfer_attempt(state, attempt_id, &error, false).await;
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = object.oid.as_hex(),
@@ -1845,17 +1969,26 @@ async fn handle_lfs_upload_request(
     {
         Ok(lease) => lease,
         Err(UploadStagingError::ConcurrencyLimit) => {
+            finish_failed_transfer_attempt_with_message(
+                state,
+                attempt_id,
+                ErrorCategory::Storage,
+                "Git LFS upload staging has reached its concurrency limit",
+            )
+            .await;
             return upload_staging_overloaded_response();
         }
         Err(error) => {
             let error = error.into_storage_error();
+            let error = ServerError::from(error);
+            finish_failed_transfer_attempt(state, attempt_id, &error, false).await;
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = oid.as_hex(),
                 %error,
                 "Git LFS upload staging admission failed"
             );
-            return git_lfs_storage_error_response(ServerError::from(error));
+            return git_lfs_storage_error_response(error);
         }
     };
 
@@ -1870,26 +2003,56 @@ async fn handle_lfs_upload_request(
     {
         Ok(staged_upload) => staged_upload,
         Err(UploadStagingError::PayloadTooLarge) => {
+            finish_failed_transfer_attempt_with_message(
+                state,
+                attempt_id,
+                ErrorCategory::Storage,
+                "Git LFS upload object exceeds the configured request size limit",
+            )
+            .await;
             return upload_payload_too_large_response();
         }
         Err(UploadStagingError::InsufficientTempSpace { .. }) => {
+            finish_failed_transfer_attempt_with_message(
+                state,
+                attempt_id,
+                ErrorCategory::Storage,
+                "Git LFS upload staging directory does not have enough free space",
+            )
+            .await;
             return upload_temp_space_exhausted_response();
         }
         Err(UploadStagingError::TimedOut) => {
+            finish_failed_transfer_attempt_with_message(
+                state,
+                attempt_id,
+                ErrorCategory::Storage,
+                "Git LFS upload request timed out while reading the object body",
+            )
+            .await;
             return upload_staging_timeout_response();
         }
         Err(UploadStagingError::ConcurrencyLimit) => {
+            finish_failed_transfer_attempt_with_message(
+                state,
+                attempt_id,
+                ErrorCategory::Storage,
+                "Git LFS upload staging has reached its concurrency limit",
+            )
+            .await;
             return upload_staging_overloaded_response();
         }
         Err(error) => {
             let error = error.into_storage_error();
+            let error = ServerError::from(error);
+            finish_failed_transfer_attempt(state, attempt_id, &error, false).await;
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = oid.as_hex(),
                 %error,
                 "Git LFS upload transfer staging failed"
             );
-            return git_lfs_storage_error_response(ServerError::from(error));
+            return git_lfs_storage_error_response(error);
         }
     };
 
@@ -1898,6 +2061,21 @@ async fn handle_lfs_upload_request(
         .await
     {
         Ok(stored_object) => {
+            if let Err(error) = state
+                .finish_transfer_attempt(
+                    attempt_id,
+                    MetadataTransferResult::succeeded(Some(stored_object.backend_id.clone())),
+                )
+                .await
+            {
+                tracing::error!(
+                    repo_id = repository.id.as_str(),
+                    oid = object.oid.as_hex(),
+                    %error,
+                    "failed to record Git LFS upload transfer success"
+                );
+                return git_lfs_storage_error_response(error);
+            }
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 storage_provider = stored_object.provider_id.as_str(),
@@ -1908,6 +2086,7 @@ async fn handle_lfs_upload_request(
             StatusCode::OK.into_response()
         }
         Err(error) => {
+            finish_failed_transfer_attempt(state, attempt_id, &error, false).await;
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = object.oid.as_hex(),
@@ -1916,6 +2095,46 @@ async fn handle_lfs_upload_request(
             );
             git_lfs_storage_error_response(error)
         }
+    }
+}
+
+fn repository_user_from_session(session: &AuthenticatedLfsSession) -> RepositoryUser {
+    RepositoryUser::new(
+        session.metadata().provider_id.clone(),
+        session.metadata().login.clone(),
+        session.metadata().stable_id.clone(),
+    )
+}
+
+async fn finish_failed_transfer_attempt(
+    state: &LfsServerState,
+    attempt_id: Option<i64>,
+    error: &ServerError,
+    download: bool,
+) {
+    let category = match error {
+        ServerError::Storage { source } => source.category(),
+        ServerError::RepositoryProvider { source } => source.category(),
+        _ => error.category(),
+    };
+    let (_, message) = git_lfs_storage_error_response_parts(error, download);
+    finish_failed_transfer_attempt_with_message(state, attempt_id, category, message).await;
+}
+
+async fn finish_failed_transfer_attempt_with_message(
+    state: &LfsServerState,
+    attempt_id: Option<i64>,
+    category: ErrorCategory,
+    message: &'static str,
+) {
+    if let Err(error) = state
+        .finish_transfer_attempt(
+            attempt_id,
+            MetadataTransferResult::failed(category, SanitizedMessage::new(message)),
+        )
+        .await
+    {
+        tracing::error!(%error, "failed to record Git LFS transfer failure");
     }
 }
 
@@ -2713,7 +2932,29 @@ fn git_lfs_authorization_error_response(error: ServerError) -> Response {
 }
 
 fn git_lfs_storage_error_response(error: ServerError) -> Response {
-    let (status, message) = match error {
+    let (status, message) = git_lfs_storage_error_response_parts(&error, false);
+    git_lfs_json_error_response(status, message)
+}
+
+fn git_lfs_storage_error_response_parts(
+    error: &ServerError,
+    download: bool,
+) -> (StatusCode, &'static str) {
+    if download
+        && matches!(
+            error,
+            ServerError::Storage {
+                source: StorageError::IntegrityMismatch { .. },
+            }
+        )
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "Git LFS storage returned an object that failed integrity validation",
+        );
+    }
+
+    match error {
         ServerError::Storage {
             source: StorageError::IntegrityMismatch { .. },
         } => (
@@ -2761,25 +3002,12 @@ fn git_lfs_storage_error_response(error: ServerError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "Git LFS transfer handling failed",
         ),
-    };
-
-    git_lfs_json_error_response(status, message)
+    }
 }
 
 fn git_lfs_download_storage_error_response(error: ServerError) -> Response {
-    if matches!(
-        &error,
-        ServerError::Storage {
-            source: StorageError::IntegrityMismatch { .. },
-        }
-    ) {
-        return git_lfs_json_error_response(
-            StatusCode::BAD_GATEWAY,
-            "Git LFS storage returned an object that failed integrity validation",
-        );
-    }
-
-    git_lfs_storage_error_response(error)
+    let (status, message) = git_lfs_storage_error_response_parts(&error, true);
+    git_lfs_json_error_response(status, message)
 }
 
 fn lfs_batch_object_error_from_server_error(error: &ServerError) -> LfsBatchObjectError {
@@ -4056,6 +4284,23 @@ repositories:
         )
     }
 
+    fn test_router_with_transfer_metadata(
+        config: ServerConfig,
+        store: LocalLfsSessionStore,
+        authorizer: RecordingBatchAuthorizer,
+        transfer_store: RecordingTransferStore,
+        metadata_database: Arc<MetadataDatabase>,
+    ) -> Router {
+        super::build_lfs_server_router(
+            config,
+            store,
+            Arc::new(authorizer),
+            Arc::new(transfer_store),
+            super::BatchBodyGuardrails::default(),
+            Some(metadata_database),
+        )
+    }
+
     #[test]
     fn route_resolver_matches_configured_lfs_paths() {
         let resolver = LfsRouteResolver::new(&test_config());
@@ -4911,6 +5156,122 @@ repositories:
     }
 
     #[tokio::test]
+    async fn object_endpoints_record_successful_and_failed_transfer_lifecycles() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let database_path = directory.path().join("metadata.sqlite3");
+        let metadata_database =
+            Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should open"));
+        let config = test_config();
+        metadata_database
+            .sync_config(&config)
+            .expect("metadata config should sync");
+
+        let upload_body = b"record this upload";
+        let upload_oid = format!("{:x}", Sha256::digest(upload_body));
+        let (upload_sessions, upload_token) = issued_session_token(Duration::from_secs(60));
+        let upload_router = test_router_with_transfer_metadata(
+            config.clone(),
+            upload_sessions,
+            RecordingBatchAuthorizer::allow(),
+            RecordingTransferStore::missing(),
+            metadata_database.clone(),
+        );
+        let upload_response = upload_router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::PUT,
+                &format!(
+                    "/github.com/owner/repo.git/info/lfs/objects/{upload_oid}?size={}",
+                    upload_body.len()
+                ),
+                Some(&format!("Bearer {upload_token}")),
+                upload_body.to_vec(),
+            ))
+            .await
+            .expect("upload router should respond");
+        assert_eq!(upload_response.status(), StatusCode::OK);
+
+        let download_object = LfsObject::new(
+            LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("test OID should parse"),
+            LfsObjectSize::new(42),
+        );
+        let (download_sessions, download_token) = issued_session_token(Duration::from_secs(60));
+        let download_router = test_router_with_transfer_metadata(
+            config,
+            download_sessions,
+            RecordingBatchAuthorizer::allow(),
+            RecordingTransferStore::existing_object_with_download_integrity_mismatch(
+                StoredObject::new(
+                    "drive-user-a",
+                    download_object,
+                    "secret-backend-id-must-not-leak",
+                ),
+            ),
+            metadata_database,
+        );
+        let download_response = download_router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::GET,
+                "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=42",
+                Some(&format!("Bearer {download_token}")),
+                Body::empty(),
+            ))
+            .await
+            .expect("download router should respond");
+        assert_eq!(download_response.status(), StatusCode::BAD_GATEWAY);
+
+        let connection = rusqlite::Connection::open(&database_path)
+            .expect("metadata inspection connection should open");
+        let rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT operation, status, backend_id, error_category, error_message
+                     FROM transfer_attempts
+                     ORDER BY id",
+                )
+                .expect("transfer attempt query should prepare");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .expect("transfer attempt query should execute")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("transfer attempt rows should decode")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "upload".to_owned(),
+                    "succeeded".to_owned(),
+                    Some("drive-file-uploaded".to_owned()),
+                    None,
+                    None,
+                ),
+                (
+                    "download".to_owned(),
+                    "failed".to_owned(),
+                    None,
+                    Some("storage".to_owned()),
+                    Some(
+                        "Git LFS storage returned an object that failed integrity validation"
+                            .to_owned(),
+                    ),
+                ),
+            ]
+        );
+        let persisted = format!("{rows:?}");
+        assert!(!persisted.contains(download_token.as_str()));
+        assert!(!persisted.contains("secret-backend-id-must-not-leak"));
+    }
+
+    #[tokio::test]
     async fn download_endpoint_streams_existing_object_bytes() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
         let body = b"download me through lfs cloud".to_vec();
@@ -5640,6 +6001,7 @@ repositories:
             Arc::new(RecordingBatchAuthorizer::allow()),
             Arc::new(RecordingTransferStore::missing()),
             BatchBodyGuardrails::default(),
+            None,
         );
         let oid = LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .expect("test oid should parse");

@@ -707,11 +707,34 @@ independently validated or adjudicated.
     here and no invalid finding attributable separately, this was high-quality,
     relevant feedback.
 
-12. **Low — Transfer-attempt metadata is declared but never recorded.** The
-    schema and documentation promise transfer state, but production inserts no
-    lifecycle rows (`src/metadata.rs:109-129`, `src/server.rs:105-106`,
-    `src/server.rs:758-764`). Record sanitized start/success/failure rows or
-    remove the table and claim until implemented.
+12. **[DONE] Transfer-attempt metadata was declared but never recorded** (Low,
+    `src/metadata.rs`, `src/server.rs`, and `AGENTS.md`): **Valid and
+    actionable.** Production now passes the shared metadata database into LFS
+    server state and creates one durable lifecycle row for each authenticated,
+    structurally valid, repository-authorized upload or download. Attempts
+    start before upload serialization, storage lookup, staging, or backend I/O;
+    ordinary completion closes them exactly once as `succeeded` or `failed`.
+    Successful rows retain the verified backend ID, while failed rows retain
+    only the responsible error category and the same fixed, secret-free
+    diagnostic safe for the Git LFS client. Raw provider errors, session
+    tokens, and backend IDs from failed transfers never cross the metadata
+    boundary. SQLite start and finish operations run through Tokio's blocking
+    pool, preserving the existing async-worker boundary. A `started` row is
+    intentionally left only when the process or request is interrupted or the
+    terminal metadata write itself fails; download success means the verified
+    backend response was prepared, not that the remote client consumed every
+    response byte. Metadata tests cover started, successful, and sanitized
+    failed rows, while an endpoint regression exercises a successful upload and
+    failed-integrity download through the real request handlers and inspects the
+    resulting SQLite history. The repository learning records the lifecycle
+    boundary. Verification passed with `yarn lint:fix`, `cargo fmt --check`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets` (540 passed, 3 ignored across targets),
+    `cargo test --doc` (38 passed), and `git diff --check`. The focused reviewer
+    found a genuine implementation-versus-schema gap, cited the exact unused
+    persistence surface, and suggested both valid resolutions without inflating
+    the severity. With one valid finding assessed here and no invalid finding
+    attributable separately, this was high-quality, relevant feedback.
 
 13. **Low — Public server documentation and the base-route error are stale.**
     They still claim transfer handling is for later work even though batch and
