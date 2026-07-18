@@ -11,6 +11,8 @@ use support::{
     lfs_object_for_bytes, lfs_pointer_file, write_lfs_pointer,
 };
 
+const TEST_REPOSITORY_NAMESPACE: &str = "github-main:owner/repo";
+
 #[test]
 fn temp_git_repo_writes_and_commits_pointer_files() {
     let repo = TempGitRepo::new();
@@ -125,26 +127,34 @@ async fn fake_storage_provider_uploads_downloads_and_deletes_bytes() {
     let provider = FakeStorageProvider::new("drive-user-a");
 
     let uploaded = provider
-        .upload_object(&object, &source)
+        .upload_object(TEST_REPOSITORY_NAMESPACE, &object, &source)
         .await
         .expect("fixture upload should succeed");
     let downloaded = provider
-        .download_object(&object, &destination)
+        .download_object(TEST_REPOSITORY_NAMESPACE, &object, &destination)
         .await
         .expect("fixture download should succeed");
 
     assert!(uploaded.backend_id.contains(object.oid.as_hex()));
     assert_eq!(downloaded.object, object);
     assert_eq!(repo.read_file("downloads/source.bin"), "large file bytes");
-    assert_eq!(provider.object_bytes(&object), Some(bytes.to_vec()));
+    assert_eq!(
+        provider.object_bytes(TEST_REPOSITORY_NAMESPACE, &object),
+        Some(bytes.to_vec())
+    );
 
     let deletion = provider
-        .delete_or_mark_object(&object)
+        .delete_or_mark_object(TEST_REPOSITORY_NAMESPACE, &object)
         .await
         .expect("fixture deletion should succeed");
 
     assert_eq!(deletion, lfs_cloud::StorageDeleteOutcome::Deleted);
-    assert!(!provider.object_exists(&object).await.unwrap());
+    assert!(
+        !provider
+            .object_exists(TEST_REPOSITORY_NAMESPACE, &object)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -155,7 +165,7 @@ async fn fake_storage_provider_rejects_size_mismatched_uploads() {
     let provider = FakeStorageProvider::new("drive-user-a");
 
     let error = provider
-        .upload_object(&object, &source)
+        .upload_object(TEST_REPOSITORY_NAMESPACE, &object, &source)
         .await
         .expect_err("fixture upload should enforce exact LFS object size");
 
@@ -167,7 +177,10 @@ async fn fake_storage_provider_rejects_size_mismatched_uploads() {
             ..
         }
     ));
-    assert_eq!(provider.object_bytes(&object), None);
+    assert_eq!(
+        provider.object_bytes(TEST_REPOSITORY_NAMESPACE, &object),
+        None
+    );
 }
 
 #[tokio::test]
@@ -178,7 +191,7 @@ async fn fake_storage_provider_rejects_oid_mismatched_uploads() {
     let provider = FakeStorageProvider::new("drive-user-a");
 
     let error = provider
-        .upload_object(&object, &source)
+        .upload_object(TEST_REPOSITORY_NAMESPACE, &object, &source)
         .await
         .expect_err("fixture upload should enforce exact LFS object oid");
 
@@ -191,7 +204,10 @@ async fn fake_storage_provider_rejects_oid_mismatched_uploads() {
             actual_size: 16,
         } if expected_oid == TEST_OID_B && actual_oid != TEST_OID_B
     ));
-    assert_eq!(provider.object_bytes(&object), None);
+    assert_eq!(
+        provider.object_bytes(TEST_REPOSITORY_NAMESPACE, &object),
+        None
+    );
 }
 
 #[tokio::test]
@@ -202,7 +218,7 @@ async fn fake_storage_provider_reports_missing_objects() {
     let destination = repo.path().join("missing.bin");
 
     let error = provider
-        .download_object(&object, &destination)
+        .download_object(TEST_REPOSITORY_NAMESPACE, &object, &destination)
         .await
         .expect_err("missing object should fail");
 
@@ -216,7 +232,7 @@ async fn fake_storage_provider_reports_missing_objects() {
     ));
 
     let delete_error = provider
-        .delete_or_mark_object(&object)
+        .delete_or_mark_object(TEST_REPOSITORY_NAMESPACE, &object)
         .await
         .expect_err("missing object deletion should fail");
 

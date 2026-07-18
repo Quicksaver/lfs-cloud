@@ -139,6 +139,8 @@ pub trait RepositoryProvider {
 pub struct StoredObject {
     /// Configured storage provider ID.
     pub provider_id: String,
+    /// Stable repository namespace that owns this backend object.
+    pub repository_namespace: String,
     /// Provider-independent LFS object identity.
     pub object: LfsObject,
     /// Backend object ID, file ID, or storage key.
@@ -150,11 +152,13 @@ impl StoredObject {
     #[must_use]
     pub fn new(
         provider_id: impl Into<String>,
+        repository_namespace: impl Into<String>,
         object: LfsObject,
         backend_id: impl Into<String>,
     ) -> Self {
         Self {
             provider_id: provider_id.into(),
+            repository_namespace: repository_namespace.into(),
             object,
             backend_id: backend_id.into(),
         }
@@ -179,39 +183,47 @@ pub enum StorageDeleteOutcome {
 }
 
 /// Storage-provider operations required by upload, download, and cleanup flows.
+///
+/// Every object operation includes the stable repository mapping ID as its
+/// namespace. Implementations must scope existence, transfer, and cleanup to
+/// that namespace even when multiple repositories share one provider account.
 pub trait StorageProvider {
     /// Returns this provider's configured ID.
     fn provider_id(&self) -> &str;
 
-    /// Checks whether an object exists in this storage backend.
+    /// Checks whether an object exists in one repository namespace.
     fn object_exists<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<bool>>;
 
-    /// Uploads an already-staged and verified object file to this backend.
+    /// Uploads an already-staged and verified object file to one repository namespace.
     ///
     /// Providers should treat the [`LfsObject`] size as part of the validation
     /// contract: stored bytes must match both the OID and the expected size.
     fn upload_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
         source: &'a Path,
     ) -> ProviderFuture<'a, StorageResult<StoredObject>>;
 
-    /// Downloads an object from this backend into the provided destination path.
+    /// Downloads a namespaced object into the provided destination path.
     ///
     /// Providers should report a missing object or integrity failure when the
     /// stored object does not match the requested OID and size.
     fn download_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
         destination: &'a Path,
     ) -> ProviderFuture<'a, StorageResult<StoredObject>>;
 
-    /// Deletes an object or marks it for later cleanup when deletion is unavailable.
+    /// Deletes or marks an object only within the supplied repository namespace.
     fn delete_or_mark_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>>;
 }
@@ -281,7 +293,7 @@ mod tests {
 
     struct FakeStorageProvider {
         provider_id: String,
-        objects: Mutex<BTreeSet<LfsObject>>,
+        objects: Mutex<BTreeSet<(String, LfsObject)>>,
     }
 
     impl StorageProvider for FakeStorageProvider {
@@ -291,6 +303,7 @@ mod tests {
 
         fn object_exists<'a>(
             &'a self,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
         ) -> ProviderFuture<'a, StorageResult<bool>> {
             Box::pin(async move {
@@ -298,12 +311,13 @@ mod tests {
                     .objects
                     .lock()
                     .expect("fake storage lock should not poison")
-                    .contains(object))
+                    .contains(&(repository_namespace.to_owned(), object.clone())))
             })
         }
 
         fn upload_object<'a>(
             &'a self,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
             _source: &'a Path,
         ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
@@ -311,10 +325,11 @@ mod tests {
                 self.objects
                     .lock()
                     .expect("fake storage lock should not poison")
-                    .insert(object.clone());
+                    .insert((repository_namespace.to_owned(), object.clone()));
 
                 Ok(StoredObject::new(
                     self.provider_id.clone(),
+                    repository_namespace,
                     object.clone(),
                     format!("drive-file-{}", object.oid),
                 ))
@@ -323,6 +338,7 @@ mod tests {
 
         fn download_object<'a>(
             &'a self,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
             _destination: &'a Path,
         ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
@@ -331,7 +347,7 @@ mod tests {
                     .objects
                     .lock()
                     .expect("fake storage lock should not poison")
-                    .contains(object)
+                    .contains(&(repository_namespace.to_owned(), object.clone()))
                 {
                     return Err(StorageError::ObjectNotFound {
                         provider: self.provider_id.clone(),
@@ -342,6 +358,7 @@ mod tests {
 
                 Ok(StoredObject::new(
                     self.provider_id.clone(),
+                    repository_namespace,
                     object.clone(),
                     format!("drive-file-{}", object.oid),
                 ))
@@ -350,13 +367,14 @@ mod tests {
 
         fn delete_or_mark_object<'a>(
             &'a self,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
         ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
             Box::pin(async move {
                 self.objects
                     .lock()
                     .expect("fake storage lock should not poison")
-                    .remove(object);
+                    .remove(&(repository_namespace.to_owned(), object.clone()));
 
                 Ok(StorageDeleteOutcome::Deleted)
             })
@@ -430,34 +448,74 @@ mod tests {
         let provider: Box<dyn StorageProvider> = Box::new(provider);
         let object = lfs_object();
         let path = Path::new("/tmp/lfs-cloud-test-object");
+        let repository_namespace = "github-main:owner/repo";
 
         assert!(
             !provider
-                .object_exists(&object)
+                .object_exists(repository_namespace, &object)
                 .await
                 .expect("exists check should work")
         );
 
         let uploaded = provider
-            .upload_object(&object, path)
+            .upload_object(repository_namespace, &object, path)
             .await
             .expect("upload should succeed");
         let downloaded = provider
-            .download_object(&object, path)
+            .download_object(repository_namespace, &object, path)
             .await
             .expect("download should succeed");
 
-        assert!(provider.object_exists(&object).await.unwrap());
+        assert!(
+            provider
+                .object_exists(repository_namespace, &object)
+                .await
+                .unwrap()
+        );
+        assert_eq!(uploaded.repository_namespace, repository_namespace);
         assert_eq!(uploaded.backend_id, format!("drive-file-{OID}"));
         assert_eq!(downloaded.object, object);
 
         let deletion = provider
-            .delete_or_mark_object(&object)
+            .delete_or_mark_object(repository_namespace, &object)
             .await
             .expect("delete should succeed");
 
         assert_eq!(deletion, StorageDeleteOutcome::Deleted);
-        assert!(!provider.object_exists(&object).await.unwrap());
+        assert!(
+            !provider
+                .object_exists(repository_namespace, &object)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_provider_trait_isolates_identical_objects_by_repository_namespace() {
+        let provider = FakeStorageProvider {
+            provider_id: "drive-user-a".to_owned(),
+            objects: Mutex::new(BTreeSet::new()),
+        };
+        let object = lfs_object();
+        let path = Path::new("/tmp/lfs-cloud-test-object");
+
+        provider
+            .upload_object("github-main:owner/repo-a", &object, path)
+            .await
+            .expect("repository A upload should succeed");
+
+        assert!(
+            provider
+                .object_exists("github-main:owner/repo-a", &object)
+                .await
+                .expect("repository A lookup should work")
+        );
+        assert!(
+            !provider
+                .object_exists("github-main:owner/repo-b", &object)
+                .await
+                .expect("repository B lookup should work")
+        );
     }
 
     #[tokio::test]
@@ -470,7 +528,7 @@ mod tests {
         let path = Path::new("/tmp/lfs-cloud-test-object");
 
         let error = provider
-            .download_object(&object, path)
+            .download_object("github-main:owner/repo", &object, path)
             .await
             .expect_err("missing object download should fail");
 

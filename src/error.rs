@@ -520,6 +520,13 @@ impl RepositoryProviderError {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// A repository-scoped provider received an operation for another namespace.
+    #[error("{provider} storage provider rejected a mismatched repository namespace")]
+    RepositoryNamespaceMismatch {
+        /// Configured storage provider ID.
+        provider: String,
+    },
+
     /// The storage provider could not load its server-side credentials.
     #[error("{provider} storage credential {reference:?} could not be loaded: {message}")]
     CredentialLoad {

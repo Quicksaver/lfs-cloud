@@ -366,7 +366,7 @@ pub struct FakeStorageProvider {
     provider_id: String,
     // These fixtures expose synchronous setup/assertion helpers, and no lock is
     // held across an await point in the async provider methods.
-    objects: Mutex<BTreeMap<LfsObject, FakeStoredBytes>>,
+    objects: Mutex<BTreeMap<(String, LfsObject), FakeStoredBytes>>,
 }
 
 impl FakeStorageProvider {
@@ -380,14 +380,20 @@ impl FakeStorageProvider {
     }
 
     /// Inserts object bytes directly into the fake backend.
-    pub fn insert_object(&self, object: LfsObject, bytes: impl Into<Vec<u8>>) -> StoredObject {
-        let stored = stored_object(&self.provider_id, &object);
+    pub fn insert_object(
+        &self,
+        repository_namespace: impl Into<String>,
+        object: LfsObject,
+        bytes: impl Into<Vec<u8>>,
+    ) -> StoredObject {
+        let repository_namespace = repository_namespace.into();
+        let stored = stored_object(&self.provider_id, &repository_namespace, &object);
 
         self.objects
             .lock()
             .expect("fake storage lock should not poison")
             .insert(
-                object.clone(),
+                (repository_namespace, object.clone()),
                 FakeStoredBytes {
                     bytes: bytes.into(),
                     backend_id: stored.backend_id.clone(),
@@ -399,11 +405,11 @@ impl FakeStorageProvider {
 
     /// Returns a copy of the fake backend bytes for assertions.
     #[must_use]
-    pub fn object_bytes(&self, object: &LfsObject) -> Option<Vec<u8>> {
+    pub fn object_bytes(&self, repository_namespace: &str, object: &LfsObject) -> Option<Vec<u8>> {
         self.objects
             .lock()
             .expect("fake storage lock should not poison")
-            .get(object)
+            .get(&(repository_namespace.to_owned(), object.clone()))
             .map(|stored| stored.bytes.clone())
     }
 }
@@ -415,6 +421,7 @@ impl StorageProvider for FakeStorageProvider {
 
     fn object_exists<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<bool>> {
         Box::pin(async move {
@@ -422,12 +429,13 @@ impl StorageProvider for FakeStorageProvider {
                 .objects
                 .lock()
                 .expect("fake storage lock should not poison")
-                .contains_key(object))
+                .contains_key(&(repository_namespace.to_owned(), object.clone())))
         })
     }
 
     fn upload_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
         source: &'a Path,
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
@@ -447,13 +455,18 @@ impl StorageProvider for FakeStorageProvider {
                 });
             }
 
-            self.insert_object(object.clone(), bytes);
-            Ok(stored_object(&self.provider_id, object))
+            self.insert_object(repository_namespace, object.clone(), bytes);
+            Ok(stored_object(
+                &self.provider_id,
+                repository_namespace,
+                object,
+            ))
         })
     }
 
     fn download_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
         destination: &'a Path,
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
@@ -464,7 +477,7 @@ impl StorageProvider for FakeStorageProvider {
                     .lock()
                     .expect("fake storage lock should not poison");
                 objects
-                    .get(object)
+                    .get(&(repository_namespace.to_owned(), object.clone()))
                     .cloned()
                     .ok_or_else(|| StorageError::ObjectNotFound {
                         provider: self.provider_id.clone(),
@@ -482,6 +495,7 @@ impl StorageProvider for FakeStorageProvider {
 
             Ok(StoredObject::new(
                 self.provider_id.clone(),
+                repository_namespace,
                 object.clone(),
                 stored.backend_id,
             ))
@@ -490,6 +504,7 @@ impl StorageProvider for FakeStorageProvider {
 
     fn delete_or_mark_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
         Box::pin(async move {
@@ -497,7 +512,7 @@ impl StorageProvider for FakeStorageProvider {
                 .objects
                 .lock()
                 .expect("fake storage lock should not poison")
-                .remove(object)
+                .remove(&(repository_namespace.to_owned(), object.clone()))
                 .is_some();
 
             if deleted {
@@ -513,11 +528,19 @@ impl StorageProvider for FakeStorageProvider {
     }
 }
 
-fn stored_object(provider_id: &str, object: &LfsObject) -> StoredObject {
+fn stored_object(
+    provider_id: &str,
+    repository_namespace: &str,
+    object: &LfsObject,
+) -> StoredObject {
     StoredObject::new(
         provider_id.to_owned(),
+        repository_namespace,
         object.clone(),
-        format!("fake://{provider_id}/objects/{}", object.oid),
+        format!(
+            "fake://{provider_id}/repositories/{repository_namespace}/objects/{}",
+            object.oid
+        ),
     )
 }
 

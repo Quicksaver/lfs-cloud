@@ -50,7 +50,7 @@ const MINIMUM_HISTORICAL_SCAN_GIT_VERSION: GitVersion = GitVersion::new(2, 40, 0
 const MINIMUM_HISTORICAL_SCAN_GIT_VERSION_TEXT: &str = "2.40.0";
 /// Default number of migration objects uploaded concurrently.
 pub const DEFAULT_MIGRATION_UPLOAD_CONCURRENCY: usize = 4;
-const MIGRATION_UPLOAD_CHECKPOINT_VERSION: u32 = 1;
+const MIGRATION_UPLOAD_CHECKPOINT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GitVersion {
@@ -295,6 +295,8 @@ pub struct MigrationSourceFetch {
 pub struct MigrationStorageUpload {
     /// Configured storage provider ID that received the upload checks.
     pub storage_provider_id: String,
+    /// Stable repository namespace used for every storage operation.
+    pub repository_namespace: String,
     /// Objects skipped because the configured storage provider already has them.
     pub already_present_objects: Vec<LfsObject>,
     /// Objects uploaded during this run or restored from its durable checkpoint.
@@ -411,6 +413,7 @@ enum MigrationUploadCheckpointCompletion {
 struct MigrationUploadCheckpointRecord {
     version: u32,
     storage_provider_id: String,
+    repository_namespace: String,
     oid: String,
     size: u64,
     completion: MigrationUploadCheckpointRecordCompletion,
@@ -843,7 +846,8 @@ where
 /// provider before uploading each object and reports already-present objects
 /// separately. For objects that do need upload, it re-verifies the selected
 /// local source bytes against the pointer OID and size immediately before
-/// delegating to the storage provider.
+/// delegating to the storage provider. Every lookup, upload, and durable
+/// checkpoint is bound to `repository_namespace`.
 ///
 /// Uploads run with [`DEFAULT_MIGRATION_UPLOAD_CONCURRENCY`] simultaneous
 /// transfers. Each success is appended and synchronized to a provider-specific
@@ -861,11 +865,21 @@ where
 pub async fn upload_migration_objects_to_storage(
     availability: &LocalMigrationObjectAvailability,
     storage: &dyn StorageProvider,
+    repository_namespace: &str,
 ) -> MigrationResult<MigrationStorageUpload> {
-    let checkpoint_path =
-        default_migration_upload_checkpoint_path(availability, storage.provider_id());
+    let checkpoint_path = default_migration_upload_checkpoint_path(
+        availability,
+        storage.provider_id(),
+        repository_namespace,
+    );
     let options = MigrationStorageUploadOptions::new(checkpoint_path);
-    upload_migration_objects_to_storage_with_options(availability, storage, &options).await
+    upload_migration_objects_to_storage_with_options(
+        availability,
+        storage,
+        repository_namespace,
+        &options,
+    )
+    .await
 }
 
 /// Uploads migration objects with an explicit checkpoint and concurrency bound.
@@ -874,7 +888,8 @@ pub async fn upload_migration_objects_to_storage(
 /// location or needs a provider-specific concurrency limit. Completed outcomes
 /// are appended as JSON Lines records and synchronized individually, making the
 /// checkpoint safe to reuse after interruption. A partial final line left by a
-/// process crash is ignored; malformed complete records fail closed.
+/// process crash is ignored; malformed complete records fail closed. The
+/// checkpoint cannot be reused for another repository namespace.
 ///
 /// # Errors
 ///
@@ -885,6 +900,7 @@ pub async fn upload_migration_objects_to_storage(
 pub async fn upload_migration_objects_to_storage_with_options(
     availability: &LocalMigrationObjectAvailability,
     storage: &dyn StorageProvider,
+    repository_namespace: &str,
     options: &MigrationStorageUploadOptions,
 ) -> MigrationResult<MigrationStorageUpload> {
     if options.max_concurrent_uploads == 0 {
@@ -896,27 +912,36 @@ pub async fn upload_migration_objects_to_storage_with_options(
     }
 
     let storage_provider_id = storage.provider_id().to_owned();
+    let repository_namespace = repository_namespace.to_owned();
     let checkpoint_path = options.checkpoint_path.clone();
-    let checkpointed =
-        load_migration_upload_checkpoint(checkpoint_path.clone(), storage_provider_id.clone())
-            .await?;
+    let checkpointed = load_migration_upload_checkpoint(
+        checkpoint_path.clone(),
+        storage_provider_id.clone(),
+        repository_namespace.clone(),
+    )
+    .await?;
     let mut indexed_outcomes = stream::iter(availability.objects.iter().cloned().enumerate())
         .map(|(index, local_object)| {
             let checkpointed = checkpointed.get(&local_object.object).cloned();
             let checkpoint_path = checkpoint_path.clone();
             let storage_provider_id = storage_provider_id.clone();
+            let repository_namespace = repository_namespace.clone();
             async move {
                 let outcome = if let Some(completion) = checkpointed {
                     resumed_migration_upload_outcome(
                         local_object.object.clone(),
                         &storage_provider_id,
+                        &repository_namespace,
                         completion,
                     )
                 } else {
-                    let status = upload_one_migration_object(&local_object, storage).await;
+                    let status =
+                        upload_one_migration_object(&local_object, storage, &repository_namespace)
+                            .await;
                     checkpoint_migration_upload_outcome(
                         &checkpoint_path,
                         &storage_provider_id,
+                        &repository_namespace,
                         local_object.object.clone(),
                         status,
                     )
@@ -968,6 +993,7 @@ pub async fn upload_migration_objects_to_storage_with_options(
 
     Ok(MigrationStorageUpload {
         storage_provider_id,
+        repository_namespace,
         already_present_objects,
         uploaded_objects,
         failed_objects,
@@ -979,16 +1005,24 @@ pub async fn upload_migration_objects_to_storage_with_options(
 async fn upload_one_migration_object(
     local_object: &LocalMigrationObject,
     storage: &dyn StorageProvider,
+    repository_namespace: &str,
 ) -> MigrationResult<MigrationObjectUploadStatus> {
     let object = &local_object.object;
-    if storage.object_exists(object).await? {
+    if storage.object_exists(repository_namespace, object).await? {
         return Ok(MigrationObjectUploadStatus::AlreadyPresent { resumed: false });
     }
 
     let source = verified_migration_upload_source_path(local_object)?;
     verify_migration_upload_source(source, object).await?;
-    let stored_object = storage.upload_object(object, source).await?;
-    validate_migration_uploaded_object(object, storage.provider_id(), &stored_object)?;
+    let stored_object = storage
+        .upload_object(repository_namespace, object, source)
+        .await?;
+    validate_migration_uploaded_object(
+        object,
+        storage.provider_id(),
+        repository_namespace,
+        &stored_object,
+    )?;
     Ok(MigrationObjectUploadStatus::Uploaded {
         stored_object,
         resumed: false,
@@ -998,6 +1032,7 @@ async fn upload_one_migration_object(
 async fn checkpoint_migration_upload_outcome(
     checkpoint_path: &Path,
     storage_provider_id: &str,
+    repository_namespace: &str,
     object: LfsObject,
     status: MigrationResult<MigrationObjectUploadStatus>,
 ) -> MigrationObjectUploadOutcome {
@@ -1018,6 +1053,7 @@ async fn checkpoint_migration_upload_outcome(
                 && let Err(error) = append_migration_upload_checkpoint(
                     checkpoint_path.to_path_buf(),
                     storage_provider_id.to_owned(),
+                    repository_namespace.to_owned(),
                     object.clone(),
                     completion,
                 )
@@ -1043,6 +1079,7 @@ async fn checkpoint_migration_upload_outcome(
 fn resumed_migration_upload_outcome(
     object: LfsObject,
     storage_provider_id: &str,
+    repository_namespace: &str,
     completion: MigrationUploadCheckpointCompletion,
 ) -> MigrationObjectUploadOutcome {
     let status = match completion {
@@ -1051,7 +1088,12 @@ fn resumed_migration_upload_outcome(
         }
         MigrationUploadCheckpointCompletion::Uploaded { backend_id } => {
             MigrationObjectUploadStatus::Uploaded {
-                stored_object: StoredObject::new(storage_provider_id, object.clone(), backend_id),
+                stored_object: StoredObject::new(
+                    storage_provider_id,
+                    repository_namespace,
+                    object.clone(),
+                    backend_id,
+                ),
                 resumed: true,
             }
         }
@@ -1062,9 +1104,11 @@ fn resumed_migration_upload_outcome(
 fn default_migration_upload_checkpoint_path(
     availability: &LocalMigrationObjectAvailability,
     storage_provider_id: &str,
+    repository_namespace: &str,
 ) -> PathBuf {
-    let provider_digest = Sha256::digest(storage_provider_id.as_bytes());
-    let filename = format!("lfs-cloud-migration-upload-{provider_digest:x}.jsonl");
+    let checkpoint_identity = format!("{storage_provider_id}\0{repository_namespace}");
+    let checkpoint_digest = Sha256::digest(checkpoint_identity.as_bytes());
+    let filename = format!("lfs-cloud-migration-upload-{checkpoint_digest:x}.jsonl");
     availability
         .git_lfs_objects_dir
         .parent()
@@ -1075,9 +1119,14 @@ fn default_migration_upload_checkpoint_path(
 async fn load_migration_upload_checkpoint(
     checkpoint_path: PathBuf,
     storage_provider_id: String,
+    repository_namespace: String,
 ) -> MigrationResult<BTreeMap<LfsObject, MigrationUploadCheckpointCompletion>> {
     tokio::task::spawn_blocking(move || {
-        load_migration_upload_checkpoint_blocking(&checkpoint_path, &storage_provider_id)
+        load_migration_upload_checkpoint_blocking(
+            &checkpoint_path,
+            &storage_provider_id,
+            &repository_namespace,
+        )
     })
     .await
     .map_err(|error| MigrationError::InvalidInput {
@@ -1090,6 +1139,7 @@ async fn load_migration_upload_checkpoint(
 fn load_migration_upload_checkpoint_blocking(
     checkpoint_path: &Path,
     storage_provider_id: &str,
+    repository_namespace: &str,
 ) -> MigrationResult<BTreeMap<LfsObject, MigrationUploadCheckpointCompletion>> {
     create_migration_checkpoint_parent(checkpoint_path)?;
     let mut file = open_migration_checkpoint(checkpoint_path)?;
@@ -1109,7 +1159,12 @@ fn load_migration_upload_checkpoint_blocking(
                 source,
             )
         })?;
-        parse_migration_upload_checkpoint(&contents, checkpoint_path, storage_provider_id)
+        parse_migration_upload_checkpoint(
+            &contents,
+            checkpoint_path,
+            storage_provider_id,
+            repository_namespace,
+        )
     })();
     let unlock_result = FileExt::unlock(&file).map_err(|source| {
         migration_checkpoint_io_error(
@@ -1128,6 +1183,7 @@ fn parse_migration_upload_checkpoint(
     contents: &str,
     checkpoint_path: &Path,
     storage_provider_id: &str,
+    repository_namespace: &str,
 ) -> MigrationResult<BTreeMap<LfsObject, MigrationUploadCheckpointCompletion>> {
     let mut completed = BTreeMap::new();
     let chunks = contents.split_inclusive('\n').collect::<Vec<_>>();
@@ -1169,6 +1225,14 @@ fn parse_migration_upload_checkpoint(
                 )),
             });
         }
+        if record.repository_namespace != repository_namespace {
+            return Err(MigrationError::InvalidInput {
+                message: SanitizedMessage::new(format!(
+                    "migration upload checkpoint {} belongs to a different repository namespace",
+                    checkpoint_path.display()
+                )),
+            });
+        }
         let oid = LfsOid::from_str(&record.oid).map_err(|source| MigrationError::InvalidInput {
             message: SanitizedMessage::new(format!(
                 "migration upload checkpoint {} contains an invalid object ID: {source}",
@@ -1200,6 +1264,7 @@ fn parse_migration_upload_checkpoint(
 async fn append_migration_upload_checkpoint(
     checkpoint_path: PathBuf,
     storage_provider_id: String,
+    repository_namespace: String,
     object: LfsObject,
     completion: MigrationUploadCheckpointCompletion,
 ) -> MigrationResult<()> {
@@ -1207,6 +1272,7 @@ async fn append_migration_upload_checkpoint(
         append_migration_upload_checkpoint_blocking(
             &checkpoint_path,
             &storage_provider_id,
+            &repository_namespace,
             &object,
             completion,
         )
@@ -1220,6 +1286,7 @@ async fn append_migration_upload_checkpoint(
 fn append_migration_upload_checkpoint_blocking(
     checkpoint_path: &Path,
     storage_provider_id: &str,
+    repository_namespace: &str,
     object: &LfsObject,
     completion: MigrationUploadCheckpointCompletion,
 ) -> MigrationResult<()> {
@@ -1244,6 +1311,7 @@ fn append_migration_upload_checkpoint_blocking(
         let record = MigrationUploadCheckpointRecord {
             version: MIGRATION_UPLOAD_CHECKPOINT_VERSION,
             storage_provider_id: storage_provider_id.to_owned(),
+            repository_namespace: repository_namespace.to_owned(),
             oid: object.oid.as_hex().to_owned(),
             size: object.size.bytes(),
             completion,
@@ -1380,6 +1448,7 @@ fn verify_migration_upload_source_blocking(path: &Path, object: &LfsObject) -> M
 fn validate_migration_uploaded_object(
     expected: &LfsObject,
     expected_provider_id: &str,
+    expected_repository_namespace: &str,
     stored: &StoredObject,
 ) -> MigrationResult<()> {
     if stored.provider_id != expected_provider_id {
@@ -1388,6 +1457,14 @@ fn validate_migration_uploaded_object(
                 "storage provider returned provider ID {}, expected {}",
                 stored.provider_id, expected_provider_id
             )),
+        });
+    }
+
+    if stored.repository_namespace != expected_repository_namespace {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new(
+                "storage provider returned a different repository namespace",
+            ),
         });
     }
 
@@ -4181,6 +4258,8 @@ mod tests {
         verified_migration_upload_source_path, wait_for_git_lfs_fetch_command,
     };
 
+    const TEST_REPOSITORY_NAMESPACE: &str = "github-main:owner/repo";
+
     #[cfg(unix)]
     #[test]
     fn bounded_git_output_stops_a_runaway_process_tree_on_overflow() {
@@ -4229,10 +4308,11 @@ mod tests {
 
     struct FakeMigrationStorageProvider {
         provider_id: String,
-        existing: Mutex<BTreeSet<LfsObject>>,
+        existing: Mutex<BTreeSet<(String, LfsObject)>>,
         uploaded: Mutex<Vec<LfsObject>>,
         returned_object_override: Mutex<Option<LfsObject>>,
         returned_provider_id_override: Mutex<Option<String>>,
+        returned_repository_namespace_override: Mutex<Option<String>>,
         returned_backend_id_override: Mutex<Option<String>>,
         upload_failures: Mutex<BTreeSet<LfsObject>>,
         upload_attempts: Mutex<Vec<LfsObject>>,
@@ -4249,6 +4329,7 @@ mod tests {
                 uploaded: Mutex::new(Vec::new()),
                 returned_object_override: Mutex::new(None),
                 returned_provider_id_override: Mutex::new(None),
+                returned_repository_namespace_override: Mutex::new(None),
                 returned_backend_id_override: Mutex::new(None),
                 upload_failures: Mutex::new(BTreeSet::new()),
                 upload_attempts: Mutex::new(Vec::new()),
@@ -4262,7 +4343,7 @@ mod tests {
             self.existing
                 .lock()
                 .expect("fake storage lock should not poison")
-                .insert(object);
+                .insert((TEST_REPOSITORY_NAMESPACE.to_owned(), object));
         }
 
         fn uploaded_objects(&self) -> Vec<LfsObject> {
@@ -4311,6 +4392,14 @@ mod tests {
                 .expect("fake provider override lock should not poison") = Some(provider_id.into());
         }
 
+        fn override_returned_repository_namespace(&self, repository_namespace: impl Into<String>) {
+            *self
+                .returned_repository_namespace_override
+                .lock()
+                .expect("fake namespace override lock should not poison") =
+                Some(repository_namespace.into());
+        }
+
         fn override_returned_backend_id(&self, backend_id: impl Into<String>) {
             *self
                 .returned_backend_id_override
@@ -4326,6 +4415,7 @@ mod tests {
 
         fn object_exists<'a>(
             &'a self,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
         ) -> ProviderFuture<'a, StorageResult<bool>> {
             Box::pin(async move {
@@ -4333,12 +4423,13 @@ mod tests {
                     .existing
                     .lock()
                     .expect("fake storage lock should not poison")
-                    .contains(object))
+                    .contains(&(repository_namespace.to_owned(), object.clone())))
             })
         }
 
         fn upload_object<'a>(
             &'a self,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
             source: &'a Path,
         ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
@@ -4397,7 +4488,7 @@ mod tests {
                 self.existing
                     .lock()
                     .expect("fake storage lock should not poison")
-                    .insert(object.clone());
+                    .insert((repository_namespace.to_owned(), object.clone()));
 
                 let returned_object = self
                     .returned_object_override
@@ -4411,6 +4502,12 @@ mod tests {
                     .expect("fake provider override lock should not poison")
                     .clone()
                     .unwrap_or_else(|| self.provider_id.clone());
+                let returned_repository_namespace = self
+                    .returned_repository_namespace_override
+                    .lock()
+                    .expect("fake namespace override lock should not poison")
+                    .clone()
+                    .unwrap_or_else(|| repository_namespace.to_owned());
                 let returned_backend_id = self
                     .returned_backend_id_override
                     .lock()
@@ -4420,6 +4517,7 @@ mod tests {
 
                 Ok(StoredObject::new(
                     returned_provider_id,
+                    returned_repository_namespace,
                     returned_object,
                     returned_backend_id,
                 ))
@@ -4428,13 +4526,15 @@ mod tests {
 
         fn download_object<'a>(
             &'a self,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
             _destination: &'a Path,
         ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
             Box::pin(async move {
-                if self.object_exists(object).await? {
+                if self.object_exists(repository_namespace, object).await? {
                     Ok(StoredObject::new(
                         self.provider_id.clone(),
+                        repository_namespace,
                         object.clone(),
                         format!("fake-storage-{}", object.oid),
                     ))
@@ -4450,13 +4550,14 @@ mod tests {
 
         fn delete_or_mark_object<'a>(
             &'a self,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
         ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
             Box::pin(async move {
                 self.existing
                     .lock()
                     .expect("fake storage lock should not poison")
-                    .remove(object);
+                    .remove(&(repository_namespace.to_owned(), object.clone()));
                 Ok(StorageDeleteOutcome::Deleted)
             })
         }
@@ -5798,11 +5899,13 @@ mod tests {
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
         storage.insert_existing(already_present.clone());
 
-        let report = upload_migration_objects_to_storage(&availability, &storage)
-            .await
-            .expect("available migration objects should upload");
+        let report =
+            upload_migration_objects_to_storage(&availability, &storage, TEST_REPOSITORY_NAMESPACE)
+                .await
+                .expect("available migration objects should upload");
 
         assert_eq!(report.storage_provider_id, "drive-user-a");
+        assert_eq!(report.repository_namespace, TEST_REPOSITORY_NAMESPACE);
         assert_eq!(
             report.already_present_objects,
             vec![already_present.clone()]
@@ -5812,7 +5915,7 @@ mod tests {
         assert_eq!(storage.uploaded_objects(), vec![missing]);
         assert!(
             storage
-                .object_exists(&already_present)
+                .object_exists(TEST_REPOSITORY_NAMESPACE, &already_present)
                 .await
                 .expect("exists check should succeed")
         );
@@ -5840,10 +5943,14 @@ mod tests {
         let options = MigrationStorageUploadOptions::new(repo.path().join("checkpoint.jsonl"))
             .with_max_concurrent_uploads(2);
 
-        let report =
-            upload_migration_objects_to_storage_with_options(&availability, &storage, &options)
-                .await
-                .expect("bounded migration uploads should complete");
+        let report = upload_migration_objects_to_storage_with_options(
+            &availability,
+            &storage,
+            TEST_REPOSITORY_NAMESPACE,
+            &options,
+        )
+        .await
+        .expect("bounded migration uploads should complete");
 
         assert!(report.failed_objects.is_empty());
         assert_eq!(report.uploaded_objects.len(), 3);
@@ -5868,6 +5975,7 @@ mod tests {
         let first_report = upload_migration_objects_to_storage_with_options(
             &availability,
             &first_storage,
+            TEST_REPOSITORY_NAMESPACE,
             &options,
         )
         .await
@@ -5878,10 +5986,22 @@ mod tests {
         assert_eq!(first_report.failed_objects[0].object, failed);
         assert!(checkpoint_path.is_file());
 
+        let wrong_namespace_storage = FakeMigrationStorageProvider::new("drive-user-a");
+        let error = upload_migration_objects_to_storage_with_options(
+            &availability,
+            &wrong_namespace_storage,
+            "github-main:owner/other",
+            &options,
+        )
+        .await
+        .expect_err("another repository must not resume this checkpoint");
+        assert!(error.to_string().contains("different repository namespace"));
+
         let resumed_storage = FakeMigrationStorageProvider::new("drive-user-a");
         let resumed_report = upload_migration_objects_to_storage_with_options(
             &availability,
             &resumed_storage,
+            TEST_REPOSITORY_NAMESPACE,
             &options,
         )
         .await
@@ -5909,9 +6029,10 @@ mod tests {
         write_git_lfs_source_object(&repo, &object, b"corrupt source bytes");
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
 
-        let report = upload_migration_objects_to_storage(&availability, &storage)
-            .await
-            .expect("per-object failures should return a retry report");
+        let report =
+            upload_migration_objects_to_storage(&availability, &storage, TEST_REPOSITORY_NAMESPACE)
+                .await
+                .expect("per-object failures should return a retry report");
 
         assert_eq!(report.failed_objects.len(), 1);
         assert!(
@@ -5934,9 +6055,10 @@ mod tests {
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
         storage.override_returned_object(returned);
 
-        let report = upload_migration_objects_to_storage(&availability, &storage)
-            .await
-            .expect("per-object failures should return a retry report");
+        let report =
+            upload_migration_objects_to_storage(&availability, &storage, TEST_REPOSITORY_NAMESPACE)
+                .await
+                .expect("per-object failures should return a retry report");
 
         assert_eq!(report.failed_objects.len(), 1);
         assert!(
@@ -5957,9 +6079,10 @@ mod tests {
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
         storage.override_returned_provider_id("drive-user-b");
 
-        let report = upload_migration_objects_to_storage(&availability, &storage)
-            .await
-            .expect("per-object failures should return a retry report");
+        let report =
+            upload_migration_objects_to_storage(&availability, &storage, TEST_REPOSITORY_NAMESPACE)
+                .await
+                .expect("per-object failures should return a retry report");
 
         assert_eq!(report.failed_objects.len(), 1);
         assert!(
@@ -5967,6 +6090,30 @@ mod tests {
                 .message
                 .as_str()
                 .contains("returned provider ID drive-user-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_migration_objects_rejects_repository_namespace_mismatch() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object_from_bytes(b"namespace mismatch bytes");
+        write_git_lfs_source_object(&repo, &object, b"namespace mismatch bytes");
+        let availability = check_local_migration_objects(repo.path(), [&object], None)
+            .expect("local migration object should be available");
+        let storage = FakeMigrationStorageProvider::new("drive-user-a");
+        storage.override_returned_repository_namespace("github-main:owner/other");
+
+        let report =
+            upload_migration_objects_to_storage(&availability, &storage, TEST_REPOSITORY_NAMESPACE)
+                .await
+                .expect("per-object failures should return a retry report");
+
+        assert_eq!(report.failed_objects.len(), 1);
+        assert!(
+            report.failed_objects[0]
+                .message
+                .as_str()
+                .contains("different repository namespace")
         );
     }
 
@@ -5980,9 +6127,10 @@ mod tests {
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
         storage.override_returned_backend_id(" ");
 
-        let report = upload_migration_objects_to_storage(&availability, &storage)
-            .await
-            .expect("per-object failures should return a retry report");
+        let report =
+            upload_migration_objects_to_storage(&availability, &storage, TEST_REPOSITORY_NAMESPACE)
+                .await
+                .expect("per-object failures should return a retry report");
 
         assert_eq!(report.failed_objects.len(), 1);
         assert!(

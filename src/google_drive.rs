@@ -815,6 +815,22 @@ impl GoogleDriveObjectStore {
         &self.storage.id
     }
 
+    /// Returns the stable repository namespace bound to this store instance.
+    #[must_use]
+    pub fn repository_namespace(&self) -> &str {
+        &self.repo_namespace
+    }
+
+    fn ensure_repository_namespace(&self, repository_namespace: &str) -> StorageResult<()> {
+        if self.repo_namespace == repository_namespace {
+            Ok(())
+        } else {
+            Err(StorageError::RepositoryNamespaceMismatch {
+                provider: self.storage.id.clone(),
+            })
+        }
+    }
+
     /// Creates a deterministic Drive object key for the configured repository.
     ///
     /// # Errors
@@ -1602,36 +1618,48 @@ impl StorageProvider for GoogleDriveObjectStore {
 
     fn object_exists<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<bool>> {
-        Box::pin(async move { GoogleDriveObjectStore::object_exists(self, object).await })
+        Box::pin(async move {
+            self.ensure_repository_namespace(repository_namespace)?;
+            GoogleDriveObjectStore::object_exists(self, object).await
+        })
     }
 
     fn upload_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
         source: &'a Path,
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
-        Box::pin(async move { GoogleDriveObjectStore::upload_object(self, object, source).await })
+        Box::pin(async move {
+            self.ensure_repository_namespace(repository_namespace)?;
+            GoogleDriveObjectStore::upload_object(self, object, source).await
+        })
     }
 
     fn download_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         object: &'a LfsObject,
         destination: &'a Path,
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
         // Delegate through the inherent method so the trait adapter keeps the
         // Drive-specific verification and atomic publication behavior in one path.
-        Box::pin(
-            async move { GoogleDriveObjectStore::download_object(self, object, destination).await },
-        )
+        Box::pin(async move {
+            self.ensure_repository_namespace(repository_namespace)?;
+            GoogleDriveObjectStore::download_object(self, object, destination).await
+        })
     }
 
     fn delete_or_mark_object<'a>(
         &'a self,
+        repository_namespace: &'a str,
         _object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
-        Box::pin(async {
+        Box::pin(async move {
+            self.ensure_repository_namespace(repository_namespace)?;
             Ok(StorageDeleteOutcome::Retained {
                 reason: "Google Drive object deletion is not implemented".to_owned(),
             })
@@ -3293,6 +3321,7 @@ fn verify_drive_object_file(
 
     Ok(StoredObject::new(
         storage.id.clone(),
+        key.repo_namespace.clone(),
         key.object.clone(),
         id,
     ))
@@ -5257,14 +5286,39 @@ mod tests {
         let storage: &dyn StorageProvider = &store;
 
         let uploaded = storage
-            .upload_object(&object, staged_file.path())
+            .upload_object("github.com/owner/repo", &object, staged_file.path())
             .await
             .expect("trait-backed Drive upload should succeed");
 
         assert_eq!(uploaded.provider_id, "drive-user-a");
+        assert_eq!(uploaded.repository_namespace, "github.com/owner/repo");
         assert_eq!(uploaded.object, object);
         assert_eq!(uploaded.backend_id, "drive-file-uploaded");
         assert_eq!(server.upload_requests()[0].body, staged_bytes);
+    }
+
+    #[tokio::test]
+    async fn object_store_storage_provider_trait_rejects_another_repository_namespace() {
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo-a",
+            access_token(),
+            reqwest::Client::new(),
+            "http://127.0.0.1:1",
+        )
+        .expect("object store should build");
+        let storage: &dyn StorageProvider = &store;
+
+        let error = storage
+            .object_exists("github.com/owner/repo-b", &lfs_object())
+            .await
+            .expect_err("repository-scoped Drive store should reject another namespace");
+
+        assert!(matches!(
+            error,
+            StorageError::RepositoryNamespaceMismatch { ref provider }
+                if provider == "drive-user-a"
+        ));
     }
 
     #[tokio::test]
@@ -5725,7 +5779,7 @@ mod tests {
         let storage: &dyn StorageProvider = &store;
 
         let downloaded = storage
-            .download_object(&object, &destination)
+            .download_object("github.com/owner/repo", &object, &destination)
             .await
             .expect("trait-backed Drive download should succeed");
 
@@ -5752,7 +5806,7 @@ mod tests {
         let storage: &dyn StorageProvider = &store;
 
         let outcome = storage
-            .delete_or_mark_object(&object)
+            .delete_or_mark_object("github.com/owner/repo", &object)
             .await
             .expect("Drive object cleanup should retain objects for now");
 

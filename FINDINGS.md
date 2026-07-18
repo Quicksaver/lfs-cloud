@@ -2113,16 +2113,39 @@ independently validated or adjudicated.
    example, but with one valid finding and no invalid finding attributable
    separately, this was useful, relevant low-severity feedback.
 
-7. **High — Storage-provider abstractions and test fakes do not consistently
-   enforce repository namespace.** The generic trait addresses objects only by
-   OID/size, while integration and server fakes key objects only by LFS identity
-   or ignore the repository argument, masking cross-repository isolation
-   failures (`src/providers.rs:137-216`, `src/lib.rs:89-90`,
-   `src/server.rs:198-231`, `src/server.rs:490-550`, `src/server.rs:2600`,
-   `tests/support/mod.rs:364`). Include repository/storage namespace in the
-   contract before adding providers or migration callers. Add two-repository
-   contract tests sharing a provider and OID, proving upload and authorization
-   for one repository do not expose the other.
+7. **[DONE] Storage-provider abstractions and test fakes did not consistently
+   enforce repository namespace** (High, `src/providers.rs`, `src/server.rs`,
+   `src/google_drive.rs`, `src/migration.rs`, `tests/support/mod.rs`, and
+   `tests/local_end_to_end.rs`): **Valid and actionable.** The generic
+   `StorageProvider` contract previously identified objects only by OID and
+   size, even though one configured storage provider can serve multiple
+   repositories. The integration fake and migration fake used the same
+   unscoped identity, and the server recording fake ignored its repository
+   argument during lookup. This allowed otherwise useful tests to model global
+   backend deduplication that the MVP explicitly forbids and could make an
+   upload in one repository appear present in another. Every generic storage
+   lookup, upload, download, and cleanup call now carries the stable
+   `RepositoryMapping::id` namespace. `StoredObject` returns that namespace so
+   server and migration adapters can reject a provider response attributed to
+   another repository. The repository-scoped Google Drive adapter verifies the
+   requested namespace before any network operation, while shared fakes key
+   objects by namespace plus LFS identity. Migration execution now requires an
+   explicit repository namespace, binds its default checkpoint filename and
+   versioned records to provider plus namespace, and rejects mismatched resumed
+   state. A test-first contract regression initially failed because the trait
+   had no namespace argument. Focused regressions now prove that identical OIDs
+   in two repositories sharing one provider remain isolated, that an authorized
+   second repository receives a missing-object response after the first uploads
+   the bytes, and that Drive and migration adapters reject namespace mismatch.
+   The repository learning records the provider boundary. Verification passed
+   with `cargo fmt --all`, focused provider/server/Drive/migration tests,
+   `yarn lint:fix`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+   focused reviewer identified a genuine high-severity repository-isolation
+   contract flaw, traced it through production adapters, migration, and
+   inaccurate fakes, and requested the decisive shared-provider/two-repository
+   regression. With one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, security-relevant feedback.
 
 8. **Medium — The repository-provider trait lacks authentication context and is
    bypassed by production authorization.** Its shape cannot express the

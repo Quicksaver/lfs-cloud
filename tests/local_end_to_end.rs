@@ -29,6 +29,7 @@ use url::Url;
 
 const TEST_DOWNLOAD_BODY_LIMIT: usize = 4 * 1024 * 1024;
 const TEST_BATCH_BODY_LIMIT: usize = 64 * 1024;
+const TEST_REPOSITORY_NAMESPACE: &str = "github-main:owner/repo";
 
 #[tokio::test]
 async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
@@ -115,7 +116,10 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         .await
         .expect("upload action should route through the server");
     assert_eq!(upload.status(), StatusCode::OK);
-    assert_eq!(drive.object_bytes(&object), Some(bytes.to_vec()));
+    assert_eq!(
+        drive.object_bytes(TEST_REPOSITORY_NAMESPACE, &object),
+        Some(bytes.to_vec())
+    );
 
     let cache_root = tempfile::tempdir().expect("cache tempdir should be created");
     let cache = LocalCacheLayout::new(cache_root.path());
@@ -185,6 +189,94 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
     );
 }
 
+#[tokio::test]
+async fn shared_storage_provider_does_not_expose_another_repository_object() {
+    let github = Arc::new(FakeRepositoryProvider::new("github-main"));
+    for (name, stable_id) in [("repo", "repo-123"), ("repo-b", "repo-456")] {
+        github.add_repository("github.com", "owner", name, Some(stable_id.to_owned()));
+        github.grant_permission(
+            "github.com",
+            "owner",
+            name,
+            "octocat",
+            RepositoryPermission::Write,
+        );
+    }
+    let user = RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned()));
+    let sessions = LocalLfsSessionStore::new();
+    let session = sessions
+        .issue_session(&user, ["repo"])
+        .expect("local LFS session should be issued");
+    let drive = Arc::new(FakeStorageProvider::new("drive-user-a"));
+    let router = lfs_server_router_with_provider_adapters(
+        local_server_config(),
+        sessions,
+        github,
+        drive.clone(),
+    )
+    .expect("two repositories may share one namespaced storage provider");
+    let bytes = b"repository A private LFS bytes";
+    let object = lfs_object_for_bytes(bytes);
+
+    let upload_batch = router
+        .clone()
+        .oneshot(lfs_json_request(
+            Method::POST,
+            "/github.com/owner/repo.git/info/lfs/objects/batch",
+            session.token.as_str(),
+            lfs_batch_request("upload", &object),
+        ))
+        .await
+        .expect("repository A upload batch should complete");
+    let upload_batch = lfs_batch_response(upload_batch).await;
+    let upload_href = upload_batch.objects[0]
+        .actions
+        .get("upload")
+        .expect("repository A should receive an upload action")
+        .href
+        .clone();
+    let upload = router
+        .clone()
+        .oneshot(authenticated_request(
+            Method::PUT,
+            &action_path_and_query(&upload_href),
+            session.token.as_str(),
+            Body::from(bytes.to_vec()),
+        ))
+        .await
+        .expect("repository A upload should complete");
+    assert_eq!(upload.status(), StatusCode::OK);
+    assert_eq!(
+        drive.object_bytes("github-main:owner/repo", &object),
+        Some(bytes.to_vec())
+    );
+    assert_eq!(
+        drive.object_bytes("github-main:owner/repo-b", &object),
+        None
+    );
+
+    let repository_b_batch = router
+        .oneshot(lfs_json_request(
+            Method::POST,
+            "/github.com/owner/repo-b.git/info/lfs/objects/batch",
+            session.token.as_str(),
+            lfs_batch_request("download", &object),
+        ))
+        .await
+        .expect("authorized repository B batch should complete");
+    assert_eq!(repository_b_batch.status(), StatusCode::OK);
+    let repository_b_batch = lfs_batch_response(repository_b_batch).await;
+    assert!(repository_b_batch.objects[0].actions.is_empty());
+    assert_eq!(
+        repository_b_batch.objects[0]
+            .error
+            .as_ref()
+            .expect("repository B object should remain missing")
+            .code,
+        404
+    );
+}
+
 #[test]
 fn provider_adapter_router_rejects_mismatched_provider_ids() {
     let sessions = LocalLfsSessionStore::new();
@@ -249,6 +341,13 @@ repositories:
     owner: owner
     name: repo
     provider_repository_id: "8675309"
+    storage_provider: drive-user-a
+  - id: github-main:owner/repo-b
+    repo_provider: github-main
+    host: github.com
+    owner: owner
+    name: repo-b
+    provider_repository_id: "8675310"
     storage_provider: drive-user-a
 "#,
     )

@@ -751,6 +751,22 @@ impl StorageProviderTransferStore {
             object.oid.as_hex()
         )
     }
+
+    fn ensure_stored_object_namespace(
+        &self,
+        repository: &RepositoryMapping,
+        stored_object: StoredObject,
+    ) -> ServerResult<StoredObject> {
+        if stored_object.repository_namespace == repository.id {
+            Ok(stored_object)
+        } else {
+            Err(ServerError::Storage {
+                source: StorageError::RepositoryNamespaceMismatch {
+                    provider: self.provider.provider_id().to_owned(),
+                },
+            })
+        }
+    }
 }
 
 impl LfsObjectTransferStore for StorageProviderTransferStore {
@@ -761,9 +777,10 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
     ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
         Box::pin(async move {
             self.ensure_provider_matches(repository)?;
-            if self.provider.object_exists(object).await? {
+            if self.provider.object_exists(&repository.id, object).await? {
                 Ok(Some(StoredObject::new(
                     self.provider.provider_id().to_owned(),
+                    repository.id.clone(),
                     object.clone(),
                     self.synthetic_existing_backend_id(object),
                 )))
@@ -782,10 +799,12 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
     ) -> ProviderFuture<'a, ServerResult<StoredObject>> {
         Box::pin(async move {
             self.ensure_provider_matches(repository)?;
-            self.provider
-                .upload_object(object, source)
+            let stored_object = self
+                .provider
+                .upload_object(&repository.id, object, source)
                 .await
-                .map_err(ServerError::from)
+                .map_err(ServerError::from)?;
+            self.ensure_stored_object_namespace(repository, stored_object)
         })
     }
 
@@ -813,8 +832,9 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
                 })?;
             let stored_object = self
                 .provider
-                .download_object(object, temp_file.path())
+                .download_object(&repository.id, object, temp_file.path())
                 .await?;
+            let stored_object = self.ensure_stored_object_namespace(repository, stored_object)?;
             let file = tokio::fs::File::open(temp_file.path())
                 .await
                 .map_err(|source| ServerError::Storage {
@@ -4285,6 +4305,7 @@ repositories:
         fn existing() -> Self {
             let stored_object = StoredObject::new(
                 "drive-user-a",
+                "github-main:owner/repo",
                 LfsObject::new(
                     LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                         .expect("test oid should parse"),
@@ -4435,7 +4456,7 @@ repositories:
     impl LfsObjectTransferStore for RecordingTransferStore {
         fn lookup_object<'a>(
             &'a self,
-            _repository: &'a RepositoryMapping,
+            repository: &'a RepositoryMapping,
             object: &'a LfsObject,
         ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
             Box::pin(async move {
@@ -4469,7 +4490,10 @@ repositories:
                     .expect("lookup records should not be poisoned")
                     .clone();
 
-                Ok(lookup_object.filter(|stored_object| stored_object.object == *object))
+                Ok(lookup_object.filter(|stored_object| {
+                    stored_object.repository_namespace == repository.id
+                        && stored_object.object == *object
+                }))
             })
         }
 
@@ -4502,6 +4526,7 @@ repositories:
 
                 let stored_object = StoredObject::new(
                     repository.storage_provider.clone(),
+                    repository.id.clone(),
                     object.clone(),
                     "drive-file-uploaded",
                 );
@@ -5593,6 +5618,7 @@ repositories:
             RecordingTransferStore::existing_object_with_download_integrity_mismatch(
                 StoredObject::new(
                     "drive-user-a",
+                    "github-main:owner/repo",
                     download_object,
                     "secret-backend-id-must-not-leak",
                 ),
@@ -5671,7 +5697,12 @@ repositories:
             LfsObjectSize::new(body.len() as u64),
         );
         let transfer_store = RecordingTransferStore::existing_object_with_download_body(
-            StoredObject::new("drive-user-a", object.clone(), "drive-file-existing"),
+            StoredObject::new(
+                "drive-user-a",
+                "github-main:owner/repo",
+                object.clone(),
+                "drive-file-existing",
+            ),
             body.clone(),
         );
         let router = test_router_with_authorizer_and_transfer_store(
@@ -5730,7 +5761,12 @@ repositories:
         );
         let transfer_store =
             RecordingTransferStore::existing_object_with_download_integrity_mismatch(
-                StoredObject::new("drive-user-a", object, "drive-file-existing"),
+                StoredObject::new(
+                    "drive-user-a",
+                    "github-main:owner/repo",
+                    object,
+                    "drive-file-existing",
+                ),
             );
         let router = test_router_with_authorizer_and_transfer_store(
             store,
@@ -5794,7 +5830,12 @@ repositories:
             LfsObjectSize::new(MAX_UPLOAD_OBJECT_BYTES + 1),
         );
         let transfer_store = RecordingTransferStore::existing_object_with_download_body(
-            StoredObject::new("drive-user-a", object.clone(), "drive-file-existing"),
+            StoredObject::new(
+                "drive-user-a",
+                "github-main:owner/repo",
+                object.clone(),
+                "drive-file-existing",
+            ),
             b"download body".to_vec(),
         );
         let router = test_router_with_authorizer_and_transfer_store(
@@ -6522,6 +6563,7 @@ repositories:
         );
         let transfer_store = RecordingTransferStore::existing_object(StoredObject::new(
             "drive-user-a",
+            "github-main:owner/repo",
             object.clone(),
             "drive-file-existing",
         ));
