@@ -1020,11 +1020,12 @@ lfs-cloud.yml stores the root_folder_id and credential reference
 
 Avoid requiring full-Drive access merely to browse for arbitrary folders. If a manually created folder is used, the setup flow must verify that the app can create, list, read, and delete test objects under that folder before accepting the config.
 
-Startup and health checks should validate the configured root folder with a
-safe `files.get` metadata request before object transfers depend on it. The
-current validator confirms that the ID resolves to a live Drive folder and that
-the credential can add child objects there. Resumable upload and download
-implementation tasks remain responsible for transfer-level verification.
+Server startup validates every configured root folder with a safe `files.get`
+metadata request before binding its listener. The startup check loads and
+refreshes each provider credential, confirms that the ID resolves to a live
+Drive folder, and verifies that the credential can add child objects there.
+The refreshed access token remains cached for transfer use. Resumable upload
+and download paths remain responsible for transfer-level verification.
 
 Drive object placement uses deterministic repository-scoped keys below the
 configured root folder:

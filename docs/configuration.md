@@ -161,6 +161,12 @@ The configured `root_folder_id` must be a folder that the app credential can
 access and create children in. Git users never receive Drive tokens or direct
 Drive access.
 
+`lfs-cloud serve` loads and refreshes the credential for every configured
+Drive provider, then performs a non-mutating metadata probe that confirms the
+root is a live folder with child-write capability. These checks complete before
+the HTTP listener binds; a missing/invalid credential or unusable root prevents
+the server from reporting readiness.
+
 ## Durable LFS Sessions
 
 Production `serve` processes persist unexpired local LFS sessions in the

@@ -398,8 +398,11 @@ The MVP Google Drive scope is
 `https://www.googleapis.com/auth/drive.file`. The configured `root_folder_id`
 must be a folder that the app created, opened through the setup flow, or was
 explicitly made accessible to this OAuth client. Current library code can
-validate the folder with a non-mutating Drive metadata probe before transfer
-paths depend on it.
+validate the folder with a non-mutating Drive metadata probe. On `serve`, LFS
+Cloud loads and refreshes every configured Drive credential and confirms that
+each root is a live folder that can accept children before binding the HTTP
+listener. A failed credential or root probe prevents the server from reporting
+readiness.
 
 The `.lfsconfig` file points only to the LFS Cloud endpoint. It should not contain Google Drive, S3, or other backend credentials.
 

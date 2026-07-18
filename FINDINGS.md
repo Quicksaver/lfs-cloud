@@ -513,11 +513,36 @@ independently validated or adjudicated.
    finding attributable separately, this was high-quality, security- and
    availability-relevant feedback.
 
-4. **Medium — Startup does not validate Drive credentials or root-folder
-   usability.** The server binds successfully and discovers invalid storage only
-   during the first batch lookup (`src/server.rs:93-116`,
-   `src/server.rs:672-704`). Validate each provider before declaring readiness,
-   or expose readiness that remains unhealthy until validation succeeds.
+4. **[DONE] Startup does not validate Drive credentials or root-folder
+   usability** (Medium, `src/server.rs`, `README.md`, `IMPLEMENTATION.md`, and
+   `docs/configuration.md`): **Valid and actionable.** Production previously
+   constructed the Drive transfer store and bound the listener without loading
+   storage credentials, refreshing an access token, or invoking the existing
+   root validator; the first batch lookup therefore discovered an unusable
+   provider after the server had already reported readiness. `serve` now
+   validates every configured Drive provider before router construction and
+   listener binding. The startup gate loads each configured credential,
+   refreshes it through Google OAuth, and performs the non-mutating Drive
+   metadata probe that requires a live folder with child-write capability. A
+   missing/invalid credential, token-refresh failure, missing/non-folder root,
+   or read-only root now aborts startup as a typed storage error. Startup and
+   transfer paths share the access-token cache, avoiding an immediate second
+   OAuth refresh after readiness validation. Dependency-injected regressions
+   prove the complete refresh-plus-root-probe composition, one refresh reused by
+   the first transfer-store construction, rejection of a read-only root, and
+   access-token redaction from the failure. README, implementation,
+   configuration, server API, and repository-learning documentation now state
+   the fail-closed startup contract. Verification passed with `yarn lint:fix`,
+   `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, focused startup tests, all integration test targets,
+   `cargo test --doc`, and `git diff --check`. The serial all-target run passed
+   527 tests with one ignored but hit three unrelated load-sensitive
+   credential-helper timeouts; all 35 credential tests, including those three,
+   passed together immediately on retry. The focused reviewer identified a
+   genuine medium-severity readiness flaw, connected it to both credential and
+   root usability, and prescribed the correct fail-closed startup boundary.
+   With one valid finding assessed here and no invalid finding attributable
+   separately, this was high-quality, operationally relevant feedback.
 
 5. **Medium — Per-object upload locks leak permanently.** Every distinct
    repository/provider/OID inserts a lock that is never removed
