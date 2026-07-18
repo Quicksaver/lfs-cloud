@@ -40,6 +40,7 @@ use crate::{
 
 const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
 const MAX_GITHUB_ERROR_BODY_LEN: usize = 16 * 1024;
+const MAX_GITHUB_OAUTH_TOKEN_RESPONSE_BODY_LEN: usize = 16 * 1024;
 const GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_USER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_PERMISSION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1006,31 +1007,51 @@ impl GitHubOAuthTokenExchanger {
             .await
             .map_err(|source| token_exchange_upstream_error(provider, None, source))?;
         let status = response.status();
+        let response_body =
+            read_bounded_github_response_body(response, MAX_GITHUB_OAUTH_TOKEN_RESPONSE_BODY_LEN)
+                .await
+                .map_err(|source| {
+                    token_exchange_upstream_error(provider, Some(status.as_u16()), source)
+                })?;
+        let response_body = match response_body {
+            BoundedGitHubResponseBody::Complete(body) => body,
+            BoundedGitHubResponseBody::ExceededLimit => {
+                return Err(token_exchange_response_too_large_error(
+                    provider,
+                    status.as_u16(),
+                ));
+            }
+        };
 
         if !status.is_success() {
-            let error = response.text().await.map_err(|source| {
-                token_exchange_upstream_error(provider, Some(status.as_u16()), source)
-            })?;
+            let error = String::from_utf8_lossy(&response_body);
 
             if let Some(error) = parse_token_error_response(&error) {
-                return Err(oauth_token_exchange_error(error));
+                return Err(oauth_token_exchange_error(redact_token_exchange_error(
+                    error, provider, callback,
+                )));
             }
 
             return Err(oauth_token_exchange_non_oauth_error(
                 provider,
                 status.as_u16(),
                 &error,
+                callback,
             ));
         }
 
-        let response = response
-            .json::<GitHubOAuthTokenResponse>()
-            .await
-            .map_err(|source| {
-                token_exchange_upstream_error(provider, Some(status.as_u16()), source)
+        let response =
+            serde_json::from_slice::<GitHubOAuthTokenResponse>(&response_body).map_err(|_| {
+                repository_provider_upstream_error(
+                    provider,
+                    Some(status.as_u16()),
+                    "malformed github oauth token response",
+                )
             })?;
         if let Some(error) = response.oauth_error() {
-            return Err(oauth_token_exchange_error(error));
+            return Err(oauth_token_exchange_error(redact_token_exchange_error(
+                error, provider, callback,
+            )));
         }
 
         GitHubOAuthToken::try_from_response(provider, response)
@@ -1894,7 +1915,36 @@ fn github_repository_not_found(
     }
 }
 
-async fn read_github_error_body(mut response: reqwest::Response) -> Result<String, reqwest::Error> {
+#[derive(Debug, Eq, PartialEq)]
+enum BoundedGitHubResponseBody {
+    Complete(Vec<u8>),
+    ExceededLimit,
+}
+
+async fn read_bounded_github_response_body(
+    mut response: reqwest::Response,
+    max_len: usize,
+) -> Result<BoundedGitHubResponseBody, reqwest::Error> {
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_len as u64)
+    {
+        return Ok(BoundedGitHubResponseBody::ExceededLimit);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > max_len {
+            return Ok(BoundedGitHubResponseBody::ExceededLimit);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(BoundedGitHubResponseBody::Complete(body))
+}
+
+async fn read_github_error_body(response: reqwest::Response) -> Result<String, reqwest::Error> {
+    let mut response = response;
     let mut body = Vec::new();
     while body.len() < MAX_GITHUB_ERROR_BODY_LEN {
         let Some(chunk) = response.chunk().await? else {
@@ -1943,8 +1993,10 @@ fn oauth_token_exchange_non_oauth_error(
     provider: &GitHubProviderConfig,
     status: u16,
     body: &str,
+    callback: &GitHubOAuthCallback,
 ) -> ServerError {
-    let body = sanitize_oauth_diagnostic_value(body);
+    let body = redact_token_exchange_secrets(body, provider, callback);
+    let body = sanitize_oauth_diagnostic_value(&body);
     let message = if body.is_empty() {
         "github oauth token endpoint returned a non-oauth error response".to_owned()
     } else {
@@ -1952,6 +2004,54 @@ fn oauth_token_exchange_non_oauth_error(
     };
 
     repository_provider_upstream_error(provider, Some(status), &message)
+}
+
+fn token_exchange_response_too_large_error(
+    provider: &GitHubProviderConfig,
+    status: u16,
+) -> ServerError {
+    repository_provider_upstream_error(
+        provider,
+        Some(status),
+        &format!(
+            "github oauth token response exceeded the \
+             {MAX_GITHUB_OAUTH_TOKEN_RESPONSE_BODY_LEN}-byte limit"
+        ),
+    )
+}
+
+fn redact_token_exchange_error(
+    error: GitHubOAuthTokenErrorResponse,
+    provider: &GitHubProviderConfig,
+    callback: &GitHubOAuthCallback,
+) -> GitHubOAuthTokenErrorResponse {
+    GitHubOAuthTokenErrorResponse {
+        error: error
+            .error
+            .map(|value| redact_token_exchange_secrets(&value, provider, callback)),
+        error_description: error
+            .error_description
+            .map(|value| redact_token_exchange_secrets(&value, provider, callback)),
+    }
+}
+
+fn redact_token_exchange_secrets(
+    value: &str,
+    provider: &GitHubProviderConfig,
+    callback: &GitHubOAuthCallback,
+) -> String {
+    let mut secrets = [
+        provider.oauth_client_secret.as_str(),
+        callback.code.as_str(),
+    ];
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+
+    secrets
+        .into_iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(value.to_owned(), |redacted, secret| {
+            redacted.replace(secret, "<redacted>")
+        })
 }
 
 fn repository_provider_upstream_error(
@@ -2570,6 +2670,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_exchange_redacts_secrets_reflected_in_json_error() {
+        let (token_url, _token_server) = token_server(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"client-secret oauth-code"}"#,
+        )
+        .await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let error = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect_err("reflected JSON OAuth denial should fail safely");
+        let rendered = error.to_string();
+
+        assert!(matches!(error, ServerError::Unauthorized { .. }));
+        assert!(rendered.contains("invalid_grant"));
+        assert!(!rendered.contains("client-secret"));
+        assert!(!rendered.contains("oauth-code"));
+    }
+
+    #[tokio::test]
     async fn token_exchange_maps_form_encoded_github_oauth_error() {
         let (token_url, _token_server) = token_server(
             StatusCode::BAD_REQUEST,
@@ -2593,6 +2716,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_exchange_redacts_secrets_reflected_in_form_error() {
+        let (token_url, _token_server) = token_server(
+            StatusCode::BAD_REQUEST,
+            "error=invalid_grant&error_description=client-secret+oauth-code",
+        )
+        .await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let error = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect_err("reflected form OAuth denial should fail safely");
+        let rendered = error.to_string();
+
+        assert!(matches!(error, ServerError::Unauthorized { .. }));
+        assert!(rendered.contains("invalid_grant"));
+        assert!(!rendered.contains("client-secret"));
+        assert!(!rendered.contains("oauth-code"));
+    }
+
+    #[tokio::test]
     async fn token_exchange_maps_non_oauth_error_body_to_upstream() {
         let (token_url, _token_server) =
             token_server(StatusCode::BAD_GATEWAY, r#"{"message":"try again later"}"#).await;
@@ -2610,6 +2756,73 @@ mod tests {
         assert!(rendered.contains("non-oauth error response"));
         assert!(rendered.contains("502"));
         assert!(!rendered.contains("oauth-code"));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_redacts_secrets_reflected_in_unstructured_error() {
+        let (token_url, _token_server) = token_server(
+            StatusCode::BAD_GATEWAY,
+            "upstream reflected client-secret and oauth-code",
+        )
+        .await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let error = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect_err("reflected unstructured failure should fail safely");
+        let rendered = error.to_string();
+
+        assert!(matches!(error, ServerError::RepositoryProvider { .. }));
+        assert!(rendered.contains("upstream reflected"));
+        assert!(!rendered.contains("client-secret"));
+        assert!(!rendered.contains("oauth-code"));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_rejects_oversized_error_response_body() {
+        let oversized_body = format!(
+            "{}client-secret oauth-code",
+            "x".repeat(super::MAX_GITHUB_OAUTH_TOKEN_RESPONSE_BODY_LEN)
+        );
+        let (token_url, _token_server) =
+            token_server(StatusCode::BAD_GATEWAY, oversized_body).await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let error = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect_err("oversized token error response should be rejected");
+        let rendered = error.to_string();
+
+        assert!(matches!(error, ServerError::RepositoryProvider { .. }));
+        assert!(rendered.contains("exceeded"));
+        assert!(!rendered.contains("client-secret"));
+        assert!(!rendered.contains("oauth-code"));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_rejects_oversized_success_response_body() {
+        let oversized_body = format!(
+            r#"{{"access_token":"{}","token_type":"bearer"}}"#,
+            "x".repeat(super::MAX_GITHUB_OAUTH_TOKEN_RESPONSE_BODY_LEN)
+        );
+        let (token_url, _token_server) = token_server(StatusCode::OK, oversized_body).await;
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
+        let callback = validated_callback("oauth-code", "csrf-state");
+
+        let error = exchanger
+            .exchange_code(&provider_config(), &callback, REDIRECT_URL)
+            .await
+            .expect_err("oversized token success response should be rejected");
+
+        assert!(matches!(error, ServerError::RepositoryProvider { .. }));
+        assert!(error.to_string().contains("exceeded"));
     }
 
     #[tokio::test]
@@ -4193,7 +4406,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TokenServerState {
         status: StatusCode,
-        body: &'static str,
+        body: String,
         requests: Mutex<Vec<CapturedTokenRequest>>,
     }
 
@@ -4236,11 +4449,11 @@ mod tests {
 
     async fn token_server(
         status: StatusCode,
-        body: &'static str,
+        body: impl Into<String>,
     ) -> (String, Arc<TokenServerState>) {
         let state = Arc::new(TokenServerState {
             status,
-            body,
+            body: body.into(),
             requests: Mutex::new(Vec::new()),
         });
         let app = Router::new()
@@ -4406,7 +4619,7 @@ mod tests {
         (
             state.status,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
-            state.body,
+            state.body.clone(),
         )
     }
 

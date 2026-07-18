@@ -200,13 +200,28 @@ independently validated or adjudicated.
    assessed here and no invalid finding attributable separately, this was
    high-quality, security-relevant feedback.
 
-9. **Medium — Token-endpoint error handling can reflect submitted secrets and
-   accepts unbounded bodies.** OAuth client secrets or authorization codes
-   echoed by the provider can enter server errors and logs
-   (`src/github_auth.rs:823-843`, `src/github_auth.rs:1468-1503`,
-   `src/github_auth.rs:1685-1706`). Bound response bodies and redact both
-   secrets before truncation or error construction. Add JSON, form, and
-   unstructured reflection tests.
+9. **[DONE] Token-endpoint errors could reflect submitted OAuth secrets and
+   accept unbounded bodies** (Medium, `src/github_auth.rs`): **Valid and
+   actionable.** Token exchange previously decoded successful JSON responses
+   and read unsuccessful response text without a byte limit. Its diagnostic
+   sanitizer removed control characters and truncated text, but never redacted
+   the submitted client secret or authorization code if GitHub reflected them.
+   Both successful and unsuccessful token responses now pass through a strict
+   16 KiB reader that rejects an oversized declared or streamed body before
+   parsing it. Structured JSON/form OAuth diagnostics and unstructured upstream
+   bodies now redact the client secret and validated callback code before the
+   existing diagnostic normalization and truncation, with longer overlapping
+   secrets redacted first. Regression coverage exercises JSON, form-encoded,
+   and unstructured reflection plus oversized success and error bodies.
+   Verification passed with `yarn lint:fix`, `cargo fmt --check`, focused
+   token-exchange tests, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, `cargo test --all-targets`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer found a
+   genuine medium-severity secret-disclosure and resource-boundary flaw,
+   correctly identified redaction ordering as security-relevant, and requested
+   the decisive response-format regressions; with one valid finding assessed
+   here and no invalid finding attributable separately, this was high-quality,
+   security-relevant feedback.
 
 10. **Medium — Failed credential lookup can disclose a stored token.** A failing
     helper's raw stderr is surfaced before the code knows the password to redact
