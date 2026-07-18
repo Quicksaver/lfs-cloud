@@ -927,11 +927,37 @@ independently validated or adjudicated.
    Google's [resumable upload
    guidance](https://developers.google.com/drive/api/guides/manage-uploads#resume-upload).
 
-7. **Medium — Drive error classification omits important quota and permission
-   reasons.** Errors that should drive retry, denial, or operator remediation can
-   collapse into generic upstream failures (`src/google_drive.rs:2358`,
-   `src/google_drive.rs:3911`). Expand classification for documented Drive
-   reason codes and add representative tests.
+7. **[DONE] Drive error classification omitted important quota and permission
+   reasons** (Medium, `src/google_drive.rs`, `src/error.rs`, `src/server.rs`, and
+   `AGENTS.md`): **Valid and actionable.** The common classifier previously
+   recognized only two Drive quota reasons, two rate-limit reasons, and
+   authentication/scope failures. Documented HTTP 403 responses for account,
+   folder, shared-drive, and daily capacity limits therefore became generic
+   upstream failures instead of quota errors that direct operator remediation.
+   Documented file ACL, domain policy, and shared-drive membership denials also
+   had no accurate typed category, while `sharingRateLimitExceeded` was not
+   retryable. The classifier now maps active-item, daily, folder-child,
+   hierarchy-depth, storage, and shared-drive file limits to
+   `StorageError::QuotaExceeded`; maps app authorization, domain policy, file
+   permission, and shared-drive membership reasons to a new sanitized
+   `StorageError::PermissionDenied`; and maps the remaining sharing rate limit
+   to `StorageError::Retryable`. The Git LFS boundary reports permission denial
+   as a non-retryable backend gateway failure without exposing provider
+   diagnostics to clients. Table-driven regressions cover every newly
+   classified capacity and permission reason, a focused regression covers the
+   additional rate-limit reason, and server coverage proves the new denial
+   category cannot be mistaken for a retryable response. The repository
+   learning records why Drive's shared HTTP 403 status cannot be classified
+   without its structured reason. Verification passed with `yarn lint:fix`,
+   `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, `cargo test --all-targets -- --test-threads=1` (580 passed,
+   3 ignored across targets), and `cargo test --doc` (38 passed). The focused
+   reviewer identified a genuine medium-severity operational correctness flaw,
+   correctly distinguished retry, denial, and capacity remediation, and asked
+   for the decisive representative tests. With one valid finding assessed here
+   and no invalid finding attributable separately, this was high-quality,
+   relevant feedback. See Google's [Drive error reason
+   guidance](https://developers.google.com/workspace/drive/api/guides/handle-errors).
 
 8. **[DONE] Flat root-folder storage creates a scaling ceiling and expensive
    list queries** (Medium, `src/google_drive.rs`, `src/server.rs`,

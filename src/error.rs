@@ -538,6 +538,15 @@ pub enum StorageError {
         provider: String,
     },
 
+    /// The storage provider denied access because of file, account, or domain policy.
+    #[error("{provider} storage permission denied: {message}")]
+    PermissionDenied {
+        /// Configured storage provider ID.
+        provider: String,
+        /// Sanitized permission failure details for operator remediation.
+        message: String,
+    },
+
     /// The requested object is not present in the configured storage backend.
     #[error("{provider} object not found: sha256:{oid} ({size} bytes)")]
     ObjectNotFound {

@@ -3103,6 +3103,9 @@ fn git_lfs_storage_error_response_parts(
             "Git LFS storage operation can be retried later",
         ),
         ServerError::Storage {
+            source: StorageError::PermissionDenied { .. },
+        } => (StatusCode::BAD_GATEWAY, "Git LFS storage access was denied"),
+        ServerError::Storage {
             source:
                 StorageError::AuthenticationRequired { .. } | StorageError::CredentialLoad { .. },
         } => (
@@ -3144,6 +3147,9 @@ fn lfs_batch_object_error_from_server_error(error: &ServerError) -> LfsBatchObje
         ServerError::Storage {
             source: StorageError::Retryable { .. },
         } => LfsBatchObjectError::new(503, "object storage lookup can be retried later"),
+        ServerError::Storage {
+            source: StorageError::PermissionDenied { .. },
+        } => LfsBatchObjectError::new(502, "object storage access was denied"),
         ServerError::Storage {
             source:
                 StorageError::AuthenticationRequired { .. } | StorageError::CredentialLoad { .. },
@@ -5308,6 +5314,25 @@ repositories:
             .expect("storage lookup failure should be object-level");
         assert_eq!(error.code, 501);
         assert_eq!(error.message, "object storage lookup is not configured");
+    }
+
+    #[test]
+    fn storage_permission_denial_maps_to_non_retryable_gateway_errors() {
+        let error = ServerError::Storage {
+            source: StorageError::PermissionDenied {
+                provider: "drive-user-a".to_owned(),
+                message: "Drive domain policy denied access".to_owned(),
+            },
+        };
+
+        assert_eq!(
+            super::git_lfs_storage_error_response_parts(&error, false),
+            (StatusCode::BAD_GATEWAY, "Git LFS storage access was denied")
+        );
+        assert_eq!(
+            super::lfs_batch_object_error_from_server_error(&error),
+            crate::LfsBatchObjectError::new(502, "object storage access was denied")
+        );
     }
 
     #[tokio::test]

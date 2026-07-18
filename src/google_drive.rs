@@ -3492,11 +3492,33 @@ fn classify_common_drive_error(
             provider: storage.id.clone(),
         });
     }
-    if diagnostic
-        .reasons
-        .iter()
-        .any(|reason| matches!(reason.as_str(), "quotaExceeded" | "storageQuotaExceeded"))
-    {
+    if diagnostic.reasons.iter().any(|reason| {
+        matches!(
+            reason.as_str(),
+            "appNotAuthorizedToFile"
+                | "domainPolicy"
+                | "insufficientFilePermissions"
+                | "teamDriveMembershipRequired"
+        )
+    }) {
+        return Some(StorageError::PermissionDenied {
+            provider: storage.id.clone(),
+            message: diagnostic.message.clone(),
+        });
+    }
+    if diagnostic.reasons.iter().any(|reason| {
+        matches!(
+            reason.as_str(),
+            "activeItemCreationLimitExceeded"
+                | "dailyLimitExceeded"
+                | "myDriveHierarchyDepthLimitExceeded"
+                | "numChildrenInNonRootLimitExceeded"
+                | "quotaExceeded"
+                | "storageQuotaExceeded"
+                | "teamDriveFileLimitExceeded"
+                | "teamDriveHierarchyTooDeep"
+        )
+    }) {
         return Some(StorageError::QuotaExceeded {
             provider: storage.id.clone(),
             message: diagnostic.message.clone(),
@@ -3507,7 +3529,7 @@ fn classify_common_drive_error(
         || diagnostic.reasons.iter().any(|reason| {
             matches!(
                 reason.as_str(),
-                "rateLimitExceeded" | "userRateLimitExceeded"
+                "rateLimitExceeded" | "sharingRateLimitExceeded" | "userRateLimitExceeded"
             )
         })
     {
@@ -4978,6 +5000,91 @@ mod tests {
             } if provider == "drive-user-a"
                 && message.contains("try later")
                 && !message.contains("access-token")
+        ));
+    }
+
+    #[test]
+    fn common_drive_errors_classify_documented_capacity_limits() {
+        for reason in [
+            "activeItemCreationLimitExceeded",
+            "dailyLimitExceeded",
+            "myDriveHierarchyDepthLimitExceeded",
+            "numChildrenInNonRootLimitExceeded",
+            "teamDriveFileLimitExceeded",
+            "teamDriveHierarchyTooDeep",
+        ] {
+            let diagnostic = super::DriveDiagnostic {
+                message: format!("Drive capacity limit: {reason}"),
+                reasons: vec![reason.to_owned()],
+            };
+
+            let error = super::classify_common_drive_error(
+                &storage_config("google-drive-user-a"),
+                StatusCode::FORBIDDEN,
+                &diagnostic,
+            )
+            .expect("documented capacity reason should be classified");
+
+            assert!(matches!(
+                error,
+                StorageError::QuotaExceeded {
+                    ref provider,
+                    ref message,
+                } if provider == "drive-user-a" && message.contains(reason)
+            ));
+        }
+    }
+
+    #[test]
+    fn common_drive_errors_classify_documented_permission_denials() {
+        for reason in [
+            "appNotAuthorizedToFile",
+            "domainPolicy",
+            "insufficientFilePermissions",
+            "teamDriveMembershipRequired",
+        ] {
+            let diagnostic = super::DriveDiagnostic {
+                message: format!("Drive permission denied: {reason}"),
+                reasons: vec![reason.to_owned()],
+            };
+
+            let error = super::classify_common_drive_error(
+                &storage_config("google-drive-user-a"),
+                StatusCode::FORBIDDEN,
+                &diagnostic,
+            )
+            .expect("documented permission reason should be classified");
+
+            assert!(matches!(
+                error,
+                StorageError::PermissionDenied {
+                    ref provider,
+                    ref message,
+                } if provider == "drive-user-a" && message.contains(reason)
+            ));
+        }
+    }
+
+    #[test]
+    fn common_drive_errors_classify_sharing_rate_limit_as_retryable() {
+        let diagnostic = super::DriveDiagnostic {
+            message: "Drive sharing rate limit exceeded".to_owned(),
+            reasons: vec!["sharingRateLimitExceeded".to_owned()],
+        };
+
+        let error = super::classify_common_drive_error(
+            &storage_config("google-drive-user-a"),
+            StatusCode::FORBIDDEN,
+            &diagnostic,
+        )
+        .expect("documented rate-limit reason should be classified");
+
+        assert!(matches!(
+            error,
+            StorageError::Retryable {
+                ref provider,
+                ref message,
+            } if provider == "drive-user-a" && message.contains("rate limit")
         ));
     }
 
