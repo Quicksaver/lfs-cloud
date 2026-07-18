@@ -47,11 +47,14 @@ const GOOGLE_DRIVE_TRANSFER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30
 const DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_";
 const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
 const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
+const MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES: usize = 124;
 const GOOGLE_DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 const GOOGLE_DRIVE_OBJECT_CONTENT_TYPE: &str = "application/octet-stream";
 const GOOGLE_DRIVE_OBJECT_VERSION: &str = "1";
 const GOOGLE_DRIVE_OBJECT_VERSION_PROPERTY: &str = "lfsCloudVersion";
 const GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY: &str = "lfsCloudRepoNamespace";
+const GOOGLE_DRIVE_REPO_NAMESPACE_FORMAT_PROPERTY: &str = "lfsCloudRepoNamespaceFormat";
+const GOOGLE_DRIVE_REPO_NAMESPACE_SHA256_FORMAT: &str = "sha256";
 const GOOGLE_DRIVE_OBJECT_OID_PROPERTY: &str = "lfsCloudOid";
 const GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY: &str = "lfsCloudSize";
 
@@ -602,30 +605,70 @@ impl GoogleDriveObjectKey {
 
     fn expected_app_properties(&self) -> GoogleDriveObjectProperties {
         GoogleDriveObjectProperties {
-            repo_namespace: self.repo_namespace.clone(),
+            repo_namespace: GoogleDriveRepositoryNamespaceProperty::new(&self.repo_namespace),
             oid: self.object.oid.as_hex().to_owned(),
             size: self.object.size.bytes().to_string(),
         }
     }
 }
 
+enum GoogleDriveRepositoryNamespaceProperty {
+    Raw(String),
+    Sha256(String),
+}
+
+impl GoogleDriveRepositoryNamespaceProperty {
+    fn new(repo_namespace: &str) -> Self {
+        // Preserve the original value for existing objects whenever Drive can
+        // represent it. Oversized values need a tagged digest so a raw
+        // namespace that resembles a digest cannot alias another repository.
+        if GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY.len() + repo_namespace.len()
+            <= MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES
+        {
+            Self::Raw(repo_namespace.to_owned())
+        } else {
+            Self::Sha256(format!("{:x}", Sha256::digest(repo_namespace.as_bytes())))
+        }
+    }
+
+    fn value(&self) -> &str {
+        match self {
+            Self::Raw(value) | Self::Sha256(value) => value,
+        }
+    }
+
+    fn format(&self) -> Option<&'static str> {
+        match self {
+            Self::Raw(_) => None,
+            Self::Sha256(_) => Some(GOOGLE_DRIVE_REPO_NAMESPACE_SHA256_FORMAT),
+        }
+    }
+}
+
 struct GoogleDriveObjectProperties {
-    repo_namespace: String,
+    repo_namespace: GoogleDriveRepositoryNamespaceProperty,
     oid: String,
     size: String,
 }
 
 impl GoogleDriveObjectProperties {
-    fn pairs(&self) -> [(&'static str, &str); 4] {
-        [
+    fn pairs(&self) -> Vec<(&'static str, &str)> {
+        let mut pairs = vec![
             (
                 GOOGLE_DRIVE_OBJECT_VERSION_PROPERTY,
                 GOOGLE_DRIVE_OBJECT_VERSION,
             ),
-            (GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY, &self.repo_namespace),
+            (
+                GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY,
+                self.repo_namespace.value(),
+            ),
             (GOOGLE_DRIVE_OBJECT_OID_PROPERTY, &self.oid),
             (GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY, &self.size),
-        ]
+        ];
+        if let Some(format) = self.repo_namespace.format() {
+            pairs.push((GOOGLE_DRIVE_REPO_NAMESPACE_FORMAT_PROPERTY, format));
+        }
+        pairs
     }
 }
 
@@ -3036,6 +3079,79 @@ mod tests {
                 "objects/github.com%2FOwner%20Repo%2Frepo.git/sha256/aa/aa/sha256-{OBJECT_OID}-42.lfs"
             )
         );
+    }
+
+    #[test]
+    fn drive_object_properties_preserve_namespace_at_property_byte_limit() {
+        let namespace_len = super::MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES
+            - super::GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY.len();
+        let namespace = "r".repeat(namespace_len);
+        let key = GoogleDriveObjectKey::new(&namespace, lfs_object())
+            .expect("maximum raw namespace should build");
+        let properties = key.expected_app_properties();
+        let pairs = properties.pairs();
+
+        assert!(pairs.contains(&(
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY,
+            namespace.as_str()
+        )));
+        assert!(
+            !pairs
+                .iter()
+                .any(|(key, _)| *key == super::GOOGLE_DRIVE_REPO_NAMESPACE_FORMAT_PROPERTY)
+        );
+        assert!(pairs.iter().all(|(key, value)| {
+            key.len() + value.len() <= super::MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES
+        }));
+    }
+
+    #[test]
+    fn drive_object_properties_digest_oversized_namespace() {
+        let namespace_byte_limit = super::MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES
+            - super::GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY.len();
+        let namespace = format!("{}é", "r".repeat(namespace_byte_limit - 1));
+        assert_eq!(
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY.len() + namespace.len(),
+            super::MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES + 1
+        );
+        let expected_digest = format!("{:x}", Sha256::digest(namespace.as_bytes()));
+        let key = GoogleDriveObjectKey::new(&namespace, lfs_object())
+            .expect("oversized raw namespace should build with digest metadata");
+        let properties = key.expected_app_properties();
+        let pairs = properties.pairs();
+
+        assert!(pairs.contains(&(
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY,
+            expected_digest.as_str()
+        )));
+        assert!(pairs.contains(&(
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_FORMAT_PROPERTY,
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_SHA256_FORMAT
+        )));
+        assert!(pairs.iter().all(|(key, value)| {
+            key.len() + value.len() <= super::MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES
+        }));
+
+        let metadata = super::drive_upload_metadata("drive-root", &key);
+        assert_eq!(
+            metadata["appProperties"][super::GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY],
+            expected_digest
+        );
+        assert_eq!(
+            metadata["appProperties"][super::GOOGLE_DRIVE_REPO_NAMESPACE_FORMAT_PROPERTY],
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_SHA256_FORMAT
+        );
+
+        let query = super::drive_object_lookup_query("drive-root", &key, &properties);
+        assert!(query.contains(&format!(
+            "appProperties has {{ key='{}' and value='{expected_digest}' }}",
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_PROPERTY
+        )));
+        assert!(query.contains(&format!(
+            "appProperties has {{ key='{}' and value='{}' }}",
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_FORMAT_PROPERTY,
+            super::GOOGLE_DRIVE_REPO_NAMESPACE_SHA256_FORMAT
+        )));
     }
 
     #[test]

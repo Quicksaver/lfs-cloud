@@ -839,12 +839,32 @@ independently validated or adjudicated.
    and no invalid finding attributable separately, this was high-quality,
    security- and availability-relevant feedback.
 
-4. **Medium — Valid repository IDs can exceed Drive app-property limits.** The
-   configuration accepts IDs that, combined with the property key, exceed
-   Drive's 124-byte key-plus-value limit (`src/google_drive.rs:596`,
-   `src/google_drive.rs:1870`, `src/google_drive.rs:1907`,
-   `src/google_drive.rs:2947`). Store a fixed-size digest or validate the true
-   boundary and add maximum-length tests. See the [Drive custom-properties
+4. **[DONE] Valid repository IDs can exceed Drive app-property limits**
+   (Medium, `src/google_drive.rs`, `IMPLEMENTATION.md`, and `AGENTS.md`):
+   **Valid and actionable.** Google Drive's current custom-property guidance
+   confirms that each UTF-8 property string is limited to 124 bytes across its
+   key and value, while repository mapping IDs have no corresponding length
+   ceiling. Repository namespace metadata now preserves the raw namespace for
+   backward compatibility only when the complete property fits that byte
+   limit. An oversized namespace is represented by its fixed 64-character
+   SHA-256 digest plus a separate `sha256` format property. The explicit format
+   marker prevents a short raw namespace that resembles a digest from aliasing
+   an oversized repository namespace. Upload metadata, lookup queries, and
+   response verification all derive the same bounded property set. Boundary
+   coverage proves that a namespace at exactly 124 combined bytes remains raw,
+   the first oversized byte switches to tagged digest metadata, every emitted
+   key/value pair remains within the provider limit, and both upload and lookup
+   paths use the digest. Implementation guidance and the repository learning
+   record the compatibility and isolation rule. Verification passed with
+   `cargo fmt`, `yarn lint:fix`, the 61-test Google Drive module suite,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+   focused reviewer identified a genuine medium-severity provider-boundary
+   failure, cited the authoritative byte limit, and requested both an
+   appropriate bounded representation and decisive maximum-length tests. With
+   one valid finding assessed here and no invalid finding attributable
+   separately, this was high-quality, relevant feedback. See the [Drive
+   custom-properties
    limits](https://developers.google.com/workspace/drive/api/guides/properties).
 
 5. **Medium — Paginated Drive lookup results are mishandled as conflicts.** The

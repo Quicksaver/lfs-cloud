@@ -1053,8 +1053,12 @@ objects/<percent-encoded-repo-namespace>/sha256/<first-2>/<next-2>/sha256-<oid>-
 Google Drive file IDs remain the backend address. The display path is for
 operator inspection and cleanup, while lookup verifies private Drive
 `appProperties` for the object-key version, repository namespace, SHA-256 OID,
-and byte size. The binary `size` returned by Drive must also match the LFS
-pointer size before an object is accepted.
+and byte size. Repository namespaces remain raw while their UTF-8 value plus
+the property key fits Drive's 124-byte property-string limit. Oversized
+namespaces use a SHA-256 value plus an explicit format property, keeping the
+backend identity bounded without making a digest-shaped raw namespace
+ambiguous. The binary `size` returned by Drive must also match the LFS pointer
+size before an object is accepted.
 
 Use Google Drive resumable uploads for large object writes. The first implementation may stage uploads to a local temp file so it can verify SHA-256 and size before uploading to Drive.
 
