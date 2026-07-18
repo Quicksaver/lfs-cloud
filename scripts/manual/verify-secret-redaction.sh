@@ -23,6 +23,7 @@ redaction_tests=(
   "google_drive::tests::refresher_redacts_credentials_from_upstream_diagnostics"
   "server_config::tests::raw_repository_provider_debug_redacts_github_oauth_client_secret"
   "server_config::tests::server_config_debug_redacts_github_oauth_client_secret"
+  "server::tests::server_tracing_events_never_render_request_or_provider_secrets"
   "sessions::tests::session_token_validates_restored_secret_and_redacts_debug"
 )
 

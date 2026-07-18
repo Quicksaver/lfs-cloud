@@ -2325,11 +2325,31 @@ independently validated or adjudicated.
    invalid finding attributable separately, this was high-quality, highly
    relevant feedback.
 
-4. **Medium — Redaction tests do not inspect emitted tracing events.** Server
-   failure paths interpolate errors into tracing fields, but tests inspect only
-   values and error strings (`src/server.rs:902`, `src/server.rs:976`). Capture
-   tracing output and assert sentinel OAuth, credential, Drive, URL, and helper
-   secrets never appear.
+4. **[DONE] Redaction tests did not inspect emitted tracing events** (Medium,
+   `src/server.rs` and `scripts/manual/verify-secret-redaction.sh`): **Valid and
+   actionable.** The request handlers rendered complete errors into tracing
+   fields and logged raw request paths; an invalid transfer `size` query could
+   therefore place attacker-controlled text directly in the emitted event,
+   while provider failures depended entirely on every upstream caller honoring
+   the `SanitizedMessage` contract. Server request tracing now records only
+   stable repository, provider, operation, object, size, error-type, and
+   source-category fields. It no longer renders request/provider errors, raw
+   request paths, or backend file IDs. A new tracing subscriber regression
+   captures the actual formatted event stream across invalid credential,
+   request-URL, repository-provider, and storage-provider failures; it verifies
+   the expected events were emitted while OAuth, credential, Drive, URL, and
+   helper sentinel secrets remain absent even when injected error text retains
+   them. The manual secret-redaction verifier now includes that regression, and
+   the repository learning records the safe server diagnostic boundary.
+   Verification passed with the focused tracing test,
+   `scripts/manual/verify-secret-redaction.sh`, `yarn lint:fix`,
+   `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, `cargo test --all-targets`, `cargo test --doc`, and
+   `git diff --check`. The reviewer identified a real medium-severity gap,
+   pointed at the decisive observable boundary rather than another value-level
+   assertion, and named the relevant secret classes. With one valid finding
+   and no invalid finding attributable separately, this was high-quality,
+   security-relevant feedback.
 
 5. **Medium — Missing prerequisites are reported as successful tests.** Many CLI
    tests silently return without Git, and explicitly selected gated tests can

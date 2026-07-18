@@ -444,7 +444,10 @@ async fn revoke_lfs_session_route(
         Ok(session) => session,
         Err(ServerError::Unauthorized { .. }) => return authentication_required_response(),
         Err(error) => {
-            tracing::error!(%error, "failed to authenticate LFS session revocation");
+            tracing::error!(
+                error_category = %server_error_log_category(&error),
+                "failed to authenticate LFS session revocation"
+            );
             return git_lfs_json_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "LFS Cloud session revocation failed",
@@ -456,7 +459,10 @@ async fn revoke_lfs_session_route(
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => authentication_required_response(),
         Err(error) => {
-            tracing::error!(%error, "failed to revoke LFS session");
+            tracing::error!(
+                error_category = %server_error_log_category(&error),
+                "failed to revoke LFS session"
+            );
             git_lfs_json_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "LFS Cloud session revocation failed",
@@ -1688,12 +1694,15 @@ async fn handle_lfs_request(
             Ok(session) => {
                 handle_authenticated_lfs_request(route, session, method, request, &state).await
             }
-            Err(error @ ServerError::Unauthorized { .. }) => {
-                tracing::debug!(path = uri.path(), %error, "LFS route request was not authenticated");
+            Err(ServerError::Unauthorized { .. }) => {
+                tracing::debug!("LFS route request was not authenticated");
                 authentication_required_response()
             }
             Err(error) => {
-                tracing::error!(path = uri.path(), %error, "failed to authenticate LFS route request");
+                tracing::error!(
+                    error_category = %server_error_log_category(&error),
+                    "failed to authenticate LFS route request"
+                );
                 git_lfs_json_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "LFS Cloud authentication failed",
@@ -1704,12 +1713,15 @@ async fn handle_lfs_request(
             StatusCode::NOT_FOUND,
             "No configured LFS Cloud repository route matches this path",
         ),
-        Err(error @ ServerError::InvalidRequest { .. }) => {
-            tracing::debug!(path = uri.path(), %error, "invalid LFS route request");
+        Err(ServerError::InvalidRequest { .. }) => {
+            tracing::debug!("invalid LFS route request");
             git_lfs_json_error_response(StatusCode::BAD_REQUEST, "Invalid LFS Cloud route")
         }
         Err(error) => {
-            tracing::error!(path = uri.path(), %error, "failed to resolve LFS route");
+            tracing::error!(
+                error_category = %server_error_log_category(&error),
+                "failed to resolve LFS route"
+            );
             git_lfs_json_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "LFS Cloud route handling failed",
@@ -1837,8 +1849,11 @@ async fn handle_lfs_batch_request(
                 );
                 handle_parsed_lfs_batch_request(repository, session, state, batch_request).await
             }
-            Err(error) => {
-                tracing::debug!(repo_id = repository.id.as_str(), %error, "invalid Git LFS batch request");
+            Err(_) => {
+                tracing::debug!(
+                    repo_id = repository.id.as_str(),
+                    "invalid Git LFS batch request"
+                );
                 git_lfs_json_error_response(
                     StatusCode::BAD_REQUEST,
                     "Invalid Git LFS batch request",
@@ -1856,7 +1871,7 @@ async fn handle_lfs_batch_request(
         Err(BatchBodyReadError::Unreadable(error)) => {
             tracing::debug!(
                 repo_id = repository.id.as_str(),
-                %error,
+                error_type = std::any::type_name_of_val(&error),
                 "failed to read Git LFS batch request body"
             );
             git_lfs_json_error_response(
@@ -1900,11 +1915,10 @@ async fn handle_lfs_download_request(
 ) -> Response {
     let expected_size = match transfer_request_expected_size(&request, "download") {
         Ok(size) => size,
-        Err(error) => {
+        Err(_) => {
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = oid.as_hex(),
-                %error,
                 "Git LFS download transfer missing or invalid object size"
             );
             return git_lfs_json_error_response(
@@ -1921,7 +1935,7 @@ async fn handle_lfs_download_request(
         tracing::debug!(
             repo_id = repository.id.as_str(),
             oid = oid.as_hex(),
-            %error,
+            error_category = %server_error_log_category(&error),
             "Git LFS download transfer authorization failed"
         );
         return git_lfs_authorization_error_response(error);
@@ -1943,7 +1957,7 @@ async fn handle_lfs_download_request(
             tracing::error!(
                 repo_id = repository.id.as_str(),
                 oid = object.oid.as_hex(),
-                %error,
+                error_category = %server_error_log_category(&error),
                 "failed to record Git LFS download transfer start"
             );
             return git_lfs_download_storage_error_response(error);
@@ -1962,7 +1976,7 @@ async fn handle_lfs_download_request(
                 tracing::error!(
                     repo_id = repository.id.as_str(),
                     oid = object.oid.as_hex(),
-                    %error,
+                    error_category = %server_error_log_category(&error),
                     "failed to record Git LFS download transfer success"
                 );
                 return git_lfs_download_storage_error_response(error);
@@ -1970,7 +1984,6 @@ async fn handle_lfs_download_request(
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 storage_provider = download.stored_object().provider_id.as_str(),
-                backend_id = download.stored_object().backend_id.as_str(),
                 oid = object.oid.as_hex(),
                 size = object.size.bytes(),
                 "prepared verified Git LFS download response"
@@ -1983,7 +1996,7 @@ async fn handle_lfs_download_request(
                 repo_id = repository.id.as_str(),
                 oid = object.oid.as_hex(),
                 size = object.size.bytes(),
-                %error,
+                error_category = %server_error_log_category(&error),
                 "Git LFS download transfer storage read failed"
             );
             git_lfs_download_storage_error_response(error)
@@ -2000,11 +2013,10 @@ async fn handle_lfs_upload_request(
 ) -> Response {
     let expected_size = match transfer_request_expected_size(&request, "upload") {
         Ok(size) => size,
-        Err(error) => {
+        Err(_) => {
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = oid.as_hex(),
-                %error,
                 "Git LFS upload transfer missing or invalid object size"
             );
             return git_lfs_json_error_response(
@@ -2035,7 +2047,7 @@ async fn handle_lfs_upload_request(
         tracing::debug!(
             repo_id = repository.id.as_str(),
             oid = oid.as_hex(),
-            %error,
+            error_category = %server_error_log_category(&error),
             "Git LFS upload transfer authorization failed"
         );
         return git_lfs_authorization_error_response(error);
@@ -2057,7 +2069,7 @@ async fn handle_lfs_upload_request(
             tracing::error!(
                 repo_id = repository.id.as_str(),
                 oid = object.oid.as_hex(),
-                %error,
+                error_category = %server_error_log_category(&error),
                 "failed to record Git LFS upload transfer start"
             );
             return git_lfs_storage_error_response(error);
@@ -2079,7 +2091,7 @@ async fn handle_lfs_upload_request(
                 tracing::debug!(
                     repo_id = repository.id.as_str(),
                     oid = object.oid.as_hex(),
-                    %error,
+                    error_category = %server_error_log_category(&error),
                     "Git LFS upload durable lock acquisition failed"
                 );
                 return git_lfs_storage_error_response(error);
@@ -2093,7 +2105,6 @@ async fn handle_lfs_upload_request(
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 storage_provider = stored_object.provider_id.as_str(),
-                backend_id = stored_object.backend_id.as_str(),
                 oid = object.oid.as_hex(),
                 size = object.size.bytes(),
                 "Git LFS upload transfer found an existing object"
@@ -2111,7 +2122,7 @@ async fn handle_lfs_upload_request(
                 tracing::debug!(
                     repo_id = repository.id.as_str(),
                     oid = object.oid.as_hex(),
-                    %error,
+                    error_category = %server_error_log_category(&error),
                     "Git LFS upload transfer metadata repair failed"
                 );
                 return git_lfs_storage_error_response(error);
@@ -2126,7 +2137,7 @@ async fn handle_lfs_upload_request(
                 tracing::error!(
                     repo_id = repository.id.as_str(),
                     oid = object.oid.as_hex(),
-                    %error,
+                    error_category = %server_error_log_category(&error),
                     "failed to record Git LFS upload transfer success"
                 );
                 return git_lfs_storage_error_response(error);
@@ -2139,7 +2150,7 @@ async fn handle_lfs_upload_request(
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = object.oid.as_hex(),
-                %error,
+                error_category = %server_error_log_category(&error),
                 "Git LFS upload transfer existence check failed"
             );
             return git_lfs_storage_error_response(error);
@@ -2168,7 +2179,7 @@ async fn handle_lfs_upload_request(
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = oid.as_hex(),
-                %error,
+                error_category = %server_error_log_category(&error),
                 "Git LFS upload staging admission failed"
             );
             return git_lfs_storage_error_response(error);
@@ -2232,7 +2243,7 @@ async fn handle_lfs_upload_request(
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = oid.as_hex(),
-                %error,
+                error_category = %server_error_log_category(&error),
                 "Git LFS upload transfer staging failed"
             );
             return git_lfs_storage_error_response(error);
@@ -2254,7 +2265,7 @@ async fn handle_lfs_upload_request(
                 tracing::error!(
                     repo_id = repository.id.as_str(),
                     oid = object.oid.as_hex(),
-                    %error,
+                    error_category = %server_error_log_category(&error),
                     "failed to record Git LFS upload transfer success"
                 );
                 return git_lfs_storage_error_response(error);
@@ -2273,7 +2284,7 @@ async fn handle_lfs_upload_request(
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 oid = object.oid.as_hex(),
-                %error,
+                error_category = %server_error_log_category(&error),
                 "Git LFS upload transfer storage write failed"
             );
             git_lfs_storage_error_response(error)
@@ -2304,6 +2315,14 @@ async fn finish_failed_transfer_attempt(
     finish_failed_transfer_attempt_with_message(state, attempt_id, category, message).await;
 }
 
+fn server_error_log_category(error: &ServerError) -> ErrorCategory {
+    match error {
+        ServerError::RepositoryProvider { source } => source.category(),
+        ServerError::Storage { source } => source.category(),
+        _ => error.category(),
+    }
+}
+
 async fn finish_failed_transfer_attempt_with_message(
     state: &LfsServerState,
     attempt_id: Option<i64>,
@@ -2317,7 +2336,10 @@ async fn finish_failed_transfer_attempt_with_message(
         )
         .await
     {
-        tracing::error!(%error, "failed to record Git LFS transfer failure");
+        tracing::error!(
+            error_category = %server_error_log_category(&error),
+            "failed to record Git LFS transfer failure"
+        );
     }
 }
 
@@ -2905,7 +2927,7 @@ async fn handle_parsed_lfs_batch_request(
         tracing::debug!(
             repo_id = repository.id.as_str(),
             operation = ?request.operation,
-            %error,
+            error_category = %server_error_log_category(&error),
             "Git LFS batch authorization failed"
         );
         return git_lfs_authorization_error_response(error);
@@ -2921,7 +2943,7 @@ async fn handle_parsed_lfs_batch_request(
                 Err(error) => {
                     tracing::debug!(
                         repo_id = repository.id.as_str(),
-                        %error,
+                        error_category = %server_error_log_category(&error),
                         "Git LFS download batch storage lookup failed"
                     );
                     git_lfs_storage_error_response(error)
@@ -2937,7 +2959,7 @@ async fn handle_parsed_lfs_batch_request(
                 Err(error) => {
                     tracing::debug!(
                         repo_id = repository.id.as_str(),
-                        %error,
+                        error_category = %server_error_log_category(&error),
                         "Git LFS upload batch storage lookup failed"
                     );
                     git_lfs_storage_error_response(error)
@@ -3712,7 +3734,7 @@ fn detect_lan_ipv4() -> Option<Ipv4Addr> {
 mod tests {
     use std::{
         fs,
-        io::{self, ErrorKind},
+        io::{self, ErrorKind, Write},
         net::TcpListener as StdTcpListener,
         path::Path as FsPath,
         sync::{Arc, Mutex},
@@ -3754,6 +3776,7 @@ mod tests {
     use base64::Engine as _;
     use futures_util::stream;
     use sha2::{Digest, Sha256};
+    use tracing::instrument::WithSubscriber as _;
 
     use crate::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, GitHubOAuthTokenExchanger,
@@ -3761,8 +3784,8 @@ mod tests {
         GoogleDriveStorageConfig, GoogleDriveTokenRefresher, LfsBatchOperation, LfsBatchResponse,
         LfsObject, LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase,
         ProviderFuture, RepositoryMapping, RepositoryPermission, RepositoryProviderError,
-        RepositoryUser, ServerConfig, ServerError, ServerResult, StorageError, StorageResult,
-        StoredObject,
+        RepositoryUser, SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
+        StorageResult, StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -4645,6 +4668,118 @@ repositories:
         }
     }
 
+    struct SecretBearingBatchAuthorizer {
+        message: String,
+    }
+
+    impl LfsBatchAuthorizer for SecretBearingBatchAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            repository: &'a RepositoryMapping,
+            _session: &'a LfsSessionRecord,
+            _operation: LfsBatchOperation,
+        ) -> ProviderFuture<'a, ServerResult<()>> {
+            Box::pin(async move {
+                Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::Upstream {
+                        provider: repository.repo_provider.clone(),
+                        status: Some(502),
+                        message: SanitizedMessage::new(self.message.clone()),
+                    },
+                })
+            })
+        }
+    }
+
+    struct SecretBearingTransferStore {
+        message: String,
+    }
+
+    impl LfsObjectTransferStore for SecretBearingTransferStore {
+        fn lookup_object<'a>(
+            &'a self,
+            repository: &'a RepositoryMapping,
+            _object: &'a LfsObject,
+        ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
+            Box::pin(async move {
+                Err(ServerError::Storage {
+                    source: StorageError::Upstream {
+                        provider: repository.storage_provider.clone(),
+                        status: Some(502),
+                        message: SanitizedMessage::new(self.message.clone()),
+                    },
+                })
+            })
+        }
+
+        fn upload_object<'a>(
+            &'a self,
+            _repository: &'a RepositoryMapping,
+            _object: &'a LfsObject,
+            _source: &'a FsPath,
+            _created_by: &'a RepositoryUser,
+        ) -> ProviderFuture<'a, ServerResult<StoredObject>> {
+            Box::pin(async { unreachable!("secret-bearing store is lookup-only") })
+        }
+
+        fn download_object_response<'a>(
+            &'a self,
+            repository: &'a RepositoryMapping,
+            _object: &'a LfsObject,
+        ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
+            Box::pin(async move {
+                Err(ServerError::Storage {
+                    source: StorageError::Upstream {
+                        provider: repository.storage_provider.clone(),
+                        status: Some(502),
+                        message: SanitizedMessage::new(self.message.clone()),
+                    },
+                })
+            })
+        }
+
+        fn record_verified_object<'a>(
+            &'a self,
+            _repository: &'a RepositoryMapping,
+            _object: &'a LfsObject,
+            _backend_id: &'a str,
+            _created_by: &'a RepositoryUser,
+        ) -> ProviderFuture<'a, ServerResult<()>> {
+            Box::pin(async { unreachable!("secret-bearing store is lookup-only") })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedTracingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CapturedTracingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes
+                .lock()
+                .expect("captured tracing bytes should not be poisoned")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedTracingWriter {
+        fn rendered(&self) -> String {
+            String::from_utf8(
+                self.bytes
+                    .lock()
+                    .expect("captured tracing bytes should not be poisoned")
+                    .clone(),
+            )
+            .expect("tracing output should be UTF-8")
+        }
+    }
+
     #[derive(Clone, Default)]
     struct RecordingTransferStore {
         lookup_object: Arc<Mutex<Option<StoredObject>>>,
@@ -5449,6 +5584,118 @@ repositories:
             "Git LFS base path is not an operation endpoint; use /objects/batch",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn server_tracing_events_never_render_request_or_provider_secrets() {
+        const CREDENTIAL_SECRET: &str = "credential-secret-sentinel";
+        const OAUTH_SECRET: &str = "oauth-secret-sentinel";
+        const DRIVE_SECRET: &str = "drive-secret-sentinel";
+        const URL_SECRET: &str = "url-query-secret-sentinel";
+        const HELPER_SECRET: &str = "helper-secret-sentinel";
+
+        let captured = CapturedTracingWriter::default();
+        let tracing_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || tracing_writer.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        async {
+            let (store, _) = issued_session_token(Duration::from_secs(60));
+            let router = test_router_with_authorizer(store, RecordingBatchAuthorizer::allow());
+            let response = router
+                .oneshot(lfs_request(
+                    "/github.com/owner/repo.git/info/lfs/objects/batch",
+                    Some(&format!("Bearer {CREDENTIAL_SECRET}")),
+                ))
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+            let (store, token) = issued_session_token(Duration::from_secs(60));
+            let router = test_router_with_authorizer(store, RecordingBatchAuthorizer::allow());
+            let response = router
+                .oneshot(lfs_request_with_method_and_body(
+                    Method::GET,
+                    &format!(
+                        "/github.com/owner/repo.git/info/lfs/objects/{}?size={URL_SECRET}",
+                        "a".repeat(64)
+                    ),
+                    Some(&format!("Bearer {token}")),
+                    "",
+                ))
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            let (store, token) = issued_session_token(Duration::from_secs(60));
+            let router = lfs_server_router_with_sessions_authorizer_and_transfer_store(
+                test_config(),
+                store,
+                Arc::new(SecretBearingBatchAuthorizer {
+                    message: format!("provider diagnostic {OAUTH_SECRET} {HELPER_SECRET}"),
+                }),
+                Arc::new(RecordingTransferStore::missing()),
+            );
+            let response = router
+                .oneshot(lfs_request_with_method_and_body(
+                    Method::POST,
+                    "/github.com/owner/repo.git/info/lfs/objects/batch",
+                    Some(&format!("Bearer {token}")),
+                    VALID_BATCH_REQUEST,
+                ))
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+            let (store, token) = issued_session_token(Duration::from_secs(60));
+            let router = lfs_server_router_with_sessions_authorizer_and_transfer_store(
+                test_config(),
+                store,
+                Arc::new(RecordingBatchAuthorizer::allow()),
+                Arc::new(SecretBearingTransferStore {
+                    message: format!("Drive diagnostic {DRIVE_SECRET}"),
+                }),
+            );
+            let response = router
+                .oneshot(lfs_request_with_method_and_body(
+                    Method::GET,
+                    &format!(
+                        "/github.com/owner/repo.git/info/lfs/objects/{}?size=42",
+                        "a".repeat(64)
+                    ),
+                    Some(&format!("Bearer {token}")),
+                    "",
+                ))
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let rendered = captured.rendered();
+        assert!(rendered.contains("LFS route request was not authenticated"));
+        assert!(rendered.contains("Git LFS download transfer missing or invalid object size"));
+        assert!(rendered.contains("Git LFS batch authorization failed"));
+        assert!(rendered.contains("Git LFS download transfer storage read failed"));
+        for secret in [
+            CREDENTIAL_SECRET,
+            OAUTH_SECRET,
+            DRIVE_SECRET,
+            URL_SECRET,
+            HELPER_SECRET,
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "captured tracing output leaked sentinel {secret:?}: {rendered}"
+            );
+        }
     }
 
     #[tokio::test]
