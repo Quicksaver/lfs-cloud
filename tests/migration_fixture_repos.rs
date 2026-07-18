@@ -26,7 +26,6 @@ fn fixture_repo_current_checkout_scan_uses_git_attributes() {
     let non_lfs_object = lfs_object_for_bytes(b"pointer-shaped docs fixture");
 
     repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n*.txt text\n");
-    repo.write_file("asset/hydrated.bin", "already hydrated bytes");
     write_lfs_pointer(
         &repo,
         "asset/model.bin",
@@ -44,10 +43,66 @@ fn fixture_repo_current_checkout_scan_uses_git_attributes() {
     let scan = enumerate_current_checkout_lfs_pointers(repo.path())
         .expect("current checkout fixture scan should succeed");
 
-    assert_eq!(scan.tracked_path_count, 2);
+    assert_eq!(scan.tracked_path_count, 1);
     assert_eq!(scan.pointers.len(), 1);
     assert_eq!(scan.pointers[0].relative_path, Path::new("asset/model.bin"));
     assert_eq!(scan.pointers[0].object, lfs_object);
+}
+
+#[test]
+fn fixture_repo_current_checkout_scan_reads_hydrated_pointer_from_index() {
+    let repo = initialized_migration_repo();
+    let object_bytes = b"hydrated current checkout object";
+    let object = lfs_object_for_bytes(object_bytes);
+
+    repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+    write_lfs_pointer(
+        &repo,
+        "asset/model.bin",
+        object.oid.as_hex(),
+        object.size.bytes(),
+    );
+    repo.commit_all("add pointer before hydration");
+    fs::write(repo.path().join("asset/model.bin"), object_bytes)
+        .expect("fixture pointer should hydrate in the worktree");
+
+    let scan = enumerate_current_checkout_lfs_pointers(repo.path())
+        .expect("hydrated current checkout fixture scan should succeed");
+
+    assert_eq!(scan.tracked_path_count, 1);
+    assert_eq!(scan.pointers.len(), 1);
+    assert_eq!(scan.pointers[0].relative_path, Path::new("asset/model.bin"));
+    assert_eq!(scan.pointers[0].object, object);
+}
+
+#[test]
+fn fixture_repo_current_checkout_scan_reads_sparse_pointer_from_index() {
+    let repo = initialized_migration_repo();
+    let object = lfs_object_for_bytes(b"sparse current checkout object");
+
+    repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+    write_lfs_pointer(
+        &repo,
+        "asset/model.bin",
+        object.oid.as_hex(),
+        object.size.bytes(),
+    );
+    repo.write_file("docs/README.md", "sparse checkout fixture\n");
+    repo.commit_all("add pointer before sparse checkout");
+    repo.git(["sparse-checkout", "init", "--cone"]);
+    repo.git(["sparse-checkout", "set", "docs"]);
+    assert!(
+        !repo.path().join("asset/model.bin").exists(),
+        "fixture should omit the LFS path from the sparse worktree"
+    );
+
+    let scan = enumerate_current_checkout_lfs_pointers(repo.path())
+        .expect("sparse current checkout fixture scan should succeed");
+
+    assert_eq!(scan.tracked_path_count, 1);
+    assert_eq!(scan.pointers.len(), 1);
+    assert_eq!(scan.pointers[0].relative_path, Path::new("asset/model.bin"));
+    assert_eq!(scan.pointers[0].object, object);
 }
 
 #[test]

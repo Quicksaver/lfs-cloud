@@ -50,8 +50,9 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > Migration support code can inspect an existing Git worktree for local Git LFS
 > installation status, LFS filter config, repository LFS endpoint config, and
 > `.gitattributes` patterns that declare `filter=lfs` without mutating local
-> state, and can enumerate checked-out Git LFS pointer files for tracked paths
-> whose Git attributes use `filter=lfs`. It can also enumerate Git LFS pointer
+> state, and can enumerate Git LFS pointer blobs from the current index for
+> tracked paths whose Git attributes use `filter=lfs`, including hydrated files
+> and files omitted by sparse checkout. It can also enumerate Git LFS pointer
 > blobs reachable from selected refs or all fetched refs by evaluating
 > historical `filter=lfs` attributes without checking out those refs.
 > Migration planning can also check discovered object identities against local

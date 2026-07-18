@@ -1464,12 +1464,33 @@ independently validated or adjudicated.
 
 ## Migration
 
-1. **High — Current-checkout discovery misses hydrated and sparse LFS files.** It
-   reads worktree files and only recognizes pointer placeholders, so hydrated
-   content and paths absent from a sparse checkout are skipped
-   (`src/migration.rs:394-418`, `src/cli.rs:918-925`,
-   `tests/migration_fixture_repos.rs:23-50`). Read pointer blobs from the Git
-   index for the current checkout and add hydrated/sparse fixtures.
+1. **[DONE] Current-checkout discovery misses hydrated and sparse LFS files**
+   (High, `src/migration.rs`, `tests/migration_fixture_repos.rs`, and migration
+   documentation): **Valid and actionable.** Current-checkout migration
+   previously listed cached paths, discarded paths absent from the worktree,
+   and parsed pointer candidates from worktree bytes. A normal Git LFS smudge
+   therefore hid hydrated objects, while sparse checkout removed otherwise
+   reachable paths from the scan entirely. Discovery now reads stage-zero
+   regular-file entries and object IDs from `git ls-files --cached --stage`,
+   lets `git check-attr` determine which index paths use `filter=lfs`, and
+   parses the corresponding Git blobs rather than worktree files. The returned
+   worktree path remains useful for reporting but may legitimately be absent.
+   Index parsing rejects malformed and unmerged entries, preserves native path
+   bytes, and excludes symlinks and gitlinks from pointer parsing. Real Git
+   fixture regressions prove both a committed pointer replaced by hydrated
+   worktree bytes and a committed pointer omitted by cone-mode sparse checkout
+   remain discoverable with the correct object identity; the existing missing-
+   path unit regression now asserts the same index-authoritative contract.
+   README, implementation status, public API documentation, and the repository
+   learning now describe hydrated and sparse current-checkout coverage.
+   Verification passed with `cargo fmt`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine high-severity
+   migration completeness flaw, located the incorrect worktree-data boundary,
+   and proposed the decisive index-backed fix and fixture coverage; with one
+   valid finding assessed here and no invalid finding attributable separately,
+   this was high-quality, relevant feedback.
 
 2. **High — A migration dry run can lazy-fetch missing partial-clone objects.**
    `git cat-file` helpers inherit the environment, so supposedly read-only

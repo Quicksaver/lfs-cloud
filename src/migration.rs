@@ -31,7 +31,6 @@ use url::Url;
 const DEFAULT_REMOTE_NAME: &str = "origin";
 const MAX_MIGRATION_GIT_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_GIT_ATTRIBUTES_BYTES: u64 = 256 * 1024;
-const MAX_CURRENT_CHECKOUT_POINTER_BYTES: u64 = 64 * 1024;
 const MAX_CURRENT_CHECKOUT_ATTR_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_REF_LIST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HISTORY_COMMIT_LIST_BYTES: usize = 32 * 1024 * 1024;
@@ -95,25 +94,25 @@ pub struct GitLfsTrackedPattern {
     pub source: PathBuf,
 }
 
-/// Git LFS pointers discovered from the current checkout.
+/// Git LFS pointers discovered from the current checkout's index.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct CurrentCheckoutLfsPointers {
     /// Git worktree root that was inspected.
     pub worktree_root: PathBuf,
-    /// Number of tracked checkout paths whose Git attributes use `filter=lfs`.
+    /// Number of tracked index paths whose Git attributes use `filter=lfs`.
     pub tracked_path_count: usize,
-    /// Pointer files found among the currently checked-out LFS-tracked paths.
+    /// Pointer blobs found among the current index's LFS-tracked paths.
     pub pointers: Vec<CurrentCheckoutLfsPointer>,
 }
 
-/// A Git LFS pointer file found in the current checkout.
+/// A Git LFS pointer blob found in the current checkout's index.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct CurrentCheckoutLfsPointer {
     /// Repository-relative path to the pointer file.
     pub relative_path: PathBuf,
-    /// Absolute worktree path to the pointer file.
+    /// Corresponding absolute worktree path, which may be absent in a sparse checkout.
     pub path: PathBuf,
     /// Object identity referenced by the pointer file.
     pub object: LfsObject,
@@ -379,13 +378,12 @@ pub fn discover_git_lfs_migration(
     })
 }
 
-/// Enumerates Git LFS pointer files in the current checkout.
+/// Enumerates Git LFS pointer blobs in the current checkout's index.
 ///
-/// This function is intentionally read-only. It asks Git which tracked paths
-/// have `filter=lfs`, then parses only small pointer-shaped files in the
-/// current worktree. Hydrated files and ordinary files are reported by their
-/// absence so migration planning can distinguish current checkout coverage from
-/// later history scans.
+/// This function is intentionally read-only. It asks Git which index paths have
+/// `filter=lfs`, then parses small pointer-shaped blobs directly from the index.
+/// The index remains authoritative when a worktree file is hydrated or omitted
+/// by sparse checkout, so both states retain complete current-checkout coverage.
 ///
 /// # Errors
 ///
@@ -396,25 +394,25 @@ pub fn enumerate_current_checkout_lfs_pointers(
 ) -> MigrationResult<CurrentCheckoutLfsPointers> {
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
-    let lfs_tracked_paths = current_checkout_lfs_tracked_paths(&worktree_root)?;
+    let lfs_tracked_blobs = current_checkout_lfs_tracked_blobs(&worktree_root)?;
     let mut pointers = Vec::new();
 
-    for relative_path in &lfs_tracked_paths {
-        let path = worktree_root.join(relative_path);
-        let Some(pointer) = read_current_checkout_pointer_candidate(&path)? else {
+    for blob in &lfs_tracked_blobs {
+        let Some(pointer) = read_index_pointer_blob_candidate(&worktree_root, &blob.object_id)?
+        else {
             continue;
         };
 
         pointers.push(CurrentCheckoutLfsPointer {
-            relative_path: relative_path.clone(),
-            path,
+            relative_path: blob.relative_path.clone(),
+            path: worktree_root.join(&blob.relative_path),
             object: pointer.object,
         });
     }
 
     Ok(CurrentCheckoutLfsPointers {
         worktree_root,
-        tracked_path_count: lfs_tracked_paths.len(),
+        tracked_path_count: lfs_tracked_blobs.len(),
         pointers,
     })
 }
@@ -1545,33 +1543,98 @@ fn git_attributes_files(worktree_root: &Path) -> MigrationResult<Vec<PathBuf>> {
     Ok(paths.into_iter().collect())
 }
 
-fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> MigrationResult<Vec<PathBuf>> {
+fn current_checkout_lfs_tracked_blobs(worktree_root: &Path) -> MigrationResult<Vec<GitIndexBlob>> {
+    const COMMAND: &str = "git ls-files -z --cached --stage";
     let output = run_git_os(
         worktree_root,
         [
             OsStr::new("ls-files"),
             OsStr::new("-z"),
             OsStr::new("--cached"),
+            OsStr::new("--stage"),
         ],
-        "git ls-files -z --cached",
+        COMMAND,
     )?;
     if !output.status.success() {
-        return Err(command_error(
-            "git ls-files -z --cached",
-            output.status,
-            &output.stderr,
-        ));
+        return Err(command_error(COMMAND, output.status, &output.stderr));
     }
     if output.stdout.is_empty() {
         return Ok(Vec::new());
     }
 
-    let output = git_check_attr_filter(worktree_root, output.stdout)?;
+    let index_blobs = parse_ls_files_stage_blob_output(&output.stdout, COMMAND)?;
+    if index_blobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tracked_paths = index_blobs
+        .iter()
+        .flat_map(|blob| blob.relative_path_bytes.iter().copied().chain([b'\0']))
+        .collect();
+    let attributes = git_check_attr_filter(worktree_root, tracked_paths)?;
     let lfs_tracked_paths = parse_git_check_attr_filter_stdout(
-        &output.stdout,
+        &attributes.stdout,
         &git_check_attr_filter_command_name(None),
-    )?;
-    current_checkout_existing_paths(worktree_root, lfs_tracked_paths)
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+
+    Ok(index_blobs
+        .into_iter()
+        .filter(|blob| lfs_tracked_paths.contains(&blob.relative_path))
+        .collect())
+}
+
+fn parse_ls_files_stage_blob_output(
+    stdout: &[u8],
+    command_name: &str,
+) -> MigrationResult<Vec<GitIndexBlob>> {
+    let mut blobs = Vec::new();
+
+    for record in stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty())
+    {
+        let Some(separator) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(index_entry_parse_error(command_name));
+        };
+        let metadata = &record[..separator];
+        let fields = metadata
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let [mode, object_id, stage] = fields.as_slice() else {
+            return Err(index_entry_parse_error(command_name));
+        };
+        if *stage != b"0" {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("Git index contains an unmerged entry"),
+            });
+        }
+        if !matches!(*mode, b"100644" | b"100755") {
+            continue;
+        }
+        let object_id = std::str::from_utf8(object_id)
+            .map_err(|_| index_entry_parse_error(command_name))?
+            .to_owned();
+        let relative_path_bytes = record[separator + 1..].to_owned();
+        let relative_path = safe_git_relative_path(&relative_path_bytes, command_name)?;
+
+        blobs.push(GitIndexBlob {
+            object_id,
+            relative_path,
+            relative_path_bytes,
+        });
+    }
+
+    Ok(blobs)
+}
+
+fn index_entry_parse_error(command_name: &str) -> MigrationError {
+    MigrationError::ExternalCommandOutput {
+        command: command_name.to_owned(),
+        message: SanitizedMessage::new("git returned malformed index metadata"),
+    }
 }
 
 fn parse_git_check_attr_filter_stdout(
@@ -1602,28 +1665,6 @@ fn parse_git_check_attr_filter_stdout(
     }
 
     Ok(paths)
-}
-
-fn current_checkout_existing_paths(
-    worktree_root: &Path,
-    paths: Vec<PathBuf>,
-) -> MigrationResult<Vec<PathBuf>> {
-    let mut existing_paths = Vec::with_capacity(paths.len());
-    for relative_path in paths {
-        let path = worktree_root.join(&relative_path);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => existing_paths.push(relative_path),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(MigrationError::Io {
-                    context: format!("failed to inspect checkout path {}", path.display()),
-                    source,
-                });
-            }
-        }
-    }
-
-    Ok(existing_paths)
 }
 
 fn git_check_attr_filter(worktree_root: &Path, tracked_paths: Vec<u8>) -> MigrationResult<Output> {
@@ -1819,36 +1860,18 @@ fn git_path_bytes_to_path_buf(relative_path: &[u8], command: &str) -> MigrationR
         })
 }
 
-fn read_current_checkout_pointer_candidate(path: &Path) -> MigrationResult<Option<LfsPointer>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(MigrationError::Io {
-                context: format!("failed to inspect checkout path {}", path.display()),
-                source,
-            });
-        }
-    };
-    if !metadata.file_type().is_file() || metadata.len() > MAX_CURRENT_CHECKOUT_POINTER_BYTES {
-        return Ok(None);
-    }
+fn read_index_pointer_blob_candidate(
+    worktree_root: &Path,
+    object_id: &str,
+) -> MigrationResult<Option<LfsPointer>> {
+    read_history_pointer_blob_candidate(worktree_root, object_id)
+}
 
-    let contents = match fs::read(path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(MigrationError::Io {
-                context: format!("failed to read checkout path {}", path.display()),
-                source,
-            });
-        }
-    };
-    let Ok(contents) = std::str::from_utf8(&contents) else {
-        return Ok(None);
-    };
-
-    Ok(LfsPointer::parse(contents).ok())
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitIndexBlob {
+    object_id: String,
+    relative_path: PathBuf,
+    relative_path_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3017,7 +3040,6 @@ mod tests {
     fn enumerates_current_checkout_lfs_pointer_files() {
         let repo = TempRepo::new();
         let pointer_object = test_lfs_object('a', 123);
-        let ordinary_lfs_object = test_lfs_object('b', 456);
         let non_lfs_pointer_object = test_lfs_object('c', 789);
 
         repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n*.txt text\n");
@@ -3025,7 +3047,6 @@ mod tests {
             "asset/model.bin",
             &LfsPointer::new(pointer_object.clone()).to_pointer_file(),
         );
-        repo.write_file("asset/hydrated.bin", "already hydrated bytes");
         repo.write_file(
             "docs/pointer-example.txt",
             &LfsPointer::new(non_lfs_pointer_object).to_pointer_file(),
@@ -3034,14 +3055,13 @@ mod tests {
             "add",
             ".gitattributes",
             "asset/model.bin",
-            "asset/hydrated.bin",
             "docs/pointer-example.txt",
         ]);
 
         let scan = enumerate_current_checkout_lfs_pointers(repo.path())
             .expect("current checkout pointer scan should succeed");
 
-        assert_eq!(scan.tracked_path_count, 2);
+        assert_eq!(scan.tracked_path_count, 1);
         assert_eq!(scan.pointers.len(), 1);
         assert_eq!(scan.pointers[0].relative_path, Path::new("asset/model.bin"));
         assert_eq!(
@@ -3055,7 +3075,6 @@ mod tests {
                 .expect("expected pointer path should canonicalize")
         );
         assert_eq!(scan.pointers[0].object, pointer_object);
-        assert_ne!(scan.pointers[0].object, ordinary_lfs_object);
     }
 
     #[test]
@@ -3088,7 +3107,7 @@ mod tests {
     }
 
     #[test]
-    fn current_checkout_pointer_scan_ignores_missing_tracked_lfs_files() {
+    fn current_checkout_pointer_scan_reads_missing_tracked_lfs_files_from_index() {
         let repo = TempRepo::new();
         let present_object = test_lfs_object('a', 123);
         let missing_object = test_lfs_object('b', 456);
@@ -3100,7 +3119,7 @@ mod tests {
         );
         repo.write_file(
             "asset/missing.bin",
-            &LfsPointer::new(missing_object).to_pointer_file(),
+            &LfsPointer::new(missing_object.clone()).to_pointer_file(),
         );
         repo.git([
             "add",
@@ -3114,13 +3133,16 @@ mod tests {
         let scan = enumerate_current_checkout_lfs_pointers(repo.path())
             .expect("current checkout pointer scan should succeed");
 
-        assert_eq!(scan.tracked_path_count, 1);
-        assert_eq!(scan.pointers.len(), 1);
-        assert_eq!(
-            scan.pointers[0].relative_path,
-            Path::new("asset/present.bin")
-        );
-        assert_eq!(scan.pointers[0].object, present_object);
+        assert_eq!(scan.tracked_path_count, 2);
+        assert_eq!(scan.pointers.len(), 2);
+        assert!(scan.pointers.iter().any(|pointer| {
+            pointer.relative_path == Path::new("asset/present.bin")
+                && pointer.object == present_object
+        }));
+        assert!(scan.pointers.iter().any(|pointer| {
+            pointer.relative_path == Path::new("asset/missing.bin")
+                && pointer.object == missing_object
+        }));
     }
 
     #[cfg(unix)]

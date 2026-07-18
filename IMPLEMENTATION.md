@@ -1369,10 +1369,10 @@ Defer:
 > local Git LFS installation status, visible LFS filter config, repository LFS
 > endpoint config, and `.gitattributes` patterns that declare `filter=lfs`,
 > without mutating Git config, worktree files, cache state, or storage. Current
-> checkout migration scanning can now ask Git for tracked paths with
-> `filter=lfs` and parse small checked-out pointer files into object identities
-> without treating hydrated files or non-LFS pointer-shaped fixtures as
-> migration pointers. Selected-ref and all-fetched-ref migration scans can now
+> checkout migration scanning can now ask Git for index paths with `filter=lfs`
+> and parse the corresponding index blobs into object identities. This keeps
+> hydrated files and paths omitted by sparse checkout in scope while excluding
+> non-LFS pointer-shaped fixtures. Selected-ref and all-fetched-ref migration scans can now
 > walk Git history, evaluate `filter=lfs` attributes against each historical
 > tree, and parse pointer blobs without checking out refs or mutating local
 > state. Migration transfer planning can now check discovered object identities
@@ -1391,8 +1391,9 @@ Defer:
 > metadata, or touching storage. `migrate --dry-run --purge-source-lfs` now
 > includes GitHub source LFS cleanup helper text, the GitHub Support flow, and
 > migrated object IDs/sizes without attempting automatic source deletion.
-> Fixture-repository tests now cover current-checkout, selected-ref, all-ref,
-> missing-object, and CLI dry-run no-op migration behavior. A local
+> Fixture-repository tests now cover hydrated and sparse current checkouts,
+> selected refs, all refs, missing objects, and CLI dry-run no-op migration
+> behavior. A local
 > fake-provider end-to-end test now covers repository init routing, fake GitHub
 > authorization, server-routed fake Drive upload/download actions, and checkout
 > hydration through the shared cache. Security review found and fixed a GitHub
