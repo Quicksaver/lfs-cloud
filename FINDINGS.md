@@ -1025,11 +1025,35 @@ independently validated or adjudicated.
    here and no invalid finding attributable separately, this was high-quality,
    security-relevant feedback.
 
-2. **Medium — GitHub owner and repository matching is case-sensitive.** Route
-   and configuration identity can diverge for names GitHub treats
-   case-insensitively (`src/server_config.rs:175-219`, `src/cli.rs:581-587`,
-   `src/cli.rs:1055-1067`, `src/git.rs:529-548`). Normalize GitHub identities for
-   comparison while preserving a display form, and add mixed-case tests.
+2. **[DONE] GitHub owner and repository matching was case-sensitive** (Medium,
+   `src/server_config.rs`, `src/server.rs`, `src/cli.rs`, `src/git.rs`, and
+   `AGENTS.md`): **Valid and actionable.** GitHub's official REST documentation
+   states that both the repository `owner` and `repo` path parameters are not
+   case-sensitive, while status and migration planning previously compared
+   those parsed remote components byte-for-byte and the server route resolver
+   required the request path to use the configured spelling. A mixed-case clone
+   of the same GitHub repository could therefore report no configured mapping
+   and receive a route-not-configured response. Server configuration now owns a
+   provider-aware repository identity matcher: host comparison ignores ASCII
+   case, and GitHub owner/repository comparison does too, while the original
+   configured and remote spelling remains available for diagnostics and
+   provider calls. Status and migration use that shared matcher. GitHub route
+   resolution ignores case only across the host/owner/repository identity
+   prefix; the `.git/info/lfs` and operation suffixes remain case-sensitive.
+   Configuration validation also canonicalizes GitHub route comparison keys so
+   two mappings that differ only by identity casing are rejected instead of
+   becoming ambiguous. Regression coverage proves mixed-case status, migration,
+   and batch-route matching, preserves display spelling, rejects case-only
+   duplicate routes, and confirms that protocol suffix casing is not relaxed.
+   The repository learning records the provider-specific comparison boundary.
+   Verification passed with `yarn lint:fix`, `cargo fmt`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+   focused reviewer found a genuine medium-severity interoperability flaw,
+   correctly tied GitHub's identity semantics to configuration, CLI, and route
+   behavior, and requested the decisive mixed-case regressions; with one valid
+   finding assessed here and no invalid finding attributable separately, this
+   was high-quality, relevant feedback.
 
 3. **Medium — `pull` can hang and buffers unbounded command output.** Child
    process output is fully captured before truncation or timeout handling

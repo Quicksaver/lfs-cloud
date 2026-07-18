@@ -236,7 +236,12 @@ impl ServerConfig {
             }
 
             let route_path = repository.route_path();
-            if !route_paths.insert(route_path.clone()) {
+            let route_comparison_key = if self.github_repository_mapping(repository) {
+                route_path.to_ascii_lowercase()
+            } else {
+                route_path.clone()
+            };
+            if !route_paths.insert(route_comparison_key) {
                 return invalid_config(
                     format!("{repo_path}.route_path"),
                     format!("duplicates configured route path {route_path:?}"),
@@ -245,6 +250,30 @@ impl ServerConfig {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn repository_mapping_for_identity(
+        &self,
+        host: &str,
+        owner: &str,
+        name: &str,
+    ) -> Option<&RepositoryMapping> {
+        self.repositories.iter().find(|repository| {
+            repository.host.eq_ignore_ascii_case(host)
+                && if self.github_repository_mapping(repository) {
+                    repository.owner.eq_ignore_ascii_case(owner)
+                        && repository.name.eq_ignore_ascii_case(name)
+                } else {
+                    repository.owner == owner && repository.name == name
+                }
+        })
+    }
+
+    pub(crate) fn github_repository_mapping(&self, repository: &RepositoryMapping) -> bool {
+        matches!(
+            self.repository_providers.get(&repository.repo_provider),
+            Some(RepositoryProviderConfig::GitHub(_))
+        )
     }
 }
 
@@ -1819,6 +1848,50 @@ repositories:
         assert_error_contains(
             &error,
             "repositories[1].route_path duplicates configured route path \"/github.com/owner/repo.git/info/lfs\"",
+        );
+    }
+
+    #[test]
+    fn rejects_github_route_paths_that_differ_only_by_case() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credential_ref: drive-credential
+    root_folder_id: drive-root
+repositories:
+  - id: one
+    repo_provider: github-main
+    host: github.com
+    owner: Owner
+    name: Repo
+    provider_repository_id: "8675309"
+    storage_provider: drive-user-a
+  - id: two
+    repo_provider: github-main
+    host: GITHUB.COM
+    owner: owner
+    name: repo
+    provider_repository_id: "8675309"
+    storage_provider: drive-user-a
+"#,
+            "<test>",
+            test_env,
+        )
+        .unwrap_err();
+
+        assert_error_contains(
+            &error,
+            "repositories[1].route_path duplicates configured route path \"/GITHUB.COM/owner/repo.git/info/lfs\"",
         );
     }
 

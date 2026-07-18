@@ -717,6 +717,17 @@ mod tests {
     }
 
     #[test]
+    fn preserves_github_identity_case_for_display() {
+        let remote = GitRemote::parse("origin", "https://GitHub.com/Owner/Repo.git")
+            .expect("remote should parse");
+
+        assert_eq!(remote.host, "github.com");
+        assert_eq!(remote.owner, "Owner");
+        assert_eq!(remote.name, "Repo");
+        assert_eq!(remote.repository_label(), "github.com/Owner/Repo");
+    }
+
+    #[test]
     fn parses_ssh_and_scp_like_github_remotes() {
         let ssh = GitRemote::parse("upstream", "ssh://git@github.com/owner/repo.git")
             .expect("ssh remote should parse");

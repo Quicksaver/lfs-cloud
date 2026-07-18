@@ -767,11 +767,11 @@ where
 
     let mapping = match (config.as_ref(), repository.as_ref()) {
         (Some(config), Some(repository)) => {
-            match config.repositories.iter().find(|candidate| {
-                candidate.host == repository.remote.host
-                    && candidate.owner == repository.remote.owner
-                    && candidate.name == repository.remote.name
-            }) {
+            match config.repository_mapping_for_identity(
+                &repository.remote.host,
+                &repository.remote.owner,
+                &repository.remote.name,
+            ) {
                 Some(mapping) => {
                     report.ok(
                         "mapping",
@@ -1251,11 +1251,11 @@ fn migration_config_access_checks<S>(
 ) where
     S: FnMut(&StorageProviderConfig) -> CliResult<()>,
 {
-    let Some(mapping) = config.repositories.iter().find(|candidate| {
-        candidate.host == repository.remote.host
-            && candidate.owner == repository.remote.owner
-            && candidate.name == repository.remote.name
-    }) else {
+    let Some(mapping) = config.repository_mapping_for_identity(
+        &repository.remote.host,
+        &repository.remote.owner,
+        &repository.remote.name,
+    ) else {
         checks.push(MigrationAccessCheck {
             name: "mapping",
             level: StatusLevel::Warning,
@@ -3471,7 +3471,7 @@ mod tests {
         run_git(&repo, &["init"]);
         run_git(
             &repo,
-            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+            &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
         );
         let config_path = temp.path().join("lfs-cloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
@@ -3491,7 +3491,7 @@ mod tests {
             |lfs_url| {
                 assert_eq!(
                     lfs_url,
-                    "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs"
+                    "http://127.0.0.1:8080/github.com/Owner/Repo.git/info/lfs"
                 );
                 Ok(())
             },
@@ -3659,6 +3659,15 @@ mod tests {
         let repo = temp.path().join("repo");
         let cache_root = temp.path().join("cache");
         init_git_repo_with_origin(&repo);
+        run_git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:Owner/Repo.git",
+            ],
+        );
         let object = object_for_bytes(b"migration object already local");
         write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(
@@ -3689,7 +3698,7 @@ mod tests {
             |lfs_url| {
                 assert_eq!(
                     lfs_url,
-                    "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs"
+                    "http://127.0.0.1:8080/github.com/Owner/Repo.git/info/lfs"
                 );
                 Ok(())
             },

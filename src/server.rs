@@ -3412,8 +3412,13 @@ impl LfsRouteResolver {
             .map(|repository| {
                 let route_path = repository.route_path();
                 ConfiguredLfsRoute {
+                    repository_identity_path: format!(
+                        "/{}/{}/{}",
+                        repository.host, repository.owner, repository.name
+                    ),
                     route_path_with_slash: format!("{route_path}/"),
                     route_path,
+                    case_insensitive_identity: config.github_repository_mapping(&repository),
                     repository,
                 }
             })
@@ -3439,14 +3444,16 @@ impl LfsRouteResolver {
         }
 
         for route in &self.routes {
-            if path == route.route_path || path == route.route_path_with_slash {
+            if route.path_matches(path, &route.route_path)
+                || route.path_matches(path, &route.route_path_with_slash)
+            {
                 return Ok(ResolvedLfsRoute {
                     repository: route.repository.clone(),
                     endpoint: LfsRouteEndpoint::Info,
                 });
             }
 
-            let Some(suffix) = path.strip_prefix(&route.route_path_with_slash) else {
+            let Some(suffix) = route.strip_path_prefix(path) else {
                 continue;
             };
 
@@ -3464,9 +3471,40 @@ impl LfsRouteResolver {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConfiguredLfsRoute {
+    repository_identity_path: String,
     route_path: String,
     route_path_with_slash: String,
+    case_insensitive_identity: bool,
     repository: RepositoryMapping,
+}
+
+impl ConfiguredLfsRoute {
+    fn path_matches(&self, candidate: &str, configured: &str) -> bool {
+        if !self.case_insensitive_identity {
+            return candidate == configured;
+        }
+
+        let identity_length = self.repository_identity_path.len();
+        let Some(candidate_identity) = candidate.get(..identity_length) else {
+            return false;
+        };
+        let Some(candidate_suffix) = candidate.get(identity_length..) else {
+            return false;
+        };
+        let Some(configured_suffix) = configured.get(identity_length..) else {
+            return false;
+        };
+
+        candidate_identity.eq_ignore_ascii_case(&self.repository_identity_path)
+            && candidate_suffix == configured_suffix
+    }
+
+    fn strip_path_prefix<'a>(&self, path: &'a str) -> Option<&'a str> {
+        let prefix = &self.route_path_with_slash;
+        let candidate = path.get(..prefix.len())?;
+        self.path_matches(candidate, prefix)
+            .then(|| &path[prefix.len()..])
+    }
 }
 
 fn parse_lfs_route_endpoint(suffix: &str) -> ServerResult<LfsRouteEndpoint> {
@@ -4641,6 +4679,25 @@ repositories:
         assert!(
             matches!(object.endpoint, LfsRouteEndpoint::Object { oid } if oid.as_hex() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+    }
+
+    #[test]
+    fn route_resolver_matches_github_identity_without_case_sensitivity() {
+        let resolver = LfsRouteResolver::new(&test_config());
+
+        let batch = resolver
+            .resolve_path("/GITHUB.COM/Owner/Repo.git/info/lfs/objects/batch")
+            .expect("mixed-case GitHub identity should resolve");
+        let uppercase_protocol_path = resolver
+            .resolve_path("/GITHUB.COM/Owner/Repo.git/INFO/LFS/objects/batch")
+            .expect_err("only the GitHub identity should ignore case");
+
+        assert_eq!(batch.repository.id, "github-main:owner/repo");
+        assert_eq!(batch.endpoint, LfsRouteEndpoint::Batch);
+        assert!(matches!(
+            uppercase_protocol_path,
+            ServerError::RouteNotConfigured { .. }
+        ));
     }
 
     #[test]
