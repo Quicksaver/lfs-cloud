@@ -5,7 +5,7 @@
 //! use without receiving the upstream GitHub token.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -28,6 +28,13 @@ pub const DEFAULT_LFS_SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 const MAX_LFS_SESSION_TOKEN_LEN: usize = 1024;
 const MAX_LOCAL_LFS_SESSIONS: usize = 1024;
+// A user can authenticate multiple worktrees or machines without one principal
+// monopolizing the bounded process-wide credential store.
+const MAX_LOCAL_LFS_SESSIONS_PER_PRINCIPAL: usize = 16;
+// Short-window issuance throttling prevents repeated successful OAuth callbacks
+// from churning tokens even when the caller immediately revokes older sessions.
+const MAX_LFS_SESSION_ISSUANCES_PER_WINDOW: usize = 8;
+const LFS_SESSION_ISSUANCE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LFS_SESSION_TOKEN_GENERATION_ATTEMPTS: usize = 8;
 const SESSION_ENCRYPTION_CONTEXT: &[u8] = b"lfs-cloud durable session encryption v1\0";
 const SESSION_TOKEN_NONCE_LEN: usize = 12;
@@ -230,18 +237,96 @@ impl fmt::Debug for IssuedLfsSession {
 /// [`Self::new`] provides isolated in-process storage for tests and injected
 /// routers. Production can use [`Self::open_durable`] to restore unexpired
 /// sessions from SQLite. Durable storage retains only the local token's SHA-256
-/// digest and authenticated-encrypted provider access-token state.
+/// digest and authenticated-encrypted provider access-token state. New
+/// issuance is bounded globally and per stable provider identity; overload is
+/// rejected without evicting an unrelated active credential.
 #[derive(Clone)]
 pub struct LocalLfsSessionStore {
-    sessions: Arc<Mutex<BTreeMap<LfsSessionTokenKey, LfsSessionRecord>>>,
+    state: Arc<Mutex<SessionStoreState>>,
     durable: Option<Arc<DurableLfsSessionStore>>,
+    clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    token_generator: Arc<dyn Fn() -> LfsSessionToken + Send + Sync>,
+    limits: SessionStoreLimits,
 }
 
 impl Default for LocalLfsSessionStore {
     fn default() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            state: Arc::new(Mutex::new(SessionStoreState::default())),
             durable: None,
+            clock: Arc::new(SystemTime::now),
+            token_generator: Arc::new(LfsSessionToken::generate),
+            limits: SessionStoreLimits::production(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionStoreState {
+    sessions: BTreeMap<LfsSessionTokenKey, LfsSessionRecord>,
+    recent_issuances: BTreeMap<LfsSessionPrincipal, VecDeque<SystemTime>>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LfsSessionPrincipal {
+    provider_id: String,
+    identity: LfsSessionPrincipalIdentity,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum LfsSessionPrincipalIdentity {
+    StableId(String),
+    Login(String),
+}
+
+impl LfsSessionPrincipal {
+    fn from_metadata(metadata: &LfsSessionMetadata) -> Self {
+        let identity = metadata
+            .stable_id
+            .clone()
+            .map(LfsSessionPrincipalIdentity::StableId)
+            .unwrap_or_else(|| LfsSessionPrincipalIdentity::Login(metadata.login.clone()));
+        Self {
+            provider_id: metadata.provider_id.clone(),
+            identity,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SessionStoreLimits {
+    max_sessions: usize,
+    max_sessions_per_principal: usize,
+    max_issuances_per_window: usize,
+    issuance_window: Duration,
+}
+
+impl SessionStoreLimits {
+    const fn production() -> Self {
+        Self {
+            max_sessions: MAX_LOCAL_LFS_SESSIONS,
+            max_sessions_per_principal: MAX_LOCAL_LFS_SESSIONS_PER_PRINCIPAL,
+            max_issuances_per_window: MAX_LFS_SESSION_ISSUANCES_PER_WINDOW,
+            issuance_window: LFS_SESSION_ISSUANCE_WINDOW,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_tests(
+        max_sessions: usize,
+        max_sessions_per_principal: usize,
+        max_issuances_per_window: usize,
+        issuance_window: Duration,
+    ) -> Self {
+        assert!(max_sessions > 0);
+        assert!(max_sessions_per_principal > 0);
+        assert!(max_issuances_per_window > 0);
+        assert!(!issuance_window.is_zero());
+        Self {
+            max_sessions,
+            max_sessions_per_principal,
+            max_issuances_per_window,
+            issuance_window,
         }
     }
 }
@@ -267,11 +352,16 @@ impl LocalLfsSessionStore {
         database: Arc<MetadataDatabase>,
         encryption_secret: impl AsRef<[u8]>,
     ) -> ServerResult<Self> {
+        let clock: Arc<dyn Fn() -> SystemTime + Send + Sync> = Arc::new(SystemTime::now);
         let durable = Arc::new(DurableLfsSessionStore::new(
             database,
             encryption_secret.as_ref(),
         )?);
-        let sessions = durable.load_sessions()?;
+        let now = clock();
+        durable
+            .database
+            .delete_expired_sessions(unix_timestamp_seconds_i64(now)?)?;
+        let sessions = durable.load_sessions(now)?;
         if sessions.len() > MAX_LOCAL_LFS_SESSIONS {
             return Err(ServerError::Internal {
                 message: "durable lfs session count exceeds the configured in-process limit"
@@ -280,16 +370,38 @@ impl LocalLfsSessionStore {
         }
 
         Ok(Self {
-            sessions: Arc::new(Mutex::new(sessions)),
+            state: Arc::new(Mutex::new(SessionStoreState {
+                sessions,
+                recent_issuances: BTreeMap::new(),
+            })),
             durable: Some(durable),
+            clock,
+            token_generator: Arc::new(LfsSessionToken::generate),
+            limits: SessionStoreLimits::production(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_components(
+        clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+        token_generator: Arc<dyn Fn() -> LfsSessionToken + Send + Sync>,
+        limits: SessionStoreLimits,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SessionStoreState::default())),
+            durable: None,
+            clock,
+            token_generator,
+            limits,
+        }
     }
 
     /// Issues a new local LFS session using the default token lifetime.
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError`] if the default lifetime cannot be represented.
+    /// Returns [`ServerError`] if the default lifetime cannot be represented or
+    /// session admission is temporarily rate limited.
     pub fn issue_session(
         &self,
         user: &RepositoryUser,
@@ -306,7 +418,8 @@ impl LocalLfsSessionStore {
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError`] if the default lifetime cannot be represented.
+    /// Returns [`ServerError`] if the default lifetime cannot be represented or
+    /// session admission is temporarily rate limited.
     pub fn issue_session_with_github_token(
         &self,
         user: &RepositoryUser,
@@ -326,7 +439,8 @@ impl LocalLfsSessionStore {
     /// # Errors
     ///
     /// Returns [`ServerError`] when `ttl` is zero, the expiration timestamp
-    /// cannot be represented, or a unique token cannot be generated.
+    /// cannot be represented, session admission is temporarily rate limited,
+    /// or a unique token cannot be generated.
     pub fn issue_session_with_ttl(
         &self,
         user: &RepositoryUser,
@@ -349,7 +463,7 @@ impl LocalLfsSessionStore {
             });
         }
 
-        let issued_at = SystemTime::now();
+        let issued_at = (self.clock)();
         let expires_at = issued_at
             .checked_add(ttl)
             .ok_or_else(|| ServerError::InvalidRequest {
@@ -357,43 +471,43 @@ impl LocalLfsSessionStore {
             })?;
         let metadata = LfsSessionMetadata::new(user, granted_scopes, issued_at, expires_at);
         let record = LfsSessionRecord::new(metadata, github_access_token);
+        let principal = LfsSessionPrincipal::from_metadata(&record.metadata);
 
-        let mut sessions = self
-            .sessions
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_expired_sessions(&mut sessions, issued_at);
+        prune_expired_sessions(&mut state.sessions, issued_at);
+        prune_recent_issuances(
+            &mut state.recent_issuances,
+            issued_at,
+            self.limits.issuance_window,
+        );
         if let Some(durable) = &self.durable {
             durable
                 .database
                 .delete_expired_sessions(unix_timestamp_seconds_i64(issued_at)?)?;
         }
+        enforce_session_admission(&state, &principal, issued_at, self.limits)?;
 
         for _ in 0..MAX_LFS_SESSION_TOKEN_GENERATION_ATTEMPTS {
-            let token = LfsSessionToken::generate();
+            let token = (self.token_generator)();
             let token_key = LfsSessionTokenKey::from_token(&token);
 
-            if sessions.contains_key(&token_key) {
+            if state.sessions.contains_key(&token_key) {
                 continue;
-            }
-
-            if sessions.len() >= MAX_LOCAL_LFS_SESSIONS {
-                let evicted =
-                    session_expiring_soonest(&sessions).ok_or_else(|| ServerError::Internal {
-                        message: "failed to select an lfs session for bounded-store eviction"
-                            .to_owned(),
-                    })?;
-                if let Some(durable) = &self.durable {
-                    durable.database.delete_session(&evicted.to_hex())?;
-                }
-                sessions.remove(&evicted);
             }
 
             if let Some(durable) = &self.durable {
                 durable.record_session(&token_key, &record)?;
             }
 
-            sessions.insert(token_key, record.clone());
+            state.sessions.insert(token_key, record.clone());
+            state
+                .recent_issuances
+                .entry(principal)
+                .or_default()
+                .push_back(issued_at);
             return Ok(IssuedLfsSession {
                 token,
                 metadata: record.metadata,
@@ -414,14 +528,15 @@ impl LocalLfsSessionStore {
     /// Returns private server-side state for a valid, unexpired token.
     #[must_use]
     pub(crate) fn verify_record(&self, token: &LfsSessionToken) -> Option<LfsSessionRecord> {
-        let now = SystemTime::now();
-        let mut sessions = self
-            .sessions
+        let now = (self.clock)();
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_expired_sessions(&mut sessions, now);
+        prune_expired_sessions(&mut state.sessions, now);
 
-        sessions
+        state
+            .sessions
             .get(&LfsSessionTokenKey::from_token(token))
             .cloned()
     }
@@ -435,29 +550,29 @@ impl LocalLfsSessionStore {
     /// Returns [`ServerError`] when durable session storage is configured and
     /// SQLite cannot delete the matching row.
     pub fn revoke(&self, token: &LfsSessionToken) -> ServerResult<bool> {
-        let now = SystemTime::now();
-        let mut sessions = self
-            .sessions
+        let now = (self.clock)();
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_expired_sessions(&mut sessions, now);
+        prune_expired_sessions(&mut state.sessions, now);
 
         let token_key = LfsSessionTokenKey::from_token(token);
         if let Some(durable) = &self.durable {
             durable.database.delete_session(&token_key.to_hex())?;
         }
 
-        Ok(sessions.remove(&token_key).is_some())
+        Ok(state.sessions.remove(&token_key).is_some())
     }
 
     fn len(&self) -> usize {
-        let now = SystemTime::now();
-        let mut sessions = self
-            .sessions
+        let now = (self.clock)();
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_expired_sessions(&mut sessions, now);
-        sessions.len()
+        prune_expired_sessions(&mut state.sessions, now);
+        state.sessions.len()
     }
 }
 
@@ -535,13 +650,89 @@ fn prune_expired_sessions(
     sessions.retain(|_, record| record.metadata.expires_at > now);
 }
 
-fn session_expiring_soonest(
-    sessions: &BTreeMap<LfsSessionTokenKey, LfsSessionRecord>,
-) -> Option<LfsSessionTokenKey> {
-    sessions
-        .iter()
-        .min_by_key(|(_, record)| record.metadata.expires_at)
-        .map(|(token, _)| *token)
+fn prune_recent_issuances(
+    recent_issuances: &mut BTreeMap<LfsSessionPrincipal, VecDeque<SystemTime>>,
+    now: SystemTime,
+    issuance_window: Duration,
+) {
+    recent_issuances.retain(|_, issued_at| {
+        issued_at.retain(|issued_at| {
+            issued_at
+                .checked_add(issuance_window)
+                .is_none_or(|expires_at| expires_at > now)
+        });
+        !issued_at.is_empty()
+    });
+}
+
+fn enforce_session_admission(
+    state: &SessionStoreState,
+    principal: &LfsSessionPrincipal,
+    now: SystemTime,
+    limits: SessionStoreLimits,
+) -> ServerResult<()> {
+    let principal_sessions = state
+        .sessions
+        .values()
+        .filter(|record| LfsSessionPrincipal::from_metadata(&record.metadata) == *principal)
+        .collect::<Vec<_>>();
+    if principal_sessions.len() >= limits.max_sessions_per_principal {
+        return Err(ServerError::RateLimited {
+            retry_after_seconds: retry_after_session_expiry(
+                principal_sessions
+                    .iter()
+                    .map(|record| record.metadata.expires_at),
+                now,
+            ),
+        });
+    }
+
+    if let Some(recent_issuances) = state.recent_issuances.get(principal)
+        && recent_issuances.len() >= limits.max_issuances_per_window
+    {
+        let retry_at = recent_issuances
+            .iter()
+            .filter_map(|issued_at| issued_at.checked_add(limits.issuance_window))
+            .min();
+        return Err(ServerError::RateLimited {
+            retry_after_seconds: retry_at
+                .map(|retry_at| retry_after_duration(retry_at, now))
+                .unwrap_or_else(|| limits.issuance_window.as_secs().max(1)),
+        });
+    }
+
+    if state.sessions.len() >= limits.max_sessions {
+        return Err(ServerError::RateLimited {
+            retry_after_seconds: retry_after_session_expiry(
+                state
+                    .sessions
+                    .values()
+                    .map(|record| record.metadata.expires_at),
+                now,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn retry_after_session_expiry(
+    expirations: impl IntoIterator<Item = SystemTime>,
+    now: SystemTime,
+) -> u64 {
+    expirations
+        .into_iter()
+        .min()
+        .map(|expires_at| retry_after_duration(expires_at, now))
+        .unwrap_or(1)
+}
+
+fn retry_after_duration(retry_at: SystemTime, now: SystemTime) -> u64 {
+    let duration = retry_at.duration_since(now).unwrap_or_default();
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+        .max(1)
 }
 
 fn unix_timestamp_seconds(time: SystemTime) -> u64 {
@@ -583,16 +774,17 @@ impl DurableLfsSessionStore {
             });
         }
 
-        let now = unix_timestamp_seconds_i64(SystemTime::now())?;
-        database.delete_expired_sessions(now)?;
         Ok(Self {
             database,
             protector: SessionTokenProtector::new(encryption_secret)?,
         })
     }
 
-    fn load_sessions(&self) -> ServerResult<BTreeMap<LfsSessionTokenKey, LfsSessionRecord>> {
-        let now = unix_timestamp_seconds_i64(SystemTime::now())?;
+    fn load_sessions(
+        &self,
+        now: SystemTime,
+    ) -> ServerResult<BTreeMap<LfsSessionTokenKey, LfsSessionRecord>> {
+        let now = unix_timestamp_seconds_i64(now)?;
         self.database
             .load_active_sessions(now)?
             .into_iter()
@@ -774,13 +966,54 @@ fn session_associated_data(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc, thread, time::Duration};
+    use std::{
+        fs,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+        },
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
-    use super::{LfsSessionToken, LocalLfsSessionStore, MAX_LFS_SESSION_TOKEN_LEN};
+    use super::{
+        LfsSessionToken, LocalLfsSessionStore, MAX_LFS_SESSION_TOKEN_LEN, SessionStoreLimits,
+    };
     use crate::{GitHubOAuthAccessToken, MetadataDatabase, RepositoryUser, ServerError};
 
     fn user() -> RepositoryUser {
         RepositoryUser::new("github-main", "octocat", Some("42".to_owned()))
+    }
+
+    fn named_user(login: &str, stable_id: &str) -> RepositoryUser {
+        RepositoryUser::new("github-main", login, Some(stable_id.to_owned()))
+    }
+
+    fn deterministic_token_generator() -> Arc<dyn Fn() -> LfsSessionToken + Send + Sync> {
+        let next_token = Arc::new(AtomicU64::new(0));
+        Arc::new(move || {
+            let sequence = next_token.fetch_add(1, Ordering::SeqCst);
+            LfsSessionToken::from_secret(format!("deterministic-lfs-token-{sequence}"))
+                .expect("deterministic token should be valid")
+        })
+    }
+
+    fn controlled_clock(
+        elapsed_seconds: Arc<AtomicU64>,
+    ) -> Arc<dyn Fn() -> SystemTime + Send + Sync> {
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        Arc::new(move || base + Duration::from_secs(elapsed_seconds.load(Ordering::SeqCst)))
+    }
+
+    fn test_store(
+        elapsed_seconds: Arc<AtomicU64>,
+        limits: SessionStoreLimits,
+    ) -> LocalLfsSessionStore {
+        LocalLfsSessionStore::with_components(
+            controlled_clock(elapsed_seconds),
+            deterministic_token_generator(),
+            limits,
+        )
     }
 
     #[test]
@@ -862,16 +1095,193 @@ mod tests {
     }
 
     #[test]
-    fn session_store_expires_tokens() {
-        let store = LocalLfsSessionStore::new();
+    fn session_store_expires_tokens_at_the_exact_boundary_without_sleeping() {
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let store = test_store(
+            Arc::clone(&elapsed_seconds),
+            SessionStoreLimits::for_tests(8, 8, 8, Duration::from_secs(60)),
+        );
         let issued = store
-            .issue_session_with_ttl(&user(), ["read:user"], Duration::from_millis(1))
+            .issue_session_with_ttl(&user(), ["read:user"], Duration::from_secs(10))
             .expect("session should be issued");
 
-        thread::sleep(Duration::from_millis(10));
+        elapsed_seconds.store(9, Ordering::SeqCst);
+        assert!(store.verify(&issued.token).is_some());
 
+        elapsed_seconds.store(10, Ordering::SeqCst);
         assert_eq!(store.verify(&issued.token), None);
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn session_store_rate_limits_each_principal_until_the_exact_window_boundary() {
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let store = test_store(
+            Arc::clone(&elapsed_seconds),
+            SessionStoreLimits::for_tests(8, 8, 2, Duration::from_secs(60)),
+        );
+
+        let first = store
+            .issue_session_with_ttl(&user(), ["repo"], Duration::from_secs(600))
+            .expect("first session should be issued");
+        let second = store
+            .issue_session_with_ttl(&user(), ["repo"], Duration::from_secs(600))
+            .expect("second session should be issued");
+        let error = store
+            .issue_session_with_ttl(&user(), ["repo"], Duration::from_secs(600))
+            .expect_err("third immediate issuance should be rate limited");
+        assert!(matches!(
+            error,
+            ServerError::RateLimited {
+                retry_after_seconds: 60
+            }
+        ));
+        assert!(store.verify(&first.token).is_some());
+        assert!(store.verify(&second.token).is_some());
+
+        elapsed_seconds.store(59, Ordering::SeqCst);
+        let error = store
+            .issue_session_with_ttl(&user(), ["repo"], Duration::from_secs(600))
+            .expect_err("issuance should remain limited before the boundary");
+        assert!(matches!(
+            error,
+            ServerError::RateLimited {
+                retry_after_seconds: 1
+            }
+        ));
+
+        elapsed_seconds.store(60, Ordering::SeqCst);
+        store
+            .issue_session_with_ttl(&user(), ["repo"], Duration::from_secs(600))
+            .expect("issuance history should prune at the exact window boundary");
+        assert_eq!(store.len(), 3);
+    }
+
+    #[test]
+    fn session_store_rejects_capacity_without_evicting_active_users() {
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let store = test_store(
+            elapsed_seconds,
+            SessionStoreLimits::for_tests(4, 2, 8, Duration::from_secs(60)),
+        );
+        let alice = named_user("alice", "1");
+        let renamed_alice = named_user("alice-renamed", "1");
+        let bob = named_user("bob", "2");
+        let carol = named_user("carol", "3");
+        let dave = named_user("dave", "4");
+
+        let alice_first = store
+            .issue_session_with_ttl(&alice, ["repo"], Duration::from_secs(600))
+            .expect("first Alice session should be issued");
+        let alice_second = store
+            .issue_session_with_ttl(&alice, ["repo"], Duration::from_secs(600))
+            .expect("second Alice session should be issued");
+        let error = store
+            .issue_session_with_ttl(&renamed_alice, ["repo"], Duration::from_secs(600))
+            .expect_err("a renamed Alice must not bypass the stable-principal cap");
+        assert!(matches!(error, ServerError::RateLimited { .. }));
+
+        let bob_session = store
+            .issue_session_with_ttl(&bob, ["repo"], Duration::from_secs(600))
+            .expect("Bob should retain independent capacity");
+        let carol_session = store
+            .issue_session_with_ttl(&carol, ["repo"], Duration::from_secs(600))
+            .expect("Carol should fill the remaining global capacity");
+        let error = store
+            .issue_session_with_ttl(&dave, ["repo"], Duration::from_secs(600))
+            .expect_err("global capacity must reject rather than evict");
+        assert!(matches!(error, ServerError::RateLimited { .. }));
+
+        for active in [alice_first, alice_second, bob_session, carol_session] {
+            assert!(
+                store.verify(&active.token).is_some(),
+                "capacity rejection must preserve every active session"
+            );
+        }
+        assert_eq!(store.len(), 4);
+    }
+
+    #[test]
+    fn session_store_prunes_expired_capacity_before_new_admission() {
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let store = test_store(
+            Arc::clone(&elapsed_seconds),
+            SessionStoreLimits::for_tests(2, 2, 8, Duration::from_secs(60)),
+        );
+        let alice = store
+            .issue_session_with_ttl(&named_user("alice", "1"), ["repo"], Duration::from_secs(10))
+            .expect("Alice session should be issued");
+        let bob = store
+            .issue_session_with_ttl(&named_user("bob", "2"), ["repo"], Duration::from_secs(10))
+            .expect("Bob session should fill capacity");
+        assert!(matches!(
+            store.issue_session_with_ttl(
+                &named_user("carol", "3"),
+                ["repo"],
+                Duration::from_secs(10),
+            ),
+            Err(ServerError::RateLimited { .. })
+        ));
+
+        elapsed_seconds.store(10, Ordering::SeqCst);
+        let carol = store
+            .issue_session_with_ttl(&named_user("carol", "3"), ["repo"], Duration::from_secs(10))
+            .expect("expired capacity should be reusable at the exact boundary");
+
+        assert!(store.verify(&alice.token).is_none());
+        assert!(store.verify(&bob.token).is_none());
+        assert!(store.verify(&carol.token).is_some());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn session_store_concurrently_issues_verifies_and_revokes_without_races() {
+        const WORKERS: usize = 16;
+
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let store = test_store(
+            elapsed_seconds,
+            SessionStoreLimits::for_tests(WORKERS, WORKERS, WORKERS, Duration::from_secs(60)),
+        );
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+        let issued = Arc::new(Barrier::new(WORKERS + 1));
+        let revoke = Arc::new(Barrier::new(WORKERS + 1));
+        let done = Arc::new(Barrier::new(WORKERS + 1));
+        let mut workers = Vec::with_capacity(WORKERS);
+
+        for _ in 0..WORKERS {
+            let store = store.clone();
+            let start = Arc::clone(&start);
+            let issued = Arc::clone(&issued);
+            let revoke = Arc::clone(&revoke);
+            let done = Arc::clone(&done);
+            workers.push(thread::spawn(move || {
+                start.wait();
+                let session = store
+                    .issue_session_with_ttl(&user(), ["repo"], Duration::from_secs(600))
+                    .expect("concurrent issuance should succeed within limits");
+                assert!(store.verify(&session.token).is_some());
+                issued.wait();
+                revoke.wait();
+                assert!(
+                    store
+                        .revoke(&session.token)
+                        .expect("concurrent revocation should succeed")
+                );
+                done.wait();
+            }));
+        }
+
+        start.wait();
+        issued.wait();
+        assert_eq!(store.len(), WORKERS);
+        revoke.wait();
+        done.wait();
+        assert_eq!(store.len(), 0);
+
+        for worker in workers {
+            worker.join().expect("worker should not panic");
+        }
     }
 
     #[test]

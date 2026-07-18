@@ -190,6 +190,10 @@ OAuth client secret.
 Before storing the token, login enables Git credential path matching in the
 repository's local config so another repository on the same LFS host cannot
 reuse it through host-only credential matching.
+Session issuance is bounded to 16 active credentials per stable provider user,
+eight successful issuances per minute per user, and 1,024 active credentials
+per server process. An overloaded callback returns HTTP 429 with `Retry-After`;
+it never evicts another active credential to admit the new login.
 
 ### Check Repository Status
 

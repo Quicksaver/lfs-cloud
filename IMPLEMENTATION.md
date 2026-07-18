@@ -452,6 +452,11 @@ private GitHub token together with the session identity, scopes, and timestamps
 using a dedicated key derived from the configured GitHub OAuth client secret;
 never store either token in plaintext.
 
+Session admission is bounded to 16 active credentials and eight successful
+issuances per minute for each stable provider user, plus 1,024 active
+credentials process-wide. Capacity exhaustion returns HTTP 429 with a
+`Retry-After` value rather than evicting an unrelated active credential.
+
 Avoid asking users to paste personal access tokens into the LFS server if possible. That can work for a quick prototype, but it means `lfs-cloud` receives and handles powerful user repository-host credentials.
 
 Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service can use one Google account's OAuth refresh token to access the backing Drive folder. For a multi-tenant or shared instance, each configured storage provider should have its own credential reference and policy boundary.

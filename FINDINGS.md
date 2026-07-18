@@ -172,14 +172,33 @@ independently validated or adjudicated.
    direction were high-quality and security-relevant; with one valid finding
    and no invalid finding attributable separately, this was strong feedback.
 
-8. **Medium — Successful logins can evict unrelated active sessions.** At the
-   global 1,024-session cap, issuance silently removes the soonest-expiring
-   active session (`src/sessions.rs:23`, `src/sessions.rs:291-313`,
-   `src/sessions.rs:422-429`). Add per-principal issuance limits and rate
-   limiting, and reject new issuance at the cap instead of evicting another
-   user. Inject clocks and token generation, then test exact expiry boundaries,
-   pruning, cross-user capacity, and concurrent issue/verify/revoke behavior
-   without wall-clock sleeps.
+8. **[DONE] Successful logins could evict unrelated active sessions** (Medium,
+   `src/sessions.rs`): **Valid and actionable.** At the process-wide
+   1,024-session cap, issuance previously deleted the soonest-expiring active
+   session, including its durable SQLite row, before admitting the new login.
+   Session admission now rejects overload with a retryable rate-limit error and
+   never evicts an active credential. It allows at most 16 active sessions and
+   eight successful issuances per minute for each stable provider user, while
+   retaining the 1,024-session process-wide cap. Stable IDs, rather than mutable
+   logins, define principals when available. The store now owns injectable clock
+   and token-generation functions, allowing deterministic tests to prove exact
+   expiry and issuance-window boundaries, expired-capacity pruning, stable-user
+   rename handling, independent cross-user capacity, overload preservation of
+   every active token, and concurrent issue/verify/revoke behavior without
+   wall-clock sleeps. README and implementation guidance document the limits,
+   HTTP 429/`Retry-After` behavior, and non-eviction contract, while the
+   repository learning records the admission boundary. Verification passed
+   with `cargo fmt`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, and `cargo test --doc`. An
+   initial default-parallel all-target run exposed seven unrelated,
+   load-sensitive credential-helper timeout failures; the complete credential
+   module then passed 31/31, and the serial all-target rerun passed. The focused
+   reviewer identified a genuine medium-severity cross-user availability flaw,
+   correctly connected eviction and unbounded per-user issuance, and requested
+   the decisive deterministic and concurrency coverage. With one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, security-relevant feedback.
 
 9. **Medium — Token-endpoint error handling can reflect submitted secrets and
    accepts unbounded bodies.** OAuth client secrets or authorization codes
