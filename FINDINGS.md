@@ -1151,10 +1151,32 @@ independently validated or adjudicated.
    prerequisite handling; with one valid finding assessed here and no invalid
    finding attributable separately, this was high-quality, relevant feedback.
 
-7. **Low — Browser launch during login can block the CLI.** The browser command
-   is invoked synchronously and may not return on some desktop integrations
-   (`src/cli.rs:2169-2184`). Spawn it in a detached, bounded manner and always
-   print the URL as a reliable fallback.
+7. **[DONE] Browser launch during login could block the CLI** (Low,
+   `src/cli.rs`, `README.md`, `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid
+   and actionable.** The platform browser command used synchronous `.output()`,
+   so login could not reach token entry until `open`, `xdg-open`, or `rundll32`
+   exited; some desktop integrations are not required to return after accepting
+   a URL. Browser handoff now bounds foreground work to process creation, gives
+   the launcher null standard streams, places it in an independent Unix process
+   group or Windows detached process group, and reaps it asynchronously without
+   delaying the CLI. Login already printed the OAuth URL before invoking the
+   launcher; regression coverage now fixes that ordering as the reliable
+   fallback, while `--no-open` retains the manual-only path. Success output says
+   that the browser open was requested instead of claiming unobservable browser
+   completion. User and implementation documentation describe the URL fallback
+   and non-blocking contract, and the repository learning records the process
+   boundary. A test-first regression failed before the helper existed and now
+   proves the launcher call returns in under one second while its child remains
+   alive for three seconds. Verification passed with `yarn lint:fix`,
+   `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (590 passed, 3 ignored), `cargo test --doc`
+   (38 passed), `scripts/manual/verify-login-command.sh`, and
+   `git diff --check`. The focused reviewer identified a genuine low-severity
+   usability and reliability flaw, pinpointed the blocking process boundary,
+   and prescribed both the non-blocking launch and reliable fallback required
+   for a complete repair. With one valid finding assessed here and no invalid
+   finding attributable separately, this was high-quality, relevant feedback.
 
 ## Local cache
 

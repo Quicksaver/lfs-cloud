@@ -540,7 +540,9 @@ where
         writeln!(output, "browser open skipped").map_err(output_error)?;
     } else {
         match open_browser(&login_url) {
-            Ok(()) => writeln!(output, "opened browser for GitHub OAuth").map_err(output_error)?,
+            Ok(()) => {
+                writeln!(output, "requested browser open for GitHub OAuth").map_err(output_error)?
+            }
             Err(error) => writeln!(output, "browser open failed: {error}").map_err(output_error)?,
         }
     }
@@ -2786,27 +2788,55 @@ fn open_url_in_default_browser(url: &str) -> CliResult<()> {
         "windows" => ("rundll32", vec!["url.dll,FileProtocolHandler", url]),
         _ => ("xdg-open", vec![url]),
     };
-    let output = ProcessCommand::new(program)
+
+    spawn_browser_launcher(program, &args)
+}
+
+fn spawn_browser_launcher(program: &str, args: &[&str]) -> CliResult<()> {
+    let mut command = ProcessCommand::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|source| CliError::Io {
-            context: format!("failed to start {program}"),
-            source,
-        })?;
+        .stderr(Stdio::null());
+    configure_browser_launcher(&mut command);
 
-    if output.status.success() {
-        return Ok(());
-    }
+    let mut child = command.spawn().map_err(|source| CliError::Io {
+        context: format!("failed to start {program}"),
+        source,
+    })?;
 
-    Err(CliError::ExternalCommand {
-        command: program.to_owned(),
-        status: process_status_text(output.status),
-        stderr: sanitize_browser_stderr(&output.stderr),
-    })
+    // Desktop launchers are not required to exit after handing off the URL.
+    // Reap the process off the CLI's critical path so token entry can begin
+    // immediately even when the desktop integration remains open indefinitely.
+    let _ = std::thread::Builder::new()
+        .name("lfs-cloud-browser-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+
+    Ok(())
 }
+
+#[cfg(unix)]
+fn configure_browser_launcher(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_browser_launcher(command: &mut ProcessCommand) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_browser_launcher(_command: &mut ProcessCommand) {}
 
 fn process_status_text(status: std::process::ExitStatus) -> String {
     status
@@ -2857,28 +2887,6 @@ fn output_error(source: io::Error) -> CliError {
     CliError::Io {
         context: "failed to write command output".to_owned(),
         source,
-    }
-}
-
-fn sanitize_browser_stderr(stderr: &[u8]) -> SanitizedMessage {
-    const MAX_BROWSER_STDERR_LEN: usize = 512;
-
-    let mut message = String::from_utf8_lossy(stderr).into_owned();
-    message = message.replace(['\r', '\n'], " ");
-    if message.len() > MAX_BROWSER_STDERR_LEN {
-        let boundary = (0..=MAX_BROWSER_STDERR_LEN)
-            .rev()
-            .find(|&index| message.is_char_boundary(index))
-            .expect("zero is always a valid string boundary");
-        message.truncate(boundary);
-        message.push_str("...");
-    }
-    let message = message.trim();
-
-    if message.is_empty() {
-        SanitizedMessage::new("<no stderr>")
-    } else {
-        SanitizedMessage::new(message.to_owned())
     }
 }
 
@@ -2958,7 +2966,7 @@ mod tests {
         read_hidden_login_token, run_bounded_child_command, run_dehydrate_from_dir,
         run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir, run_login_from_dir,
         run_logout_from_dir, run_migrate_from_dir, run_pull_from_dir, run_status_from_dir,
-        sanitize_browser_stderr, tracing_config, validate_status_storage, write_init_change,
+        spawn_browser_launcher, tracing_config, validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
@@ -5442,7 +5450,15 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("authorize LFS Cloud with GitHub:"));
-        assert!(rendered.contains("opened browser for GitHub OAuth"));
+        assert!(rendered.contains("requested browser open for GitHub OAuth"));
+        assert!(
+            rendered
+                .find("http://127.0.0.1:8080/auth/github/login")
+                .expect("login URL should be printed")
+                < rendered
+                    .find("requested browser open for GitHub OAuth")
+                    .expect("browser status should be printed")
+        );
         assert!(rendered.contains("stored local LFS credential"));
         assert!(rendered.contains("username: lfs-cloud"));
         assert!(!rendered.contains("local-lfs-token"));
@@ -5720,13 +5736,18 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn browser_stderr_sanitizer_cleans_multiline_output() {
-        assert_eq!(
-            sanitize_browser_stderr(b"first line\nsecond line\r\n").as_str(),
-            "first line second line"
+    fn browser_launcher_does_not_wait_for_the_desktop_process() {
+        let started = Instant::now();
+
+        spawn_browser_launcher("/bin/sh", &["-c", "sleep 3"])
+            .expect("browser launcher should start");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "browser launcher waited for the desktop process"
         );
-        assert_eq!(sanitize_browser_stderr(b"\n").as_str(), "<no stderr>");
     }
 
     fn status_config(public_url: &str) -> String {

@@ -993,6 +993,12 @@ git lfs client
   sends token to lfs-cloud for batch/upload/download requests
 ```
 
+The CLI must print the OAuth login URL before requesting the platform browser
+launcher. Start that launcher with null standard streams in a separate process
+group and reap it asynchronously; desktop integrations are not required to
+exit after accepting a URL, so login must continue to token entry without
+waiting for them. `--no-open` retains a fully manual URL-only path.
+
 Personal access tokens may be considered only as a local-development fallback. They should not be the default MVP path.
 
 For GitHub permission checks, use:
