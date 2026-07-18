@@ -666,6 +666,15 @@ pub enum MigrationError {
         size: u64,
     },
 
+    /// A Git object referenced by the migration inventory is not stored locally.
+    #[error(
+        "Git object {object_id} is unavailable locally; fetch partial-clone objects before migration planning"
+    )]
+    GitObjectUnavailable {
+        /// Git object ID that read-only discovery refused to lazy-fetch.
+        object_id: String,
+    },
+
     /// The caller supplied invalid migration input.
     #[error("invalid migration input: {message}")]
     InvalidInput {

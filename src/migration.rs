@@ -37,6 +37,7 @@ const MAX_HISTORY_COMMIT_LIST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_TREE_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_CHECK_ATTR_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_POINTER_BYTES: u64 = 64 * 1024;
+const GIT_NO_LAZY_FETCH_ENV: &str = "GIT_NO_LAZY_FETCH";
 const MIGRATION_SOURCE_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MIGRATION_SOURCE_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -1260,7 +1261,7 @@ fn git_lfs_object_path(git_lfs_objects_dir: &Path, oid: &LfsOid) -> MigrationRes
 }
 
 fn detect_git_lfs_installation(worktree_root: &Path) -> GitLfsInstallation {
-    match Command::new("git")
+    match read_only_git_command()
         .args(["lfs", "version"])
         .current_dir(worktree_root)
         .output()
@@ -1691,7 +1692,7 @@ fn git_check_attr_filter_with_source(
     }
     args.push(OsString::from("filter"));
 
-    let mut child = Command::new("git")
+    let mut child = read_only_git_command()
         .args(&args)
         .current_dir(worktree_root)
         .stdin(Stdio::piped())
@@ -2251,7 +2252,12 @@ fn read_history_pointer_blob_candidate(
         ],
         &size_command,
     )?;
-    let size_stdout = required_success_stdout(size_output, &size_command)?;
+    if !size_output.status.success() {
+        return Err(MigrationError::GitObjectUnavailable {
+            object_id: object_id.to_owned(),
+        });
+    }
+    let size_stdout = output_stdout(size_output, &size_command)?;
     let size = size_stdout
         .trim_end_matches(['\n', '\r'])
         .parse::<u64>()
@@ -2435,7 +2441,7 @@ fn git_config_get_os<const N: usize>(
 }
 
 fn run_git<const N: usize>(current_dir: &Path, args: [&str; N]) -> MigrationResult<Output> {
-    Command::new("git")
+    read_only_git_command()
         .args(args)
         .current_dir(current_dir)
         .output()
@@ -2450,7 +2456,7 @@ fn run_git_os<const N: usize>(
     args: [&OsStr; N],
     command_name: &str,
 ) -> MigrationResult<Output> {
-    Command::new("git")
+    read_only_git_command()
         .args(args)
         .current_dir(current_dir)
         .output()
@@ -2465,7 +2471,7 @@ fn run_git_os_vec(
     args: Vec<OsString>,
     command_name: &str,
 ) -> MigrationResult<Output> {
-    Command::new("git")
+    read_only_git_command()
         .args(args)
         .current_dir(current_dir)
         .output()
@@ -2473,6 +2479,15 @@ fn run_git_os_vec(
             context: format!("failed to start {command_name}"),
             source,
         })
+}
+
+fn read_only_git_command() -> Command {
+    let mut command = Command::new("git");
+    // Promisor repositories may fetch missing objects from their remote during
+    // otherwise read-only commands. Migration discovery must never transfer
+    // data, especially when it is building a dry-run report.
+    command.env(GIT_NO_LAZY_FETCH_ENV, "1");
+    command
 }
 
 fn required_success_stdout(output: Output, command_name: &str) -> MigrationResult<String> {
@@ -3143,6 +3158,64 @@ mod tests {
             pointer.relative_path == Path::new("asset/missing.bin")
                 && pointer.object == missing_object
         }));
+    }
+
+    #[test]
+    fn current_checkout_pointer_scan_does_not_lazy_fetch_promisor_blobs() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('a', 123);
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(object).to_pointer_file(),
+        );
+        repo.commit_all("add migration pointer");
+
+        let blob_id = repo.git_stdout(["rev-parse", ":asset/model.bin"]);
+        let remote_parent = tempfile::tempdir()
+            .expect("temporary promisor remote parent directory should be created");
+        let remote_path = remote_parent.path().join("remote.git");
+        let clone_output = Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(repo.path())
+            .arg(&remote_path)
+            .output()
+            .expect("promisor remote clone should start");
+        assert!(
+            clone_output.status.success(),
+            "promisor remote clone failed: {}",
+            String::from_utf8_lossy(&clone_output.stderr)
+        );
+
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            remote_path
+                .to_str()
+                .expect("temporary remote path should be UTF-8"),
+        ]);
+        repo.git(["config", "remote.origin.promisor", "true"]);
+        repo.git(["config", "remote.origin.partialclonefilter", "blob:none"]);
+
+        let local_blob_path = repo
+            .path()
+            .join(".git/objects")
+            .join(&blob_id[..2])
+            .join(&blob_id[2..]);
+        fs::remove_file(&local_blob_path).expect("local pointer blob should be removable");
+
+        let error = enumerate_current_checkout_lfs_pointers(repo.path())
+            .expect_err("missing promisor blob should remain unavailable during discovery");
+
+        assert!(
+            error.to_string().contains("unavailable locally"),
+            "unexpected missing-promisor diagnostic: {error}"
+        );
+        assert!(
+            !local_blob_path.exists(),
+            "read-only migration discovery must not lazy-fetch the missing blob"
+        );
     }
 
     #[cfg(unix)]
@@ -4338,6 +4411,26 @@ mod tests {
                 args.join(" "),
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+
+        fn git_stdout<const N: usize>(&self, args: [&str; N]) -> String {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(self.root.path())
+                .output()
+                .expect("git command should start");
+
+            assert!(
+                output.status.success(),
+                "git command failed: {}\nstderr: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            String::from_utf8(output.stdout)
+                .expect("git stdout should be UTF-8")
+                .trim()
+                .to_owned()
         }
     }
 

@@ -330,7 +330,9 @@ dry-run reports scanned refs, planned local config writes, discovered
 objects, objects that would be fetched from the source Git LFS provider,
 objects that would be uploaded to LFS Cloud storage, and local access-check
 results. It does not fetch, upload, write Git config, create cache state, open
-metadata storage, or touch the configured storage provider.
+metadata storage, or touch the configured storage provider. Git discovery also
+disables partial-clone lazy fetching; if a required Git object exists only on a
+promisor remote, fetch that object explicitly before rerunning the plan.
 Use `--purge-source-lfs` with `--dry-run` to include GitHub Support cleanup
 instructions and object IDs/sizes for a post-migration source LFS purge
 request.

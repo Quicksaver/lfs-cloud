@@ -1492,11 +1492,32 @@ independently validated or adjudicated.
    valid finding assessed here and no invalid finding attributable separately,
    this was high-quality, relevant feedback.
 
-2. **High — A migration dry run can lazy-fetch missing partial-clone objects.**
-   `git cat-file` helpers inherit the environment, so supposedly read-only
-   discovery can trigger network transfer (`src/migration.rs:2217-2267`,
-   `src/migration.rs:2414-2452`). Set `GIT_NO_LAZY_FETCH=1`, detect promisor
-   objects, and report unavailable data explicitly.
+2. **[DONE] A migration dry run could lazy-fetch missing partial-clone
+   objects** (High, `src/migration.rs`, `src/error.rs`, and migration
+   documentation): **Valid and actionable.** Pointer discovery used ordinary
+   Git subprocesses, so `git cat-file` could retrieve a missing index or
+   historical blob from its promisor remote while building a supposedly
+   read-only plan. A test-first regression creates a real local promisor
+   remote, removes an LFS pointer blob from the planning repository, and proves
+   the earlier discovery path silently restored it. All read-only migration Git
+   commands now come from one helper that sets `GIT_NO_LAZY_FETCH=1`, including
+   the piped historical `check-attr` path. Pointer reads convert a failed
+   no-lazy-fetch `git cat-file -s` check into the typed
+   `MigrationError::GitObjectUnavailable` with an actionable explicit-fetch
+   diagnostic when the blob is absent. The intentional non-dry-run
+   `git lfs fetch` runner remains separate and can still transfer requested LFS
+   media. The promisor regression now proves discovery returns the availability
+   error and leaves the local blob absent. README, implementation guidance, and
+   the repository learning document the partial-clone dry-run boundary.
+   Verification passed with `cargo fmt --all -- --check`, `yarn lint:fix`,
+   `git diff --check`, the 57-test focused migration suite,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, and `cargo test --doc`. The
+   focused reviewer identified a genuine high-severity violation of the
+   dry-run no-write/no-transfer contract, pinpointed Git's promisor behavior,
+   and prescribed both the correct process boundary and explicit missing-data
+   outcome; with one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, relevant feedback.
 
 3. **High — Source and target repository identities can silently diverge.** The
    target comes from `origin`, current-checkout source selection can follow the

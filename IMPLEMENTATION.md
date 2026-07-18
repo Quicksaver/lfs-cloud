@@ -591,6 +591,11 @@ lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 - configured storage-provider access verification result
 - warnings for missing objects, unsupported purge, quota risks, or permission gaps
 
+Git commands used for dry-run discovery must disable partial-clone lazy
+fetching. A pointer blob that is not stored locally must produce an explicit
+availability error rather than silently transferring data from a promisor
+remote.
+
 The migration should not need to rewrite Git history in the common case. Existing Git LFS pointer files already contain stable object IDs and sizes:
 
 ```text
@@ -1375,7 +1380,9 @@ Defer:
 > non-LFS pointer-shaped fixtures. Selected-ref and all-fetched-ref migration scans can now
 > walk Git history, evaluate `filter=lfs` attributes against each historical
 > tree, and parse pointer blobs without checking out refs or mutating local
-> state. Migration transfer planning can now check discovered object identities
+> state. Read-only migration Git subprocesses disable lazy fetching, and a
+> pointer blob that exists only on a promisor remote produces an explicit local
+> availability error. Migration transfer planning can now check discovered object identities
 > against both repository Git LFS media storage and an optional shared
 > `lfs-cloud` cache, verifying SHA-256 and size before treating local bytes as
 > available. Missing migration objects can now be fetched from the source Git
