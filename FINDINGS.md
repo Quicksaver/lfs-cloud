@@ -2057,10 +2057,34 @@ independently validated or adjudicated.
    compatibility behavior. With one partly valid finding and no separate
    invalid finding, this was useful protocol feedback of moderate precision.
 
-5. **Medium — Duplicate extension priorities are accepted.** Multiple
-   extensions can claim the same order, making interpretation ambiguous
-   (`src/lfs.rs:294-305`, `src/lfs.rs:344-382`). Reject duplicate priorities and
-   add upstream-compatible pointer fixtures.
+5. **[DONE] Duplicate extension priorities are accepted** (Medium,
+   `src/lfs.rs` and `AGENTS.md`): **Valid and actionable.** LFS Cloud keyed
+   extensions by their full pointer key, so distinct names such as `ext-0-bar`
+   and `ext-0-foo` could both claim execution priority zero and survive parsing
+   or programmatic construction. The reference Git LFS
+   [`validatePointerExtensions`](https://github.com/git-lfs/git-lfs/blob/main/lfs/pointer.go)
+   rejects repeated numeric priorities, and its upstream invalid-pointer
+   fixtures include that exact case. A local interoperability check with Git
+   LFS 3.7.1 also rejected the duplicate-priority pointer while accepting a
+   canonical pointer whose priorities were distinct. `LfsPointer` now routes
+   both parsing and `insert_extension` through one priority-aware insertion
+   helper and returns the typed `PointerDuplicateExtensionPriority` error when
+   another extension already owns the single-digit priority. Replacing the
+   same exact extension key remains supported, while a different name cannot
+   introduce an ambiguous execution order. Test-first regressions initially
+   failed because the error and uniqueness check did not exist; they now mirror
+   the upstream accepted three-priority fixture, reject a canonical-order
+   duplicate-priority fixture, and prove the public construction API preserves
+   the same invariant. The repository learning records the compatibility
+   boundary. Verification passed with `cargo fmt --all`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (all automated targets
+   passed; three provider/manual tests ignored), `cargo test --doc` (39
+   passed), and `git diff --check`. The focused reviewer identified a genuine
+   medium-severity interoperability and extension-ordering flaw, cited the
+   exact parser boundaries, and requested the decisive upstream-compatible
+   fixtures. With one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, protocol-relevant feedback.
 
 6. **Low — Historical Git LFS version aliases are rejected without an explicit
    compatibility decision.** The version parser accepts only the current URL

@@ -115,6 +115,13 @@ pub enum LfsObjectError {
         key: String,
     },
 
+    /// Multiple pointer extensions declared the same execution priority.
+    #[error("duplicate LFS pointer extension priority: {priority}")]
+    PointerDuplicateExtensionPriority {
+        /// Single-digit extension priority that was declared more than once.
+        priority: u8,
+    },
+
     /// The pointer file met or exceeded Git LFS's exclusive size cutoff.
     #[error("Git LFS pointer is too large: {size} bytes must be smaller than {size_cutoff} bytes")]
     PointerTooLarge {
@@ -336,8 +343,9 @@ impl LfsPointer {
     /// Inserts an extension pointer record.
     ///
     /// The `version`, `oid`, and `size` keys are owned by the core pointer
-    /// fields. Extension keys and values must use Git LFS extension syntax so
-    /// the pointer can be rendered back into its canonical sorted form.
+    /// fields. Extension keys and values must use Git LFS extension syntax and
+    /// each extension must have a distinct priority so the pointer can be
+    /// rendered back into its canonical sorted form.
     pub fn insert_extension(
         &mut self,
         key: impl Into<String>,
@@ -349,8 +357,7 @@ impl LfsPointer {
         validate_extension_key(&key)?;
         let value = normalize_extension_value(&key, &value)?;
 
-        self.extensions.insert(key, value);
-        Ok(())
+        insert_extension_record(&mut self.extensions, key, value)
     }
 
     /// Parses a Git LFS pointer file.
@@ -449,7 +456,11 @@ impl LfsPointer {
                 }
                 extension_key if is_valid_extension_key(extension_key) => {
                     let extension_value = normalize_extension_value(extension_key, value)?;
-                    extensions.insert(extension_key.to_owned(), extension_value);
+                    insert_extension_record(
+                        &mut extensions,
+                        extension_key.to_owned(),
+                        extension_value,
+                    )?;
                 }
                 _ => {
                     return Err(LfsObjectError::PointerUnexpectedLine {
@@ -513,22 +524,48 @@ fn validate_extension_key(key: &str) -> Result<(), LfsObjectError> {
 }
 
 fn is_valid_extension_key(key: &str) -> bool {
-    let Some(extension_name) = key.strip_prefix("ext-") else {
-        return false;
-    };
-    let Some((priority, name)) = extension_name.split_once('-') else {
-        return false;
-    };
+    extension_priority(key).is_some()
+}
+
+fn extension_priority(key: &str) -> Option<u8> {
+    let extension_name = key.strip_prefix("ext-")?;
+    let (priority, name) = extension_name.split_once('-')?;
 
     let starts_with_name_char = name
         .bytes()
         .next()
         .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
 
-    priority.len() == 1
-        && priority.bytes().all(|byte| byte.is_ascii_digit())
-        && starts_with_name_char
-        && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+    if priority.len() != 1
+        || !starts_with_name_char
+        || name.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+
+    priority
+        .bytes()
+        .next()?
+        .checked_sub(b'0')
+        .filter(|value| *value <= 9)
+}
+
+fn insert_extension_record(
+    extensions: &mut BTreeMap<String, String>,
+    key: String,
+    value: String,
+) -> Result<(), LfsObjectError> {
+    let priority = extension_priority(&key)
+        .ok_or_else(|| LfsObjectError::PointerInvalidExtensionKey { key: key.clone() })?;
+
+    if extensions.keys().any(|existing_key| {
+        existing_key != &key && extension_priority(existing_key) == Some(priority)
+    }) {
+        return Err(LfsObjectError::PointerDuplicateExtensionPriority { priority });
+    }
+
+    extensions.insert(key, value);
+    Ok(())
 }
 
 fn normalize_extension_value(key: &str, value: &str) -> Result<String, LfsObjectError> {
@@ -1203,6 +1240,28 @@ mod tests {
     }
 
     #[test]
+    fn pointer_matches_git_lfs_extension_priority_fixtures() {
+        let distinct_priorities = "version https://git-lfs.github.com/spec/v1\n\
+             ext-0-foo sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n\
+             ext-1-bar sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             ext-2-baz sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+             size 12345\n";
+        let duplicate_priority = "version https://git-lfs.github.com/spec/v1\n\
+             ext-0-bar sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             ext-0-foo sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n\
+             oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+             size 12345\n";
+
+        LfsPointer::parse(distinct_priorities)
+            .expect("Git LFS accepts extensions with distinct priorities");
+        assert!(matches!(
+            LfsPointer::parse(duplicate_priority),
+            Err(LfsObjectError::PointerDuplicateExtensionPriority { priority: 0 })
+        ));
+    }
+
+    #[test]
     fn pointer_accepts_git_lfs_extension_key_characters() {
         let contents = "version https://git-lfs.github.com/spec/v1\n\
              ext-0-Foo_bar/path+v1 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
@@ -1426,6 +1485,27 @@ mod tests {
         assert!(matches!(
             pointer.insert_extension("ext-0-test", "not-an-oid"),
             Err(LfsObjectError::PointerInvalidExtensionValue { .. })
+        ));
+    }
+
+    #[test]
+    fn pointer_rejects_duplicate_extension_priorities_during_construction() {
+        let object = LfsObject::new(LfsOid::from_str(OID).unwrap(), LfsObjectSize::new(42));
+        let mut pointer = LfsPointer::new(object);
+
+        pointer
+            .insert_extension(
+                "ext-0-bar",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .expect("first extension priority should be available");
+
+        assert!(matches!(
+            pointer.insert_extension(
+                "ext-0-foo",
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            ),
+            Err(LfsObjectError::PointerDuplicateExtensionPriority { priority: 0 })
         ));
     }
 
