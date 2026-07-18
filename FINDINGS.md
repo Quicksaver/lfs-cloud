@@ -2024,12 +2024,38 @@ independently validated or adjudicated.
    finding and only this minor boundary imprecision, this was high-quality,
    protocol-relevant feedback.
 
-4. **Medium — Pointer parsing accepts non-canonical uppercase and whitespace.**
-   Lenient OID/version parsing can diverge from Git LFS clients
-   (`src/lfs.rs:128-162`, `src/lfs.rs:200-207`, `src/lfs.rs:416-423`,
-   `src/lfs.rs:456-473`, `src/lfs.rs:980-990`, `src/lfs.rs:1065-1085`). Enforce
-   canonical lowercase and line syntax, or explicitly separate tolerant input
-   from canonical output with interoperability tests.
+4. **[DONE] Pointer parsing accepts non-canonical uppercase and whitespace**
+   (Medium, `src/lfs.rs` and `AGENTS.md`): **Partly valid and actionable.** The
+   official [Git LFS pointer
+   specification](https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md#the-pointer)
+   requires the SHA-256 hash to use lowercase hexadecimal and defines one
+   canonical pointer encoding. The pointer parser nevertheless used the
+   tolerant programmatic OID constructor for both the main object and extension
+   hashes, silently lowercasing uppercase input that Git LFS's reference
+   `parseOid` rejects. Pointer parsing now uses the existing canonical SHA-256
+   validator for both locations. A test-first regression failed against the
+   normalization behavior and now proves uppercase main and extension OIDs are
+   rejected, while `LfsOid::new` remains intentionally tolerant for
+   programmatic construction. The review's blanket whitespace diagnosis was
+   not valid: Git LFS's reference
+   [`DecodeFrom`](https://github.com/git-lfs/git-lfs/blob/main/lfs/pointer.go)
+   accepts blank lines, CRLF endings, and a missing final newline, then records
+   whether re-encoding differs through its `Canonical` flag. LFS Cloud retains
+   those same compatible inputs for existing repository history and now
+   explicitly documents the split: parsing accepts the reference decoder's
+   whitespace forms, while `to_pointer_file` always emits canonical bytes. A
+   dedicated interoperability regression proves that behavior. The repository
+   learning records the boundary for future pointer consumers. Verification
+   passed with `cargo fmt --all`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (all automated targets
+   passed; three provider/manual tests ignored), `cargo test --doc` (39
+   passed), and `git diff --check`. The focused reviewer identified a real
+   medium-severity interoperability issue in uppercase OID normalization and
+   offered the correct tolerant-input/canonical-output alternative, but its
+   whitespace claim did not account for the reference decoder's deliberate
+   compatibility behavior. With one partly valid finding and no separate
+   invalid finding, this was useful protocol feedback of moderate precision.
 
 5. **Medium — Duplicate extension priorities are accepted.** Multiple
    extensions can claim the same order, making interpretation ambiguous

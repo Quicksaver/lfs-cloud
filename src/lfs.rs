@@ -358,7 +358,11 @@ impl LfsPointer {
     /// A zero-byte file parses as Git LFS's canonical pointer for empty
     /// content, whose object identity is the SHA-256 digest of zero bytes.
     /// Non-empty pointer files must be smaller than
-    /// [`LFS_POINTER_SIZE_CUTOFF`] bytes.
+    /// [`LFS_POINTER_SIZE_CUTOFF`] bytes. Object identifiers must use canonical
+    /// lowercase hexadecimal. For interoperability with the reference Git LFS
+    /// decoder, non-canonical blank lines, CRLF endings, and a missing final
+    /// newline are accepted; [`Self::to_pointer_file`] always emits canonical
+    /// line endings and spacing.
     ///
     /// # Examples
     ///
@@ -494,7 +498,7 @@ impl LfsPointer {
             }
         })?;
 
-        LfsOid::from_sha256_hex(oid_hex)
+        LfsOid::from_canonical_sha256_hex(oid_hex)
     }
 }
 
@@ -540,7 +544,7 @@ fn normalize_extension_value(key: &str, value: &str) -> Result<String, LfsObject
         });
     };
 
-    LfsOid::from_sha256_hex(oid_hex)
+    LfsOid::from_canonical_sha256_hex(oid_hex)
         .map(|oid| oid.as_pointer_oid())
         .map_err(|_| LfsObjectError::PointerInvalidExtensionValue {
             key: key.to_owned(),
@@ -1218,22 +1222,37 @@ mod tests {
     }
 
     #[test]
-    fn pointer_normalizes_extension_oids() {
+    fn pointer_rejects_non_canonical_uppercase_oids() {
+        let uppercase_oid = "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
+             size 42\n";
         let contents = "version https://git-lfs.github.com/spec/v1\n\
              ext-0-foo sha256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n\
              oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
              size 42\n";
 
-        let pointer = LfsPointer::parse(contents).expect("extended pointer should parse");
+        assert!(matches!(
+            LfsPointer::parse(uppercase_oid),
+            Err(LfsObjectError::NonCanonicalSha256Hex { index: 0 })
+        ));
+        assert!(matches!(
+            LfsPointer::parse(contents),
+            Err(LfsObjectError::PointerInvalidExtensionValue { .. })
+        ));
+    }
 
-        assert_eq!(
-            pointer.extensions().get("ext-0-foo").map(String::as_str),
-            Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        );
+    #[test]
+    fn pointer_accepts_reference_compatible_whitespace_and_renders_canonically() {
+        let contents = "\r\nversion https://git-lfs.github.com/spec/v1\r\n\r\n\
+             oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+             size 42";
+
+        let pointer = LfsPointer::parse(contents)
+            .expect("Git LFS-compatible non-canonical whitespace should parse");
+
         assert_eq!(
             pointer.to_pointer_file(),
             "version https://git-lfs.github.com/spec/v1\n\
-             ext-0-foo sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
              oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
              size 42\n"
         );
