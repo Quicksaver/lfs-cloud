@@ -1058,7 +1058,10 @@ the property key fits Drive's 124-byte property-string limit. Oversized
 namespaces use a SHA-256 value plus an explicit format property, keeping the
 backend identity bounded without making a digest-shaped raw namespace
 ambiguous. The binary `size` returned by Drive must also match the LFS pointer
-size before an object is accepted.
+size before an object is accepted. Lookup follows every Drive list page and
+validates every candidate before deciding absence or selecting the
+lexicographically smallest exact-match file ID. Repeated page tokens are
+rejected as retryable provider failures rather than allowed to loop forever.
 
 Use Google Drive resumable uploads for large object writes. The first implementation may stage uploads to a local temp file so it can verify SHA-256 and size before uploading to Drive.
 

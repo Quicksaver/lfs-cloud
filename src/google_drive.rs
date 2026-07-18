@@ -5,7 +5,7 @@
 //! access tokens. It does not expose Drive credentials to Git LFS clients.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
@@ -836,44 +836,66 @@ impl GoogleDriveObjectStore {
     pub async fn lookup_object(&self, object: &LfsObject) -> StorageResult<Option<StoredObject>> {
         let key = self.object_key(object)?;
         let expected_properties = key.expected_app_properties();
-        let response = self
-            .metadata_client
-            .get(drive_object_lookup_url(
-                self.api_base_url.clone(),
-                &self.storage.root_folder_id,
+        let mut stored_objects = Vec::new();
+        let mut page_token = None;
+        let mut seen_page_tokens = BTreeSet::new();
+
+        loop {
+            let response = self
+                .metadata_client
+                .get(drive_object_lookup_url(
+                    self.api_base_url.clone(),
+                    &self.storage.root_folder_id,
+                    &key,
+                    &expected_properties,
+                    page_token.as_deref(),
+                )?)
+                .header(ACCEPT, "application/json")
+                .header(
+                    AUTHORIZATION,
+                    self.token.authorization_header_value(&self.storage.id)?,
+                )
+                .header(ACCEPT_ENCODING, "identity")
+                .send()
+                .await
+                .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+            let status = response.status();
+            let response_body = read_google_response_body(response)
+                .await
+                .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+
+            if !status.is_success() {
+                return Err(parse_drive_object_lookup_error(
+                    &self.storage,
+                    &self.token,
+                    status,
+                    &response_body,
+                ));
+            }
+
+            let page = parse_drive_object_lookup_success(
+                &self.storage,
                 &key,
                 &expected_properties,
-            )?)
-            .header(ACCEPT, "application/json")
-            .header(
-                AUTHORIZATION,
-                self.token.authorization_header_value(&self.storage.id)?,
-            )
-            .header(ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
-        let status = response.status();
-        let response_body = read_google_response_body(response)
-            .await
-            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
-
-        if !status.is_success() {
-            return Err(parse_drive_object_lookup_error(
-                &self.storage,
-                &self.token,
                 status,
                 &response_body,
-            ));
+            )?;
+            stored_objects.extend(page.stored_objects);
+
+            let Some(next_page_token) = page.next_page_token else {
+                break;
+            };
+            if !seen_page_tokens.insert(next_page_token.clone()) {
+                return Err(StorageError::Retryable {
+                    provider: self.storage.id.clone(),
+                    message: "Google Drive object lookup repeated a page token".to_owned(),
+                });
+            }
+            page_token = Some(next_page_token);
         }
 
-        parse_drive_object_lookup_success(
-            &self.storage,
-            &key,
-            &expected_properties,
-            status,
-            &response_body,
-        )
+        stored_objects.sort_unstable_by(|left, right| left.backend_id.cmp(&right.backend_id));
+        Ok(stored_objects.into_iter().next())
     }
 
     /// Uploads a staged and locally verified object file through Drive resumable upload.
@@ -1937,6 +1959,7 @@ fn drive_object_lookup_url(
     root_folder_id: &str,
     key: &GoogleDriveObjectKey,
     expected_properties: &GoogleDriveObjectProperties,
+    page_token: Option<&str>,
 ) -> StorageResult<Url> {
     if root_folder_id.trim().is_empty() {
         return Err(StorageError::Upstream {
@@ -1982,6 +2005,11 @@ fn drive_object_lookup_url(
             "q",
             &drive_object_lookup_query(root_folder_id, key, expected_properties),
         );
+    if let Some(page_token) = page_token {
+        api_base_url
+            .query_pairs_mut()
+            .append_pair("pageToken", page_token);
+    }
 
     Ok(api_base_url)
 }
@@ -2340,7 +2368,7 @@ fn parse_drive_object_lookup_success(
     expected_properties: &GoogleDriveObjectProperties,
     status: StatusCode,
     body: &str,
-) -> StorageResult<Option<StoredObject>> {
+) -> StorageResult<VerifiedGoogleDriveObjectPage> {
     let response =
         serde_json::from_str::<GoogleDriveFileList>(body).map_err(|_| StorageError::Upstream {
             provider: storage.id.clone(),
@@ -2353,20 +2381,36 @@ fn parse_drive_object_lookup_success(
             message: "Google Drive object lookup returned incomplete search results".to_owned(),
         });
     }
-    if response.next_page_token.is_some() {
-        return Err(StorageError::Conflict {
-            provider: storage.id.clone(),
-            oid: key.object.oid.as_hex().to_owned(),
-        });
-    }
+    let next_page_token = response
+        .next_page_token
+        .map(|token| {
+            if token.trim().is_empty() {
+                return Err(StorageError::Upstream {
+                    provider: storage.id.clone(),
+                    status: Some(status.as_u16()),
+                    message: SanitizedMessage::new(
+                        "Google Drive object lookup returned a blank page token",
+                    ),
+                });
+            }
+            Ok(token)
+        })
+        .transpose()?;
 
-    let mut stored_objects = response
+    let stored_objects = response
         .files
         .into_iter()
         .map(|file| verify_drive_object_file(storage, key, expected_properties, status, file))
         .collect::<StorageResult<Vec<_>>>()?;
-    stored_objects.sort_unstable_by(|left, right| left.backend_id.cmp(&right.backend_id));
-    Ok(stored_objects.into_iter().next())
+    Ok(VerifiedGoogleDriveObjectPage {
+        stored_objects,
+        next_page_token,
+    })
+}
+
+struct VerifiedGoogleDriveObjectPage {
+    stored_objects: Vec<StoredObject>,
+    next_page_token: Option<String>,
 }
 
 fn verify_drive_object_file(
@@ -3163,6 +3207,7 @@ mod tests {
             "drive-root",
             &key,
             &key.expected_app_properties(),
+            None,
         )
         .expect("lookup URL should build");
 
@@ -3661,6 +3706,47 @@ mod tests {
             .expect("an exact Drive match should be returned");
 
         assert_eq!(stored_object.backend_id, "drive-file-a");
+    }
+
+    #[tokio::test]
+    async fn object_store_reconciles_drive_matches_across_all_pages() {
+        let server = DriveFilesListServer::start_paginated(
+            format!(
+                r#"{{
+                    "files":[{}],
+                    "nextPageToken":"page-2"
+                }}"#,
+                drive_object_json("drive-file-b", OBJECT_OID, 42)
+            ),
+            [(
+                "page-2",
+                drive_object_list_json("drive-file-a", OBJECT_OID, 42),
+            )],
+        )
+        .await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let stored_object = store
+            .lookup_object(&lfs_object())
+            .await
+            .expect("paginated Drive matches should reconcile")
+            .expect("an exact Drive match should be returned");
+
+        assert_eq!(stored_object.backend_id, "drive-file-a");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        let first_query = form_pairs(&requests[0].query);
+        let second_query = form_pairs(&requests[1].query);
+        assert!(!first_query.contains_key("pageToken"));
+        assert_eq!(second_query["pageToken"], "page-2");
+        assert_eq!(first_query["q"], second_query["q"]);
     }
 
     #[tokio::test]
@@ -4875,9 +4961,33 @@ mod tests {
 
     impl DriveFilesListServer {
         async fn start(status: StatusCode, body: impl Into<String>) -> Self {
+            Self::start_with_pages(status, body, BTreeMap::new()).await
+        }
+
+        async fn start_paginated(
+            first_body: impl Into<String>,
+            subsequent_pages: impl IntoIterator<Item = (&'static str, String)>,
+        ) -> Self {
+            Self::start_with_pages(
+                StatusCode::OK,
+                first_body,
+                subsequent_pages
+                    .into_iter()
+                    .map(|(token, body)| (token.to_owned(), body))
+                    .collect(),
+            )
+            .await
+        }
+
+        async fn start_with_pages(
+            status: StatusCode,
+            body: impl Into<String>,
+            paginated_bodies: BTreeMap<String, String>,
+        ) -> Self {
             let state = Arc::new(DriveFilesListServerState {
                 status,
                 body: body.into(),
+                paginated_bodies,
                 requests: Mutex::new(Vec::new()),
             });
             let app = Router::new()
@@ -4920,6 +5030,7 @@ mod tests {
     struct DriveFilesListServerState {
         status: StatusCode,
         body: String,
+        paginated_bodies: BTreeMap<String, String>,
         requests: Mutex<Vec<CapturedDriveFilesListRequest>>,
     }
 
@@ -4934,19 +5045,26 @@ mod tests {
         headers: HeaderMap,
         uri: Uri,
     ) -> Response {
+        let query = uri.query().unwrap_or_default();
         state
             .requests
             .lock()
             .expect("test Drive files-list requests lock should not poison")
             .push(CapturedDriveFilesListRequest {
                 headers,
-                query: uri.query().unwrap_or_default().to_owned(),
+                query: query.to_owned(),
             });
+        let page_token = url::form_urlencoded::parse(query.as_bytes())
+            .find_map(|(key, value)| (key == "pageToken").then(|| value.into_owned()));
+        let body = page_token
+            .as_deref()
+            .and_then(|token| state.paginated_bodies.get(token))
+            .unwrap_or(&state.body);
 
         (
             state.status,
             [(CONTENT_TYPE, "application/json")],
-            state.body.clone(),
+            body.clone(),
         )
             .into_response()
     }

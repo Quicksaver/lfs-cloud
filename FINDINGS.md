@@ -867,10 +867,30 @@ independently validated or adjudicated.
    custom-properties
    limits](https://developers.google.com/workspace/drive/api/guides/properties).
 
-5. **Medium — Paginated Drive lookup results are mishandled as conflicts.** The
-   lookup URL omits page tokens and does not follow `nextPageToken`
-   (`src/google_drive.rs:1682`, `src/google_drive.rs:2103`). Iterate all pages
-   before deciding whether the object is missing, unique, or duplicated.
+5. **[DONE] Paginated Drive lookup results were mishandled as conflicts**
+   (Medium, `src/google_drive.rs`, `IMPLEMENTATION.md`, and `AGENTS.md`):
+   **Valid and actionable.** Object lookup previously treated any
+   `nextPageToken` as a storage conflict, never sent `pageToken`, and therefore
+   could not discover or validate exact matches beyond the first Drive list
+   page. Lookup now follows every opaque page token while retaining the exact
+   repository/OID/size query, validates every returned candidate, and only
+   after the final page decides absence or selects the lexicographically
+   smallest verified Drive file ID. Blank tokens are rejected as malformed
+   upstream responses, while repeated tokens produce a retryable failure so a
+   bad provider response cannot loop forever. A mocked two-page regression
+   proves that the second request carries `pageToken`, preserves the lookup
+   query, and reconciles duplicates split across pages to the same canonical
+   file ID. Implementation guidance and the repository learning record the
+   pagination and duplicate-recovery boundary. Verification passed with
+   `yarn lint:fix`, `cargo fmt --all --check`, the 62-test Google Drive module
+   suite, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (565 passed, 3 ignored across
+   targets), `cargo test --doc` (38 passed), and `git diff --check`. The focused
+   reviewer identified a genuine medium-severity availability and correctness
+   flaw, precisely located both the missing request token and the premature
+   conflict decision, and requested the decisive all-pages behavior. With one
+   valid finding assessed here and no invalid finding attributable separately,
+   this was high-quality, relevant feedback.
 
 6. **Medium — The resumable upload implementation does not actually resume.** A
    failed upload starts over instead of querying or continuing the existing
