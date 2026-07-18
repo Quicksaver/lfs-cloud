@@ -1126,7 +1126,7 @@ struct LfsServerState {
     provider_calls: Arc<Semaphore>,
     authorization_cache: Arc<std::sync::Mutex<HashMap<AuthorizationCacheKey, Instant>>>,
     authorization_locks: Arc<std::sync::Mutex<HashMap<AuthorizationCacheKey, Arc<AsyncMutex<()>>>>>,
-    upload_locks: Arc<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    upload_locks: Arc<std::sync::Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     upload_staging: UploadStagingCoordinator,
 }
 
@@ -1178,10 +1178,17 @@ impl LfsServerState {
             .upload_locks
             .lock()
             .expect("upload lock map should not be poisoned");
-        locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        // Weak entries preserve single-flight coordination only while an
+        // upload holder or waiter owns the lock. Purging dead entries on every
+        // admission prevents completed object keys from accumulating.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     async fn authorize(
@@ -5409,6 +5416,46 @@ repositories:
         assert_eq!(first_response.status(), StatusCode::OK);
         assert_eq!(second_response.status(), StatusCode::OK);
         assert_eq!(transfer_store.uploads().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_upload_lock_is_not_retained() {
+        let config = test_config();
+        let repository = config.repositories[0].clone();
+        let state = super::LfsServerState::new(
+            config,
+            LocalLfsSessionStore::new(),
+            Arc::new(RecordingBatchAuthorizer::allow()),
+            Arc::new(RecordingTransferStore::missing()),
+            BatchBodyGuardrails::default(),
+        );
+        let oid = LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("test oid should parse");
+        let upload_lock = state.upload_lock_for(&repository, &oid);
+        let retained_lock = Arc::downgrade(&upload_lock);
+
+        let upload_guard = upload_lock.lock().await;
+        drop(upload_guard);
+        drop(upload_lock);
+
+        assert!(
+            retained_lock.upgrade().is_none(),
+            "completed uploads must release their per-object lock allocation"
+        );
+
+        let next_oid =
+            LfsOid::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .expect("second test oid should parse");
+        let _next_upload_lock = state.upload_lock_for(&repository, &next_oid);
+        assert_eq!(
+            state
+                .upload_locks
+                .lock()
+                .expect("upload lock map should not be poisoned")
+                .len(),
+            1,
+            "a later upload should purge completed object keys"
+        );
     }
 
     #[tokio::test]

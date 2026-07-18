@@ -544,11 +544,29 @@ independently validated or adjudicated.
    With one valid finding assessed here and no invalid finding attributable
    separately, this was high-quality, operationally relevant feedback.
 
-5. **Medium — Per-object upload locks leak permanently.** Every distinct
-   repository/provider/OID inserts a lock that is never removed
-   (`src/server.rs:849-891`, `src/server.rs:1149-1151`). Use a race-safe keyed
-   lock manager with weak or bounded entries, and test that completed uploads do
-   not retain locks.
+5. **[DONE] Per-object upload locks leak permanently** (Medium,
+   `src/server.rs`): **Valid and actionable.** The upload-lock map previously
+   stored a strong `Arc` for every repository/storage-provider/OID key, so the
+   mutex allocation and key survived after the last holder and waiter had
+   completed. The map now stores `Weak` mutex references, purges dead entries on
+   every lock admission, reuses a live mutex when one can be upgraded, and
+   creates a replacement only after no holder or waiter can still own the old
+   mutex. Upgrade and insertion remain under the map mutex, so concurrent
+   requests cannot split same-object serialization across two live locks. The
+   test-first lifecycle regression failed against the strong-reference map and
+   now proves that a completed upload retains no lock allocation and that the
+   next distinct upload removes its stale key. The existing concurrent-retry
+   regression continues to prove that two live uploads for the same object
+   serialize and perform only one backend write. The repository learning now
+   records the weak single-flight lock contract. Verification passed with
+   `cargo fmt --all`, `yarn lint:fix`, `git diff --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, and `cargo test --doc`. The focused reviewer
+   identified a genuine medium-severity, attacker-amplifiable memory-retention
+   flaw, pinpointed the ownership mistake, and recommended both an appropriate
+   weak/bounded lock-manager design and the decisive lifecycle regression; with
+   one valid finding assessed here and no invalid finding attributable
+   separately, this was high-quality, relevant feedback.
 
 6. **Medium — Graceful shutdown and transfer draining are absent.** The server
    does not use `with_graceful_shutdown`, so termination can interrupt large
