@@ -2236,13 +2236,31 @@ independently validated or adjudicated.
 
 ## Test suite
 
-1. **High — No test exercises Git LFS through the real HTTP boundary.** The
-   nominal end-to-end test explicitly excludes Git LFS, uses `Router::oneshot`,
-   and manually sends Bearer authentication; Basic authentication is tested only
-   through a helper (`tests/local_end_to_end.rs:1`,
-   `tests/local_end_to_end.rs:87`, `tests/local_end_to_end.rs:271-297`,
-   `src/server.rs:2860`). Bind an ephemeral TCP listener, configure a temporary
-   credential helper, and run real `git lfs push/fetch/checkout` commands.
+1. **[DONE] No test exercised Git LFS through the real HTTP boundary** (High,
+   `tests/local_end_to_end.rs` and `src/server.rs`): **Valid and actionable.**
+   The existing local end-to-end test called `Router::oneshot`, supplied Bearer
+   authentication itself, and never invoked the reference Git LFS client. A new
+   integration test now binds the fake-provider router to an ephemeral loopback
+   TCP listener, creates a temporary bare Git remote, stores the local session
+   credential through a repository-scoped temporary Git credential helper, and
+   runs real `git lfs push`, pointer-only clone, `git lfs fetch`, and
+   `git lfs checkout` commands. It verifies the pushed bytes reached the
+   repository-namespaced fake storage provider and that a separate checkout
+   materializes the exact fetched bytes. The Git LFS prerequisite check fails
+   clearly instead of silently skipping the test. The test exposed a real
+   protocol defect hidden by direct router coverage: the reference client does
+   not carry batch-request credentials to advertised transfer URLs. Batch
+   upload and download actions now include only the local `lfs-cloud` Basic
+   session credential, never the private GitHub or Drive token, and focused
+   unit tests assert both action types carry that authorization. Verification
+   passed with `yarn lint:fix`, `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+   reviewer identified a genuine high-severity test-boundary gap and prescribed
+   the exact listener, credential-helper, and real-client coverage needed; the
+   resulting test immediately found a production interoperability failure.
+   With one valid finding and no invalid finding attributable separately, this
+   was high-quality, highly relevant feedback.
 
 2. **High — Tests bypass the production server composition path.** The tested
    router omits production configuration loading, SQLite synchronization, OAuth

@@ -1,12 +1,18 @@
 //! Local end-to-end coverage for the fake-provider MVP path.
 //!
-//! This test keeps real GitHub, Google Drive, and Git LFS binaries out of the
-//! loop while still exercising the repository-init, provider authorization,
-//! object transfer, and checkout-materialization boundaries together.
+//! These tests keep real GitHub and Google Drive services out of the loop while
+//! exercising repository initialization, provider authorization, object
+//! transfer, and checkout materialization. The TCP-boundary test additionally
+//! drives those routes through the real Git LFS client.
 
 mod support;
 
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+    sync::Arc,
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -16,9 +22,10 @@ use axum::{
     },
 };
 use lfs_cloud::{
-    GitHubOAuthAccessToken, GitLfsConfigTarget, GitRepository, LfsBatchResponse, LfsInitRoute,
-    LocalCacheDehydrationStatus, LocalCacheLayout, LocalLfsSessionStore, RepositoryPermission,
-    RepositoryUser, ServerConfig, ServerError, lfs_server_router_with_provider_adapters,
+    GitCredentialApproval, GitHubOAuthAccessToken, GitLfsConfigTarget, GitRepository,
+    LfsBatchResponse, LfsInitRoute, LocalCacheDehydrationStatus, LocalCacheLayout,
+    LocalLfsSessionStore, RepositoryPermission, RepositoryUser, ServerConfig, ServerError,
+    lfs_server_router_with_provider_adapters,
 };
 use support::{
     FakeRepositoryProvider, FakeStorageProvider, TempGitRepo, lfs_object_for_bytes,
@@ -30,6 +37,141 @@ use url::Url;
 const TEST_DOWNLOAD_BODY_LIMIT: usize = 4 * 1024 * 1024;
 const TEST_BATCH_BODY_LIMIT: usize = 64 * 1024;
 const TEST_REPOSITORY_NAMESPACE: &str = "github-main:owner/repo";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_git_lfs_push_fetch_and_checkout_cross_the_tcp_boundary() {
+    assert_command_success(
+        Command::new("git").args(["lfs", "version"]),
+        "Git LFS prerequisite check",
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("local Git LFS test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("local Git LFS test listener address should resolve");
+    let server_url = format!("http://{address}");
+    let lfs_url = format!("{server_url}/github.com/owner/repo.git/info/lfs");
+
+    let github = Arc::new(FakeRepositoryProvider::new("github-main"));
+    github.add_repository("github.com", "owner", "repo", Some("8675309".to_owned()));
+    github.grant_permission(
+        "github.com",
+        "owner",
+        "repo",
+        "octocat",
+        RepositoryPermission::Write,
+    );
+    let sessions = LocalLfsSessionStore::new();
+    let session = sessions
+        .issue_session_with_github_token(
+            &RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned())),
+            ["repo"],
+            GitHubOAuthAccessToken::from_secret("fake-provider-token")
+                .expect("fake provider token should parse"),
+        )
+        .expect("local LFS session should be issued");
+    let drive = Arc::new(FakeStorageProvider::new("drive-user-a"));
+    let router = lfs_server_router_with_provider_adapters(
+        local_server_config_for_public_url(&server_url),
+        sessions,
+        github,
+        drive.clone(),
+    )
+    .expect("fake-provider router should build for the TCP listener");
+
+    let source = TempGitRepo::new();
+    let bare_remote = tempfile::tempdir().expect("bare remote tempdir should be created");
+    assert_command_success(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(bare_remote.path()),
+        "bare Git remote initialization",
+    );
+    source.git(["lfs", "install", "--local"]);
+    source.git(["remote", "add", "origin", path_str(bare_remote.path())]);
+    source.git(["config", "--file", ".lfsconfig", "lfs.url", &lfs_url]);
+    source.write_file(
+        ".gitattributes",
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+    );
+    let bytes = b"real Git LFS bytes crossing an ephemeral TCP listener";
+    fs::create_dir_all(source.path().join("assets"))
+        .expect("source asset directory should be created");
+    fs::write(source.path().join("assets/model.bin"), bytes)
+        .expect("source LFS bytes should be written");
+    source.commit_all("Add LFS fixture");
+    configure_test_credential(&source, &lfs_url, session.token.clone());
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("local Git LFS test server should run");
+    });
+
+    assert_command_success(
+        Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("-C")
+            .arg(source.path())
+            .args(["lfs", "push", "origin", "main"]),
+        "Git LFS push through lfs-cloud",
+    );
+    let object = lfs_object_for_bytes(bytes);
+    assert_eq!(
+        drive.object_bytes(TEST_REPOSITORY_NAMESPACE, &object),
+        Some(bytes.to_vec())
+    );
+    source.git(["push", "--no-verify", "origin", "main"]);
+
+    let checkout_parent = tempfile::tempdir().expect("checkout tempdir should be created");
+    let checkout = checkout_parent.path().join("checkout");
+    assert_command_success(
+        Command::new("git")
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .args(["clone"])
+            .arg(bare_remote.path())
+            .arg(&checkout),
+        "Git LFS pointer-only clone",
+    );
+    assert_eq!(
+        fs::read(checkout.join("assets/model.bin"))
+            .expect("pointer-only checkout file should be readable"),
+        lfs_pointer_file(object.oid.as_hex(), object.size.bytes()).as_bytes()
+    );
+    assert_command_success(
+        Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["lfs", "install", "--local"]),
+        "checkout-local Git LFS installation",
+    );
+    configure_test_credential_path(&checkout, &lfs_url, session.token);
+    assert_command_success(
+        Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["lfs", "fetch", "origin", "main"]),
+        "Git LFS fetch through lfs-cloud",
+    );
+    assert_command_success(
+        Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["lfs", "checkout", "assets/model.bin"]),
+        "Git LFS checkout from fetched object bytes",
+    );
+    assert_eq!(
+        fs::read(checkout.join("assets/model.bin"))
+            .expect("materialized Git LFS checkout should be readable"),
+        bytes
+    );
+
+    server.abort();
+    let _ = server.await;
+}
 
 #[tokio::test]
 async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
@@ -329,10 +471,14 @@ fn provider_adapter_router_rejects_mismatched_provider_ids() {
 }
 
 fn local_server_config() -> ServerConfig {
-    ServerConfig::load_from_str(
+    local_server_config_for_public_url("http://127.0.0.1:8080")
+}
+
+fn local_server_config_for_public_url(public_url: &str) -> ServerConfig {
+    ServerConfig::load_from_str(&format!(
         r#"
 server:
-  public_url: http://127.0.0.1:8080
+  public_url: {public_url}
 repository_providers:
   github-main:
     type: github
@@ -359,9 +505,64 @@ repositories:
     name: repo-b
     provider_repository_id: "8675310"
     storage_provider: drive-user-a
-"#,
-    )
+"#
+    ))
     .expect("local fake-provider server config should load")
+}
+
+fn configure_test_credential(
+    repository: &TempGitRepo,
+    lfs_url: &str,
+    token: lfs_cloud::LfsSessionToken,
+) {
+    repository.git([
+        "config",
+        "--local",
+        "credential.helper",
+        "store --file=.git/lfs-cloud-test-credentials",
+    ]);
+    GitCredentialApproval::new(lfs_url, token)
+        .expect("loopback LFS credential URL should be accepted")
+        .approve_in_dir(repository.path())
+        .expect("source repository credential should be approved");
+}
+
+fn configure_test_credential_path(
+    repository: &Path,
+    lfs_url: &str,
+    token: lfs_cloud::LfsSessionToken,
+) {
+    assert_command_success(
+        Command::new("git").arg("-C").arg(repository).args([
+            "config",
+            "--local",
+            "credential.helper",
+            "store --file=.git/lfs-cloud-test-credentials",
+        ]),
+        "checkout-local credential helper configuration",
+    );
+    GitCredentialApproval::new(lfs_url, token)
+        .expect("loopback LFS credential URL should be accepted")
+        .approve_in_dir(repository)
+        .expect("checkout repository credential should be approved");
+}
+
+fn assert_command_success(command: &mut Command, description: &str) -> Output {
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("{description} should start: {error}"));
+    assert!(
+        output.status.success(),
+        "{description} should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn path_str(path: &Path) -> &str {
+    path.to_str()
+        .expect("temporary test repository paths should be valid UTF-8")
 }
 
 fn lfs_batch_request(operation: &str, object: &lfs_cloud::LfsObject) -> String {

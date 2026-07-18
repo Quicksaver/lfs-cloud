@@ -2817,7 +2817,10 @@ async fn handle_parsed_lfs_batch_request(
     match request.operation {
         LfsBatchOperation::Download => {
             match download_batch_response_with_storage_lookup(&repository, state, request).await {
-                Ok(response) => git_lfs_json_response(response),
+                Ok(response) => git_lfs_json_response(with_session_action_authorization(
+                    response,
+                    session.token(),
+                )),
                 Err(error) => {
                     tracing::debug!(
                         repo_id = repository.id.as_str(),
@@ -2830,7 +2833,10 @@ async fn handle_parsed_lfs_batch_request(
         }
         LfsBatchOperation::Upload => {
             match upload_batch_response_with_storage_lookup(&repository, state, request).await {
-                Ok(response) => git_lfs_json_response(response),
+                Ok(response) => git_lfs_json_response(with_session_action_authorization(
+                    response,
+                    session.token(),
+                )),
                 Err(error) => {
                     tracing::debug!(
                         repo_id = repository.id.as_str(),
@@ -2842,6 +2848,31 @@ async fn handle_parsed_lfs_batch_request(
             }
         }
     }
+}
+
+fn with_session_action_authorization(
+    mut response: LfsBatchResponse,
+    token: &LfsSessionToken,
+) -> LfsBatchResponse {
+    // The reference Git LFS client does not carry batch credentials to action
+    // URLs automatically. Supplying the repository-scoped local credential in
+    // each action keeps backend provider tokens private while letting the
+    // client authenticate the advertised upload or download request.
+    let credentials = BASE64_STANDARD.encode(format!(
+        "{DEFAULT_GIT_CREDENTIAL_USERNAME}:{}",
+        token.as_str()
+    ));
+    let authorization = format!("Basic {credentials}");
+
+    for object in &mut response.objects {
+        for action in object.actions.values_mut() {
+            action
+                .header
+                .insert("Authorization".to_owned(), authorization.clone());
+        }
+    }
+
+    response
 }
 
 fn permission_required_for_batch_operation(operation: LfsBatchOperation) -> RepositoryPermission {
@@ -5297,6 +5328,10 @@ repositories:
         assert_eq!(body.objects.len(), 1);
         assert_eq!(body.objects[0].error, None);
         assert!(body.objects[0].actions.contains_key("download"));
+        let expected_authorization = format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(format!("{DEFAULT_GIT_CREDENTIAL_USERNAME}:{token}"))
+        );
         assert_eq!(
             body.objects[0]
                 .actions
@@ -5305,6 +5340,13 @@ repositories:
             Some(
                 "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=42"
             )
+        );
+        assert_eq!(
+            body.objects[0]
+                .actions
+                .get("download")
+                .and_then(|action| action.header.get("Authorization")),
+            Some(&expected_authorization)
         );
     }
 
@@ -5437,6 +5479,10 @@ repositories:
         );
         assert_eq!(body.objects[0].error, None);
         assert!(body.objects[0].actions.contains_key("upload"));
+        let expected_authorization = format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(format!("{DEFAULT_GIT_CREDENTIAL_USERNAME}:{token}"))
+        );
         assert_eq!(
             body.objects[0]
                 .actions
@@ -5445,6 +5491,13 @@ repositories:
             Some(
                 "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=42"
             )
+        );
+        assert_eq!(
+            body.objects[0]
+                .actions
+                .get("upload")
+                .and_then(|action| action.header.get("Authorization")),
+            Some(&expected_authorization)
         );
     }
 
