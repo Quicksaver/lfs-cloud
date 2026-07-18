@@ -1639,7 +1639,7 @@ Defer:
 
 - [x] [T] Check which discovered objects already exist locally.
 - [x] [M] Fetch missing objects from the source LFS provider without changing working tree files or inheriting recent-fetch scope expansion. Manual verification: `scripts/manual/verify-migration-source-fetch.sh`.
-- [x] [M] Upload discovered objects to `lfs-cloud` idempotently. Manual verification: `scripts/manual/verify-migration-upload.sh`.
+- [x] [T] Upload discovered objects to the configured storage-provider boundary idempotently. Focused fake-provider verification: `scripts/manual/verify-migration-upload-simulation.sh`. This script does not contact Google Drive; live migration-transfer coverage remains part of the gated external integration work.
 - [x] [T] Verify uploaded hashes and sizes against pointers.
 
 #### Epic 7.3: Migration Safety

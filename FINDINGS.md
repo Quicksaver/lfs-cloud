@@ -1842,10 +1842,31 @@ independently validated or adjudicated.
     and no invalid finding attributable separately, this was high-quality,
     relevant feedback.
 
-14. **Medium — The manual migration-upload script exercises only fake stores.**
-    It does not validate the live Drive upload path
-    (`scripts/manual/verify-migration-upload.sh:9-16`). Add a gated disposable
-    Drive scenario or rename and document the script as simulated verification.
+14. **[DONE] The manual migration-upload script exercises only fake stores**
+    (Medium, `scripts/manual/verify-migration-upload-simulation.sh`,
+    `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and actionable.** The script
+    previously ran only focused unit tests backed by
+    `FakeMigrationStorageProvider`, but its manual-verification name and the
+    migration checklist implied that it exercised a live `lfs-cloud`/Google
+    Drive upload. It never constructed `GoogleDriveObjectStore`, loaded real
+    Drive credentials, or contacted an external service. The verifier is now
+    named `verify-migration-upload-simulation.sh`, identifies its fake-provider
+    boundary in both a source comment and its success output, and remains useful
+    as a repeatable focused contract check. The migration checklist now marks
+    the upload task as automated `[T]`, describes the implemented generic
+    storage-provider boundary precisely, and states that live Drive transfer
+    remains external-integration work. The repository learning preserves that
+    distinction for future verification claims. Adding a disposable Drive
+    upload here would duplicate and only partially address the broader live
+    provider-transfer finding in the test-suite section, so the reviewer's
+    explicit rename-and-document alternative is the complete scoped fix.
+    Verification passed with
+    `scripts/manual/verify-migration-upload-simulation.sh`, `yarn lint:fix`,
+    and `git diff --check`. The focused reviewer identified a genuine
+    medium-severity verification-provenance problem and offered an appropriately
+    scoped remediation that avoids presenting fake-provider coverage as live
+    provider evidence; with one valid finding assessed here and no invalid
+    finding attributable separately, this was high-quality, relevant feedback.
 
 15. **Medium — Large migration uploads are serialized and lose accumulated
     progress on failure.** One failed object aborts the run without a durable
