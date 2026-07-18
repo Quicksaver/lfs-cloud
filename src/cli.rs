@@ -202,6 +202,10 @@ struct GcCommand {
     /// Report objects and worktree registrations that would be removed.
     #[arg(long)]
     dry_run: bool,
+
+    /// Permanently forget unavailable worktrees before removing objects.
+    #[arg(long)]
+    prune_unavailable_worktrees: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1107,7 +1111,7 @@ where
     let layout = local_cache_layout(command.cache_root)?;
     register_current_worktree_for_gc(&layout, start_dir.as_ref())?;
     let report = layout
-        .garbage_collect(command.dry_run)
+        .garbage_collect(command.dry_run, command.prune_unavailable_worktrees)
         .map_err(local_cache_cli_error)?;
 
     write_gc_result(output, layout.root(), &report).map_err(output_error)
@@ -2606,8 +2610,9 @@ where
     writeln!(output, "  cache: {}", cache_root.display())?;
     writeln!(
         output,
-        "  worktrees: {} active, {} {}",
+        "  worktrees: {} active, {} unavailable, {} {}",
         report.active_worktree_count,
+        report.unavailable_worktrees.len(),
         report.pruned_worktrees.len(),
         if report.dry_run {
             "would prune"
@@ -2617,8 +2622,9 @@ where
     )?;
     writeln!(
         output,
-        "  objects: {} retained, {} {}, {} skipped",
+        "  objects: {} retained, {} protected, {} {}, {} skipped",
         report.retained_objects.len(),
+        report.protected_objects.len(),
         report.unreferenced_objects.len(),
         action,
         report.skipped_cache_paths.len()
@@ -2626,6 +2632,17 @@ where
 
     for object in &report.unreferenced_objects {
         write_gc_object(output, action, object)?;
+    }
+    for object in &report.protected_objects {
+        write_gc_object(output, "protected while worktree unavailable", object)?;
+    }
+    for registration in &report.unavailable_worktrees {
+        writeln!(
+            output,
+            "unavailable worktree {} ({})",
+            registration.worktree_root.display(),
+            registration.repository_id
+        )?;
     }
     for registration in &report.pruned_worktrees {
         let action = if report.dry_run {
@@ -3124,7 +3141,8 @@ mod tests {
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig,
         LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken, LocalCacheError,
-        LocalCacheLayout, SanitizedMessage, ServeOptions, StorageProviderConfig,
+        LocalCacheLayout, LocalCacheWorktreeRegistration, SanitizedMessage, ServeOptions,
+        StorageProviderConfig,
     };
 
     #[test]
@@ -3318,13 +3336,14 @@ mod tests {
     }
 
     #[test]
-    fn gc_command_accepts_cache_root_and_dry_run_option() {
+    fn gc_command_accepts_cache_root_dry_run_and_explicit_prune_options() {
         let cli = Cli::try_parse_from([
             "lfs-cloud",
             "gc",
             "--cache-root",
             "/tmp/lfs-cloud-cache",
             "--dry-run",
+            "--prune-unavailable-worktrees",
         ])
         .expect("gc command should parse");
 
@@ -3334,6 +3353,7 @@ mod tests {
 
         assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
         assert!(command.dry_run);
+        assert!(command.prune_unavailable_worktrees);
     }
 
     #[test]
@@ -5184,6 +5204,7 @@ mod tests {
             GcCommand {
                 cache_root: Some(layout.root().to_path_buf()),
                 dry_run: false,
+                prune_unavailable_worktrees: false,
             },
             &repo,
             &mut gc_output,
@@ -5584,6 +5605,7 @@ mod tests {
             GcCommand {
                 cache_root: Some(cache_root),
                 dry_run: false,
+                prune_unavailable_worktrees: false,
             },
             &repo,
             &mut output,
@@ -5594,8 +5616,8 @@ mod tests {
         assert!(!layout.object_path(&remove_object).exists());
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("lfs-cloud gc"));
-        assert!(rendered.contains("worktrees: 1 active, 0 pruned"));
-        assert!(rendered.contains("objects: 1 retained, 1 removed, 0 skipped"));
+        assert!(rendered.contains("worktrees: 1 active, 0 unavailable, 0 pruned"));
+        assert!(rendered.contains("objects: 1 retained, 0 protected, 1 removed, 0 skipped"));
         assert!(rendered.contains(remove_object.oid.as_hex()));
     }
 
@@ -5619,6 +5641,7 @@ mod tests {
             GcCommand {
                 cache_root: Some(cache_root),
                 dry_run: true,
+                prune_unavailable_worktrees: false,
             },
             &repo,
             &mut output,
@@ -5627,9 +5650,75 @@ mod tests {
 
         assert!(layout.object_path(&object).exists());
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("objects: 0 retained, 1 would remove, 0 skipped"));
+        assert!(rendered.contains("objects: 0 retained, 0 protected, 1 would remove, 0 skipped"));
         assert!(rendered.contains("would remove"));
         assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn gc_requires_explicit_pruning_before_collecting_with_unavailable_worktrees() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let missing_repo = temp.path().join("disconnected-repo");
+        init_git_repo_with_origin(&repo);
+        let bytes = b"possibly referenced by disconnected worktree";
+        let object = object_for_bytes(bytes);
+        let layout = LocalCacheLayout::new(&cache_root);
+        let missing_registration = LocalCacheWorktreeRegistration::new(
+            "github-main:owner/disconnected",
+            &missing_repo,
+            missing_repo.join(".git"),
+        )
+        .expect("missing worktree registration should validate");
+        layout
+            .register_worktree(missing_registration)
+            .expect("missing worktree should register");
+        write_file(&layout.object_path(&object), bytes);
+        let mut protected_output = Vec::new();
+
+        run_gc_from_dir(
+            GcCommand {
+                cache_root: Some(cache_root.clone()),
+                dry_run: false,
+                prune_unavailable_worktrees: false,
+            },
+            &repo,
+            &mut protected_output,
+        )
+        .expect("ordinary gc should preserve objects for unavailable worktrees");
+
+        assert!(layout.object_path(&object).exists());
+        let rendered = String::from_utf8(protected_output).expect("output should be UTF-8");
+        assert!(rendered.contains("1 unavailable, 0 pruned"));
+        assert!(rendered.contains("1 protected, 0 removed"));
+        assert!(rendered.contains("unavailable worktree"));
+        assert!(rendered.contains("protected while worktree unavailable"));
+
+        run_gc_from_dir(
+            GcCommand {
+                cache_root: Some(cache_root),
+                dry_run: false,
+                prune_unavailable_worktrees: true,
+            },
+            &repo,
+            &mut Vec::new(),
+        )
+        .expect("explicit pruning should permit collection");
+
+        assert!(!layout.object_path(&object).exists());
+        assert_eq!(
+            layout
+                .load_worktree_registry()
+                .expect("registry should reload")
+                .worktrees()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -5648,6 +5737,7 @@ mod tests {
             GcCommand {
                 cache_root: Some(cache_root),
                 dry_run: false,
+                prune_unavailable_worktrees: false,
             },
             &start_dir,
             &mut output,
@@ -5656,8 +5746,8 @@ mod tests {
 
         assert!(!layout.object_path(&object).exists());
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("worktrees: 0 active, 0 pruned"));
-        assert!(rendered.contains("objects: 0 retained, 1 removed, 0 skipped"));
+        assert!(rendered.contains("worktrees: 0 active, 0 unavailable, 0 pruned"));
+        assert!(rendered.contains("objects: 0 retained, 0 protected, 1 removed, 0 skipped"));
     }
 
     #[test]

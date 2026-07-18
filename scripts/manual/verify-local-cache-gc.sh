@@ -105,7 +105,7 @@ remove_cache_path="$cache_root/objects/${remove_oid:0:2}/${remove_oid:2:2}/$remo
 
 test -f "$keep_cache_path"
 test -f "$remove_cache_path"
-grep -F "would remove" "$tmp_dir/gc-dry-run-output" >/dev/null
+grep -F "protected while worktree unavailable" "$tmp_dir/gc-dry-run-output" >/dev/null
 grep -F "$remove_oid" "$tmp_dir/gc-dry-run-output" >/dev/null
 grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null
 
@@ -116,12 +116,25 @@ grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null
 )
 
 test -f "$keep_cache_path"
-test ! -e "$remove_cache_path"
-grep -F "removed" "$tmp_dir/gc-output" >/dev/null
+test -f "$remove_cache_path"
+grep -F "protected while worktree unavailable" "$tmp_dir/gc-output" >/dev/null
 grep -F "$remove_oid" "$tmp_dir/gc-output" >/dev/null
+grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null
+
+(
+  cd "$repo_dir"
+  cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
+    gc --cache-root "$cache_root" --prune-unavailable-worktrees \
+    >"$tmp_dir/gc-prune-output"
+)
+
+test -f "$keep_cache_path"
+test ! -e "$remove_cache_path"
+grep -F "removed" "$tmp_dir/gc-prune-output" >/dev/null
+grep -F "$remove_oid" "$tmp_dir/gc-prune-output" >/dev/null
 if grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null; then
-  echo "missing worktree registration was not pruned" >&2
+  echo "explicitly pruned worktree registration remains" >&2
   exit 1
 fi
 
-echo "lfs-cloud gc verified retained referenced objects and removed unreferenced cache objects"
+echo "lfs-cloud gc verified unavailable-root protection and explicit pruning"

@@ -484,10 +484,18 @@ pub struct LocalCacheGarbageCollection {
     pub dry_run: bool,
     /// Number of registered worktrees that still existed and were scanned.
     pub active_worktree_count: usize,
-    /// Worktree registrations whose roots were missing or no longer directories and were pruned.
+    /// Worktree registrations whose roots could not be scanned.
+    ///
+    /// A missing path may be a disconnected volume or a transient rename, so
+    /// these registrations remain authoritative unless pruning was explicitly
+    /// requested.
+    pub unavailable_worktrees: Vec<LocalCacheWorktreeRegistration>,
+    /// Unavailable worktree registrations pruned, or that a dry run would prune.
     pub pruned_worktrees: Vec<LocalCacheWorktreeRegistration>,
     /// Valid cached object files that were still referenced by a worktree.
     pub retained_objects: Vec<LocalCacheGarbageCollectionObject>,
+    /// Cached objects protected because an unavailable worktree may reference them.
+    pub protected_objects: Vec<LocalCacheGarbageCollectionObject>,
     /// Valid cached object files that were not referenced by any worktree.
     pub unreferenced_objects: Vec<LocalCacheGarbageCollectionObject>,
     /// Valid cached object files removed from disk during a real run.
@@ -896,17 +904,23 @@ impl LocalCacheLayout {
     ///
     /// Reachability is intentionally conservative and local: the collector
     /// scans existing registered worktree roots for Git LFS pointer files and
-    /// keeps every cached OID that a pointer references. Missing worktree
-    /// registrations are pruned from the registry during a real run. Cache
-    /// paths that do not match the expected sharded SHA-256 layout are reported
-    /// but never deleted.
+    /// keeps every cached OID that a pointer references. When any registered
+    /// root is unavailable, objects not referenced by the remaining roots are
+    /// protected unless `prune_unavailable_worktrees` is true. Explicit pruning
+    /// treats unavailable roots as permanently abandoned. Cache paths that do
+    /// not match the expected sharded SHA-256 layout are reported but never
+    /// deleted.
     ///
     /// # Errors
     ///
     /// Returns [`LocalCacheError`] when the worktree registry cannot be read or
     /// written, a registered worktree cannot be scanned, or a cache object
     /// cannot be removed.
-    pub fn garbage_collect(&self, dry_run: bool) -> LocalCacheResult<LocalCacheGarbageCollection> {
+    pub fn garbage_collect(
+        &self,
+        dry_run: bool,
+        prune_unavailable_worktrees: bool,
+    ) -> LocalCacheResult<LocalCacheGarbageCollection> {
         // Mutations and materializations take the shared side of this lock.
         // Taking it exclusively gives GC a stable cache/worktree snapshot and
         // keeps it out of multi-step publication windows.
@@ -916,18 +930,24 @@ impl LocalCacheLayout {
         // could lose cache bytes before its pointers are considered.
         let _lock = self.lock_worktree_registry()?;
         let mut registry = self.load_worktree_registry()?;
-        let (active_worktrees, pruned_worktrees) =
+        let (active_worktrees, unavailable_worktrees) =
             partition_existing_worktrees(registry.worktrees())?;
         let referenced_oids = referenced_worktree_oids(&active_worktrees)?;
         let (mut cache_objects, mut skipped_cache_paths) = self.cache_object_files()?;
         let mut retained_objects = Vec::new();
+        let mut protected_objects = Vec::new();
         let mut unreferenced_objects = Vec::new();
         let mut deleted_objects = Vec::new();
+        let pruned_worktrees = if prune_unavailable_worktrees {
+            unavailable_worktrees.clone()
+        } else {
+            Vec::new()
+        };
 
         cache_objects.sort_by(|left, right| left.path.cmp(&right.path));
         skipped_cache_paths.sort();
 
-        if !dry_run && !pruned_worktrees.is_empty() {
+        if !dry_run && prune_unavailable_worktrees && !pruned_worktrees.is_empty() {
             for registration in &pruned_worktrees {
                 registry.remove(&registration.worktree_root);
             }
@@ -937,6 +957,11 @@ impl LocalCacheLayout {
         for object in cache_objects {
             if referenced_oids.contains(&object.oid) {
                 retained_objects.push(object);
+            } else if !unavailable_worktrees.is_empty() && !prune_unavailable_worktrees {
+                // An unavailable worktree may contain the only pointer keeping
+                // this object reachable, so absence from the scanned roots is
+                // not enough evidence for destructive collection.
+                protected_objects.push(object);
             } else {
                 if !dry_run {
                     self.delete_cache_object(&object)?;
@@ -949,8 +974,10 @@ impl LocalCacheLayout {
         Ok(LocalCacheGarbageCollection {
             dry_run,
             active_worktree_count: active_worktrees.len(),
+            unavailable_worktrees,
             pruned_worktrees,
             retained_objects,
+            protected_objects,
             unreferenced_objects,
             deleted_objects,
             skipped_cache_paths,
@@ -3158,7 +3185,7 @@ mod tests {
                 .send(())
                 .expect("test should receive collector start");
             collection_done_tx
-                .send(collection_layout.garbage_collect(false))
+                .send(collection_layout.garbage_collect(false, false))
                 .expect("test should receive collection result");
         });
         let collection_started = collection_started_rx.recv();
@@ -3592,7 +3619,7 @@ mod tests {
     }
 
     #[test]
-    fn garbage_collect_removes_unreferenced_cache_objects_and_prunes_missing_worktrees() {
+    fn garbage_collect_preserves_objects_when_a_registered_worktree_is_unavailable() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
         let repo = temp.path().join("repo");
@@ -3628,29 +3655,34 @@ mod tests {
             .expect("missing worktree should register");
 
         let report = layout
-            .garbage_collect(false)
+            .garbage_collect(false, false)
             .expect("garbage collection should finish");
 
         assert_eq!(report.active_worktree_count, 1);
-        assert_eq!(report.pruned_worktrees, vec![missing_registration]);
+        assert_eq!(
+            report.unavailable_worktrees,
+            vec![missing_registration.clone()]
+        );
+        assert!(report.pruned_worktrees.is_empty());
         assert_eq!(report.retained_objects.len(), 1);
         assert_eq!(report.retained_objects[0].oid, referenced.oid);
-        assert_eq!(report.unreferenced_objects.len(), 1);
-        assert_eq!(report.unreferenced_objects[0].oid, unreferenced.oid);
-        assert_eq!(report.deleted_objects, report.unreferenced_objects);
+        assert_eq!(report.protected_objects.len(), 1);
+        assert_eq!(report.protected_objects[0].oid, unreferenced.oid);
+        assert!(report.unreferenced_objects.is_empty());
+        assert!(report.deleted_objects.is_empty());
         assert!(layout.object_path(&referenced).exists());
-        assert!(!layout.object_path(&unreferenced).exists());
+        assert!(layout.object_path(&unreferenced).exists());
         assert_eq!(
             layout
                 .load_worktree_registry()
                 .expect("registry should reload")
                 .worktrees(),
-            &[active_registration]
+            &[active_registration, missing_registration]
         );
     }
 
     #[test]
-    fn garbage_collect_prunes_registered_worktree_that_became_a_file() {
+    fn garbage_collect_prunes_unavailable_worktree_only_when_explicitly_requested() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
         let replaced_repo = temp.path().join("replaced-repo");
@@ -3670,11 +3702,13 @@ mod tests {
             .expect("worktree should register");
 
         let report = layout
-            .garbage_collect(false)
+            .garbage_collect(false, true)
             .expect("file-replaced worktree should prune");
 
         assert_eq!(report.active_worktree_count, 0);
+        assert_eq!(report.unavailable_worktrees, vec![registration.clone()]);
         assert_eq!(report.pruned_worktrees, vec![registration]);
+        assert!(report.protected_objects.is_empty());
         assert_eq!(report.unreferenced_objects.len(), 1);
         assert!(!layout.object_path(&object).exists());
         assert!(
@@ -3707,7 +3741,7 @@ mod tests {
             .expect("worktree should register");
 
         let report = layout
-            .garbage_collect(false)
+            .garbage_collect(false, false)
             .expect("garbage collection should finish");
 
         assert_eq!(report.active_worktree_count, 1);
@@ -3743,7 +3777,7 @@ mod tests {
             .expect("worktree should register");
 
         let report = layout
-            .garbage_collect(false)
+            .garbage_collect(false, false)
             .expect("garbage collection should finish");
 
         assert_eq!(report.unreferenced_objects.len(), 1);
@@ -3771,13 +3805,18 @@ mod tests {
             .expect("missing worktree should register");
 
         let report = layout
-            .garbage_collect(true)
+            .garbage_collect(true, false)
             .expect("dry-run garbage collection should finish");
 
         assert!(report.dry_run);
         assert_eq!(report.active_worktree_count, 0);
-        assert_eq!(report.pruned_worktrees, vec![missing_registration.clone()]);
-        assert_eq!(report.unreferenced_objects.len(), 1);
+        assert_eq!(
+            report.unavailable_worktrees,
+            vec![missing_registration.clone()]
+        );
+        assert!(report.pruned_worktrees.is_empty());
+        assert_eq!(report.protected_objects.len(), 1);
+        assert!(report.unreferenced_objects.is_empty());
         assert!(report.deleted_objects.is_empty());
         assert!(layout.object_path(&object).exists());
         assert_eq!(
@@ -3797,7 +3836,7 @@ mod tests {
         write_file(&invalid_cache_path, b"invalid cache payload");
 
         let report = layout
-            .garbage_collect(false)
+            .garbage_collect(false, false)
             .expect("garbage collection should skip invalid paths");
 
         assert!(report.retained_objects.is_empty());

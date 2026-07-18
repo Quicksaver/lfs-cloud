@@ -283,11 +283,14 @@ lfs-cloud gc --dry-run
 
 This scans registered worktrees in the shared cache registry, keeps cached
 objects referenced by Git LFS pointer files in those worktrees, and removes
-unreferenced cached objects. It also prunes missing worktree registrations
-during a real run. Garbage collection runs exclusively with respect to cache
-ingest, hydration, materialization, and dehydration so it sees completed object
-and pointer publication. Use `--cache-root` to target a non-default local cache
-root.
+unreferenced cached objects. If any registered worktree is unavailable, such as
+on a disconnected volume, ordinary garbage collection preserves its registry
+entry and every object that the unavailable worktree might reference. Restore
+the worktree and rerun GC, or use `--prune-unavailable-worktrees` only after
+confirming that every reported unavailable worktree is permanently abandoned.
+Garbage collection runs exclusively with respect to cache ingest, hydration,
+materialization, and dehydration so it sees completed object and pointer
+publication. Use `--cache-root` to target a non-default local cache root.
 
 ### Pull And Materialize LFS Objects
 

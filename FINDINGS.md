@@ -1277,12 +1277,37 @@ independently validated or adjudicated.
    finding assessed here and no invalid finding attributable separately, this
    was high-quality, integrity-relevant feedback.
 
-4. **Medium — Temporarily unavailable worktrees are immediately pruned and
-   their cache objects deleted.** `NotFound` is treated as permanent removal, so
-   a disconnected volume or transient rename can cause data loss in the same GC
-   run (`src/local_cache.rs:869-885`, `src/local_cache.rs:1025-1051`). Mark roots
-   stale with a grace period or require explicit pruning; conservatively skip
-   destructive collection when roots are unavailable.
+4. **[DONE] Temporarily unavailable worktrees were immediately pruned and
+   their cache objects deleted** (Medium, `src/local_cache.rs`, `src/cli.rs`,
+   cache documentation, and the manual GC verifier): **Valid and actionable.**
+   Garbage collection previously treated a missing registered root or a root
+   replaced by a non-directory as permanently abandoned, removed its registry
+   row, and deleted every cache object not referenced by the remaining roots in
+   the same run. A disconnected volume and a transient rename are
+   indistinguishable from permanent removal at that boundary. Ordinary GC now
+   retains every unavailable registration and classifies all objects not proven
+   reachable from scanned roots as protected rather than unreferenced. The new
+   `--prune-unavailable-worktrees` flag is required to declare the reported
+   roots permanently abandoned before their registrations and possibly
+   referenced objects can be removed. GC reports active, unavailable, pruned,
+   retained, protected, and removed state separately so both ordinary and dry
+   runs explain the safety decision. Test-first library and CLI regressions
+   prove a missing root preserves its registration and uncertain object by
+   default, while explicit pruning permits collection; the manual verifier
+   exercises the same two-step operator workflow. README, implementation
+   guidance, and the repository learning document the opt-in data-loss
+   boundary. Verification passed with `yarn lint:fix`,
+   `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (599 passed, 3 ignored across targets),
+   `cargo test --doc` (38 passed),
+   `scripts/manual/verify-local-cache-gc.sh`, and `git diff --check`. The
+   focused reviewer identified a genuine medium-severity local data-loss flaw,
+   correctly explained why `NotFound` is not proof of permanent removal, and
+   recommended the conservative default plus explicit operator decision now
+   implemented. With one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, integrity-relevant
+   feedback.
 
 5. **Medium — GC scans the raw filesystem instead of Git LFS tracked paths.** It
    recursively reads small files in ignored, generated, vendor, or dependency

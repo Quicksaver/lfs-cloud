@@ -1333,9 +1333,11 @@ Defer:
 > The `hydrate` and `dehydrate` CLI commands now expose those local cache
 > operations for explicit path lists, including `--cache-root` overrides for
 > tests or non-default local cache locations. The `gc` CLI command now scans
-> registered worktrees for Git LFS pointer references, removes unreferenced
-> shared cache objects, prunes missing worktree registrations, and supports
-> `--dry-run` for review before deletion. The `pull` CLI command now runs
+> registered worktrees for Git LFS pointer references and removes unreferenced
+> shared cache objects. An unavailable registered root conservatively protects
+> all objects it might reference; `--prune-unavailable-worktrees` is required
+> to declare those roots permanently abandoned before collection proceeds.
+> `gc` also supports `--dry-run` for review before deletion. The `pull` CLI command now runs
 > `git lfs fetch`, ingests fetched current-checkout objects from Git LFS media
 > storage into the shared cache, and hydrates LFS-tracked pointer files with
 > verified cache bytes. Pull fetches drain stdout and stderr concurrently with
