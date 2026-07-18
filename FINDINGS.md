@@ -1727,11 +1727,29 @@ independently validated or adjudicated.
    here and no invalid finding attributable separately, this was high-quality,
    security- and reliability-relevant feedback.
 
-10. **Medium — Default checkout migration gives no warning about objects on
-    other refs.** The report can appear complete even though only the current
-    checkout is inventoried (`src/cli.rs:898-926`, `src/cli.rs:1155-1247`,
-    `IMPLEMENTATION.md:542`). State the scope prominently and report that other
-    refs were not scanned.
+10. **[DONE] Default checkout migration gave no warning about objects on other
+    refs** (Medium, `src/cli.rs`, `README.md`, `IMPLEMENTATION.md`, and
+    `AGENTS.md`): **Valid and actionable.** The implementation plan already
+    defined the current checkout as the safe default only when accompanied by
+    a warning that other refs may retain uncopied objects, but the dry-run
+    report previously exposed only the terse `current-checkout` mode and
+    counted the checkout as one scanned ref. The report now places a plain
+    `current checkout index only` scope directly after the mode, warns that
+    other refs were not scanned and may reference additional LFS objects, and
+    directs full provider moves to `--all-refs`. Selected-ref and all-ref modes
+    receive equally explicit scope labels without the default-mode warning.
+    Unit and real fixture-repository regressions prove the current-checkout
+    report includes the scope, warning, and remediation while retaining its
+    no-write behavior. README, implementation status/checklist, and the
+    repository learning now preserve the user-visible scope boundary.
+    Verification passed with `cargo fmt`, `yarn lint:fix`, `git diff --check`,
+    focused unit and fixture tests, `cargo clippy --all-targets -- -D warnings`,
+    `cargo build`, `cargo test --all-targets -- --test-threads=1`, and
+    `cargo test --doc`. The focused reviewer identified a genuine
+    medium-severity completeness and operator-safety flaw, matched the existing
+    implementation requirement precisely, and proposed the minimal decisive
+    remediation; with one valid finding assessed here and no invalid finding
+    attributable separately, this was high-quality, relevant feedback.
 
 11. **Medium — Migration silently requires Git 2.40 or newer.** Historical
     attribute discovery uses `git check-attr --source`, but installation docs do

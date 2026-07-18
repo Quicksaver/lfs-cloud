@@ -1425,7 +1425,9 @@ Defer:
 > fetched refs, reporting scanned refs, planned config writes, discovered
 > objects, source fetch/upload counts, and explicitly local readiness status without
 > fetching, uploading, writing Git config, creating cache state, opening
-> metadata, or touching storage. `migrate --dry-run --purge-source-lfs` now
+> metadata, or touching storage. The default current-checkout report labels its
+> index-only scope prominently and warns that unscanned refs may reference
+> additional LFS objects. `migrate --dry-run --purge-source-lfs` now
 > includes GitHub source LFS cleanup helper text and the GitHub Support flow,
 > but withholds purge input because planning has not verified any destination
 > upload. Future purge manifests must come from a durable, integrity-verified
@@ -1635,7 +1637,7 @@ Defer:
 #### Epic 7.3: Migration Safety
 
 - [x] [T] Implement `migrate --dry-run` with no filesystem, Git config, DB, or storage writes.
-- [x] [T] `--dry-run` reports refs scanned, files touched, objects fetched, local source availability, unknown target existence, and explicitly local readiness results.
+- [x] [T] `--dry-run` reports scan scope, unscanned-ref warnings, refs scanned, files touched, objects fetched, local source availability, unknown target existence, and explicitly local readiness results.
 - [x] [T] Implement GitHub-specific `--purge-source-lfs` guidance that withholds purge input until a durable, integrity-verified migration receipt exists.
 - [x] [T] Add fixture-repo tests for current checkout, selected refs, all refs, missing objects, and dry-run no-op behavior.
 

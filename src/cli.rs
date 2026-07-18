@@ -1230,6 +1230,25 @@ impl MigrationScanMode {
             Self::AllFetchedRefs => "all-refs",
         }
     }
+
+    fn scope_label(self) -> &'static str {
+        match self {
+            Self::CurrentCheckout => "current checkout index only",
+            Self::SelectedRefs => "selected refs only",
+            Self::AllFetchedRefs => {
+                "all local branches, tags, and fetched refs for the source remote"
+            }
+        }
+    }
+
+    fn scope_warning(self) -> Option<&'static str> {
+        match self {
+            Self::CurrentCheckout => Some(
+                "other refs were not scanned and may reference additional LFS objects; use --all-refs for a full provider move",
+            ),
+            Self::SelectedRefs | Self::AllFetchedRefs => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1558,6 +1577,10 @@ where
         report.discovery.worktree_root.display()
     )?;
     writeln!(output, "  mode: {}", report.scan.mode.label())?;
+    writeln!(output, "  scope: {}", report.scan.mode.scope_label())?;
+    if let Some(warning) = report.scan.mode.scope_warning() {
+        writeln!(output, "  warning: {warning}")?;
+    }
     writeln!(
         output,
         "  source remote: {} ({})",
@@ -4451,6 +4474,11 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("lfs-cloud migrate dry-run"));
         assert!(rendered.contains("mode: current-checkout"));
+        assert!(rendered.contains("scope: current checkout index only"));
+        assert!(rendered.contains(
+            "warning: other refs were not scanned and may reference additional LFS objects"
+        ));
+        assert!(rendered.contains("use --all-refs for a full provider move"));
         assert!(rendered.contains("refs scanned: 1"));
         assert!(rendered.contains("current checkout"));
         assert!(rendered.contains("files touched: 1 would update"));

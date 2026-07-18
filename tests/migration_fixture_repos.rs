@@ -302,6 +302,13 @@ fn fixture_repo_migrate_dry_run_leaves_repo_and_cache_untouched() {
     let stdout = String::from_utf8(output.stdout).expect("dry-run output should be UTF-8");
     assert!(stdout.contains("lfs-cloud migrate dry-run"));
     assert!(stdout.contains("mode: current-checkout"));
+    assert!(stdout.contains("scope: current checkout index only"));
+    assert!(
+        stdout.contains(
+            "warning: other refs were not scanned and may reference additional LFS objects"
+        )
+    );
+    assert!(stdout.contains("use --all-refs for a full provider move"));
     assert!(stdout.contains("objects fetched:"));
     assert!(stdout.contains("1 would fetch"));
     assert!(stdout.contains("0 already local"));

@@ -354,7 +354,9 @@ all-ref planning require a non-shallow repository because a shallow clone
 cannot provide a complete inventory for those history scopes. Run
 `git fetch --unshallow` before using either mode. Current-checkout planning is
 still available in a shallow clone because it inventories only the current
-index.
+index. When neither `--ref` nor `--all-refs` is selected, the report prominently
+warns that other refs were not scanned and may reference additional LFS
+objects. Use `--all-refs` for a full provider move.
 Historical scans reuse unchanged Git tree and blob objects across commits and
 cache equivalent historical attribute queries. This keeps large selected-ref
 and all-ref plans proportional to changed tree state plus reported pointer
