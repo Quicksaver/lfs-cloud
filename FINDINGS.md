@@ -568,11 +568,29 @@ independently validated or adjudicated.
    one valid finding assessed here and no invalid finding attributable
    separately, this was high-quality, relevant feedback.
 
-6. **Medium — Graceful shutdown and transfer draining are absent.** The server
-   does not use `with_graceful_shutdown`, so termination can interrupt large
-   staged transfers and leave incomplete backend/metadata state
-   (`src/server.rs:117-133`). Handle SIGINT/SIGTERM, stop accepting requests,
-   and drain transfers for a documented bounded interval.
+6. **[DONE] Graceful shutdown and transfer draining were absent** (Medium,
+   `src/server.rs`, `README.md`, `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid
+   and actionable.** Production previously awaited `axum::serve` directly, so
+   normal process termination provided no listener shutdown or in-flight
+   transfer drain boundary. The server now handles SIGINT and SIGTERM on Unix
+   (and Ctrl+C on other supported targets), passes the signal to Axum's
+   graceful-shutdown path to stop new listener admission, and waits up to a
+   documented 30 seconds for active batch and object-transfer requests. The
+   deadline is applied outside Axum's otherwise unbounded graceful wait; after
+   it expires, `serve` returns so process shutdown terminates remaining work and
+   content-addressed clients can retry. Test-first TCP regressions prove that a
+   request already in flight completes while new connections are refused, and
+   that a permanently blocked request cannot retain the server past its drain
+   deadline. README and implementation guidance document the operational
+   contract, while the repository learning preserves the deadline-placement
+   rationale. Verification passed with `cargo fmt --all`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+   focused reviewer identified a genuine medium-severity shutdown-integrity and
+   availability flaw, recommended Axum's correct graceful-shutdown mechanism,
+   and included the essential bounded-drain requirement; with one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, operationally relevant feedback.
 
 7. **Medium — Metadata config synchronization retains stale routes and can block
    legitimate renames.** Synchronization only upserts, so a removed mapping can

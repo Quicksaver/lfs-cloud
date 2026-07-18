@@ -7,6 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    future::{Future, IntoFuture},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
@@ -65,6 +66,13 @@ const BATCH_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const BATCH_STORAGE_LOOKUP_CONCURRENCY: usize = 16;
 const AUTHORIZATION_CACHE_TTL: Duration = Duration::from_secs(15);
 const GOOGLE_ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
+const SERVER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerShutdownOutcome {
+    Drained,
+    TimedOut,
+}
 
 /// Runtime options supplied by `lfs-cloud serve`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,7 +102,8 @@ impl ServeOptions {
 /// Before binding the listener, the server refreshes credentials for every
 /// configured Google Drive provider and validates that each root is a live,
 /// writable folder. It then serves authenticated Git LFS batch and object
-/// transfer routes.
+/// transfer routes. SIGINT and SIGTERM stop new request admission and allow
+/// active transfers up to 30 seconds to finish before process shutdown.
 ///
 /// # Errors
 ///
@@ -140,9 +149,87 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
 
     println!("{}", render_server_startup_message(&urls));
 
-    axum::serve(listener, router)
-        .await
-        .map_err(|source| ServerError::Serve { source })
+    serve_with_graceful_shutdown(
+        listener,
+        router,
+        shutdown_signal(),
+        SERVER_SHUTDOWN_DRAIN_TIMEOUT,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|source| ServerError::Serve { source })
+}
+
+async fn serve_with_graceful_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown_signal: F,
+    drain_timeout: Duration,
+) -> io::Result<ServerShutdownOutcome>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (shutdown_started_sender, shutdown_started_receiver) = tokio::sync::oneshot::channel();
+    let tracked_shutdown_signal = async move {
+        shutdown_signal.await;
+        let _ = shutdown_started_sender.send(());
+    };
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(tracked_shutdown_signal)
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => result.map(|()| ServerShutdownOutcome::Drained),
+        shutdown_started = shutdown_started_receiver => {
+            if shutdown_started.is_err() {
+                return server.await.map(|()| ServerShutdownOutcome::Drained);
+            }
+
+            tracing::info!(
+                drain_timeout_seconds = drain_timeout.as_secs(),
+                "shutdown signal received; stopped accepting requests and draining active transfers"
+            );
+            match tokio::time::timeout(drain_timeout, &mut server).await {
+                Ok(result) => result.map(|()| ServerShutdownOutcome::Drained),
+                Err(_) => {
+                    tracing::warn!(
+                        drain_timeout_seconds = drain_timeout.as_secs(),
+                        "shutdown drain deadline expired; terminating remaining transfers"
+                    );
+                    Ok(ServerShutdownOutcome::TimedOut)
+                }
+            }
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(source) => {
+                    tracing::error!(%source, "failed to install SIGTERM handler");
+                    return;
+                }
+            };
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(source) = result {
+                    tracing::error!(%source, "failed to install SIGINT handler");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    if let Err(source) = tokio::signal::ctrl_c().await {
+        tracing::error!(%source, "failed to install Ctrl+C handler");
+    }
 }
 
 fn production_session_store(
@@ -3162,15 +3249,15 @@ mod tests {
         GoogleDriveCredentialSource, GoogleDriveTransferStore, LFS_AUTH_CHALLENGE,
         LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore,
         LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind,
-        UploadStagingCoordinator, UploadStagingGuardrails, advertised_server_urls,
-        authenticate_lfs_session, ensure_temp_space_for_upload_with_available_space,
-        lfs_server_router_with_sessions,
+        ServerShutdownOutcome, UploadStagingCoordinator, UploadStagingGuardrails,
+        advertised_server_urls, authenticate_lfs_session,
+        ensure_temp_space_for_upload_with_available_space, lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
         lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails,
-        production_session_store, render_server_startup_message, server_router_with_sessions,
-        stage_upload_request_body, stage_upload_request_body_with_guardrails,
-        stage_upload_request_body_with_limit, upload_staging_file_io_error,
-        upload_staging_preflight_size,
+        production_session_store, render_server_startup_message, serve_with_graceful_shutdown,
+        server_router_with_sessions, stage_upload_request_body,
+        stage_upload_request_body_with_guardrails, stage_upload_request_body_with_limit,
+        upload_staging_file_io_error, upload_staging_preflight_size,
     };
     use base64::Engine as _;
     use futures_util::stream;
@@ -4043,6 +4130,129 @@ repositories:
 
         assert_eq!(loopback.local, "http://[::1]:8080");
         assert_eq!(loopback.network, None);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_an_active_request() {
+        let request_started = Arc::new(Notify::new());
+        let release_request = Arc::new(Notify::new());
+        let router = Router::new().route(
+            "/",
+            get({
+                let request_started = request_started.clone();
+                let release_request = release_request.clone();
+                move || {
+                    let request_started = request_started.clone();
+                    let release_request = release_request.clone();
+                    async move {
+                        request_started.notify_one();
+                        release_request.notified().await;
+                        "transfer completed"
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_with_graceful_shutdown(
+            listener,
+            router,
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            Duration::from_secs(1),
+        ));
+        let request = tokio::spawn(async move {
+            reqwest::get(format!("http://{address}/"))
+                .await
+                .expect("active request should receive a response")
+                .text()
+                .await
+                .expect("active response body should be readable")
+        });
+
+        request_started.notified().await;
+        shutdown_sender
+            .send(())
+            .expect("shutdown receiver should remain active");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if tokio::net::TcpStream::connect(address).await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown should stop listener admission");
+        release_request.notify_one();
+
+        assert_eq!(
+            request.await.expect("request task should finish"),
+            "transfer completed"
+        );
+        assert_eq!(
+            server
+                .await
+                .expect("server task should finish")
+                .expect("server should shut down cleanly"),
+            ServerShutdownOutcome::Drained
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_stops_waiting_at_the_drain_deadline() {
+        let request_started = Arc::new(Notify::new());
+        let router = Router::new().route(
+            "/",
+            get({
+                let request_started = request_started.clone();
+                move || {
+                    let request_started = request_started.clone();
+                    async move {
+                        request_started.notify_one();
+                        std::future::pending::<&'static str>().await
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_with_graceful_shutdown(
+            listener,
+            router,
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            Duration::from_millis(50),
+        ));
+        let request = tokio::spawn(async move {
+            let _ = reqwest::get(format!("http://{address}/")).await;
+        });
+
+        request_started.notified().await;
+        shutdown_sender
+            .send(())
+            .expect("shutdown receiver should remain active");
+
+        assert_eq!(
+            server
+                .await
+                .expect("server task should finish")
+                .expect("deadline expiry should be a controlled shutdown"),
+            ServerShutdownOutcome::TimedOut
+        );
+        request.abort();
     }
 
     #[test]

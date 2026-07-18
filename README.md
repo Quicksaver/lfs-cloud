@@ -149,6 +149,11 @@ lfs-cloud server running
   network: http://192.168.1.25:8080
 ```
 
+On SIGINT or SIGTERM, the server stops accepting new requests and gives active
+batch and object transfers up to 30 seconds to finish. After that bounded drain
+period, the process exits even if a transfer is still incomplete; clients can
+retry interrupted content-addressed uploads or downloads after restart.
+
 ### Initialize A Repository
 
 ```bash

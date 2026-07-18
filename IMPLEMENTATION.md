@@ -254,6 +254,12 @@ size against aggregate staging capacity and keeps that weighted reservation
 with the temporary file. A live filesystem free-space check with reserved
 headroom remains a secondary defense against non-server disk use.
 
+SIGINT and SIGTERM initiate graceful server shutdown: listener admission stops
+immediately, while active batch and object-transfer requests receive a bounded
+30-second drain period. Once the deadline expires, process shutdown proceeds;
+content-addressed clients can safely retry an interrupted transfer after the
+server restarts.
+
 Each mapping also persists the repository provider's stable repository ID.
 Authorization resolves the current repository at the configured owner/name and
 denies access unless that provider ID still matches, preventing repository
