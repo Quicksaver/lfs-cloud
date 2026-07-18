@@ -586,10 +586,17 @@ lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 - objects that would be fetched from the source LFS provider
 - objects that would be uploaded to `lfs-cloud`
 - local files and config files that would be touched
-- source-provider access verification result
-- target `lfs-cloud` server access verification result
-- configured storage-provider access verification result
+- source endpoint configuration and local Git LFS availability
+- target `lfs-cloud` server TCP reachability
+- local LFS credential availability
+- configured storage credential loading
 - warnings for missing objects, unsupported purge, quota risks, or permission gaps
+
+The dry-run readiness section is intentionally local and must label that scope
+explicitly. It does not verify source repository access, target server
+authentication or repository permission, or Drive root access, because the
+dry-run must not contact remote providers. Live access validation remains a
+server startup/runtime or future execution preflight responsibility.
 
 Migration uses one explicit source Git remote, defaulting to `origin`, for
 remote-scoped LFS endpoint discovery, source fetches, and remote-tracking refs
@@ -1248,7 +1255,7 @@ A practical MVP could implement:
 - `lfs-cloud login` for GitHub OAuth and local credential setup.
 - `lfs-cloud init` for repository setup.
 - `lfs-cloud migrate` for converting an existing Git LFS clone to `lfs-cloud`.
-- `lfs-cloud migrate --dry-run` for migration planning and access verification.
+- `lfs-cloud migrate --dry-run` for migration planning and local readiness reporting.
 - Shared local content-addressed cache.
 - CoW materialization on filesystems that support it.
 - Manual `hydrate`, `dehydrate`, `gc`, and `status` commands.
@@ -1403,7 +1410,7 @@ Defer:
 > validated after upload. The `migrate --dry-run` CLI command can now build a
 > read-only migration plan for the current checkout, selected refs, or all
 > fetched refs, reporting scanned refs, planned config writes, discovered
-> objects, source fetch/upload counts, and local access-check status without
+> objects, source fetch/upload counts, and explicitly local readiness status without
 > fetching, uploading, writing Git config, creating cache state, opening
 > metadata, or touching storage. `migrate --dry-run --purge-source-lfs` now
 > includes GitHub source LFS cleanup helper text, the GitHub Support flow, and
@@ -1613,7 +1620,7 @@ Defer:
 #### Epic 7.3: Migration Safety
 
 - [x] [T] Implement `migrate --dry-run` with no filesystem, Git config, DB, or storage writes.
-- [x] [T] `--dry-run` reports refs scanned, files touched, objects fetched, objects uploaded, and access-check results.
+- [x] [T] `--dry-run` reports refs scanned, files touched, objects fetched, objects uploaded, and explicitly local readiness results.
 - [x] [T] Implement GitHub-specific `--purge-source-lfs` helper report and support-flow instructions.
 - [x] [T] Add fixture-repo tests for current checkout, selected refs, all refs, missing objects, and dry-run no-op behavior.
 

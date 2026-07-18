@@ -1564,12 +1564,36 @@ independently validated or adjudicated.
    durable, integrity-verified completion receipt and distinguish planned from
    uploaded objects.
 
-6. **High — Migration access checks can report success without checking
-   repository or storage access.** Target readiness is TCP-only and storage
-   readiness can stop at credential parsing (`src/cli.rs:1009-1053`,
-   `src/cli.rs:1097-1112`, `IMPLEMENTATION.md:498-501`). Rename these checks to
-   their actual scope or add real read-only GitHub permission, server readiness,
-   and Drive root probes.
+6. **[DONE] Migration access checks can report success without checking
+   repository or storage access** (High, `src/cli.rs`, `README.md`,
+   `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and actionable.** Migration
+   planning previously grouped source endpoint discovery, target TCP
+   reachability, local credential lookup, config mapping, and Drive credential
+   parsing under `access checks`, with generic `source`, `target`, `auth`, and
+   `storage` rows. An `ok` target or storage row therefore appeared to prove
+   remote access that had never been attempted. Adding GitHub permission and
+   Drive root probes would conflict with the command's existing guarantee that
+   `--dry-run` does not contact remote providers, so the supported scoping
+   remediation was applied instead. The report now calls the section
+   `local readiness checks (no remote access probes)` and uses precise
+   `source-config`, `server-tcp`, `lfs-credential`, and
+   `storage-credential` labels. Successful rows explicitly state that source
+   repository access, target authentication/repository permission, server
+   credential acceptance, and Drive root access were not probed. Internal
+   access-check types and helpers were renamed around readiness, and README,
+   implementation guidance, checklist wording, and the repository learning now
+   preserve the local-only boundary. A test-first regression failed against the
+   old report and now asserts the scoped heading, labels, and unverified-access
+   disclosures; the warning-path assertion also names the TCP probe precisely.
+   Verification passed with `yarn lint:fix`, `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine high-severity
+   operator-safety ambiguity and offered both valid remediation directions. The
+   proposed live probes did not fit the established no-provider-contact dry-run
+   contract, but the alternative precise-labeling recommendation addressed the
+   issue completely; with one valid finding and no invalid finding attributable
+   separately, this was high-quality, relevant feedback.
 
 7. **Medium — Dry-run upload counts ignore objects already present at the
    destination.** Planning reports every available source object as an upload,

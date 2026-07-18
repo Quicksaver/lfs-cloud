@@ -1176,10 +1176,10 @@ where
     let availability =
         check_local_migration_objects(start_dir, scan.objects.iter(), cache_layout.as_ref())?;
     let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
-    let access_checks = migration_access_checks(
+    let readiness_checks = migration_readiness_checks(
         &config_path,
         &repository,
-        MigrationTargetAccess {
+        MigrationTargetReadiness {
             server_url: &command.server,
             lfs_url: &route.lfs_url,
         },
@@ -1197,7 +1197,7 @@ where
         availability,
         route,
         config_path,
-        access_checks,
+        readiness_checks,
         would_touch_files: migration_dry_run_touched_files(&repository),
         source_purge,
     };
@@ -1239,20 +1239,20 @@ struct MigrationDryRunReport {
     availability: LocalMigrationObjectAvailability,
     route: LfsInitRoute,
     config_path: PathBuf,
-    access_checks: Vec<MigrationAccessCheck>,
+    readiness_checks: Vec<MigrationReadinessCheck>,
     would_touch_files: Vec<PathBuf>,
     source_purge: Option<MigrationSourcePurgeReport>,
 }
 
 #[derive(Debug)]
-struct MigrationAccessCheck {
+struct MigrationReadinessCheck {
     name: &'static str,
     level: StatusLevel,
     message: String,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct MigrationTargetAccess<'a> {
+struct MigrationTargetReadiness<'a> {
     server_url: &'a str,
     lfs_url: &'a str,
 }
@@ -1329,35 +1329,35 @@ fn dedupe_lfs_objects<'a>(objects: impl IntoIterator<Item = &'a LfsObject>) -> V
         .collect()
 }
 
-fn migration_access_checks<P, A, S>(
+fn migration_readiness_checks<P, A, S>(
     config_path: &Path,
     repository: &GitRepository,
-    target: MigrationTargetAccess<'_>,
+    target: MigrationTargetReadiness<'_>,
     discovery: &GitLfsMigrationDiscovery,
     probe_server: &mut P,
     lookup_credential: &mut A,
     validate_storage: &mut S,
-) -> Vec<MigrationAccessCheck>
+) -> Vec<MigrationReadinessCheck>
 where
     P: FnMut(&str) -> CliResult<()>,
     A: FnMut(&str) -> CliResult<()>,
     S: FnMut(&StorageProviderConfig) -> CliResult<()>,
 {
     let mut checks = Vec::new();
-    checks.push(migration_source_access_check(discovery));
-    checks.push(migration_target_access_check(
+    checks.push(migration_source_readiness_check(discovery));
+    checks.push(migration_target_readiness_check(
         target.server_url,
         probe_server,
     ));
 
     checks.push(match lookup_credential(target.lfs_url) {
-        Ok(()) => MigrationAccessCheck {
-            name: "auth",
+        Ok(()) => MigrationReadinessCheck {
+            name: "lfs-credential",
             level: StatusLevel::Ok,
-            message: "local LFS credential found".to_owned(),
+            message: "local LFS credential found; server acceptance not probed".to_owned(),
         },
-        Err(error) => MigrationAccessCheck {
-            name: "auth",
+        Err(error) => MigrationReadinessCheck {
+            name: "lfs-credential",
             level: StatusLevel::Warning,
             message: format!("{error}"),
         },
@@ -1365,14 +1365,14 @@ where
 
     match ServerConfig::load_from_path(config_path) {
         Ok(config) => {
-            checks.push(MigrationAccessCheck {
+            checks.push(MigrationReadinessCheck {
                 name: "config",
                 level: StatusLevel::Ok,
                 message: format!("loaded {}", config_path.display()),
             });
-            migration_config_access_checks(&mut checks, &config, repository, validate_storage);
+            migration_config_readiness_checks(&mut checks, &config, repository, validate_storage);
         }
-        Err(error) => checks.push(MigrationAccessCheck {
+        Err(error) => checks.push(MigrationReadinessCheck {
             name: "config",
             level: StatusLevel::Warning,
             message: format!("{error}"),
@@ -1382,54 +1382,65 @@ where
     checks
 }
 
-fn migration_target_access_check<P>(server_url: &str, probe_server: &mut P) -> MigrationAccessCheck
+fn migration_target_readiness_check<P>(
+    server_url: &str,
+    probe_server: &mut P,
+) -> MigrationReadinessCheck
 where
     P: FnMut(&str) -> CliResult<()>,
 {
     let display = redacted_url_for_display(server_url);
     match probe_server(server_url) {
-        Ok(()) => MigrationAccessCheck {
-            name: "target",
+        Ok(()) => MigrationReadinessCheck {
+            name: "server-tcp",
             level: StatusLevel::Ok,
-            message: format!("{display} is reachable"),
+            message: format!(
+                "{display} TCP endpoint is reachable; server authentication and repository access not probed"
+            ),
         },
-        Err(error) => MigrationAccessCheck {
-            name: "target",
+        Err(error) => MigrationReadinessCheck {
+            name: "server-tcp",
             level: StatusLevel::Warning,
-            message: format!("{display} is unreachable: {error}"),
+            message: format!(
+                "{display} TCP endpoint is unreachable: {error}; server authentication and repository access not probed"
+            ),
         },
     }
 }
 
-fn migration_source_access_check(discovery: &GitLfsMigrationDiscovery) -> MigrationAccessCheck {
+fn migration_source_readiness_check(
+    discovery: &GitLfsMigrationDiscovery,
+) -> MigrationReadinessCheck {
     match (&discovery.source_endpoint, discovery.installation.installed) {
-        (Some(endpoint), true) => MigrationAccessCheck {
-            name: "source",
+        (Some(endpoint), true) => MigrationReadinessCheck {
+            name: "source-config",
             level: StatusLevel::Ok,
             message: format!(
-                "{} ({})",
+                "{} ({}); source repository access not probed",
                 redacted_url_for_display(&endpoint.url),
                 source_endpoint_source_label(endpoint.source)
             ),
         },
-        (Some(endpoint), false) => MigrationAccessCheck {
-            name: "source",
+        (Some(endpoint), false) => MigrationReadinessCheck {
+            name: "source-config",
             level: StatusLevel::Warning,
             message: format!(
-                "{} configured, but git lfs is not available for source fetches",
+                "{} configured, but git lfs is not available for source fetches; source repository access not probed",
                 redacted_url_for_display(&endpoint.url)
             ),
         },
-        (None, _) => MigrationAccessCheck {
-            name: "source",
+        (None, _) => MigrationReadinessCheck {
+            name: "source-config",
             level: StatusLevel::Warning,
-            message: "source Git LFS endpoint is not configured".to_owned(),
+            message:
+                "source Git LFS endpoint is not configured; source repository access not probed"
+                    .to_owned(),
         },
     }
 }
 
-fn migration_config_access_checks<S>(
-    checks: &mut Vec<MigrationAccessCheck>,
+fn migration_config_readiness_checks<S>(
+    checks: &mut Vec<MigrationReadinessCheck>,
     config: &ServerConfig,
     repository: &GitRepository,
     validate_storage: &mut S,
@@ -1441,7 +1452,7 @@ fn migration_config_access_checks<S>(
         &repository.remote.owner,
         &repository.remote.name,
     ) else {
-        checks.push(MigrationAccessCheck {
+        checks.push(MigrationReadinessCheck {
             name: "mapping",
             level: StatusLevel::Warning,
             message: format!(
@@ -1452,15 +1463,15 @@ fn migration_config_access_checks<S>(
         return;
     };
 
-    checks.push(MigrationAccessCheck {
+    checks.push(MigrationReadinessCheck {
         name: "mapping",
         level: StatusLevel::Ok,
         message: format!("{} -> {}", mapping.id, mapping.storage_provider),
     });
 
     let Some(storage) = config.storage_providers.get(&mapping.storage_provider) else {
-        checks.push(MigrationAccessCheck {
-            name: "storage",
+        checks.push(MigrationReadinessCheck {
+            name: "storage-credential",
             level: StatusLevel::Warning,
             message: format!(
                 "mapping {} references unknown storage provider {}",
@@ -1471,17 +1482,17 @@ fn migration_config_access_checks<S>(
     };
 
     checks.push(match validate_storage(storage) {
-        Ok(()) => MigrationAccessCheck {
-            name: "storage",
+        Ok(()) => MigrationReadinessCheck {
+            name: "storage-credential",
             level: StatusLevel::Ok,
             message: format!(
-                "{} {} credential is configured",
+                "{} {} credential loads locally; Drive root access not probed",
                 storage.provider_type(),
                 storage.id()
             ),
         },
-        Err(error) => MigrationAccessCheck {
-            name: "storage",
+        Err(error) => MigrationReadinessCheck {
+            name: "storage-credential",
             level: StatusLevel::Warning,
             message: format!("{error}"),
         },
@@ -1618,8 +1629,11 @@ where
         output,
         "  objects uploaded: {available_count} ready to upload, {fetch_count} after fetch"
     )?;
-    writeln!(output, "  access checks:")?;
-    for check in &report.access_checks {
+    writeln!(
+        output,
+        "  local readiness checks (no remote access probes):"
+    )?;
+    for check in &report.readiness_checks {
         writeln!(
             output,
             "    {:<10} {:<7} {}",
@@ -4438,10 +4452,14 @@ mod tests {
         assert!(rendered.contains("objects discovered: 1"));
         assert!(rendered.contains("objects fetched: 0 would fetch, 1 already local"));
         assert!(rendered.contains("objects uploaded: 1 ready to upload, 0 after fetch"));
-        assert!(rendered.contains("access checks:"));
-        assert!(rendered.contains("target     ok"));
-        assert!(rendered.contains("auth       ok"));
-        assert!(rendered.contains("storage    ok"));
+        assert!(rendered.contains("local readiness checks (no remote access probes):"));
+        assert!(rendered.contains("source-config"));
+        assert!(rendered.contains("server-tcp"));
+        assert!(rendered.contains("lfs-credential"));
+        assert!(rendered.contains("storage-credential"));
+        assert!(rendered.contains("source repository access not probed"));
+        assert!(rendered.contains("server authentication and repository access not probed"));
+        assert!(rendered.contains("Drive root access not probed"));
         assert!(rendered.contains(object.oid.as_hex()));
     }
 
@@ -4577,7 +4595,7 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("objects fetched: 1 would fetch, 0 already local"));
         assert!(rendered.contains("objects uploaded: 0 ready to upload, 1 after fetch"));
-        assert!(rendered.contains("target     warning"));
+        assert!(rendered.contains("server-tcp warning"));
     }
 
     #[test]
