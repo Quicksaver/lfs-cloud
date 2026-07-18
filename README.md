@@ -67,8 +67,10 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > current checkout, selected refs, or all fetched refs without fetching,
 > uploading, writing Git config, creating cache state, opening metadata, or
 > touching storage. When requested with `--purge-source-lfs`, the dry-run
-> includes a GitHub-specific source LFS cleanup helper report with support-flow
-> instructions and migrated object IDs instead of attempting automatic deletion.
+> includes GitHub-specific source LFS cleanup guidance but withholds purge
+> input because planning does not prove that any object was uploaded. A future
+> execution path must generate purge input only from a durable,
+> integrity-verified migration receipt.
 > Full non-dry-run migration execution and release packaging are still planned.
 
 ## Why
@@ -351,8 +353,10 @@ cannot provide a complete inventory for those history scopes. Run
 still available in a shallow clone because it inventories only the current
 index.
 Use `--purge-source-lfs` with `--dry-run` to include GitHub Support cleanup
-instructions and object IDs/sizes for a post-migration source LFS purge
-request.
+guidance. The dry-run labels discovered objects as planned candidates and does
+not emit a purge manifest. Planned OIDs and sizes are not proof that the
+destination received verified bytes; purge input must come from a future
+durable, integrity-verified migration receipt.
 
 Full non-dry-run migration execution is not implemented yet. It is expected to:
 
@@ -374,7 +378,9 @@ For an intentional fork-to-target migration:
 lfs-cloud migrate --server http://127.0.0.1:8080 --source-remote upstream --all-refs --dry-run --allow-cross-remote
 ```
 
-For GitHub, automatic purge is not expected to be possible through a normal API. The command should instead produce a report and helper text for GitHub Support.
+For GitHub, automatic purge is not expected to be possible through a normal
+API. The dry-run produces helper text for GitHub Support, but no object list
+that could be mistaken for safe purge input.
 
 ## Server Configuration
 

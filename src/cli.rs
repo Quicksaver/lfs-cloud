@@ -243,11 +243,12 @@ struct MigrateCommand {
     #[arg(long, required = true)]
     dry_run: bool,
 
-    /// Include GitHub source-LFS purge helper text in the migration report.
+    /// Include GitHub source-LFS purge guidance in the migration report.
     ///
     /// GitHub does not expose a normal self-service API for arbitrary LFS
     /// object deletion, so this flag reports support-flow instructions instead
-    /// of attempting source-provider mutation.
+    /// of attempting source-provider mutation or emitting unverified purge
+    /// input from a dry-run plan.
     #[arg(long)]
     purge_source_lfs: bool,
 }
@@ -1677,7 +1678,7 @@ where
             writeln!(output, "    automatic purge: unsupported")?;
             writeln!(
                 output,
-                "    report objects: {} ({} bytes)",
+                "    planned candidates: {} ({} bytes; upload not verified)",
                 report.scan.objects.len(),
                 total_bytes
             )?;
@@ -1692,20 +1693,16 @@ where
             )?;
             writeln!(
                 output,
-                "    instructions: use GitHub's repository support flow or Virtual Agent, then provide the object IDs and sizes from this report if requested."
+                "    instructions: use GitHub's repository support flow or Virtual Agent only after migration execution verifies every object at the destination."
             )?;
             writeln!(
                 output,
-                "    purge manifest: complete object list for GitHub Support"
+                "    purge manifest: unavailable during dry-run planning"
             )?;
-            for object in &report.scan.objects {
-                writeln!(
-                    output,
-                    "      sha256:{} ({} bytes)",
-                    object.oid,
-                    object.size.bytes()
-                )?;
-            }
+            writeln!(
+                output,
+                "    requirement: generate purge input only from a durable, integrity-verified migration receipt; planned objects are not proof of upload."
+            )?;
         }
         MigrationSourcePurgeReport::NotConfigured => {
             writeln!(output, "    provider: {SOURCE_PROVIDER_UNKNOWN_LABEL}")?;
@@ -4600,7 +4597,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_dry_run_reports_github_purge_support_flow_when_requested() {
+    fn migrate_dry_run_withholds_unverified_github_purge_manifest() {
         if !git_is_available() {
             return;
         }
@@ -4657,7 +4654,15 @@ mod tests {
                 .contains("https://support.github.com/contact-next/product-selection/repositories")
         );
         assert!(rendered.contains("suggested subject: Purge Git LFS objects after migration"));
-        assert!(rendered.contains("purge manifest: complete object list for GitHub Support"));
+        assert!(rendered.contains("planned candidates: 1"));
+        assert!(rendered.contains("upload not verified"));
+        assert!(rendered.contains("purge manifest: unavailable during dry-run planning"));
+        assert!(rendered.contains("durable, integrity-verified migration receipt"));
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("      sha256:"))
+        );
         assert!(rendered.contains(object.oid.as_hex()));
         assert!(rendered.contains(&format!("{} bytes", object.size.bytes())));
     }
@@ -4776,7 +4781,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_dry_run_purge_manifest_lists_all_objects() {
+    fn migrate_dry_run_purge_report_does_not_bypass_object_listing_limit() {
         if !git_is_available() {
             return;
         }
@@ -4826,14 +4831,15 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("    sha256:") && !line.starts_with("      sha256:"))
             .count();
-        let manifest_count = rendered
-            .lines()
-            .filter(|line| line.starts_with("      sha256:"))
-            .count();
         assert!(rendered.contains("... 1 more objects omitted"));
         assert_eq!(main_listing_count, super::MIGRATION_OBJECT_REPORT_LIMIT);
-        assert!(rendered.contains("purge manifest: complete object list for GitHub Support"));
-        assert_eq!(manifest_count, super::MIGRATION_OBJECT_REPORT_LIMIT + 1);
+        assert!(rendered.contains("planned candidates: 101"));
+        assert!(rendered.contains("purge manifest: unavailable during dry-run planning"));
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("      sha256:"))
+        );
     }
 
     #[test]

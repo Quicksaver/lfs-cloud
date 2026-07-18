@@ -1579,12 +1579,36 @@ independently validated or adjudicated.
    one valid finding assessed here and no invalid finding attributable
    separately, this was high-quality, safety-relevant feedback.
 
-5. **High — Purge-manifest candidates are labeled complete without a verified
-   migration receipt.** The CLI can present a destructive follow-up inventory
-   based on planning rather than confirmed upload state (`src/cli.rs:1250-1305`,
-   `src/cli.rs:3510-3566`, `README.md:247-249`). Generate purge input only from a
-   durable, integrity-verified completion receipt and distinguish planned from
-   uploaded objects.
+5. **[DONE] Purge-manifest candidates were labeled complete without a verified
+   migration receipt** (High, `src/cli.rs`, `README.md`, `IMPLEMENTATION.md`,
+   and `AGENTS.md`): **Valid and actionable.** The only implemented migration
+   command is a read-only dry run that performs no upload or destination
+   integrity check, yet its GitHub cleanup section repeated every discovered
+   OID and size in an uncapped list labeled as a complete purge manifest. That
+   output could be submitted for destructive source cleanup despite proving
+   only planned scope. Dry-run source-purge guidance now labels the count and
+   bytes as planned candidates whose uploads are unverified, withholds the
+   purge manifest and its per-object list entirely, and states that future
+   purge input must come only from a durable completion receipt that
+   integrity-verifies every destination object. The ordinary discovery section
+   remains available as a capped planning aid and is no longer bypassed by a
+   second purge-oriented inventory. Test-first regressions failed against the
+   old output and now prove both that a GitHub dry run exposes the receipt
+   requirement without a purge-manifest object list and that requesting purge
+   guidance cannot bypass the normal object-report limit. README,
+   implementation guidance, the migration checklist, CLI help, and the
+   repository learning now preserve the planned-versus-uploaded boundary.
+   Verification passed with `cargo fmt --all`, `yarn lint:fix`, the focused
+   migration dry-run tests, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, `cargo test --all-targets -- --test-threads=1` (619 passed,
+   3 ignored across targets), `cargo test --doc` (38 passed), and
+   `git diff --check`. The focused reviewer identified a genuine high-severity
+   source-data-loss risk, traced it to the precise destructive handoff, and
+   prescribed the correct durable receipt boundary. Because full migration
+   execution does not yet exist, withholding purge input is the only current
+   implementation that can satisfy that boundary. With one valid finding and
+   no invalid finding attributable separately, this was high-quality,
+   safety-critical feedback.
 
 6. **[DONE] Migration access checks can report success without checking
    repository or storage access** (High, `src/cli.rs`, `README.md`,

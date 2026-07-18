@@ -655,7 +655,12 @@ all refs
 
 The safest default should be to migrate the current checkout and warn if other refs still reference objects that have not been copied. For a full provider move, the user should choose an explicit all-refs mode. In all-refs mode, the command should fetch refs first, enumerate LFS pointers across those refs, fetch missing object bytes from the source LFS provider, and upload every discovered object to `lfs-cloud`.
 
-The `--purge-source-lfs` option should be best-effort and provider-dependent. It should never claim to guarantee deletion unless the source provider exposes a supported object-deletion API and the operation succeeds.
+The `--purge-source-lfs` option should be best-effort and provider-dependent.
+It should never claim to guarantee deletion unless the source provider exposes
+a supported object-deletion API and the operation succeeds. A plan is not a
+migration receipt: purge input must include only objects proven uploaded and
+integrity-verified by a durable completion record. Dry-run output may identify
+planned candidates, but must not emit a purge manifest.
 
 For GitHub specifically, this is an important limitation:
 
@@ -670,7 +675,8 @@ Removing LFS pointers from Git history or changing `.lfsconfig` does not necessa
 1. Detect that the source provider is GitHub.
 2. Explain that automatic purge is not available.
 3. Optionally disable GitHub LFS for the repository if appropriate and supported.
-4. Produce a report of migrated LFS object IDs and sizes.
+4. Produce a purge manifest of migrated LFS object IDs and sizes only from a
+   durable, integrity-verified completion receipt.
 5. Provide instructions for support/manual cleanup.
 ```
 
@@ -1414,8 +1420,10 @@ Defer:
 > objects, source fetch/upload counts, and explicitly local readiness status without
 > fetching, uploading, writing Git config, creating cache state, opening
 > metadata, or touching storage. `migrate --dry-run --purge-source-lfs` now
-> includes GitHub source LFS cleanup helper text, the GitHub Support flow, and
-> migrated object IDs/sizes without attempting automatic source deletion.
+> includes GitHub source LFS cleanup helper text and the GitHub Support flow,
+> but withholds purge input because planning has not verified any destination
+> upload. Future purge manifests must come from a durable, integrity-verified
+> migration receipt.
 > Fixture-repository tests now cover hydrated and sparse current checkouts,
 > selected refs, all refs, shallow-history rejection, missing objects, and CLI dry-run no-op migration
 > behavior. A local
@@ -1622,7 +1630,7 @@ Defer:
 
 - [x] [T] Implement `migrate --dry-run` with no filesystem, Git config, DB, or storage writes.
 - [x] [T] `--dry-run` reports refs scanned, files touched, objects fetched, objects uploaded, and explicitly local readiness results.
-- [x] [T] Implement GitHub-specific `--purge-source-lfs` helper report and support-flow instructions.
+- [x] [T] Implement GitHub-specific `--purge-source-lfs` guidance that withholds purge input until a durable, integrity-verified migration receipt exists.
 - [x] [T] Add fixture-repo tests for current checkout, selected refs, all refs, missing objects, and dry-run no-op behavior.
 
 ### Phase 8: Local Cache And Materialization
