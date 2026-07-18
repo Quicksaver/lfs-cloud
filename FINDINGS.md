@@ -1208,18 +1208,44 @@ independently validated or adjudicated.
    assessed here and no invalid finding attributable separately, this was
    high-quality, security- and integrity-relevant feedback.
 
-2. **High — CLI cleanliness verification is tautological, accepts unrelated
-   files, and preserves bytes only in the private cache.** The current bytes
-   define the expected identity, so dirty edits, untracked files, outside paths,
-   and non-LFS files all pass. A later `git lfs push` can then report the object
-   missing, and losing the private cache loses the only preserved bytes
-   (`src/cli.rs:665-690`, `src/cli.rs:743-760`, `src/cli.rs:1401-1406`,
-   `src/cli.rs:1681-1772`, `src/cli.rs:4216-4267`,
-   `IMPLEMENTATION.md:1161-1163`, `IMPLEMENTATION.md:1420`). Require a contained,
-   Git-tracked `filter=lfs` path and derive expected identity from the index
-   pointer. If intentional new-content ingestion is supported, make it an
-   explicit mode that publishes into Git LFS media or upload state. Add a
-   dehydrate-to-real-`git lfs push` test.
+2. **[DONE] CLI dehydration accepted unrelated or dirty files and preserved
+   bytes only in the private cache** (High, `src/cli.rs`,
+   `scripts/manual/verify-local-cache-cli.sh`, `README.md`,
+   `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and actionable.** The CLI
+   previously hashed the selected worktree bytes to create the expected object
+   and immediately passed that same identity to the cache verifier. That check
+   was tautological, so dirty edits, untracked files, non-LFS files, and paths
+   outside the current worktree could all be converted into pointers. The CLI
+   now discovers the current repository once, requires each selected path to be
+   contained within its worktree, confirms the exact path has one stage-zero
+   Git index entry and an effective `filter=lfs` attribute, bounds and parses
+   that index blob as a Git LFS pointer, and uses only the pointer's OID and size
+   as the expected identity. The existing cache dehydration verifier therefore
+   rejects changed worktree bytes instead of blessing their newly calculated
+   hash. After successful dehydration, verified cache bytes are also
+   materialized into the repository's configured Git LFS media store, including
+   linked-worktree and custom `lfs.storage` resolution, so a later
+   `git lfs push` does not depend on the private shared cache. Existing matching
+   pointers remain idempotent; when their shared cache bytes exist, those bytes
+   can repair missing repository media. Regression coverage proves valid
+   indexed LFS content dehydrates, dirty content remains untouched and
+   uncached, untracked and non-LFS paths are rejected, outside paths are
+   rejected, and a real Git LFS repository whose local media was removed can
+   dehydrate from shared cache and successfully push the object to a local bare
+   remote. The manual cache verifier now exercises the same missing-media
+   recovery and real `git lfs push` boundary. README, implementation guidance,
+   and the repository learning document the index-identity and dual-publication
+   contract. Verification passed with `yarn lint:fix`, `cargo fmt --all`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (577 passed, 3 ignored across targets),
+   `cargo test --doc` (38 passed),
+   `scripts/manual/verify-local-cache-cli.sh`, and `git diff --check`. The
+   focused reviewer identified a genuine high-severity local data-loss and
+   repository-integrity flaw, traced both the tautological identity check and
+   missing Git LFS publication boundary, and requested the decisive real-push
+   regression. With one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, security- and
+   integrity-relevant feedback.
 
 3. **Medium — Hydration and dehydration can overwrite a concurrent edit after
    their final check.** Each checks a path and then performs an unconditional

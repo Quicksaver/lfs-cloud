@@ -70,6 +70,7 @@ git -C "$repo_dir" add .gitattributes asset/model.bin
 git -C "$repo_dir" commit --quiet -m "Add Git LFS fixture"
 git -C "$repo_dir" show HEAD:asset/model.bin >"$pointer_file"
 cp "$pointer_file" "$repo_dir/asset/model.bin"
+rm -rf "$repo_dir/.git/lfs/objects"
 
 (
   cd "$repo_dir"
@@ -88,9 +89,16 @@ cmp "$payload_file" "$repo_dir/asset/model.bin" >/dev/null
 oid="$(cat "$oid_file")"
 cmp "$payload_file" "$cache_root/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
 cmp "$pointer_file" "$repo_dir/asset/model.bin" >/dev/null
+cmp "$payload_file" "$repo_dir/.git/lfs/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
+
+git -C "$tmp_dir" init --quiet --bare lfs-remote.git
+git -C "$repo_dir" remote add lfs-verifier "$tmp_dir/lfs-remote.git"
+git -C "$repo_dir" lfs push lfs-verifier HEAD
+cmp "$payload_file" "$tmp_dir/lfs-remote.git/lfs/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
+
 grep -F "hydrated" "$tmp_dir/hydrate-output" >/dev/null
 grep -F "asset/model.bin" "$tmp_dir/hydrate-output" >/dev/null
 grep -F "dehydrated" "$tmp_dir/dehydrate-output" >/dev/null
 grep -F "asset/model.bin" "$tmp_dir/dehydrate-output" >/dev/null
 
-echo "lfs-cloud hydrate/dehydrate verified against the shared local cache"
+echo "lfs-cloud hydrate/dehydrate and Git LFS push verified"

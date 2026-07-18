@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::{
     collections::BTreeSet,
     ffi::OsString,
-    fs::{self, File},
+    fs,
     future::Future,
     io::{self, BufRead, IsTerminal, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
@@ -23,7 +23,6 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use reqwest::{Client, StatusCode as HttpStatusCode, redirect::Policy};
-use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
@@ -31,8 +30,8 @@ use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitCredentialRejection,
     GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers, GitLfsMigrationDiscovery,
     GitLfsSourceEndpointSource, GitRepository, GoogleDriveCredentialLoader,
-    GoogleDriveStorageConfig, LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsObjectSize,
-    LfsOid, LfsPointer, LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
+    GoogleDriveStorageConfig, LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsPointer,
+    LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
     LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
     LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
     LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
@@ -1080,14 +1079,17 @@ where
 {
     let layout = local_cache_layout(command.cache_root)?;
     let start_dir = start_dir.as_ref();
-    register_current_worktree(&layout, start_dir)?;
+    let repository = GitRepository::discover(start_dir)?;
+    register_worktree(&layout, &repository)?;
+    let git_lfs_objects_dir = git_lfs_objects_dir(&repository)?;
 
     for path in command.paths {
         let path = resolve_cli_path(start_dir, &path);
-        let object = object_for_dehydration_path(&path)?;
+        let object = indexed_lfs_object_for_dehydration(&repository.worktree_root, &path)?;
         let dehydration = layout
             .dehydrate_file(&object, &path)
             .map_err(local_cache_cli_error)?;
+        publish_dehydrated_object_to_git_lfs(&layout, &git_lfs_objects_dir, &dehydration)?;
         write_dehydrate_result(output, &dehydration).map_err(output_error)?;
     }
 
@@ -1689,11 +1691,18 @@ fn is_git_worktree_discovery_error(error: &CliError) -> bool {
 
 fn register_current_worktree(layout: &LocalCacheLayout, start_dir: &Path) -> CliResult<()> {
     let repository = GitRepository::discover(start_dir)?;
+    register_worktree(layout, &repository)
+}
+
+fn register_worktree(layout: &LocalCacheLayout, repository: &GitRepository) -> CliResult<()> {
     let repository_id = repository.remote.repository_label();
     let git_dir = repository.git_dir_path()?;
-    let registration =
-        LocalCacheWorktreeRegistration::new(repository_id, repository.worktree_root, git_dir)
-            .map_err(local_cache_cli_error)?;
+    let registration = LocalCacheWorktreeRegistration::new(
+        repository_id,
+        repository.worktree_root.clone(),
+        git_dir,
+    )
+    .map_err(local_cache_cli_error)?;
 
     layout
         .register_worktree(registration)
@@ -2292,98 +2301,241 @@ fn read_current_checkout_pointer_candidate(path: &Path) -> CliResult<Option<LfsP
     Ok(LfsPointer::parse(contents).ok())
 }
 
-fn object_for_dehydration_path(path: &Path) -> CliResult<LfsObject> {
-    let metadata = fs::metadata(path).map_err(|source| CliError::Io {
-        context: format!("failed to inspect dehydration path {}", path.display()),
+fn indexed_lfs_object_for_dehydration(worktree_root: &Path, path: &Path) -> CliResult<LfsObject> {
+    let relative_path = dehydration_relative_path(worktree_root, path)?;
+    require_lfs_filter(worktree_root, &relative_path, path)?;
+    let blob_oid = index_blob_oid(worktree_root, &relative_path, path)?;
+    let pointer = read_index_lfs_pointer(worktree_root, &blob_oid, path)?;
+
+    Ok(pointer.object)
+}
+
+fn dehydration_relative_path(worktree_root: &Path, path: &Path) -> CliResult<PathBuf> {
+    let root = dunce::canonicalize(worktree_root).map_err(|source| CliError::Io {
+        context: format!(
+            "failed to resolve Git worktree root {}",
+            worktree_root.display()
+        ),
         source,
     })?;
-    if !metadata.is_file() {
-        return Err(CliError::InvalidArguments {
-            message: format!("dehydration path is not a file: {}", path.display()),
+    let parent = path.parent().ok_or_else(|| CliError::InvalidArguments {
+        message: format!(
+            "dehydration path must be contained in the current Git worktree: {}",
+            path.display()
+        ),
+    })?;
+    let parent = dunce::canonicalize(parent).map_err(|source| CliError::Io {
+        context: format!("failed to resolve dehydration path {}", path.display()),
+        source,
+    })?;
+    let relative_parent = parent
+        .strip_prefix(&root)
+        .map_err(|_| CliError::InvalidArguments {
+            message: format!(
+                "dehydration path must be contained in the current Git worktree: {}",
+                path.display()
+            ),
+        })?;
+    let file_name = path.file_name().ok_or_else(|| CliError::InvalidArguments {
+        message: format!("dehydration path is not a file: {}", path.display()),
+    })?;
+
+    Ok(relative_parent.join(file_name))
+}
+
+fn require_lfs_filter(
+    worktree_root: &Path,
+    relative_path: &Path,
+    display_path: &Path,
+) -> CliResult<()> {
+    let output = ProcessCommand::new("git")
+        .args(["check-attr", "-z", "filter", "--"])
+        .arg(relative_path)
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: "failed to start git check-attr -z filter".to_owned(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(CliError::ExternalCommand {
+            command: "git check-attr -z filter -- <path>".to_owned(),
+            status: process_status_text(output.status),
+            stderr: sanitized_external_stderr(&output.stderr),
         });
     }
 
-    let mut file = File::open(path).map_err(|source| CliError::Io {
-        context: format!("failed to open dehydration path {}", path.display()),
-        source,
-    })?;
-
-    object_for_dehydration_file(path, &mut file, metadata.len())
-}
-
-fn object_for_dehydration_file(path: &Path, file: &mut File, size: u64) -> CliResult<LfsObject> {
-    if size > MAX_CLI_POINTER_CANDIDATE_SIZE {
-        return hash_file_object_from_reader(path, file);
-    }
-
-    let mut contents = Vec::new();
-    Read::by_ref(file)
-        .take(MAX_CLI_POINTER_CANDIDATE_SIZE + 1)
-        .read_to_end(&mut contents)
-        .map_err(|source| CliError::Io {
-            context: format!("failed to read dehydration path {}", path.display()),
-            source,
-        })?;
-    if contents.len() as u64 > MAX_CLI_POINTER_CANDIDATE_SIZE {
-        return hash_file_object_with_prefix(path, &contents, file);
-    }
-
-    // Path-only dehydrate has no separate expected object identity, so small
-    // valid pointer files are accepted as already dehydrated before hashing.
-    // Larger files are treated as content to keep pointer probing bounded.
-    if let Ok(contents) = std::str::from_utf8(&contents)
-        && let Ok(pointer) = LfsPointer::parse(contents)
+    let mut fields = output.stdout.split(|byte| *byte == b'\0');
+    let returned_path = fields.next();
+    let attribute = fields.next();
+    let value = fields.next();
+    let terminator = fields.next();
+    if returned_path.is_none()
+        || attribute != Some(&b"filter"[..])
+        || value != Some(&b"lfs"[..])
+        || terminator != Some(&[][..])
+        || fields.next().is_some()
     {
-        return Ok(pointer.object);
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "dehydration path must be tracked with filter=lfs: {}",
+                display_path.display()
+            ),
+        });
     }
 
-    hash_file_object_with_prefix(path, &contents, file)
+    Ok(())
 }
 
-fn hash_file_object_from_reader(path: &Path, file: &mut File) -> CliResult<LfsObject> {
-    hash_file_object_with_prefix(path, &[], file)
-}
-
-fn hash_file_object_with_prefix(
-    path: &Path,
-    prefix: &[u8],
-    file: &mut File,
-) -> CliResult<LfsObject> {
-    let mut hasher = Sha256::new();
-    let mut size = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-
-    if !prefix.is_empty() {
-        hasher.update(prefix);
-        size = u64::try_from(prefix.len()).expect("pointer candidate size fits u64");
-    }
-
-    loop {
-        let bytes_read = file.read(&mut buffer).map_err(|source| CliError::Io {
-            context: format!("failed to read dehydration path {}", path.display()),
+fn index_blob_oid(
+    worktree_root: &Path,
+    relative_path: &Path,
+    display_path: &Path,
+) -> CliResult<String> {
+    let output = ProcessCommand::new("git")
+        .args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"])
+        .arg(relative_path)
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: "failed to start git ls-files --stage -z".to_owned(),
             source,
         })?;
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-        size = size
-            .checked_add(bytes_read as u64)
-            .ok_or_else(|| CliError::InvalidArguments {
-                message: format!("file is too large to dehydrate: {}", path.display()),
-            })?;
+    if !output.status.success() {
+        return Err(CliError::ExternalCommand {
+            command: "git --literal-pathspecs ls-files --stage -z -- <path>".to_owned(),
+            status: process_status_text(output.status),
+            stderr: sanitized_external_stderr(&output.stderr),
+        });
     }
 
-    let oid = LfsOid::new(format!("{:x}", hasher.finalize())).map_err(|source| {
-        CliError::InvalidArguments {
+    let records = output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty())
+        .collect::<Vec<_>>();
+    let [record] = records.as_slice() else {
+        return Err(CliError::InvalidArguments {
             message: format!(
-                "failed to build SHA-256 object id for {}: {source}",
-                path.display()
+                "dehydration path must have one tracked index entry: {}",
+                display_path.display()
             ),
-        }
-    })?;
+        });
+    };
+    let Some(separator) = record.iter().position(|byte| *byte == b'\t') else {
+        return Err(index_entry_parse_error());
+    };
+    let metadata = &record[..separator];
+    let fields = metadata
+        .split(|byte| *byte == b' ')
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let [_mode, oid, stage] = fields.as_slice() else {
+        return Err(index_entry_parse_error());
+    };
+    if *stage != b"0" {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "dehydration path has an unmerged index entry: {}",
+                display_path.display()
+            ),
+        });
+    }
 
-    Ok(LfsObject::new(oid, LfsObjectSize::new(size)))
+    std::str::from_utf8(oid)
+        .map(str::to_owned)
+        .map_err(|_| index_entry_parse_error())
+}
+
+fn index_entry_parse_error() -> CliError {
+    CliError::ExternalCommandOutput {
+        command: "git --literal-pathspecs ls-files --stage -z -- <path>".to_owned(),
+        message: SanitizedMessage::new("git returned malformed index metadata"),
+    }
+}
+
+fn read_index_lfs_pointer(
+    worktree_root: &Path,
+    blob_oid: &str,
+    display_path: &Path,
+) -> CliResult<LfsPointer> {
+    let size_output = ProcessCommand::new("git")
+        .args(["cat-file", "-s", blob_oid])
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: "failed to start git cat-file -s".to_owned(),
+            source,
+        })?;
+    if !size_output.status.success() {
+        return Err(CliError::ExternalCommand {
+            command: "git cat-file -s <index-object>".to_owned(),
+            status: process_status_text(size_output.status),
+            stderr: sanitized_external_stderr(&size_output.stderr),
+        });
+    }
+    let size = std::str::from_utf8(&size_output.stdout)
+        .ok()
+        .and_then(|size| size.trim().parse::<u64>().ok())
+        .ok_or_else(|| CliError::ExternalCommandOutput {
+            command: "git cat-file -s <index-object>".to_owned(),
+            message: SanitizedMessage::new("git returned an invalid index object size"),
+        })?;
+    if size > MAX_CLI_POINTER_CANDIDATE_SIZE {
+        return Err(invalid_index_pointer_error(display_path));
+    }
+
+    let pointer_output = ProcessCommand::new("git")
+        .args(["cat-file", "blob", blob_oid])
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|source| CliError::Io {
+            context: "failed to start git cat-file blob".to_owned(),
+            source,
+        })?;
+    if !pointer_output.status.success() {
+        return Err(CliError::ExternalCommand {
+            command: "git cat-file blob <index-object>".to_owned(),
+            status: process_status_text(pointer_output.status),
+            stderr: sanitized_external_stderr(&pointer_output.stderr),
+        });
+    }
+    let contents = std::str::from_utf8(&pointer_output.stdout)
+        .map_err(|_| invalid_index_pointer_error(display_path))?;
+
+    LfsPointer::parse(contents).map_err(|_| invalid_index_pointer_error(display_path))
+}
+
+fn invalid_index_pointer_error(path: &Path) -> CliError {
+    CliError::InvalidArguments {
+        message: format!(
+            "dehydration path must have a valid Git LFS pointer in the index: {}",
+            path.display()
+        ),
+    }
+}
+
+fn publish_dehydrated_object_to_git_lfs(
+    layout: &LocalCacheLayout,
+    git_lfs_objects_dir: &Path,
+    dehydration: &LocalCacheDehydration,
+) -> CliResult<()> {
+    if dehydration.status == LocalCacheDehydrationStatus::AlreadyDehydrated
+        && !dehydration.cache_path.is_file()
+    {
+        return Ok(());
+    }
+
+    let oid = dehydration.object.oid.as_hex();
+    let destination = git_lfs_objects_dir
+        .join(&oid[..2])
+        .join(&oid[2..4])
+        .join(oid);
+    layout
+        .materialize_object(&dehydration.object, destination)
+        .map_err(local_cache_cli_error)?;
+
+    Ok(())
 }
 
 fn write_hydrate_result<W>(
@@ -4999,6 +5151,7 @@ mod tests {
         let bytes = b"hydrated model bytes";
         let object = object_for_bytes(bytes);
         let layout = LocalCacheLayout::new(&cache_root);
+        stage_lfs_pointer(&repo, "asset/model.bin", &object);
         write_file(&worktree_file, bytes);
         let mut output = Vec::new();
 
@@ -5052,7 +5205,7 @@ mod tests {
         let worktree_file = repo.join("asset/model.bin");
         let object = object_for_bytes(b"already dehydrated bytes");
         let pointer = LfsPointer::new(object.clone()).to_pointer_file();
-        write_file(&worktree_file, pointer.as_bytes());
+        stage_lfs_pointer(&repo, "asset/model.bin", &object);
         let mut output = Vec::new();
 
         run_dehydrate_from_dir(
@@ -5072,6 +5225,185 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("already-dehydrated"));
         assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[test]
+    fn dehydrate_rejects_dirty_lfs_content_without_caching_it() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let worktree_file = repo.join("asset/model.bin");
+        let clean_object = object_for_bytes(b"clean hydrated model bytes");
+        let dirty_bytes = b"dirty edit that must not be preserved as LFS content";
+        let dirty_object = object_for_bytes(dirty_bytes);
+        stage_lfs_pointer(&repo, "asset/model.bin", &clean_object);
+        write_file(&worktree_file, dirty_bytes);
+        let mut output = Vec::new();
+
+        let error = run_dehydrate_from_dir(
+            DehydrateCommand {
+                cache_root: Some(cache_root.clone()),
+                paths: vec![PathBuf::from("asset/model.bin")],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect_err("dirty LFS content must not be dehydrated");
+
+        assert!(matches!(
+            error,
+            CliError::LocalCache {
+                source: LocalCacheError::IntegrityMismatch { .. }
+            }
+        ));
+        assert_eq!(
+            fs::read(&worktree_file).expect("dirty file should remain readable"),
+            dirty_bytes
+        );
+        assert!(
+            !LocalCacheLayout::new(cache_root)
+                .object_path(&dirty_object)
+                .exists()
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn dehydrate_rejects_untracked_and_non_lfs_paths() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        write_file(&repo.join("untracked.bin"), b"untracked bytes");
+        write_file(&repo.join("tracked.txt"), b"ordinary tracked bytes");
+        run_git(&repo, &["add", "tracked.txt"]);
+
+        for path in ["untracked.bin", "tracked.txt"] {
+            let mut output = Vec::new();
+            let error = run_dehydrate_from_dir(
+                DehydrateCommand {
+                    cache_root: Some(cache_root.clone()),
+                    paths: vec![PathBuf::from(path)],
+                },
+                &repo,
+                &mut output,
+            )
+            .expect_err("only tracked filter=lfs paths may be dehydrated");
+
+            assert!(matches!(error, CliError::InvalidArguments { .. }));
+            assert!(output.is_empty());
+        }
+
+        assert!(!cache_root.join("objects").exists());
+    }
+
+    #[test]
+    fn dehydrate_rejects_paths_outside_the_current_worktree() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside.bin");
+        init_git_repo_with_origin(&repo);
+        write_file(&outside, b"outside bytes");
+        let mut output = Vec::new();
+
+        let error = run_dehydrate_from_dir(
+            DehydrateCommand {
+                cache_root: Some(cache_root.clone()),
+                paths: vec![outside.clone()],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect_err("outside paths must not be dehydrated");
+
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        assert_eq!(
+            fs::read(&outside).expect("outside file should remain readable"),
+            b"outside bytes"
+        );
+        assert!(!cache_root.join("objects").exists());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn dehydrate_republishes_cache_bytes_for_real_git_lfs_push() {
+        if !git_lfs_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        init_git_repo_with_origin(&repo);
+        run_git(&repo, &["config", "user.name", "LFS Cloud Test"]);
+        run_git(
+            &repo,
+            &["config", "user.email", "lfs-cloud@example.invalid"],
+        );
+        run_git(&repo, &["lfs", "install", "--local"]);
+        run_git(temp.path(), &["init", "--bare", "remote.git"]);
+        write_file(
+            &repo.join(".gitattributes"),
+            b"*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        );
+        let worktree_file = repo.join("asset/model.bin");
+        let bytes = b"object restored to Git LFS media before push";
+        let object = object_for_bytes(bytes);
+        write_file(&worktree_file, bytes);
+        run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
+        run_git(&repo, &["commit", "-m", "Add LFS object"]);
+        let local_media = repo.join(".git").join("lfs").join("objects");
+        fs::remove_dir_all(&local_media).expect("local Git LFS media should be removable");
+        let mut output = Vec::new();
+
+        run_dehydrate_from_dir(
+            DehydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![PathBuf::from("asset/model.bin")],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect("dehydrate should restore Git LFS media");
+        run_git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                remote
+                    .to_str()
+                    .expect("temporary remote path should be UTF-8"),
+            ],
+        );
+        run_git(&repo, &["lfs", "push", "origin", "HEAD"]);
+
+        let oid = object.oid.as_hex();
+        let remote_object = remote
+            .join("lfs")
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(oid);
+        assert_eq!(
+            fs::read(remote_object).expect("pushed Git LFS object should be readable"),
+            bytes
+        );
     }
 
     #[test]
@@ -5823,9 +6155,25 @@ repositories:
         );
     }
 
+    fn stage_lfs_pointer(repo: &Path, relative_path: &str, object: &LfsObject) {
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(
+            &repo.join(relative_path),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        run_git(repo, &["add", ".gitattributes", relative_path]);
+    }
+
     fn git_is_available() -> bool {
         ProcessCommand::new("git")
             .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn git_lfs_is_available() -> bool {
+        ProcessCommand::new("git")
+            .args(["lfs", "version"])
             .output()
             .is_ok_and(|output| output.status.success())
     }

@@ -776,7 +776,11 @@ lfs-cloud hydrate
   replace pointer/placeholders with usable file contents
 
 lfs-cloud dehydrate
-  replace selected large files with pointers/placeholders when not needed
+  require a contained Git-tracked filter=lfs path
+  derive the expected object identity from the Git index pointer
+  reject dirty or unrelated worktree bytes
+  preserve verified bytes in shared cache and repository Git LFS media
+  replace the file with its canonical pointer
 
 lfs-cloud gc
   remove local cached objects not referenced by any registered repo/worktree
@@ -1308,8 +1312,11 @@ Defer:
 > fallback copying elsewhere; matching Git LFS pointer files can be hydrated
 > from the shared cache while non-pointer worktree content is left untouched.
 > Clean hydrated worktree files can now be dehydrated back to canonical Git LFS
-> pointer files only after the full bytes are verified and preserved in the
-> shared cache; dirty or unrelated worktree content is left untouched. Cache
+> pointer files only when they are contained, Git-tracked `filter=lfs` paths
+> whose index pointers identify the same bytes. Verified bytes are preserved in
+> both the shared cache and repository Git LFS media so a later
+> `git lfs push` remains complete; dirty or unrelated worktree content is left
+> untouched. Cache
 > ingest and worktree materialization operations share a cross-process lock,
 > while garbage collection takes that lock exclusively. Dehydration retains
 > its shared lock from cache publication through pointer publication so GC

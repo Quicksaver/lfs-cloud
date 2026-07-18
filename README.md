@@ -259,12 +259,15 @@ target a non-default local cache root.
 lfs-cloud dehydrate path/to/file.bin
 ```
 
-This hashes clean worktree bytes, preserves them in the shared local cache, and
-replaces the worktree file with a canonical Git LFS pointer. Existing matching
-pointer files are treated as already dehydrated. A cache-wide operation lock
-prevents concurrent garbage collection from deleting newly preserved bytes
-before the pointer becomes visible. Use `--cache-root` to target a non-default
-local cache root.
+This accepts only paths contained in the current worktree that Git tracks with
+`filter=lfs`. It reads the expected object identity from the Git index pointer,
+verifies that the worktree bytes still match, preserves them in the shared
+local cache and the repository's Git LFS media store, and then replaces the
+worktree file with the canonical pointer. Dirty, untracked, non-LFS, and outside
+paths are rejected. Existing matching pointer files are treated as already
+dehydrated. A cache-wide operation lock prevents concurrent garbage collection
+from deleting newly preserved bytes before the pointer becomes visible. Use
+`--cache-root` to target a non-default local cache root.
 
 ### Garbage-Collect The Local Cache
 
