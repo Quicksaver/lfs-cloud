@@ -6,7 +6,10 @@
 
 use url::Url;
 
-use crate::{CliError, CliResult, GitRemote, http_transport::uses_protected_http_transport};
+use crate::{
+    CliError, CliResult, GitRemote,
+    http_transport::{HttpUrlPolicy, HttpUrlValidationError, validate_http_url},
+};
 
 /// Resolved Git LFS endpoint for an `lfs-cloud init --server` invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,43 +69,17 @@ impl LfsInitRoute {
 }
 
 pub(crate) fn validate_server_url(value: &str, allow_insecure_http: bool) -> CliResult<Url> {
-    if value.is_empty() {
-        return invalid_server_url("server URL must not be blank");
-    }
-    if value
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control() || character == '\\')
-    {
-        return invalid_server_url(
-            "server URL must not include whitespace, control characters, or backslashes",
-        );
-    }
-    if value.ends_with('/') {
-        return invalid_server_url("server URL must not end with a trailing slash");
-    }
-    if raw_server_path_has_dot_segments(value) {
-        return invalid_server_url("server URL path must not include dot segments");
-    }
-
-    let parsed = Url::parse(value).map_err(|source| CliError::InvalidArguments {
-        message: format!("server URL is not valid: {source}"),
-    })?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return invalid_server_url("server URL must be a valid http or https URL");
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return invalid_server_url("server URL must not include credentials");
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return invalid_server_url("server URL must not include a query string or fragment");
-    }
-    if !allow_insecure_http && !uses_protected_http_transport(&parsed) {
-        return invalid_server_url(
-            "server URL must use HTTPS unless it targets an exact loopback IP; pass --allow-insecure-http only on a trusted development network",
-        );
-    }
-
-    Ok(parsed)
+    validate_http_url(value, HttpUrlPolicy::route_base(allow_insecure_http)).map_err(|error| {
+        let hint = match error {
+            HttpUrlValidationError::InsecureTransport => {
+                "; pass --allow-insecure-http only on a trusted development network"
+            }
+            _ => "",
+        };
+        CliError::InvalidArguments {
+            message: format!("server URL {error}{hint}"),
+        }
+    })
 }
 
 fn normalized_server_url(url: &Url) -> String {
@@ -126,34 +103,6 @@ fn append_lfs_route_segments(url: &mut Url, remote: &GitRemote) -> CliResult<()>
     ]);
 
     Ok(())
-}
-
-fn raw_server_path_has_dot_segments(value: &str) -> bool {
-    let Some((_, after_scheme)) = value.split_once("://") else {
-        return false;
-    };
-    let Some(path_start) = after_scheme.find('/') else {
-        return false;
-    };
-    let path = after_scheme[path_start + 1..]
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default();
-
-    path.split('/').any(is_dot_segment)
-}
-
-fn is_dot_segment(segment: &str) -> bool {
-    matches!(
-        segment.to_ascii_lowercase().as_str(),
-        "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
-    )
-}
-
-fn invalid_server_url<T>(message: impl Into<String>) -> CliResult<T> {
-    Err(CliError::InvalidArguments {
-        message: message.into(),
-    })
 }
 
 #[cfg(test)]

@@ -202,10 +202,13 @@ race has already left multiple otherwise exact object matches.
 
 ## Validation Rules
 
-- `server.public_url` and GitHub `api_url` must be HTTP(S) URLs without
-  credentials, query strings, or fragments. They must use HTTPS unless the
-  host is an exact IPv4/IPv6 loopback address. Non-loopback HTTP requires the
-  explicit development-only `server.allow_insecure_http: true` setting.
+- `server.public_url`, GitHub `api_url`, and CLI `--server` route bases use the
+  same validation policy. They must be HTTP(S) URLs without credentials, query
+  strings, fragments, trailing slashes, whitespace, control characters,
+  backslashes, or path dot segments. They must use HTTPS unless the host is an
+  exact IPv4/IPv6 loopback address. Non-loopback HTTP requires the explicit
+  development-only `server.allow_insecure_http: true` setting and the matching
+  CLI `--allow-insecure-http` flag.
 - `server.max_batch_objects`, `server.max_provider_calls`,
   `server.max_concurrent_requests`, `server.max_concurrent_uploads`, and
   `server.max_concurrent_uploads_per_user` must be greater than zero when

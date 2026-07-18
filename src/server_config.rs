@@ -12,9 +12,11 @@ use std::{
 
 use config::{Config, File, FileFormat};
 use serde::Deserialize;
-use url::Url;
 
-use crate::{ServerError, ServerResult, http_transport::uses_protected_http_transport};
+use crate::{
+    ServerError, ServerResult,
+    http_transport::{HttpUrlPolicy, HttpUrlValidationError, validate_http_url as validate_url},
+};
 
 /// Default server config path used when no explicit path is supplied.
 pub const DEFAULT_CONFIG_PATH: &str = "lfs-cloud.yml";
@@ -337,12 +339,7 @@ impl ServerSettings {
     ) -> ServerResult<Self> {
         let host = resolve_required(raw.host, "server.host", env)?;
         let public_url = resolve_required(raw.public_url, "server.public_url", env)?;
-        validate_http_url(
-            &public_url,
-            "server.public_url",
-            false,
-            raw.allow_insecure_http,
-        )?;
+        validate_config_http_url(&public_url, "server.public_url", raw.allow_insecure_http)?;
         let metadata_path = resolve_metadata_path(raw.metadata_path, metadata_base_dir, env)?;
 
         if raw.port == 0 {
@@ -816,7 +813,7 @@ fn resolve_http_url(
 ) -> ServerResult<String> {
     let path = path.into();
     let value = resolve_required(value, &path, env)?;
-    validate_http_url(&value, &path, false, allow_insecure_http)?;
+    validate_config_http_url(&value, &path, allow_insecure_http)?;
     Ok(value)
 }
 
@@ -988,36 +985,23 @@ fn validate_route_component(component: &str, path: impl Into<String>) -> ServerR
     Ok(())
 }
 
-fn validate_http_url(
+fn validate_config_http_url(
     url: &str,
     path: impl Into<String>,
-    allow_trailing_slash: bool,
     allow_insecure_http: bool,
 ) -> ServerResult<()> {
     let path = path.into();
-    validate_no_outer_whitespace(url, &path)?;
-    if !allow_trailing_slash && url.ends_with('/') {
-        return invalid_config(path, "must not end with a trailing slash");
-    }
-    let parsed = Url::parse(url)
-        .map_err(|_| invalid_config_error(&path, "must be a valid http or https URL"))?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return invalid_config(path, "must be a valid http or https URL");
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return invalid_config(path, "must not include a query string or fragment");
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return invalid_config(path, "must not include credentials");
-    }
-    if !allow_insecure_http && !uses_protected_http_transport(&parsed) {
-        return invalid_config(
-            path,
-            "must use HTTPS unless it targets an exact loopback IP; set server.allow_insecure_http to true only for a trusted development network",
-        );
-    }
-
-    Ok(())
+    validate_url(url, HttpUrlPolicy::route_base(allow_insecure_http))
+        .map(|_| ())
+        .map_err(|error| {
+            let hint = match error {
+                HttpUrlValidationError::InsecureTransport => {
+                    "; set server.allow_insecure_http to true only for a trusted development network"
+                }
+                _ => "",
+            };
+            invalid_config_error(path, format!("{error}{hint}"))
+        })
 }
 
 fn validate_no_outer_whitespace(value: &str, path: &str) -> ServerResult<()> {
@@ -1049,7 +1033,7 @@ mod tests {
     use super::{
         DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
         GoogleDriveStorageConfig, RawRepositoryProviderConfig, RepositoryProviderConfig,
-        ServerConfig, ServerError, StorageProviderConfig,
+        ServerConfig, ServerError, StorageProviderConfig, validate_config_http_url,
     };
 
     fn valid_yaml() -> &'static str {
@@ -2005,6 +1989,26 @@ server:
             &error,
             "server.public_url must not end with a trailing slash",
         );
+    }
+
+    #[test]
+    fn rejects_route_unsafe_http_url_forms_consistently() {
+        for url in [
+            "https://lfs.example.com/base path",
+            "https://lfs.example.com/base\npath",
+            "https://lfs.example.com\\base",
+            "https://lfs.example.com/../base",
+            "https://lfs.example.com/./base",
+            "https://lfs.example.com/%2e%2e/base",
+        ] {
+            let error = validate_config_http_url(url, "server.public_url", false)
+                .expect_err("route-unsafe URL should be rejected");
+
+            assert!(
+                matches!(error, ServerError::InvalidConfiguration { .. }),
+                "{url:?}"
+            );
+        }
     }
 
     #[test]

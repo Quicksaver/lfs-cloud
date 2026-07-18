@@ -1109,11 +1109,28 @@ independently validated or adjudicated.
    assessed here and no invalid finding attributable separately, this was
    high-quality, security-relevant feedback.
 
-5. **Medium — URL safety rules differ between `init` and server configuration.**
-   An endpoint accepted in one path can be rejected or interpreted differently
-   in another (`src/init.rs:56-88`, `src/server_config.rs:805-827`). Centralize a
-   single URL validation policy with explicit context-specific exceptions and
-   a shared test matrix.
+5. **[DONE] URL safety rules differed between `init` and server configuration**
+   (Medium, `src/http_transport.rs`, `src/init.rs`, and
+   `src/server_config.rs`): **Valid and actionable.** CLI server-base validation
+   rejected raw whitespace, control characters, backslashes, and path dot
+   segments before URL parsing, while server configuration accepted forms that
+   the URL parser could discard or reinterpret. HTTP route bases now use one
+   shared typed validator for scheme/host, raw-input safety, trailing slashes,
+   dot segments, credentials, queries/fragments, and protected transport. The
+   only context-specific exception is the existing explicit non-loopback HTTP
+   opt-in; CLI and config callers retain tailored guidance for enabling it.
+   One shared accepted/rejected matrix covers the complete policy, while the
+   config regression proves the previously accepted parser-normalized forms are
+   denied. Operator documentation and the repository learning now state that
+   CLI server bases, server public URLs, and GitHub API URLs share this policy.
+   Verification passed with `yarn lint:fix`, `cargo fmt --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+   focused reviewer identified a genuine medium-severity consistency and URL
+   interpretation flaw, named both affected boundaries precisely, and proposed
+   the appropriate shared-policy and matrix-test design; with one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, relevant feedback.
 
 6. **Medium — The manual hydrate/dehydrate verification script cannot exercise
    the workflow.** Its fixture is not initialized as a Git repository, while the
