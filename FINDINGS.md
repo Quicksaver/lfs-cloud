@@ -2207,12 +2207,32 @@ independently validated or adjudicated.
    covered it; this was good focused feedback with no remaining actionable
    defect in the current tree.
 
-10. **Low — Provider tests are tautological and fake an inaccurate permission
-    hierarchy.** Tests mostly restate mock behavior rather than enforce a
-    production contract (`src/providers.rs:234-364`,
-    `src/providers.rs:373-485`, `tests/support/mod.rs:29-230`). Replace them with
-    contract tests shared by real and fake providers, including denial and
-    repository-isolation cases.
+10. **[DONE] Provider tests were tautological and faked an inaccurate
+    permission hierarchy** (Low, `src/providers.rs`, `tests/support/mod.rs`,
+    `tests/provider_contracts.rs`, and `tests/fixture_helpers.rs`): **Valid and
+    actionable.** The provider-trait unit tests defined a private fake whose
+    permission rule allowed an exact grant or admin only, so write permission
+    incorrectly failed to satisfy a read requirement. Because those tests
+    asserted only that fake's own behavior, they could pass without enforcing
+    the production GitHub adapter's conservative read/write/admin lattice. The
+    private fake and its duplicate trait-behavior tests are removed. Shared
+    integration contract helpers now exercise every granted/required
+    permission combination and require precise denial errors, authorization
+    metadata, and provider IDs. The same helpers run unchanged against the
+    reusable fake and `GitHubRepositoryProvider` through a loopback GitHub API
+    fixture. A second shared contract proves that a successful grant for one
+    configured stable repository ID cannot authorize the same owner/name with
+    a different stable ID in either implementation. Existing byte-integrity
+    and storage-namespace fixture tests remain focused on the storage contract
+    already strengthened by the completed repository-namespace finding.
+    Verification passed with `cargo fmt --all`, `yarn lint:fix`,
+    `cargo test --test provider_contracts`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+    reviewer identified a real low-severity test-fidelity flaw, pointed to the
+    duplicate fake-only coverage, and requested the decisive production/fake
+    parity and isolation checks. With one valid finding and no invalid finding
+    attributable separately, this was high-quality, relevant feedback.
 
 ## Test suite
 

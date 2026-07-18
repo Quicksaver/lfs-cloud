@@ -347,6 +347,82 @@ fn permission_allows(granted: RepositoryPermission, required: RepositoryPermissi
     )
 }
 
+/// Asserts the permission lattice required of every repository-provider adapter.
+///
+/// The same contract is run against integration fakes and production adapters,
+/// preventing a test double from inventing different read/write/admin semantics.
+pub async fn assert_repository_permission_contract(
+    provider: &dyn RepositoryProvider,
+    repository: &RepositoryIdentity,
+    authentication: &RepositoryAuthentication,
+    granted: RepositoryPermission,
+) {
+    assert_eq!(provider.provider_id(), repository.provider_id);
+
+    for required in [
+        RepositoryPermission::Read,
+        RepositoryPermission::Write,
+        RepositoryPermission::Admin,
+    ] {
+        let result = provider
+            .check_permission(repository, authentication, required)
+            .await;
+
+        if permission_allows(granted, required) {
+            let authorization = result.expect("provider grant should satisfy required permission");
+            assert_eq!(authorization.user, *authentication.user());
+            assert_eq!(authorization.repository, *repository);
+            assert_eq!(authorization.required, required);
+            assert_eq!(authorization.granted, granted);
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(ServerError::RepositoryProvider {
+                        source: RepositoryProviderError::PermissionDenied {
+                            required: denied_required,
+                            ..
+                        }
+                    }) if denied_required == required
+                ),
+                "provider should deny {required:?} when it grants only {granted:?}"
+            );
+        }
+    }
+}
+
+/// Asserts that a provider grant cannot cross a stable repository boundary.
+pub async fn assert_repository_isolation_contract(
+    provider: &dyn RepositoryProvider,
+    repository: &RepositoryIdentity,
+    isolated_repository: &RepositoryIdentity,
+    authentication: &RepositoryAuthentication,
+) {
+    provider
+        .check_permission(repository, authentication, RepositoryPermission::Read)
+        .await
+        .expect("configured repository should authorize reads");
+
+    let result = provider
+        .check_permission(
+            isolated_repository,
+            authentication,
+            RepositoryPermission::Read,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ServerError::RepositoryProvider {
+                source: RepositoryProviderError::RepositoryNotFound { .. }
+                    | RepositoryProviderError::PermissionDenied { .. }
+            })
+        ),
+        "provider grant must not authorize a different stable repository identity"
+    );
+}
+
 #[derive(Clone, Debug)]
 struct FakeStoredBytes {
     bytes: Vec<u8>,
