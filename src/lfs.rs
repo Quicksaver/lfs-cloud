@@ -11,6 +11,10 @@ use url::Url;
 
 /// Git LFS pointer file version supported by this package.
 pub const LFS_POINTER_VERSION: &str = "https://git-lfs.github.com/spec/v1";
+/// Exclusive byte-size cutoff for Git LFS pointer files.
+///
+/// Pointer files must be smaller than this value, including extension lines.
+pub const LFS_POINTER_SIZE_CUTOFF: u64 = 1_024;
 /// Git LFS batch transfer adapter supported by the MVP server.
 pub const LFS_BASIC_TRANSFER: &str = "basic";
 
@@ -109,6 +113,15 @@ pub enum LfsObjectError {
     PointerInvalidExtensionValue {
         /// Extension key associated with the invalid value.
         key: String,
+    },
+
+    /// The pointer file met or exceeded Git LFS's exclusive size cutoff.
+    #[error("Git LFS pointer is too large: {size} bytes must be smaller than {size_cutoff} bytes")]
+    PointerTooLarge {
+        /// Actual pointer size in bytes.
+        size: u64,
+        /// Exclusive Git LFS pointer size cutoff.
+        size_cutoff: u64,
     },
 }
 
@@ -344,6 +357,8 @@ impl LfsPointer {
     ///
     /// A zero-byte file parses as Git LFS's canonical pointer for empty
     /// content, whose object identity is the SHA-256 digest of zero bytes.
+    /// Non-empty pointer files must be smaller than
+    /// [`LFS_POINTER_SIZE_CUTOFF`] bytes.
     ///
     /// # Examples
     ///
@@ -360,6 +375,14 @@ impl LfsPointer {
     /// # Ok::<(), lfs_cloud::LfsObjectError>(())
     /// ```
     pub fn parse(contents: &str) -> Result<Self, LfsObjectError> {
+        let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+        if size >= LFS_POINTER_SIZE_CUTOFF {
+            return Err(LfsObjectError::PointerTooLarge {
+                size,
+                size_cutoff: LFS_POINTER_SIZE_CUTOFF,
+            });
+        }
+
         if contents.is_empty() {
             return Ok(Self::new(LfsObject::new(
                 LfsOid(EMPTY_SHA256_HEX.to_owned()),
@@ -1094,6 +1117,45 @@ mod tests {
         assert_eq!(pointer.object.oid.as_hex(), OID);
         assert_eq!(pointer.object.size.bytes(), 42);
         assert_eq!(pointer.to_pointer_file(), contents);
+    }
+
+    #[test]
+    fn pointer_enforces_the_exclusive_1024_byte_cutoff() {
+        fn pointer_with_size_bytes(size: usize) -> String {
+            let prefix = format!(
+                "version {LFS_POINTER_VERSION}\next-0-",
+                LFS_POINTER_VERSION = super::LFS_POINTER_VERSION,
+            );
+            let suffix = format!(" sha256:{OID}\noid sha256:{OID}\nsize 42\n",);
+            let extension_name_len = size
+                .checked_sub(prefix.len() + suffix.len())
+                .expect("test pointer size should fit canonical metadata");
+
+            format!("{prefix}{}{suffix}", "a".repeat(extension_name_len))
+        }
+
+        let maximum_size_pointer = pointer_with_size_bytes(1_023);
+        let cutoff_size_pointer = pointer_with_size_bytes(1_024);
+        let oversized_pointer = pointer_with_size_bytes(1_025);
+
+        assert_eq!(maximum_size_pointer.len(), 1_023);
+        assert_eq!(cutoff_size_pointer.len(), 1_024);
+        assert_eq!(oversized_pointer.len(), 1_025);
+        LfsPointer::parse(&maximum_size_pointer).expect("1,023-byte pointer should parse");
+        assert!(matches!(
+            LfsPointer::parse(&cutoff_size_pointer),
+            Err(LfsObjectError::PointerTooLarge {
+                size: 1_024,
+                size_cutoff: super::LFS_POINTER_SIZE_CUTOFF,
+            })
+        ));
+        assert!(matches!(
+            LfsPointer::parse(&oversized_pointer),
+            Err(LfsObjectError::PointerTooLarge {
+                size: 1_025,
+                size_cutoff: super::LFS_POINTER_SIZE_CUTOFF,
+            })
+        ));
     }
 
     #[test]

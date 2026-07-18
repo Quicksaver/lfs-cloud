@@ -1992,11 +1992,37 @@ independently validated or adjudicated.
    invalid finding attributable separately, this was high-quality,
    protocol-relevant feedback.
 
-3. **Medium — Pointer detection uses a 64 KiB cutoff instead of Git LFS's 1,024
-   byte limit.** Multiple call sites will treat larger pointer-shaped files as
-   valid pointers (`src/lfs.rs:325-399`, `src/cli.rs:48`,
-   `src/local_cache.rs:35`, `src/migration.rs:34-40`). Centralize the canonical
-   limit and test the 1,024/1,025-byte boundary.
+3. **[DONE] Pointer detection used a 64 KiB cutoff instead of Git LFS's 1,024
+   byte cutoff** (Medium, `src/lfs.rs`, `src/cli.rs`, `src/local_cache.rs`, and
+   `src/migration.rs`): **Valid and actionable, with an off-by-one clarification.**
+   The official
+   [Git LFS specification](https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md)
+   requires pointer files to be strictly smaller than 1,024 bytes, and the
+   reference client's `DecodePointerFromBlob` and `DecodePointerFromFile`
+   implementations reject sizes greater than or equal to that cutoff. LFS Cloud
+   previously used three independent 64 KiB candidate constants, while direct
+   `LfsPointer::parse` calls had no size check at all. The shared protocol module
+   now exports the exclusive `LFS_POINTER_SIZE_CUTOFF`, direct parsing returns a
+   typed `PointerTooLarge` error at the boundary, and checkout scans, index-blob
+   reads, cache hydration/dehydration and GC discovery, plus current and
+   historical migration scans all apply the same cutoff before accepting a
+   candidate. Bounded file reads stop at the cutoff instead of reading an extra
+   64 KiB candidate. A test-first regression failed because a syntactically
+   valid 1,025-byte pointer was accepted; the final regression proves 1,023
+   bytes parse while both 1,024 and 1,025 bytes are rejected, and hydration
+   coverage proves an exact-cutoff file is rejected without an unbounded read.
+   The repository learning records the exclusive boundary. Verification passed
+   with `cargo fmt --all`, focused pointer/cache/migration tests,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (all automated targets
+   passed; three provider/manual tests ignored), and `cargo test --doc` (39
+   passed). The focused reviewer identified a genuine medium-severity
+   interoperability issue, correctly found every duplicated detection boundary,
+   and requested decisive boundary coverage. Its wording treated 1,024 as an
+   inclusive maximum, whereas upstream makes it the first invalid size, but the
+   underlying diagnosis and remediation direction were strong. With one valid
+   finding and only this minor boundary imprecision, this was high-quality,
+   protocol-relevant feedback.
 
 4. **Medium — Pointer parsing accepts non-canonical uppercase and whitespace.**
    Lenient OID/version parsing can diverge from Git LFS clients

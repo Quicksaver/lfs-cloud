@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout, MigrationError,
-    MigrationResult, SanitizedMessage, StorageProvider, StoredObject,
+    LFS_POINTER_SIZE_CUTOFF, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout,
+    MigrationError, MigrationResult, SanitizedMessage, StorageProvider, StoredObject,
 };
 use url::Url;
 
@@ -41,7 +41,6 @@ const MAX_HISTORY_REF_LIST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HISTORY_COMMIT_LIST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_TREE_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_CHECK_ATTR_INPUT_BYTES: usize = 1024 * 1024;
-const MAX_HISTORY_POINTER_BYTES: u64 = 64 * 1024;
 const GIT_NO_LAZY_FETCH_ENV: &str = "GIT_NO_LAZY_FETCH";
 const MIGRATION_SOURCE_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MIGRATION_SOURCE_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -2861,7 +2860,7 @@ impl<'a> HistoryScanner<'a> {
                 message: SanitizedMessage::new("git tree entry did not resolve to a blob"),
             });
         }
-        if info.size > MAX_HISTORY_POINTER_BYTES {
+        if info.size >= LFS_POINTER_SIZE_CUTOFF {
             return Ok(None);
         }
 
@@ -2873,7 +2872,7 @@ impl<'a> HistoryScanner<'a> {
             .contents(
                 object_id,
                 "blob",
-                MAX_HISTORY_POINTER_BYTES as usize,
+                LFS_POINTER_SIZE_CUTOFF as usize,
                 &blob_command,
             )?;
         let Ok(contents) = std::str::from_utf8(&contents) else {
@@ -3544,7 +3543,7 @@ fn read_history_pointer_blob_candidate(
             command: size_command.clone(),
             message: SanitizedMessage::new("git returned an invalid blob size"),
         })?;
-    if size > MAX_HISTORY_POINTER_BYTES {
+    if size >= LFS_POINTER_SIZE_CUTOFF {
         return Ok(None);
     }
 
@@ -3565,7 +3564,7 @@ fn read_history_pointer_blob_candidate(
             &blob_output.stderr,
         ));
     }
-    if blob_output.stdout.len() > MAX_HISTORY_POINTER_BYTES as usize {
+    if blob_output.stdout.len() >= LFS_POINTER_SIZE_CUTOFF as usize {
         return Ok(None);
     }
     let Ok(contents) = std::str::from_utf8(&blob_output.stdout) else {

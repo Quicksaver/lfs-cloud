@@ -30,8 +30,8 @@ use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitCredentialRejection,
     GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers, GitLfsMigrationDiscovery,
     GitLfsSourceEndpointSource, GitRemote, GitRepository, GoogleDriveCredentialLoader,
-    GoogleDriveStorageConfig, LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsPointer,
-    LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
+    GoogleDriveStorageConfig, LFS_POINTER_SIZE_CUTOFF, LFS_SESSION_REVOKE_PATH, LfsInitRoute,
+    LfsObject, LfsPointer, LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
     LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
     LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
     LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
@@ -50,7 +50,6 @@ const CHILD_OUTPUT_DRAIN_AFTER_KILL: Duration = Duration::from_secs(1);
 const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
 const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
-const MAX_CLI_POINTER_CANDIDATE_SIZE: u64 = 64 * 1024;
 const MAX_LOGIN_TOKEN_INPUT_BYTES: usize = 1024;
 
 #[derive(Debug, Parser)]
@@ -2518,7 +2517,7 @@ fn read_current_checkout_pointer_candidate(path: &Path) -> CliResult<Option<LfsP
             });
         }
     };
-    if !metadata.is_file() || metadata.len() > MAX_CLI_POINTER_CANDIDATE_SIZE {
+    if !metadata.is_file() || metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
         return Ok(None);
     }
 
@@ -2749,7 +2748,7 @@ fn read_index_lfs_pointer(
             command: "git cat-file -s <index-object>".to_owned(),
             message: SanitizedMessage::new("git returned an invalid index object size"),
         })?;
-    if size > MAX_CLI_POINTER_CANDIDATE_SIZE {
+    if size >= LFS_POINTER_SIZE_CUTOFF {
         return Err(invalid_index_pointer_error(display_path));
     }
 

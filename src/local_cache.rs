@@ -32,7 +32,9 @@ use std::{
     os::windows::ffi::{OsStrExt, OsStringExt},
 };
 
-use crate::{LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer};
+use crate::{
+    LFS_POINTER_SIZE_CUTOFF, LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer,
+};
 
 /// Default directory name used below a user's home directory for local state.
 pub const DEFAULT_LOCAL_CACHE_HOME_DIR: &str = ".lfs-cloud";
@@ -49,7 +51,6 @@ const WORKTREE_PATH_LOCKS_DIR: &str = "worktree-path-locks";
 const WORKTREE_REGISTRY_LOCK_FILE: &str = "worktrees.json.lock";
 const LEGACY_WORKTREE_REGISTRY_VERSION: u32 = 1;
 const WORKTREE_REGISTRY_VERSION: u32 = 2;
-const MAX_LFS_POINTER_FILE_SIZE: u64 = 64 * 1024;
 #[cfg(unix)]
 const DEFAULT_MATERIALIZED_FILE_MODE: u32 = 0o600;
 #[cfg(not(unix))]
@@ -211,7 +212,7 @@ pub enum LocalCacheError {
 
     /// A worktree path was too large to safely parse as a Git LFS pointer.
     #[error(
-        "Git LFS pointer at {} is too large to hydrate safely: {size} bytes exceeds {max_size} bytes",
+        "Git LFS pointer at {} is too large to hydrate safely: {size} bytes must be smaller than {size_cutoff} bytes",
         path.display()
     )]
     PointerFileTooLarge {
@@ -219,8 +220,8 @@ pub enum LocalCacheError {
         path: PathBuf,
         /// Actual file size in bytes.
         size: u64,
-        /// Maximum pointer file size accepted by hydration.
-        max_size: u64,
+        /// Exclusive Git LFS pointer size cutoff.
+        size_cutoff: u64,
     },
 
     /// A worktree path was small enough to be a pointer but was not UTF-8 text.
@@ -1641,7 +1642,7 @@ fn collect_pointer_oid_from_file(
             });
         }
     };
-    if !metadata.is_file() || metadata.len() > MAX_LFS_POINTER_FILE_SIZE {
+    if !metadata.is_file() || metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
         return Ok(());
     }
 
@@ -1651,14 +1652,14 @@ fn collect_pointer_oid_from_file(
         source,
     })?;
     let mut contents = Vec::new();
-    file.take(MAX_LFS_POINTER_FILE_SIZE + 1)
+    file.take(LFS_POINTER_SIZE_CUTOFF)
         .read_to_end(&mut contents)
         .map_err(|source| LocalCacheError::Io {
             context: "failed to read worktree pointer candidate",
             path: path.to_path_buf(),
             source,
         })?;
-    if contents.len() as u64 > MAX_LFS_POINTER_FILE_SIZE {
+    if contents.len() as u64 >= LFS_POINTER_SIZE_CUTOFF {
         return Ok(());
     }
 
@@ -1861,16 +1862,16 @@ fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
         path: path.to_path_buf(),
         source,
     })?;
-    if metadata.len() > MAX_LFS_POINTER_FILE_SIZE {
+    if metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
         return Err(LocalCacheError::PointerFileTooLarge {
             path: path.to_path_buf(),
             size: metadata.len(),
-            max_size: MAX_LFS_POINTER_FILE_SIZE,
+            size_cutoff: LFS_POINTER_SIZE_CUTOFF,
         });
     }
 
     let mut contents = Vec::new();
-    file.take(MAX_LFS_POINTER_FILE_SIZE + 1)
+    file.take(LFS_POINTER_SIZE_CUTOFF)
         .read_to_end(&mut contents)
         .map_err(|source| LocalCacheError::Io {
             context: "failed to read Git LFS pointer file",
@@ -1878,11 +1879,11 @@ fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
             source,
         })?;
     let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
-    if size > MAX_LFS_POINTER_FILE_SIZE {
+    if size >= LFS_POINTER_SIZE_CUTOFF {
         return Err(LocalCacheError::PointerFileTooLarge {
             path: path.to_path_buf(),
             size,
-            max_size: MAX_LFS_POINTER_FILE_SIZE,
+            size_cutoff: LFS_POINTER_SIZE_CUTOFF,
         });
     }
 
@@ -1907,19 +1908,19 @@ fn read_existing_lfs_pointer_file(path: &Path) -> LocalCacheResult<Option<LfsPoi
         path: path.to_path_buf(),
         source,
     })?;
-    if metadata.len() > MAX_LFS_POINTER_FILE_SIZE {
+    if metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
         return Ok(None);
     }
 
     let mut contents = Vec::new();
-    file.take(MAX_LFS_POINTER_FILE_SIZE + 1)
+    file.take(LFS_POINTER_SIZE_CUTOFF)
         .read_to_end(&mut contents)
         .map_err(|source| LocalCacheError::Io {
             context: "failed to read dehydration target",
             path: path.to_path_buf(),
             source,
         })?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_LFS_POINTER_FILE_SIZE {
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) >= LFS_POINTER_SIZE_CUTOFF {
         return Ok(None);
     }
 
@@ -3549,7 +3550,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
         let destination = temp.path().join("repo/assets/model.bin");
-        let bytes = vec![b'x'; (MAX_LFS_POINTER_FILE_SIZE + 1) as usize];
+        let bytes = vec![b'x'; LFS_POINTER_SIZE_CUTOFF as usize];
         write_file(&destination, &bytes);
 
         let error = layout
@@ -3558,10 +3559,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            LocalCacheError::PointerFileTooLarge { path, size, max_size }
+            LocalCacheError::PointerFileTooLarge { path, size, size_cutoff }
                 if path == destination
-                    && size == MAX_LFS_POINTER_FILE_SIZE + 1
-                    && max_size == MAX_LFS_POINTER_FILE_SIZE
+                    && size == LFS_POINTER_SIZE_CUTOFF
+                    && size_cutoff == LFS_POINTER_SIZE_CUTOFF
         ));
     }
 
@@ -3666,7 +3667,7 @@ mod tests {
     fn dehydrate_file_reads_uncached_large_worktree_bytes_only_twice() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
-        let bytes = vec![b'x'; (MAX_LFS_POINTER_FILE_SIZE + 1) as usize];
+        let bytes = vec![b'x'; (LFS_POINTER_SIZE_CUTOFF + 1) as usize];
         let object = object_for_bytes(&bytes);
         let worktree_path = temp.path().join("repo/assets/model.bin");
         write_file(&worktree_path, &bytes);
@@ -3688,7 +3689,7 @@ mod tests {
     fn dehydrate_file_reads_cached_large_worktree_bytes_only_once() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
-        let bytes = vec![b'x'; (MAX_LFS_POINTER_FILE_SIZE + 1) as usize];
+        let bytes = vec![b'x'; (LFS_POINTER_SIZE_CUTOFF + 1) as usize];
         let object = object_for_bytes(&bytes);
         let worktree_path = temp.path().join("repo/assets/model.bin");
         write_file(&layout.object_path(&object), &bytes);

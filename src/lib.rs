@@ -50,9 +50,9 @@ pub use google_drive::{
 };
 pub use init::LfsInitRoute;
 pub use lfs::{
-    LFS_BASIC_TRANSFER, LFS_POINTER_VERSION, LfsBatchAction, LfsBatchDownloadObject,
-    LfsBatchHashAlgorithm, LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation,
-    LfsBatchRef, LfsBatchRequest, LfsBatchRequestParseError, LfsBatchResponse,
+    LFS_BASIC_TRANSFER, LFS_POINTER_SIZE_CUTOFF, LFS_POINTER_VERSION, LfsBatchAction,
+    LfsBatchDownloadObject, LfsBatchHashAlgorithm, LfsBatchObjectError, LfsBatchObjectResponse,
+    LfsBatchOperation, LfsBatchRef, LfsBatchRequest, LfsBatchRequestParseError, LfsBatchResponse,
     LfsBatchUploadObject, LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer,
     parse_lfs_batch_request_json,
 };
