@@ -2947,7 +2947,7 @@ where
 fn materialization_status_label(status: LocalCacheMaterializationStatus) -> &'static str {
     match status {
         LocalCacheMaterializationStatus::AlreadyMaterialized => "already-materialized",
-        LocalCacheMaterializationStatus::CopyOnWriteAttempted => "copy-on-write-attempted",
+        LocalCacheMaterializationStatus::CopyOnWriteCloned => "copy-on-write-cloned",
         LocalCacheMaterializationStatus::Copied => "copied",
     }
 }
@@ -5556,7 +5556,25 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("hydrated"));
-        assert!(rendered.contains("copied") || rendered.contains("copy-on-write-attempted"));
+        #[cfg(target_os = "macos")]
+        {
+            let file_system = rustix::fs::statfs(temp.path())
+                .expect("test filesystem should be inspectable")
+                .f_fstypename;
+            let is_apfs = file_system
+                .iter()
+                .copied()
+                .take_while(|byte| *byte != 0)
+                .map(|byte| byte as u8)
+                .eq(b"apfs".iter().copied());
+            if is_apfs {
+                assert!(rendered.contains("copy-on-write-cloned"));
+            } else {
+                assert!(rendered.contains("copied"));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert!(rendered.contains("copied"));
         assert!(rendered.contains("asset/model.bin"));
         assert!(rendered.contains(object.oid.as_hex()));
     }

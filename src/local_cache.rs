@@ -605,12 +605,8 @@ pub struct LocalCacheMaterialization {
 pub enum LocalCacheMaterializationStatus {
     /// Destination already contained the exact verified object bytes.
     AlreadyMaterialized,
-    /// Destination was created using the platform's copy-on-write path.
-    ///
-    /// Some platform tools may silently fall back to a normal copy while still
-    /// reporting success, so this status records the selected strategy rather
-    /// than a guaranteed backend storage layout.
-    CopyOnWriteAttempted,
+    /// Destination was created using the platform's copy-on-write primitive.
+    CopyOnWriteCloned,
     /// Destination was created by copying bytes because CoW was unavailable.
     Copied,
 }
@@ -2116,6 +2112,25 @@ fn materialize_to_temporary_file(
     destination_parent: &Path,
     object: &LfsObject,
 ) -> LocalCacheResult<(tempfile::NamedTempFile, LocalCacheMaterializationStatus)> {
+    materialize_to_temporary_file_with_clone(
+        cache_path,
+        destination_parent,
+        object,
+        copy_on_write_clone,
+    )
+}
+
+fn materialize_to_temporary_file_with_clone(
+    cache_path: &Path,
+    destination_parent: &Path,
+    object: &LfsObject,
+    try_clone: impl FnOnce(&Path, &Path) -> LocalCacheResult<Option<tempfile::NamedTempFile>>,
+) -> LocalCacheResult<(tempfile::NamedTempFile, LocalCacheMaterializationStatus)> {
+    if let Some(temp) = try_clone(cache_path, destination_parent)? {
+        verify_file_object(temp.path(), object)?;
+        return Ok((temp, LocalCacheMaterializationStatus::CopyOnWriteCloned));
+    }
+
     let mut temp = tempfile::NamedTempFile::new_in(destination_parent).map_err(|source| {
         LocalCacheError::Io {
             context: "failed to create temporary materialized object",
@@ -2123,16 +2138,9 @@ fn materialize_to_temporary_file(
             source,
         }
     })?;
+    copy_cache_object_to_temporary_file(cache_path, &mut temp, object)?;
 
-    let status = if copy_on_write_clone(cache_path, temp.path())? {
-        verify_file_object(temp.path(), object)?;
-        LocalCacheMaterializationStatus::CopyOnWriteAttempted
-    } else {
-        copy_cache_object_to_temporary_file(cache_path, &mut temp, object)?;
-        LocalCacheMaterializationStatus::Copied
-    };
-
-    Ok((temp, status))
+    Ok((temp, LocalCacheMaterializationStatus::Copied))
 }
 
 fn copy_cache_object_to_temporary_file(
@@ -2401,39 +2409,86 @@ fn set_temporary_file_mode(
 }
 
 #[cfg(target_os = "macos")]
-fn copy_on_write_clone(source_path: &Path, destination_path: &Path) -> LocalCacheResult<bool> {
-    // `NamedTempFile` keeps an open descriptor for cleanup, but this macOS-only
-    // path intentionally operates by pathname and verifies that path before
-    // publication. Fallback copying writes through the open handle.
-    let output = std::process::Command::new("/bin/cp")
-        .arg("-c")
-        .arg(source_path)
-        .arg(destination_path)
-        .output()
-        .map_err(|source| LocalCacheError::Io {
-            context: "failed to invoke macOS copy-on-write clone primitive",
-            path: destination_path.to_path_buf(),
+fn copy_on_write_clone(
+    source_path: &Path,
+    destination_parent: &Path,
+) -> LocalCacheResult<Option<tempfile::NamedTempFile>> {
+    let source = File::open(source_path).map_err(|source| LocalCacheError::Io {
+        context: "failed to open cache object for copy-on-write cloning",
+        path: source_path.to_path_buf(),
+        source,
+    })?;
+    let destination_directory =
+        tempfile::tempdir_in(destination_parent).map_err(|source| LocalCacheError::Io {
+            context: "failed to create temporary clone directory",
+            path: destination_parent.to_path_buf(),
+            source,
+        })?;
+    let candidate = tempfile::NamedTempFile::new_in(destination_parent).map_err(|source| {
+        LocalCacheError::Io {
+            context: "failed to reserve temporary clone path",
+            path: destination_parent.to_path_buf(),
+            source,
+        }
+    })?;
+    let destination_path = candidate.path().to_path_buf();
+    let clone_name = "materialized-object";
+    let clone_path = destination_directory.path().join(clone_name);
+    let clone_directory =
+        File::open(destination_directory.path()).map_err(|source| LocalCacheError::Io {
+            context: "failed to open temporary clone directory",
+            path: destination_directory.path().to_path_buf(),
             source,
         })?;
 
-    if output.status.success() {
-        return Ok(true);
+    if let Err(source) = rustix::fs::fclonefileat(
+        &source,
+        &clone_directory,
+        clone_name,
+        rustix::fs::CloneFlags::NOFOLLOW,
+    ) {
+        tracing::debug!(
+            source = %source_path.display(),
+            destination = %destination_path.display(),
+            error = %source,
+            "macOS copy-on-write clone failed; falling back to verified copy"
+        );
+        return Ok(None);
     }
 
-    tracing::debug!(
-        source = %source_path.display(),
-        destination = %destination_path.display(),
-        status = %output.status,
-        stderr = %String::from_utf8_lossy(&output.stderr),
-        "macOS copy-on-write clone command failed; falling back to verified copy"
-    );
+    let (candidate_file, temporary_path) = candidate.into_parts();
+    drop(candidate_file);
+    fs::rename(&clone_path, &destination_path).map_err(|source| LocalCacheError::Io {
+        context: "failed to move temporary cloned object into place",
+        path: destination_path.clone(),
+        source,
+    })?;
+    let cloned_file = rustix::fs::openat(
+        rustix::fs::CWD,
+        &destination_path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)
+    .map_err(|source| LocalCacheError::Io {
+        context: "failed to open temporary cloned object",
+        path: destination_path,
+        source,
+    })?;
 
-    Ok(false)
+    Ok(Some(tempfile::NamedTempFile::from_parts(
+        cloned_file,
+        temporary_path,
+    )))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn copy_on_write_clone(_source_path: &Path, _destination_path: &Path) -> LocalCacheResult<bool> {
-    Ok(false)
+fn copy_on_write_clone(
+    _source_path: &Path,
+    _destination_parent: &Path,
+) -> LocalCacheResult<Option<tempfile::NamedTempFile>> {
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -2959,6 +3014,21 @@ mod tests {
         fs::write(path, bytes).expect("test file should be written");
     }
 
+    #[cfg(target_os = "macos")]
+    fn is_apfs(path: &Path) -> bool {
+        let file_system = rustix::fs::statfs(path)
+            .expect("test filesystem should be inspectable")
+            .f_fstypename;
+        let file_system = file_system
+            .iter()
+            .copied()
+            .take_while(|byte| *byte != 0)
+            .map(|byte| byte as u8)
+            .collect::<Vec<_>>();
+
+        file_system == b"apfs"
+    }
+
     fn initialize_git_worktree(path: &Path) {
         fs::create_dir_all(path).expect("test worktree should be created");
         let output = Command::new("git")
@@ -3204,15 +3274,64 @@ mod tests {
         assert_eq!(materialization.object, object);
         assert_eq!(materialization.cache_path, layout.object_path(&object));
         assert_eq!(materialization.destination_path, destination);
-        assert!(matches!(
-            materialization.status,
+        #[cfg(target_os = "macos")]
+        let expected_status = if is_apfs(temp.path()) {
+            LocalCacheMaterializationStatus::CopyOnWriteCloned
+        } else {
             LocalCacheMaterializationStatus::Copied
-                | LocalCacheMaterializationStatus::CopyOnWriteAttempted
-        ));
+        };
+        #[cfg(not(target_os = "macos"))]
+        let expected_status = LocalCacheMaterializationStatus::Copied;
+        assert_eq!(materialization.status, expected_status);
         assert_eq!(
             fs::read(&materialization.destination_path)
                 .expect("materialized destination should be readable"),
             bytes
+        );
+    }
+
+    #[test]
+    fn materialize_to_temporary_file_copies_when_clone_is_unavailable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let bytes = b"cache bytes for fallback materialization";
+        let object = object_for_bytes(bytes);
+        let cache_path = temp.path().join("cache-object");
+        write_file(&cache_path, bytes);
+
+        let (materialized, status) = materialize_to_temporary_file_with_clone(
+            &cache_path,
+            temp.path(),
+            &object,
+            |_source_path, _destination_parent| Ok(None),
+        )
+        .expect("unavailable cloning should fall back to a verified copy");
+
+        assert_eq!(status, LocalCacheMaterializationStatus::Copied);
+        assert_eq!(
+            fs::read(materialized.path()).expect("fallback copy should be readable"),
+            bytes
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn materialize_object_uses_copy_on_write_on_apfs() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        assert!(is_apfs(temp.path()), "this test requires an APFS fixture");
+
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"cache bytes that must be cloned on APFS";
+        let object = object_for_bytes(bytes);
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+
+        let materialization = layout
+            .materialize_object(&object, &destination)
+            .expect("APFS materialization should succeed");
+
+        assert_eq!(
+            materialization.status,
+            LocalCacheMaterializationStatus::CopyOnWriteCloned
         );
     }
 
@@ -3322,11 +3441,15 @@ mod tests {
             .expect("matching pointer should hydrate from cache");
 
         assert_eq!(materialization.object, object);
-        assert!(matches!(
-            materialization.status,
+        #[cfg(target_os = "macos")]
+        let expected_status = if is_apfs(temp.path()) {
+            LocalCacheMaterializationStatus::CopyOnWriteCloned
+        } else {
             LocalCacheMaterializationStatus::Copied
-                | LocalCacheMaterializationStatus::CopyOnWriteAttempted
-        ));
+        };
+        #[cfg(not(target_os = "macos"))]
+        let expected_status = LocalCacheMaterializationStatus::Copied;
+        assert_eq!(materialization.status, expected_status);
         assert_eq!(
             fs::read(&destination).expect("hydrated destination should be readable"),
             bytes

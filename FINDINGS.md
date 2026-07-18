@@ -2376,10 +2376,31 @@ independently validated or adjudicated.
    finding and no invalid finding attributable separately, this was
    high-quality, directly actionable feedback.
 
-6. **Medium — macOS copy-on-write tests accept ordinary copying.** The assertions
-   allow either result even on environments intended to protect the CoW feature
-   (`src/local_cache.rs:2440`, `src/cli.rs:4173`). Assert CoW on supported APFS
-   fixtures and test fallback copying separately on unsupported filesystems.
+6. **[DONE] macOS copy-on-write tests accepted ordinary copying** (Medium,
+   `src/local_cache.rs`, `src/cli.rs`, and
+   `scripts/manual/verify-local-cache-materialization.sh`): **Valid and
+   actionable.** The implementation invoked `/bin/cp -c`, whose documented
+   macOS behavior falls back to an ordinary copy when cloning is unsupported,
+   but treated every successful command as `CopyOnWriteAttempted`; the cited
+   tests then accepted either that ambiguous result or `Copied`. Materialization
+   now calls the existing safe `rustix::fs::fclonefileat` wrapper directly and
+   reports `CopyOnWriteCloned` only when the clone syscall succeeds. A failed
+   clone still takes the verified byte-copy path. Tests assert the exact clone
+   result when their macOS fixture is APFS, assert the CLI's exact strategy
+   label from the fixture filesystem, and inject clone unavailability to cover
+   fallback copying independently. The manual materialization verifier now
+   runs the APFS-specific assertion instead of repeating the ambiguous
+   `/bin/cp -c` probe, while implementation and repository documentation record
+   the confirmed-clone contract. Verification passed with `yarn lint:fix`,
+   `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (623 unit tests passed, 1 ignored; all integration
+   targets passed with 4 credential-gated tests ignored), `cargo test --doc`
+   (39 passed), `scripts/manual/verify-local-cache-materialization.sh`, and
+   `git diff --check`. The reviewer identified a genuine medium-severity
+   regression-test blind spot and correctly distinguished an attempted clone
+   from confirmed copy-on-write behavior; with one valid finding and no invalid
+   finding attributable separately, this was high-quality, directly actionable
+   feedback.
 
 7. **Medium — Platform-specific process handling is not tested across supported
    operating systems.** Windows timeout cleanup uses `taskkill`, while relevant

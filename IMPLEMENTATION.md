@@ -1382,7 +1382,7 @@ Defer:
 > registered repository worktrees in a versioned `worktrees.json` registry so
 > future garbage collection can inspect known cache consumers before deleting
 > shared objects. Verified cache objects can now be materialized into worktree
-> paths with macOS `/bin/cp -c` copy-on-write cloning where available and
+> paths with confirmed macOS `fclonefileat` copy-on-write cloning where available and
 > fallback copying elsewhere; matching Git LFS pointer files can be hydrated
 > from the shared cache while non-pointer worktree content is left untouched.
 > Clean hydrated worktree files can now be dehydrated back to canonical Git LFS
