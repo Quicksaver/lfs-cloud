@@ -5,7 +5,7 @@
 //! use without receiving the upstream GitHub token.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, VecDeque, btree_map::Entry},
     fmt,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -263,7 +263,7 @@ impl Default for LocalLfsSessionStore {
 
 #[derive(Default)]
 struct SessionStoreState {
-    sessions: BTreeMap<LfsSessionTokenKey, LfsSessionRecord>,
+    sessions: BTreeMap<LfsSessionTokenKey, Arc<LfsSessionRecord>>,
     recent_issuances: BTreeMap<LfsSessionPrincipal, VecDeque<SystemTime>>,
 }
 
@@ -470,7 +470,7 @@ impl LocalLfsSessionStore {
                 message: "lfs session expiration timestamp overflowed".to_owned(),
             })?;
         let metadata = LfsSessionMetadata::new(user, granted_scopes, issued_at, expires_at);
-        let record = LfsSessionRecord::new(metadata, github_access_token);
+        let record = Arc::new(LfsSessionRecord::new(metadata, github_access_token));
         let principal = LfsSessionPrincipal::from_metadata(&record.metadata);
 
         let mut state = self
@@ -499,10 +499,10 @@ impl LocalLfsSessionStore {
             }
 
             if let Some(durable) = &self.durable {
-                durable.record_session(&token_key, &record)?;
+                durable.record_session(&token_key, record.as_ref())?;
             }
 
-            state.sessions.insert(token_key, record.clone());
+            state.sessions.insert(token_key, Arc::clone(&record));
             state
                 .recent_issuances
                 .entry(principal)
@@ -510,7 +510,7 @@ impl LocalLfsSessionStore {
                 .push_back(issued_at);
             return Ok(IssuedLfsSession {
                 token,
-                metadata: record.metadata,
+                metadata: record.metadata.clone(),
             });
         }
 
@@ -522,23 +522,20 @@ impl LocalLfsSessionStore {
     /// Returns non-secret metadata for a valid, unexpired token.
     #[must_use]
     pub fn verify(&self, token: &LfsSessionToken) -> Option<LfsSessionMetadata> {
-        self.verify_record(token).map(|record| record.metadata)
+        self.verify_record(token)
+            .map(|record| record.metadata.clone())
     }
 
     /// Returns private server-side state for a valid, unexpired token.
     #[must_use]
-    pub(crate) fn verify_record(&self, token: &LfsSessionToken) -> Option<LfsSessionRecord> {
+    pub(crate) fn verify_record(&self, token: &LfsSessionToken) -> Option<Arc<LfsSessionRecord>> {
         let now = (self.clock)();
+        let token_key = LfsSessionTokenKey::from_token(token);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_expired_sessions(&mut state.sessions, now);
-
-        state
-            .sessions
-            .get(&LfsSessionTokenKey::from_token(token))
-            .cloned()
+        take_active_session(&mut state.sessions, token_key, now)
     }
 
     /// Revokes a token if it is currently stored.
@@ -551,18 +548,20 @@ impl LocalLfsSessionStore {
     /// SQLite cannot delete the matching row.
     pub fn revoke(&self, token: &LfsSessionToken) -> ServerResult<bool> {
         let now = (self.clock)();
+        let token_key = LfsSessionTokenKey::from_token(token);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_expired_sessions(&mut state.sessions, now);
 
-        let token_key = LfsSessionTokenKey::from_token(token);
         if let Some(durable) = &self.durable {
             durable.database.delete_session(&token_key.to_hex())?;
         }
 
-        Ok(state.sessions.remove(&token_key).is_some())
+        Ok(state
+            .sessions
+            .remove(&token_key)
+            .is_some_and(|record| record.metadata.expires_at > now))
     }
 
     fn len(&self) -> usize {
@@ -644,10 +643,27 @@ impl LfsSessionTokenKey {
 }
 
 fn prune_expired_sessions(
-    sessions: &mut BTreeMap<LfsSessionTokenKey, LfsSessionRecord>,
+    sessions: &mut BTreeMap<LfsSessionTokenKey, Arc<LfsSessionRecord>>,
     now: SystemTime,
 ) {
     sessions.retain(|_, record| record.metadata.expires_at > now);
+}
+
+fn take_active_session(
+    sessions: &mut BTreeMap<LfsSessionTokenKey, Arc<LfsSessionRecord>>,
+    token_key: LfsSessionTokenKey,
+    now: SystemTime,
+) -> Option<Arc<LfsSessionRecord>> {
+    match sessions.entry(token_key) {
+        Entry::Occupied(entry) if entry.get().metadata.expires_at > now => {
+            Some(Arc::clone(entry.get()))
+        }
+        Entry::Occupied(entry) => {
+            entry.remove();
+            None
+        }
+        Entry::Vacant(_) => None,
+    }
 }
 
 fn prune_recent_issuances(
@@ -783,7 +799,7 @@ impl DurableLfsSessionStore {
     fn load_sessions(
         &self,
         now: SystemTime,
-    ) -> ServerResult<BTreeMap<LfsSessionTokenKey, LfsSessionRecord>> {
+    ) -> ServerResult<BTreeMap<LfsSessionTokenKey, Arc<LfsSessionRecord>>> {
         let now = unix_timestamp_seconds_i64(now)?;
         self.database
             .load_active_sessions(now)?
@@ -795,7 +811,7 @@ impl DurableLfsSessionStore {
     fn restore_session(
         &self,
         stored: MetadataSessionRecord,
-    ) -> ServerResult<(LfsSessionTokenKey, LfsSessionRecord)> {
+    ) -> ServerResult<(LfsSessionTokenKey, Arc<LfsSessionRecord>)> {
         let token_key = LfsSessionTokenKey::from_hex(&stored.token_sha256)?;
         let granted_scopes = serde_json::from_str::<Vec<String>>(&stored.granted_scopes_json)
             .map_err(|_| invalid_durable_session("stored granted scopes are not valid JSON"))?;
@@ -832,7 +848,7 @@ impl DurableLfsSessionStore {
 
         Ok((
             token_key,
-            LfsSessionRecord::new(metadata, github_access_token),
+            Arc::new(LfsSessionRecord::new(metadata, github_access_token)),
         ))
     }
 
@@ -977,7 +993,8 @@ mod tests {
     };
 
     use super::{
-        LfsSessionToken, LocalLfsSessionStore, MAX_LFS_SESSION_TOKEN_LEN, SessionStoreLimits,
+        LfsSessionToken, LfsSessionTokenKey, LocalLfsSessionStore, MAX_LFS_SESSION_TOKEN_LEN,
+        SessionStoreLimits,
     };
     use crate::{GitHubOAuthAccessToken, MetadataDatabase, RepositoryUser, ServerError};
 
@@ -1111,6 +1128,51 @@ mod tests {
         elapsed_seconds.store(10, Ordering::SeqCst);
         assert_eq!(store.verify(&issued.token), None);
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn session_store_verification_checks_only_the_requested_record() {
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let store = test_store(
+            Arc::clone(&elapsed_seconds),
+            SessionStoreLimits::for_tests(8, 8, 8, Duration::from_secs(60)),
+        );
+        let expired = store
+            .issue_session_with_ttl(&user(), ["repo"], Duration::from_secs(10))
+            .expect("short-lived session should be issued");
+        let active = store
+            .issue_session_with_ttl(&user(), ["repo"], Duration::from_secs(100))
+            .expect("long-lived session should be issued");
+
+        elapsed_seconds.store(10, Ordering::SeqCst);
+        let verified = store
+            .verify_record(&active.token)
+            .expect("requested active session should verify");
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            state.sessions.len(),
+            2,
+            "verification must not scan and prune unrelated sessions"
+        );
+        let stored = state
+            .sessions
+            .get(&LfsSessionTokenKey::from_token(&active.token))
+            .expect("active record should remain stored");
+        assert!(
+            Arc::ptr_eq(&verified, stored),
+            "verification should share the OAuth-bearing record"
+        );
+        drop(state);
+
+        assert!(store.verify_record(&expired.token).is_none());
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.sessions.len(), 1);
     }
 
     #[test]

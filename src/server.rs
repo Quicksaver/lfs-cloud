@@ -980,7 +980,7 @@ impl LfsServerState {
 #[derive(Debug)]
 struct AuthenticatedLfsSession {
     token: LfsSessionToken,
-    record: LfsSessionRecord,
+    record: Arc<LfsSessionRecord>,
 }
 
 impl AuthenticatedLfsSession {

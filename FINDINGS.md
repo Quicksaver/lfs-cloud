@@ -333,11 +333,31 @@ independently validated or adjudicated.
     with one valid finding and no invalid finding attributable separately, this
     was high-quality feedback with one minor outdated detail.
 
-14. **Low — Authentication performs a serialized O(n) session scan and clones
-    OAuth-bearing records.** Every request locks the map and prunes all sessions
-    (`src/sessions.rs:329-340`, `src/sessions.rs:415-420`). Check only the
-    requested entry, maintain an expiry index or background pruning task, and
-    share records through `Arc`.
+14. **[DONE] Authentication performs a serialized O(n) session scan and clones
+    OAuth-bearing records** (Low, `src/sessions.rs` and `src/server.rs`):
+    **Valid and actionable.** Session authentication previously retained every
+    map entry while holding the mutex, then deep-cloned the matching record,
+    including its private GitHub OAuth token. Verification now hashes the
+    presented token before taking the lock, performs one direct `BTreeMap`
+    entry lookup, removes only that entry when it has expired, and returns an
+    `Arc` to the stored OAuth-bearing record. The authenticated server request
+    carries that same shared record, and revocation likewise removes only the
+    presented token instead of scanning unrelated sessions. Full-map expiry
+    pruning remains only on session admission and diagnostic length paths,
+    where bounded capacity must be reconciled and which are not part of the
+    per-request authentication hot path; an expiry index or background task
+    would therefore add lifecycle complexity without improving normal request
+    lookup. A deterministic regression proves that validating an active token
+    leaves an unrelated expired entry untouched, returns the exact stored
+    `Arc`, and removes the expired entry only when that token is itself checked.
+    Verification passed with `yarn lint:fix`, `cargo fmt --check`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`.
+    The focused reviewer found a genuine low-severity scalability and
+    secret-handling inefficiency, identified both sources of avoidable work,
+    and recommended the decisive exact-entry and shared-record changes. With
+    one valid finding assessed here and no invalid finding attributable
+    separately, this was high-quality, relevant feedback.
 
 15. **Low — GitHub REST requests do not pin an API version.** Requests set
     `Accept` but omit `X-GitHub-Api-Version`
