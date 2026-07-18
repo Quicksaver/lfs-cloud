@@ -1060,10 +1060,12 @@ where
 {
     let layout = local_cache_layout(command.cache_root)?;
     let start_dir = start_dir.as_ref();
-    register_current_worktree(&layout, start_dir)?;
+    let repository = GitRepository::discover(start_dir)?;
+    register_worktree(&layout, &repository)?;
 
     for path in command.paths {
         let path = resolve_cli_path(start_dir, &path);
+        let path = contained_worktree_file_path(&repository.worktree_root, &path, "hydration")?;
         let materialization = layout
             .hydrate_pointer_file(&path)
             .map_err(local_cache_cli_error)?;
@@ -1089,6 +1091,7 @@ where
 
     for path in command.paths {
         let path = resolve_cli_path(start_dir, &path);
+        let path = contained_worktree_file_path(&repository.worktree_root, &path, "dehydration")?;
         let object = indexed_lfs_object_for_dehydration(&repository.worktree_root, &path)?;
         let dehydration = layout
             .dehydrate_file(&object, &path)
@@ -2322,29 +2325,65 @@ fn dehydration_relative_path(worktree_root: &Path, path: &Path) -> CliResult<Pat
         ),
         source,
     })?;
+    let path = contained_worktree_file_path(worktree_root, path, "dehydration")?;
+    path.strip_prefix(&root)
+        .map(Path::to_path_buf)
+        .map_err(|_| CliError::InvalidArguments {
+            message: format!(
+                "dehydration path must be contained in the current Git worktree: {}",
+                path.display()
+            ),
+        })
+}
+
+fn contained_worktree_file_path(
+    worktree_root: &Path,
+    path: &Path,
+    operation: &'static str,
+) -> CliResult<PathBuf> {
+    let root = dunce::canonicalize(worktree_root).map_err(|source| CliError::Io {
+        context: format!(
+            "failed to resolve Git worktree root {}",
+            worktree_root.display()
+        ),
+        source,
+    })?;
     let parent = path.parent().ok_or_else(|| CliError::InvalidArguments {
         message: format!(
-            "dehydration path must be contained in the current Git worktree: {}",
+            "{operation} path must be contained in the current Git worktree: {}",
             path.display()
         ),
     })?;
     let parent = dunce::canonicalize(parent).map_err(|source| CliError::Io {
-        context: format!("failed to resolve dehydration path {}", path.display()),
+        context: format!("failed to resolve {operation} path {}", path.display()),
         source,
     })?;
     let relative_parent = parent
         .strip_prefix(&root)
         .map_err(|_| CliError::InvalidArguments {
             message: format!(
-                "dehydration path must be contained in the current Git worktree: {}",
+                "{operation} path must be contained in the current Git worktree: {}",
                 path.display()
             ),
         })?;
     let file_name = path.file_name().ok_or_else(|| CliError::InvalidArguments {
-        message: format!("dehydration path is not a file: {}", path.display()),
+        message: format!("{operation} path is not a file: {}", path.display()),
     })?;
+    let path = root.join(relative_parent).join(file_name);
+    let metadata = fs::symlink_metadata(&path).map_err(|source| CliError::Io {
+        context: format!("failed to inspect {operation} path {}", path.display()),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "{operation} path must be a regular file and not a symbolic link: {}",
+                path.display()
+            ),
+        });
+    }
 
-    Ok(relative_parent.join(file_name))
+    Ok(path)
 }
 
 fn require_lfs_filter(
@@ -5361,6 +5400,45 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_rejects_paths_outside_the_current_worktree() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let cache_root = temp.path().join("cache");
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside.bin");
+        init_git_repo_with_origin(&repo);
+        let bytes = b"outside cached bytes";
+        let object = object_for_bytes(bytes);
+        let pointer = LfsPointer::new(object.clone()).to_pointer_file();
+        write_file(&outside, pointer.as_bytes());
+        write_file(
+            &LocalCacheLayout::new(&cache_root).object_path(&object),
+            bytes,
+        );
+        let mut output = Vec::new();
+
+        let error = run_hydrate_from_dir(
+            HydrateCommand {
+                cache_root: Some(cache_root),
+                paths: vec![outside.clone()],
+            },
+            &repo,
+            &mut output,
+        )
+        .expect_err("outside paths must not be hydrated");
+
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside pointer should remain readable"),
+            pointer
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn dehydrate_republishes_cache_bytes_for_real_git_lfs_push() {
         if !git_lfs_is_available() {
             return;
@@ -5455,7 +5533,7 @@ mod tests {
             error,
             CliError::LocalCache {
                 source: LocalCacheError::PointerParse { path, .. }
-            } if path == worktree_file
+            } if path == worktree_file.canonicalize().unwrap_or(worktree_file)
         ));
         assert!(output.is_empty());
     }

@@ -181,6 +181,13 @@ pub enum LocalCacheError {
         path: PathBuf,
     },
 
+    /// A worktree cache operation was asked to follow a symbolic link.
+    #[error("refusing to follow symbolic link at worktree path {}", path.display())]
+    WorktreePathSymlink {
+        /// Symbolic link that was rejected before reading or replacement.
+        path: PathBuf,
+    },
+
     /// A worktree path could not be parsed as a Git LFS pointer.
     #[error("failed to parse Git LFS pointer at {}: {source}", path.display())]
     PointerParse {
@@ -769,7 +776,7 @@ impl LocalCacheLayout {
                 status: LocalCacheDehydrationStatus::AlreadyDehydrated,
             });
         }
-        let verified_worktree = match verify_file_object(worktree_path, object) {
+        let verified_worktree = match verify_worktree_file_object(worktree_path, object) {
             Ok(verified) => verified,
             Err(error) => {
                 if let Some(pointer) = existing_pointer {
@@ -1688,7 +1695,9 @@ enum MaterializationMode {
 }
 
 fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
-    let metadata = fs::metadata(path).map_err(|source| LocalCacheError::Io {
+    let file =
+        open_worktree_file_without_following_symlinks(path, "failed to open Git LFS pointer file")?;
+    let metadata = file.metadata().map_err(|source| LocalCacheError::Io {
         context: "failed to inspect Git LFS pointer file",
         path: path.to_path_buf(),
         source,
@@ -1701,11 +1710,6 @@ fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
         });
     }
 
-    let file = File::open(path).map_err(|source| LocalCacheError::Io {
-        context: "failed to read Git LFS pointer file",
-        path: path.to_path_buf(),
-        source,
-    })?;
     let mut contents = Vec::new();
     file.take(MAX_LFS_POINTER_FILE_SIZE + 1)
         .read_to_end(&mut contents)
@@ -1737,27 +1741,17 @@ fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
 }
 
 fn read_existing_lfs_pointer_file(path: &Path) -> LocalCacheResult<Option<LfsPointer>> {
-    let metadata = fs::metadata(path).map_err(|source| LocalCacheError::Io {
+    let file =
+        open_worktree_file_without_following_symlinks(path, "failed to open dehydration target")?;
+    let metadata = file.metadata().map_err(|source| LocalCacheError::Io {
         context: "failed to inspect dehydration target",
         path: path.to_path_buf(),
         source,
     })?;
-    if !metadata.is_file() {
-        return Err(LocalCacheError::Io {
-            context: "dehydration target is not a file",
-            path: path.to_path_buf(),
-            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
-        });
-    }
     if metadata.len() > MAX_LFS_POINTER_FILE_SIZE {
         return Ok(None);
     }
 
-    let file = File::open(path).map_err(|source| LocalCacheError::Io {
-        context: "failed to open dehydration target",
-        path: path.to_path_buf(),
-        source,
-    })?;
     let mut contents = Vec::new();
     file.take(MAX_LFS_POINTER_FILE_SIZE + 1)
         .read_to_end(&mut contents)
@@ -1815,10 +1809,10 @@ where
     })?;
     set_temporary_file_mode(temp.path(), path, mode)?;
 
-    verify_file_object(path, object)?;
+    verify_worktree_file_object(path, object)?;
     before_publish();
     replace_retaining_displaced(temp, path, |displaced_path| {
-        remap_integrity_path(verify_file_object(displaced_path, object), path).map(|_| ())
+        remap_integrity_path(verify_worktree_file_object(displaced_path, object), path).map(|_| ())
     })?;
 
     let pointer = read_lfs_pointer_file(path)?;
@@ -1900,7 +1894,7 @@ fn materialize_verified_object(
     // The final verification proves the path currently contains the expected
     // object. If an uncoordinated writer races this local worktree path, the
     // caller may still receive an integrity error after publication.
-    let materialized = verify_file_object(destination_path, &verified.object)?;
+    let materialized = verify_worktree_file_object(destination_path, &verified.object)?;
 
     Ok(LocalCacheMaterialization {
         object: materialized.object,
@@ -1920,13 +1914,18 @@ fn existing_destination_status(
     path: &Path,
     object: &LfsObject,
 ) -> LocalCacheResult<ExistingDestinationStatus> {
-    match fs::metadata(path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(LocalCacheError::WorktreePathSymlink {
+                path: path.to_path_buf(),
+            })
+        }
         Ok(metadata) if metadata.is_file() => {
             if metadata.len() != object.size.bytes() {
                 return Ok(ExistingDestinationStatus::Different);
             }
 
-            match verify_file_object(path, object) {
+            match verify_worktree_file_object(path, object) {
                 Ok(_) => Ok(ExistingDestinationStatus::AlreadyMaterialized),
                 Err(LocalCacheError::IntegrityMismatch { .. }) => {
                     Ok(ExistingDestinationStatus::Different)
@@ -2066,7 +2065,7 @@ fn publish_materialized_file(
             match temp.persist_noclobber(destination_path) {
                 Ok(_) => Ok(()),
                 Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                    match verify_file_object(destination_path, object) {
+                    match verify_worktree_file_object(destination_path, object) {
                         Ok(_) => Ok(()),
                         Err(LocalCacheError::IntegrityMismatch { .. }) => {
                             Err(LocalCacheError::MaterializationTargetExists {
@@ -2204,13 +2203,8 @@ fn exchange_paths(left: &Path, right: &Path) -> io::Result<()> {
 fn existing_file_mode(path: &Path) -> LocalCacheResult<u32> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::metadata(path)
+    worktree_file_metadata_without_following_symlinks(path)
         .map(|metadata| metadata.permissions().mode() & 0o777)
-        .map_err(|source| LocalCacheError::Io {
-            context: "failed to inspect materialization destination permissions",
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 #[cfg(not(unix))]
@@ -2425,16 +2419,47 @@ fn verify_file_object(
     })
 }
 
+fn verify_worktree_file_object(
+    path: &Path,
+    expected: &LfsObject,
+) -> LocalCacheResult<VerifiedLocalCacheObject> {
+    let file = open_worktree_file_without_following_symlinks(
+        path,
+        "failed to open worktree object for hashing",
+    )?;
+    let (actual_oid, actual_size) = hash_open_file(file, path)?;
+
+    if actual_oid != expected.oid || actual_size != expected.size {
+        return Err(LocalCacheError::IntegrityMismatch {
+            path: path.to_path_buf(),
+            expected_oid: expected.oid.clone(),
+            expected_size: expected.size,
+            actual_oid,
+            actual_size,
+        });
+    }
+
+    Ok(VerifiedLocalCacheObject {
+        object: expected.clone(),
+        path: path.to_path_buf(),
+    })
+}
+
 fn copy_verified_object_to_cache(
     source_path: &Path,
     cache_path: &Path,
     object: &LfsObject,
 ) -> LocalCacheResult<LocalCacheIngestStatus> {
-    copy_verified_path_to_cache(
+    let source = File::open(source_path).map_err(|source| LocalCacheError::Io {
+        context: "failed to open Git LFS source object",
+        path: source_path.to_path_buf(),
+        source,
+    })?;
+    copy_verified_file_to_cache(
+        source,
         source_path,
         cache_path,
         object,
-        "failed to open Git LFS source object",
         "failed to read Git LFS source object",
         CachePublishDurability::Recoverable,
     )
@@ -2445,11 +2470,15 @@ fn copy_verified_worktree_object_to_cache(
     cache_path: &Path,
     object: &LfsObject,
 ) -> LocalCacheResult<()> {
-    copy_verified_path_to_cache(
+    let source = open_worktree_file_without_following_symlinks(
+        source_path,
+        "failed to open hydrated worktree object",
+    )?;
+    copy_verified_file_to_cache(
+        source,
         source_path,
         cache_path,
         object,
-        "failed to open hydrated worktree object",
         "failed to read hydrated worktree object",
         CachePublishDurability::Durable,
     )
@@ -2462,11 +2491,11 @@ enum CachePublishDurability {
     Durable,
 }
 
-fn copy_verified_path_to_cache(
+fn copy_verified_file_to_cache(
+    mut source: File,
     source_path: &Path,
     cache_path: &Path,
     object: &LfsObject,
-    open_context: &'static str,
     read_context: &'static str,
     durability: CachePublishDurability,
 ) -> LocalCacheResult<LocalCacheIngestStatus> {
@@ -2484,11 +2513,6 @@ fn copy_verified_path_to_cache(
         source,
     })?;
 
-    let mut source = File::open(source_path).map_err(|source| LocalCacheError::Io {
-        context: open_context,
-        path: source_path.to_path_buf(),
-        source,
-    })?;
     let mut temp =
         tempfile::NamedTempFile::new_in(cache_parent).map_err(|source| LocalCacheError::Io {
             context: "failed to create temporary cache object",
@@ -2619,11 +2643,16 @@ fn copy_and_verify_object(
 }
 
 fn hash_file(path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
-    let mut file = File::open(path).map_err(|source| LocalCacheError::Io {
+    let file = File::open(path).map_err(|source| LocalCacheError::Io {
         context: "failed to open object for hashing",
         path: path.to_path_buf(),
         source,
     })?;
+
+    hash_open_file(file, path)
+}
+
+fn hash_open_file(mut file: File, path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
     let mut hasher = Sha256::new();
     let mut total_size = 0u64;
     let mut buffer = [0u8; 64 * 1024];
@@ -2653,6 +2682,81 @@ fn hash_file(path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
         LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid"),
         LfsObjectSize::new(total_size),
     ))
+}
+
+fn worktree_file_metadata_without_following_symlinks(
+    path: &Path,
+) -> LocalCacheResult<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| LocalCacheError::Io {
+        context: "failed to inspect worktree path",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(LocalCacheError::WorktreePathSymlink {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(LocalCacheError::Io {
+            context: "worktree path is not a file",
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
+        });
+    }
+
+    Ok(metadata)
+}
+
+fn open_worktree_file_without_following_symlinks(
+    path: &Path,
+    context: &'static str,
+) -> LocalCacheResult<File> {
+    worktree_file_metadata_without_following_symlinks(path)?;
+
+    #[cfg(unix)]
+    let file = rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from);
+
+    #[cfg(not(unix))]
+    let file = File::open(path);
+
+    let file = file.map_err(|source| {
+        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            LocalCacheError::WorktreePathSymlink {
+                path: path.to_path_buf(),
+            }
+        } else {
+            LocalCacheError::Io {
+                context,
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    if !file
+        .metadata()
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to inspect opened worktree file",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .is_file()
+    {
+        return Err(LocalCacheError::Io {
+            context: "opened worktree path is not a file",
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
+        });
+    }
+
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -3259,6 +3363,49 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hydrate_pointer_file_rejects_symlink_without_replacing_it() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"cached bytes for symlink hydration";
+        let object = object_for_bytes(bytes);
+        let outside_pointer = temp.path().join("outside-pointer");
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(
+            &outside_pointer,
+            LfsPointer::new(object).to_pointer_file().as_bytes(),
+        );
+        fs::create_dir_all(
+            destination
+                .parent()
+                .expect("destination should have a parent"),
+        )
+        .expect("destination parent should be created");
+        std::os::unix::fs::symlink(&outside_pointer, &destination)
+            .expect("worktree symlink should be created");
+
+        let error = layout
+            .hydrate_pointer_file(&destination)
+            .expect_err("a symlink must not be hydrated");
+
+        assert!(matches!(
+            error,
+            LocalCacheError::WorktreePathSymlink { path } if path == destination
+        ));
+        assert!(
+            fs::symlink_metadata(&destination)
+                .expect("symlink metadata should remain readable")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_pointer).expect("outside pointer should remain readable"),
+            LfsPointer::new(object_for_bytes(bytes)).to_pointer_file()
+        );
+    }
+
     #[test]
     fn dehydrate_file_replaces_clean_hydrated_bytes_with_pointer_and_caches_object() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -3287,6 +3434,46 @@ mod tests {
             fs::read(layout.object_path(&object)).expect("cache object should be readable"),
             bytes
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dehydrate_file_rejects_symlink_without_replacing_it() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"outside bytes must not be dehydrated";
+        let object = object_for_bytes(bytes);
+        let outside_file = temp.path().join("outside-object");
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(&outside_file, bytes);
+        fs::create_dir_all(
+            worktree_path
+                .parent()
+                .expect("worktree path should have a parent"),
+        )
+        .expect("worktree parent should be created");
+        std::os::unix::fs::symlink(&outside_file, &worktree_path)
+            .expect("worktree symlink should be created");
+
+        let error = layout
+            .dehydrate_file(&object, &worktree_path)
+            .expect_err("a symlink must not be dehydrated");
+
+        assert!(matches!(
+            error,
+            LocalCacheError::WorktreePathSymlink { path } if path == worktree_path
+        ));
+        assert!(
+            fs::symlink_metadata(&worktree_path)
+                .expect("symlink metadata should remain readable")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(&outside_file).expect("outside file should remain readable"),
+            bytes
+        );
+        assert!(!layout.object_path(&object).exists());
     }
 
     #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]

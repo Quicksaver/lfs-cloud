@@ -787,6 +787,12 @@ lfs-cloud gc
 ```
 
 Hydration and dehydration serialize operations for the same worktree path.
+Their CLI boundary canonicalizes the requested file's parent and proves it
+remains under the discovered worktree. The final path component must be a
+regular file, never a symbolic link; worktree reads use no-follow opens where
+the platform provides them, and displaced-file verification repeats that
+check after atomic publication so a raced symlink is restored rather than
+followed or discarded.
 On macOS and Linux, destructive publication atomically exchanges the proposed
 file with the current path, verifies the displaced bytes, and exchanges them
 back if an edit landed after the final precondition check. A failed rollback

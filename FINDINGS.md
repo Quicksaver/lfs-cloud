@@ -1344,12 +1344,33 @@ independently validated or adjudicated.
    local-only references. With one valid finding assessed here and no invalid
    finding attributable separately, this was high-quality, relevant feedback.
 
-6. **Medium — Worktree symlinks are followed and then replaced.** Dehydration
-   can hash an outside-repository symlink target and replace the symlink with a
-   pointer; hydration can similarly replace a symlink whose target is a pointer
-   (`src/local_cache.rs:1336-1423`, `src/local_cache.rs:1556-1587`,
-   `src/cli.rs:1681-1697`). Use `symlink_metadata`, no-follow opens where
-   supported, canonical parent containment, and explicit symlink rejection.
+6. **[DONE] Worktree symlinks were followed and then replaced** (Medium,
+   `src/local_cache.rs` and `src/cli.rs`): **Valid and actionable.** Hydration
+   previously accepted arbitrary paths after only registering the current
+   worktree, while dehydration proved only the resolved parent was contained;
+   both operations then used follow-symlink metadata and file opens for the
+   final component. A matching outside target could therefore be hashed or
+   parsed before atomic publication replaced the symlink itself. Both CLI
+   paths now canonicalize the requested parent, prove it remains under the
+   discovered worktree, and reject a final component that is not a regular
+   file or is a symbolic link. The local-cache boundary independently exposes
+   a typed symlink rejection and uses no-follow worktree opens on Unix for
+   pointer parsing, object hashing, cache copying, and final displaced-file
+   verification; a symlink introduced during publication is rejected and
+   rolled back instead of followed or discarded. Regression coverage proves
+   direct hydration/dehydration preserve symlinks and their outside targets,
+   and that CLI hydration cannot mutate an outside-worktree pointer. README,
+   implementation guidance, and the repository learning document the new path
+   boundary. Verification passed with `cargo fmt --all`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+   first full test run encountered five unrelated credential-helper test
+   timeouts; all nine focused approval tests passed serially and the immediate
+   full-suite rerun passed, confirming no cache-path regression. The focused
+   reviewer identified a genuine medium-severity filesystem-boundary flaw and
+   prescribed the correct containment, no-follow, and regression-test
+   defenses; with one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, relevant feedback.
 
 7. **Medium — Dehydration performs three to four full reads of large files.**
    CLI hashing, library verification, cache copying, and the final race check

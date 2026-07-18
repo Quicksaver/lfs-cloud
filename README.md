@@ -253,8 +253,9 @@ the shared local cache. It refuses non-pointer worktree content and fails if the
 referenced object is missing or corrupt in the cache. Same-path cache
 operations are serialized. On macOS and Linux, publication atomically retains
 and verifies the displaced pointer, restoring it if a concurrent edit landed
-after the final check. Use `--cache-root` to target a non-default local cache
-root.
+after the final check. Hydration accepts only regular files whose resolved
+parent remains inside the current worktree; symbolic links are never followed
+or replaced. Use `--cache-root` to target a non-default local cache root.
 
 ### Dehydrate Files To Pointers
 
@@ -272,8 +273,9 @@ dehydrated. A cache-wide operation lock prevents concurrent garbage collection
 from deleting newly preserved bytes before the pointer becomes visible.
 Same-path cache operations are serialized. On macOS and Linux, pointer
 publication atomically retains and verifies the displaced file, restoring it
-if a concurrent edit landed after the final check. Use `--cache-root` to target
-a non-default local cache root.
+if a concurrent edit landed after the final check. Dehydration rejects symbolic
+links without reading their targets or replacing the links. Use `--cache-root`
+to target a non-default local cache root.
 
 ### Garbage-Collect The Local Cache
 
