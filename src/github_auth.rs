@@ -33,9 +33,10 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    GitHubProviderConfig, IssuedLfsSession, LocalLfsSessionStore, RepositoryAuthorization,
-    RepositoryIdentity, RepositoryPermission, RepositoryProviderError, RepositoryUser,
-    SanitizedMessage, ServerError, ServerResult, http_transport::uses_protected_http_transport,
+    GitHubProviderConfig, IssuedLfsSession, LocalLfsSessionStore, ProviderFuture,
+    RepositoryAuthentication, RepositoryAuthorization, RepositoryIdentity, RepositoryPermission,
+    RepositoryProvider, RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerError,
+    ServerResult, http_transport::uses_protected_http_transport,
 };
 
 const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
@@ -643,6 +644,75 @@ impl GitHubUserClient {
 #[derive(Clone, Debug)]
 pub struct GitHubRepositoryPermissionClient {
     client: Client,
+}
+
+/// GitHub repository-provider adapter used by production LFS authorization.
+///
+/// The adapter consumes the generic per-session authentication context and
+/// keeps GitHub-specific token parsing and permission API behavior behind the
+/// [`RepositoryProvider`] boundary.
+#[derive(Clone, Debug)]
+pub struct GitHubRepositoryProvider {
+    provider: GitHubProviderConfig,
+    permission_client: Option<GitHubRepositoryPermissionClient>,
+}
+
+impl GitHubRepositoryProvider {
+    /// Creates a GitHub repository provider using the default API client.
+    #[must_use]
+    pub fn new(provider: GitHubProviderConfig) -> Self {
+        Self {
+            provider,
+            permission_client: None,
+        }
+    }
+
+    /// Creates a GitHub repository provider with an explicit permission client.
+    ///
+    /// This constructor lets tests and future server composition share a
+    /// configured HTTP client without weakening the production provider trait.
+    #[must_use]
+    pub fn with_client(
+        provider: GitHubProviderConfig,
+        permission_client: GitHubRepositoryPermissionClient,
+    ) -> Self {
+        Self {
+            provider,
+            permission_client: Some(permission_client),
+        }
+    }
+}
+
+impl RepositoryProvider for GitHubRepositoryProvider {
+    fn provider_id(&self) -> &str {
+        &self.provider.id
+    }
+
+    fn check_permission<'a>(
+        &'a self,
+        repository: &'a RepositoryIdentity,
+        authentication: &'a RepositoryAuthentication,
+        required: RepositoryPermission,
+    ) -> ProviderFuture<'a, ServerResult<RepositoryAuthorization>> {
+        Box::pin(async move {
+            let token =
+                GitHubOAuthAccessToken::from_secret(authentication.access_token().to_owned())?;
+            let client = match &self.permission_client {
+                Some(client) => client.clone(),
+                None => GitHubRepositoryPermissionClient::new()?,
+            };
+
+            client
+                .check_permission(
+                    &self.provider,
+                    &token,
+                    repository,
+                    authentication.user(),
+                    required,
+                )
+                .await
+        })
+    }
 }
 
 impl GitHubRepositoryPermissionClient {
@@ -2571,13 +2641,14 @@ mod tests {
         GitHubOAuthAccessToken, GitHubOAuthAuthorization, GitHubOAuthCallback,
         GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteState, GitHubOAuthState,
         GitHubOAuthStateRegistry, GitHubOAuthTokenExchanger, GitHubRepositoryPermissionClient,
-        GitHubUserClient, MAX_PENDING_GITHUB_OAUTH_STATES, exchange_github_oauth_code,
-        fetch_authenticated_github_user, github_oauth_authorization_url,
-        github_oauth_callback_router, github_oauth_login_router,
+        GitHubRepositoryProvider, GitHubUserClient, MAX_PENDING_GITHUB_OAUTH_STATES,
+        exchange_github_oauth_code, fetch_authenticated_github_user,
+        github_oauth_authorization_url, github_oauth_callback_router, github_oauth_login_router,
     };
     use crate::{
-        GitHubProviderConfig, LfsSessionToken, LocalLfsSessionStore, RepositoryIdentity,
-        RepositoryPermission, RepositoryProviderError, RepositoryUser, ServerError,
+        GitHubProviderConfig, LfsSessionToken, LocalLfsSessionStore, RepositoryAuthentication,
+        RepositoryIdentity, RepositoryPermission, RepositoryProvider, RepositoryProviderError,
+        RepositoryUser, ServerError,
     };
 
     const REDIRECT_URL: &str = "http://127.0.0.1:8080/auth/github/callback";
@@ -3270,7 +3341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_client_allows_public_read_repo_download() {
+    async fn repository_provider_uses_authentication_context_for_public_read() {
         let (api_url, permission_server) = permission_server(
             StatusCode::OK,
             r#"{"permission":"read","role_name":"triage","user":{"login":"octocat","id":583231}}"#,
@@ -3278,19 +3349,14 @@ mod tests {
         )
         .await;
         let provider = provider_config_with_api_url(api_url);
-        let token = GitHubOAuthAccessToken::from_secret("gho_token").expect("token should parse");
         let repository = repository_identity("public-owner", "public-repo");
         let user = repository_user("octocat");
         let client = GitHubRepositoryPermissionClient::new().expect("client should build");
+        let provider_adapter = GitHubRepositoryProvider::with_client(provider, client);
+        let authentication = RepositoryAuthentication::new(user, "gho_token");
 
-        let authorization = client
-            .check_permission(
-                &provider,
-                &token,
-                &repository,
-                &user,
-                RepositoryPermission::Read,
-            )
+        let authorization = provider_adapter
+            .check_permission(&repository, &authentication, RepositoryPermission::Read)
             .await
             .expect("read permission should authorize download");
 
@@ -3317,6 +3383,7 @@ mod tests {
             identity_request.authorization.as_deref(),
             Some("Bearer gho_token")
         );
+        assert_eq!(provider_adapter.provider_id(), "github-main");
     }
 
     #[tokio::test]

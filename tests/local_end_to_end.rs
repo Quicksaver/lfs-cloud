@@ -16,9 +16,9 @@ use axum::{
     },
 };
 use lfs_cloud::{
-    GitLfsConfigTarget, GitRepository, LfsBatchResponse, LfsInitRoute, LocalCacheDehydrationStatus,
-    LocalCacheLayout, LocalLfsSessionStore, RepositoryPermission, RepositoryUser, ServerConfig,
-    ServerError, lfs_server_router_with_provider_adapters,
+    GitHubOAuthAccessToken, GitLfsConfigTarget, GitRepository, LfsBatchResponse, LfsInitRoute,
+    LocalCacheDehydrationStatus, LocalCacheLayout, LocalLfsSessionStore, RepositoryPermission,
+    RepositoryUser, ServerConfig, ServerError, lfs_server_router_with_provider_adapters,
 };
 use support::{
     FakeRepositoryProvider, FakeStorageProvider, TempGitRepo, lfs_object_for_bytes,
@@ -60,7 +60,7 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
     );
 
     let github = Arc::new(FakeRepositoryProvider::new("github-main"));
-    github.add_repository("github.com", "owner", "repo", Some("repo-123".to_owned()));
+    github.add_repository("github.com", "owner", "repo", Some("8675309".to_owned()));
     github.grant_permission(
         "github.com",
         "owner",
@@ -71,7 +71,12 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
     let user = RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned()));
     let sessions = LocalLfsSessionStore::new();
     let session = sessions
-        .issue_session(&user, ["repo"])
+        .issue_session_with_github_token(
+            &user,
+            ["repo"],
+            GitHubOAuthAccessToken::from_secret("fake-provider-token")
+                .expect("fake provider token should parse"),
+        )
         .expect("local LFS session should be issued");
 
     let bytes = b"large model bytes fetched through lfs-cloud";
@@ -192,7 +197,7 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
 #[tokio::test]
 async fn shared_storage_provider_does_not_expose_another_repository_object() {
     let github = Arc::new(FakeRepositoryProvider::new("github-main"));
-    for (name, stable_id) in [("repo", "repo-123"), ("repo-b", "repo-456")] {
+    for (name, stable_id) in [("repo", "8675309"), ("repo-b", "8675310")] {
         github.add_repository("github.com", "owner", name, Some(stable_id.to_owned()));
         github.grant_permission(
             "github.com",
@@ -205,7 +210,12 @@ async fn shared_storage_provider_does_not_expose_another_repository_object() {
     let user = RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned()));
     let sessions = LocalLfsSessionStore::new();
     let session = sessions
-        .issue_session(&user, ["repo"])
+        .issue_session_with_github_token(
+            &user,
+            ["repo"],
+            GitHubOAuthAccessToken::from_secret("fake-provider-token")
+                .expect("fake provider token should parse"),
+        )
         .expect("local LFS session should be issued");
     let drive = Arc::new(FakeStorageProvider::new("drive-user-a"));
     let router = lfs_server_router_with_provider_adapters(

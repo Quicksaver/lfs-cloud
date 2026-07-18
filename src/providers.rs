@@ -4,9 +4,9 @@
 //! the storage provider, but the LFS protocol layer should depend on these
 //! traits rather than concrete provider implementations.
 
-use std::{future::Future, path::Path, pin::Pin};
+use std::{fmt, future::Future, path::Path, pin::Pin};
 
-use crate::{LfsObject, RepositoryPermission, RepositoryProviderResult, StorageResult};
+use crate::{LfsObject, RepositoryPermission, ServerResult, StorageResult};
 
 /// Boxed asynchronous provider operation.
 ///
@@ -14,38 +14,7 @@ use crate::{LfsObject, RepositoryPermission, RepositoryProviderResult, StorageRe
 /// trait objects while implementations can still perform network I/O.
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Configured repository address resolved from an LFS route or CLI context.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RepositoryHandle {
-    /// Repository provider ID from server configuration.
-    pub provider_id: String,
-    /// Repository host, such as `github.com`.
-    pub host: String,
-    /// Repository owner or namespace.
-    pub owner: String,
-    /// Repository name.
-    pub name: String,
-}
-
-impl RepositoryHandle {
-    /// Creates a configured repository handle.
-    #[must_use]
-    pub fn new(
-        provider_id: impl Into<String>,
-        host: impl Into<String>,
-        owner: impl Into<String>,
-        name: impl Into<String>,
-    ) -> Self {
-        Self {
-            provider_id: provider_id.into(),
-            host: host.into(),
-            owner: owner.into(),
-            name: name.into(),
-        }
-    }
-}
-
-/// Stable repository identity returned by a repository provider.
+/// Stable repository identity configured for a repository provider.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryIdentity {
     /// Configured repository provider ID.
@@ -60,20 +29,6 @@ pub struct RepositoryIdentity {
     pub name: String,
 }
 
-impl RepositoryIdentity {
-    /// Creates repository identity metadata from a configured handle.
-    #[must_use]
-    pub fn from_handle(handle: &RepositoryHandle, stable_id: Option<String>) -> Self {
-        Self {
-            provider_id: handle.provider_id.clone(),
-            stable_id,
-            host: handle.host.clone(),
-            owner: handle.owner.clone(),
-            name: handle.name.clone(),
-        }
-    }
-}
-
 /// Authenticated repository-provider user.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryUser {
@@ -83,6 +38,53 @@ pub struct RepositoryUser {
     pub login: String,
     /// Provider-specific stable user ID, when available.
     pub stable_id: Option<String>,
+}
+
+/// Per-session authentication context for repository-provider authorization.
+///
+/// The access token remains server-side and is never returned to Git LFS. Its
+/// debug representation is always redacted so provider adapters can safely be
+/// composed without accidentally logging the credential.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RepositoryAuthentication {
+    user: RepositoryUser,
+    access_token: String,
+}
+
+impl RepositoryAuthentication {
+    /// Creates an authenticated provider context from an actor and access token.
+    #[must_use]
+    pub fn new(user: RepositoryUser, access_token: impl Into<String>) -> Self {
+        Self {
+            user,
+            access_token: access_token.into(),
+        }
+    }
+
+    /// Returns the authenticated provider user.
+    #[must_use]
+    pub fn user(&self) -> &RepositoryUser {
+        &self.user
+    }
+
+    /// Returns the provider access token for the adapter's upstream request.
+    ///
+    /// Callers must not log, persist, or expose this value outside the
+    /// repository-provider boundary.
+    #[must_use]
+    pub fn access_token(&self) -> &str {
+        &self.access_token
+    }
+}
+
+impl fmt::Debug for RepositoryAuthentication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RepositoryAuthentication")
+            .field("user", &self.user)
+            .field("access_token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RepositoryUser {
@@ -119,19 +121,17 @@ pub trait RepositoryProvider {
     /// Returns this provider's configured ID.
     fn provider_id(&self) -> &str;
 
-    /// Resolves a configured repository handle to a provider-stable identity.
-    fn repository_identity<'a>(
-        &'a self,
-        repository: &'a RepositoryHandle,
-    ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryIdentity>>;
-
-    /// Checks whether a user has the permission required by an LFS operation.
+    /// Checks whether an authenticated user has the required repository access.
+    ///
+    /// Implementations must validate both the configured stable repository
+    /// identity and the actor identity carried by `authentication` before
+    /// returning a successful authorization.
     fn check_permission<'a>(
         &'a self,
         repository: &'a RepositoryIdentity,
-        user: &'a RepositoryUser,
+        authentication: &'a RepositoryAuthentication,
         required: RepositoryPermission,
-    ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryAuthorization>>;
+    ) -> ProviderFuture<'a, ServerResult<RepositoryAuthorization>>;
 }
 
 /// Storage metadata for an object that exists in a backend provider.
@@ -233,12 +233,12 @@ mod tests {
     use std::{collections::BTreeSet, path::Path, str::FromStr, sync::Mutex};
 
     use super::{
-        ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,
+        ProviderFuture, RepositoryAuthentication, RepositoryAuthorization, RepositoryIdentity,
         RepositoryProvider, RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
     };
     use crate::{
         LfsObject, LfsObjectSize, LfsOid, RepositoryPermission, RepositoryProviderError,
-        RepositoryProviderResult, StorageError, StorageResult,
+        ServerError, ServerResult, StorageError, StorageResult,
     };
 
     const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -253,38 +253,28 @@ mod tests {
             &self.provider_id
         }
 
-        fn repository_identity<'a>(
-            &'a self,
-            repository: &'a RepositoryHandle,
-        ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryIdentity>> {
-            Box::pin(async move {
-                Ok(RepositoryIdentity::from_handle(
-                    repository,
-                    Some("repo-123".to_owned()),
-                ))
-            })
-        }
-
         fn check_permission<'a>(
             &'a self,
             repository: &'a RepositoryIdentity,
-            user: &'a RepositoryUser,
+            authentication: &'a RepositoryAuthentication,
             required: RepositoryPermission,
-        ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryAuthorization>> {
+        ) -> ProviderFuture<'a, ServerResult<RepositoryAuthorization>> {
             Box::pin(async move {
                 if self.granted == required || self.granted == RepositoryPermission::Admin {
                     Ok(RepositoryAuthorization {
-                        user: user.clone(),
+                        user: authentication.user().clone(),
                         repository: repository.clone(),
                         required,
                         granted: self.granted,
                     })
                 } else {
-                    Err(RepositoryProviderError::PermissionDenied {
-                        provider: self.provider_id.clone(),
-                        owner: repository.owner.clone(),
-                        repo: repository.name.clone(),
-                        required,
+                    Err(ServerError::RepositoryProvider {
+                        source: RepositoryProviderError::PermissionDenied {
+                            provider: self.provider_id.clone(),
+                            owner: repository.owner.clone(),
+                            repo: repository.name.clone(),
+                            required,
+                        },
                     })
                 }
             })
@@ -388,6 +378,19 @@ mod tests {
         )
     }
 
+    #[test]
+    fn repository_authentication_debug_redacts_access_token() {
+        let authentication = RepositoryAuthentication::new(
+            RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned())),
+            "provider-secret-token",
+        );
+        let debug = format!("{authentication:?}");
+
+        assert!(debug.contains("octocat"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("provider-secret-token"));
+    }
+
     #[tokio::test]
     async fn repository_provider_trait_resolves_identity_and_authorizes_user() {
         let provider = FakeRepositoryProvider {
@@ -395,15 +398,17 @@ mod tests {
             granted: RepositoryPermission::Write,
         };
         let provider: Box<dyn RepositoryProvider> = Box::new(provider);
-        let handle = RepositoryHandle::new("github-main", "github.com", "owner", "repo");
+        let identity = RepositoryIdentity {
+            provider_id: "github-main".to_owned(),
+            stable_id: Some("repo-123".to_owned()),
+            host: "github.com".to_owned(),
+            owner: "owner".to_owned(),
+            name: "repo".to_owned(),
+        };
         let user = RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned()));
-
-        let identity = provider
-            .repository_identity(&handle)
-            .await
-            .expect("repository should resolve");
+        let authentication = RepositoryAuthentication::new(user, "provider-token");
         let authorization = provider
-            .check_permission(&identity, &user, RepositoryPermission::Write)
+            .check_permission(&identity, &authentication, RepositoryPermission::Write)
             .await
             .expect("write permission should be granted");
 
@@ -418,23 +423,28 @@ mod tests {
             provider_id: "github-main".to_owned(),
             granted: RepositoryPermission::Read,
         };
-        let handle = RepositoryHandle::new("github-main", "github.com", "owner", "repo");
+        let identity = RepositoryIdentity {
+            provider_id: "github-main".to_owned(),
+            stable_id: Some("repo-123".to_owned()),
+            host: "github.com".to_owned(),
+            owner: "owner".to_owned(),
+            name: "repo".to_owned(),
+        };
         let user = RepositoryUser::new("github-main", "octocat", None);
-        let identity = provider
-            .repository_identity(&handle)
-            .await
-            .expect("repository should resolve");
+        let authentication = RepositoryAuthentication::new(user, "provider-token");
 
         let error = provider
-            .check_permission(&identity, &user, RepositoryPermission::Write)
+            .check_permission(&identity, &authentication, RepositoryPermission::Write)
             .await
             .expect_err("read permission should not satisfy write");
 
         assert!(matches!(
             error,
-            RepositoryProviderError::PermissionDenied {
-                required: RepositoryPermission::Write,
-                ..
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::PermissionDenied {
+                    required: RepositoryPermission::Write,
+                    ..
+                }
             }
         ));
     }

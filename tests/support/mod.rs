@@ -17,10 +17,10 @@ use std::{
 };
 
 use lfs_cloud::{
-    LfsObject, LfsObjectSize, LfsOid, LfsPointer, ProviderFuture, RepositoryAuthorization,
-    RepositoryHandle, RepositoryIdentity, RepositoryPermission, RepositoryProvider,
-    RepositoryProviderError, RepositoryProviderResult, RepositoryUser, StorageDeleteOutcome,
-    StorageError, StorageProvider, StorageResult, StoredObject,
+    LfsObject, LfsObjectSize, LfsOid, LfsPointer, ProviderFuture, RepositoryAuthentication,
+    RepositoryAuthorization, RepositoryIdentity, RepositoryPermission, RepositoryProvider,
+    RepositoryProviderError, ServerError, ServerResult, StorageDeleteOutcome, StorageError,
+    StorageProvider, StorageResult, StoredObject,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -178,15 +178,6 @@ impl FakeRepositoryKey {
         }
     }
 
-    fn from_handle(repository: &RepositoryHandle) -> Self {
-        Self::from_parts(
-            repository.provider_id.clone(),
-            repository.host.clone(),
-            repository.owner.clone(),
-            repository.name.clone(),
-        )
-    }
-
     fn from_identity(repository: &RepositoryIdentity) -> Self {
         Self::from_parts(
             repository.provider_id.clone(),
@@ -262,43 +253,29 @@ impl RepositoryProvider for FakeRepositoryProvider {
         &self.provider_id
     }
 
-    fn repository_identity<'a>(
-        &'a self,
-        repository: &'a RepositoryHandle,
-    ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryIdentity>> {
-        Box::pin(async move {
-            let repositories = self
-                .repositories
-                .lock()
-                .expect("fake repository lock should not poison");
-            let Some(record) = repositories.get(&FakeRepositoryKey::from_handle(repository)) else {
-                return Err(RepositoryProviderError::RepositoryNotFound {
-                    provider: self.provider_id.clone(),
-                    owner: repository.owner.clone(),
-                    repo: repository.name.clone(),
-                });
-            };
-
-            Ok(RepositoryIdentity::from_handle(
-                repository,
-                record.stable_id.clone(),
-            ))
-        })
-    }
-
     fn check_permission<'a>(
         &'a self,
         repository: &'a RepositoryIdentity,
-        user: &'a RepositoryUser,
+        authentication: &'a RepositoryAuthentication,
         required: RepositoryPermission,
-    ) -> ProviderFuture<'a, RepositoryProviderResult<RepositoryAuthorization>> {
+    ) -> ProviderFuture<'a, ServerResult<RepositoryAuthorization>> {
         Box::pin(async move {
+            let user = authentication.user();
+            if authentication.access_token().is_empty() {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: self.provider_id.clone(),
+                    },
+                });
+            }
             if user.provider_id != self.provider_id {
-                return Err(RepositoryProviderError::PermissionDenied {
-                    provider: self.provider_id.clone(),
-                    owner: repository.owner.clone(),
-                    repo: repository.name.clone(),
-                    required,
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::PermissionDenied {
+                        provider: self.provider_id.clone(),
+                        owner: repository.owner.clone(),
+                        repo: repository.name.clone(),
+                        required,
+                    },
                 });
             }
 
@@ -308,22 +285,35 @@ impl RepositoryProvider for FakeRepositoryProvider {
                 .expect("fake repository lock should not poison");
             let Some(record) = repositories.get(&FakeRepositoryKey::from_identity(repository))
             else {
-                return Err(RepositoryProviderError::RepositoryNotFound {
-                    provider: self.provider_id.clone(),
-                    owner: repository.owner.clone(),
-                    repo: repository.name.clone(),
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::RepositoryNotFound {
+                        provider: self.provider_id.clone(),
+                        owner: repository.owner.clone(),
+                        repo: repository.name.clone(),
+                    },
                 });
             };
+            if record.stable_id != repository.stable_id {
+                return Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::RepositoryNotFound {
+                        provider: self.provider_id.clone(),
+                        owner: repository.owner.clone(),
+                        repo: repository.name.clone(),
+                    },
+                });
+            }
 
             let granted = record
                 .permissions_by_login
                 .get(&user.login)
                 .copied()
-                .ok_or_else(|| RepositoryProviderError::PermissionDenied {
-                    provider: self.provider_id.clone(),
-                    owner: repository.owner.clone(),
-                    repo: repository.name.clone(),
-                    required,
+                .ok_or_else(|| ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::PermissionDenied {
+                        provider: self.provider_id.clone(),
+                        owner: repository.owner.clone(),
+                        repo: repository.name.clone(),
+                        required,
+                    },
                 })?;
 
             if permission_allows(granted, required) {
@@ -334,11 +324,13 @@ impl RepositoryProvider for FakeRepositoryProvider {
                     granted,
                 })
             } else {
-                Err(RepositoryProviderError::PermissionDenied {
-                    provider: self.provider_id.clone(),
-                    owner: repository.owner.clone(),
-                    repo: repository.name.clone(),
-                    required,
+                Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::PermissionDenied {
+                        provider: self.provider_id.clone(),
+                        owner: repository.owner.clone(),
+                        repo: repository.name.clone(),
+                        required,
+                    },
                 })
             }
         })

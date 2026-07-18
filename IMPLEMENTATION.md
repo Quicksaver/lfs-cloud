@@ -144,6 +144,12 @@ Bitbucket repo D
 
 This implies a plugin/adapter boundary for both repository providers and storage providers. The LFS protocol surface remains stable while the server dispatches to the configured repo auth adapter and storage adapter.
 
+Repository authorization receives a configured stable repository identity and
+an explicit per-session authentication context containing the provider actor
+and its private access token. The context redacts the token from debug output,
+and production batch handling dispatches through the same provider trait used
+by test adapters rather than calling a concrete provider client directly.
+
 ## Server Configuration
 
 A hosted `lfs-cloud` instance should load private server-side configuration at boot. This configuration should not be committed to the Git repositories being served, because it may contain storage account IDs, credential references, bucket names, Drive folder IDs, and policy decisions.

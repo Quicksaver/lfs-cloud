@@ -2147,11 +2147,42 @@ independently validated or adjudicated.
    regression. With one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, security-relevant feedback.
 
-8. **Medium — The repository-provider trait lacks authentication context and is
-   bypassed by production authorization.** Its shape cannot express the
-   per-session credential checks the server needs (`src/providers.rs:117-135`,
-   `src/server.rs:770-847`). Redesign the abstraction around explicit actor/token
-   context or remove the misleading unused boundary.
+8. **[DONE] The repository-provider trait lacked authentication context and was
+   bypassed by production authorization** (Medium, `src/providers.rs`,
+   `src/github_auth.rs`, `src/server.rs`, and provider integration fixtures):
+   **Valid and actionable.** The trait previously accepted only a repository
+   identity and user, while production authorization needed the private OAuth
+   token retained by the local session. Production therefore skipped the trait
+   and constructed `GitHubRepositoryPermissionClient` directly, leaving the
+   public provider contract and fake-provider path unable to model the real
+   authorization boundary. `RepositoryAuthentication` now carries the stable
+   provider actor plus its server-side access token and redacts that token from
+   debug output. `RepositoryProvider::check_permission` consumes this explicit
+   context together with the configured stable repository identity; the
+   unauthenticated identity-resolution method was removed because private
+   repository verification also requires the session credential.
+   `GitHubRepositoryProvider` now implements the trait by validating the generic
+   token as a GitHub OAuth token and delegating stable repository, stable user,
+   and permission checks to the existing GitHub client. Production batch
+   composition builds a provider-trait registry from server configuration, so
+   normal serving and injected test adapters share the same authorization path.
+   Integration fakes now require a token and verify the configured stable
+   repository ID instead of resolving a different identity behind the server's
+   back. A test-first regression initially failed because the adapter and
+   authentication context did not exist; focused GitHub adapter, redaction,
+   fixture-contract, and fake end-to-end coverage now pass. Implementation
+   guidance and the repository learning document the production composition
+   boundary. Verification passed with `cargo fmt --all`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (all automated targets passed; three external or
+   manual tests ignored), `cargo test --doc` (39 passed), and
+   `git diff --check`. The focused reviewer identified a genuine medium-severity
+   architecture gap with direct production consequences and offered both valid
+   remediation choices. The actor/token redesign was the stronger choice
+   because it preserves the documented provider-extensibility goal while
+   eliminating the production bypass; with one valid finding assessed here and
+   no invalid finding attributable separately, this was high-quality, relevant
+   feedback.
 
 9. **Medium — Upload batch lookups are sequential while downloads are bounded
    concurrent.** Large upload batches incur avoidable provider latency

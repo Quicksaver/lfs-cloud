@@ -40,18 +40,17 @@ use url::{Url, form_urlencoded};
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GITHUB_OAUTH_CALLBACK_PATH,
-    GitHubOAuthCallbackRouteState, GitHubOAuthStateRegistry, GitHubProviderConfig,
-    GitHubRepositoryPermissionClient, GoogleDriveAccessToken, GoogleDriveCredential,
-    GoogleDriveCredentialLoader, GoogleDriveObjectStore, GoogleDriveRootValidator,
-    GoogleDriveStorageConfig, GoogleDriveTokenRefresher, LFS_BASIC_TRANSFER,
-    LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation, LfsBatchRequest,
-    LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken,
-    LocalLfsSessionStore, MetadataDatabase, MetadataObjectVerificationStatus, ProviderFuture,
-    RepositoryHandle, RepositoryIdentity, RepositoryMapping, RepositoryPermission,
-    RepositoryProvider, RepositoryProviderConfig, RepositoryProviderError, RepositoryUser,
-    SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError, StorageProvider,
-    StorageProviderConfig, StorageResult, StoredObject, github_oauth_callback_router,
-    github_oauth_login_router,
+    GitHubOAuthCallbackRouteState, GitHubOAuthStateRegistry, GitHubRepositoryProvider,
+    GoogleDriveAccessToken, GoogleDriveCredential, GoogleDriveCredentialLoader,
+    GoogleDriveObjectStore, GoogleDriveRootValidator, GoogleDriveStorageConfig,
+    GoogleDriveTokenRefresher, LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError,
+    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject,
+    LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase,
+    MetadataObjectVerificationStatus, ProviderFuture, RepositoryAuthentication, RepositoryIdentity,
+    RepositoryMapping, RepositoryPermission, RepositoryProvider, RepositoryProviderConfig,
+    RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerConfig, ServerError,
+    ServerResult, StorageError, StorageProvider, StorageProviderConfig, StorageResult,
+    StoredObject, github_oauth_callback_router, github_oauth_login_router,
     metadata::{MetadataTransferOperation, MetadataTransferResult},
     parse_lfs_batch_request_json,
     sessions::LfsSessionRecord,
@@ -287,7 +286,7 @@ pub fn server_router_with_sessions(
     let lfs_router = build_lfs_server_router(
         config.clone(),
         session_store.clone(),
-        Arc::new(GitHubBatchAuthorizer::new(&config)),
+        Arc::new(ProviderBatchAuthorizer::from_config(&config)),
         Arc::new(PendingLfsObjectTransferStore),
         BatchBodyGuardrails::default(),
         None,
@@ -316,7 +315,7 @@ fn server_router_with_sessions_and_transfer_store(
     let lfs_router = build_lfs_server_router(
         config.clone(),
         session_store.clone(),
-        Arc::new(GitHubBatchAuthorizer::new(&config)),
+        Arc::new(ProviderBatchAuthorizer::from_config(&config)),
         transfer_store,
         BatchBodyGuardrails::default(),
         Some(metadata_database),
@@ -383,7 +382,7 @@ pub fn lfs_server_router_with_sessions(
     lfs_server_router_with_sessions_and_authorizer(
         config.clone(),
         session_store,
-        Arc::new(GitHubBatchAuthorizer::new(&config)),
+        Arc::new(ProviderBatchAuthorizer::from_config(&config)),
     )
 }
 
@@ -659,12 +658,30 @@ impl LfsDownloadResponse {
 
 #[derive(Clone)]
 struct ProviderBatchAuthorizer {
-    provider: Arc<dyn RepositoryProvider + Send + Sync>,
+    providers: BTreeMap<String, Arc<dyn RepositoryProvider + Send + Sync>>,
 }
 
 impl ProviderBatchAuthorizer {
     fn new(provider: Arc<dyn RepositoryProvider + Send + Sync>) -> Self {
-        Self { provider }
+        Self {
+            providers: BTreeMap::from([(provider.provider_id().to_owned(), provider)]),
+        }
+    }
+
+    fn from_config(config: &ServerConfig) -> Self {
+        let providers = config
+            .repository_providers
+            .iter()
+            .map(|(id, provider)| match provider {
+                RepositoryProviderConfig::GitHub(provider) => (
+                    id.clone(),
+                    Arc::new(GitHubRepositoryProvider::new(provider.clone()))
+                        as Arc<dyn RepositoryProvider + Send + Sync>,
+                ),
+            })
+            .collect();
+
+        Self { providers }
     }
 }
 
@@ -677,16 +694,15 @@ impl LfsBatchAuthorizer for ProviderBatchAuthorizer {
     ) -> ProviderFuture<'a, ServerResult<()>> {
         Box::pin(async move {
             let required = permission_required_for_batch_operation(operation);
-            if self.provider.provider_id() != repository.repo_provider {
-                return Err(ServerError::InvalidConfiguration {
+            let provider = self
+                .providers
+                .get(&repository.repo_provider)
+                .ok_or_else(|| ServerError::InvalidConfiguration {
                     message: format!(
-                        "repository {} references repository provider {}, but injected provider is {}",
-                        repository.id,
-                        repository.repo_provider,
-                        self.provider.provider_id()
+                        "repository {} references unknown provider {}",
+                        repository.id, repository.repo_provider
                     ),
-                });
-            }
+                })?;
             if session.metadata().provider_id != repository.repo_provider {
                 return Err(ServerError::RepositoryProvider {
                     source: RepositoryProviderError::PermissionDenied {
@@ -698,21 +714,30 @@ impl LfsBatchAuthorizer for ProviderBatchAuthorizer {
                 });
             }
 
-            let handle = RepositoryHandle::new(
-                repository.repo_provider.clone(),
-                repository.host.clone(),
-                repository.owner.clone(),
-                repository.name.clone(),
-            );
-            let identity = self.provider.repository_identity(&handle).await?;
+            let token =
+                session
+                    .github_access_token()
+                    .ok_or_else(|| ServerError::RepositoryProvider {
+                        source: RepositoryProviderError::AuthenticationRequired {
+                            provider: repository.repo_provider.clone(),
+                        },
+                    })?;
+            let identity = RepositoryIdentity {
+                provider_id: repository.repo_provider.clone(),
+                stable_id: Some(repository.provider_repository_id.clone()),
+                host: repository.host.clone(),
+                owner: repository.owner.clone(),
+                name: repository.name.clone(),
+            };
             let user = RepositoryUser::new(
                 session.metadata().provider_id.clone(),
                 session.metadata().login.clone(),
                 session.metadata().stable_id.clone(),
             );
+            let authentication = RepositoryAuthentication::new(user, token.as_str());
 
-            self.provider
-                .check_permission(&identity, &user, required)
+            provider
+                .check_permission(&identity, &authentication, required)
                 .await?;
             Ok(())
         })
@@ -1250,85 +1275,6 @@ impl LfsObjectTransferStore for GoogleDriveTransferStore {
                     created_by.clone(),
                 )
                 .await?;
-            Ok(())
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct GitHubBatchAuthorizer {
-    providers: BTreeMap<String, GitHubProviderConfig>,
-}
-
-impl GitHubBatchAuthorizer {
-    fn new(config: &ServerConfig) -> Self {
-        let providers = config
-            .repository_providers
-            .iter()
-            .map(|(id, provider)| match provider {
-                RepositoryProviderConfig::GitHub(provider) => (id.clone(), provider.clone()),
-            })
-            .collect();
-
-        Self { providers }
-    }
-}
-
-impl LfsBatchAuthorizer for GitHubBatchAuthorizer {
-    fn authorize<'a>(
-        &'a self,
-        repository: &'a RepositoryMapping,
-        session: &'a LfsSessionRecord,
-        operation: LfsBatchOperation,
-    ) -> ProviderFuture<'a, ServerResult<()>> {
-        Box::pin(async move {
-            let required = permission_required_for_batch_operation(operation);
-            let provider = self
-                .providers
-                .get(&repository.repo_provider)
-                .ok_or_else(|| ServerError::InvalidConfiguration {
-                    message: format!(
-                        "repository {} references unknown provider {}",
-                        repository.id, repository.repo_provider
-                    ),
-                })?;
-            let token =
-                session
-                    .github_access_token()
-                    .ok_or_else(|| ServerError::RepositoryProvider {
-                        source: RepositoryProviderError::AuthenticationRequired {
-                            provider: repository.repo_provider.clone(),
-                        },
-                    })?;
-
-            if session.metadata().provider_id != repository.repo_provider {
-                return Err(ServerError::RepositoryProvider {
-                    source: RepositoryProviderError::PermissionDenied {
-                        provider: repository.repo_provider.clone(),
-                        owner: repository.owner.clone(),
-                        repo: repository.name.clone(),
-                        required,
-                    },
-                });
-            }
-
-            let identity = RepositoryIdentity {
-                provider_id: repository.repo_provider.clone(),
-                stable_id: Some(repository.provider_repository_id.clone()),
-                host: repository.host.clone(),
-                owner: repository.owner.clone(),
-                name: repository.name.clone(),
-            };
-            let user = RepositoryUser::new(
-                session.metadata().provider_id.clone(),
-                session.metadata().login.clone(),
-                session.metadata().stable_id.clone(),
-            );
-
-            GitHubRepositoryPermissionClient::new()?
-                .check_permission(provider, token, &identity, &user, required)
-                .await?;
-
             Ok(())
         })
     }
