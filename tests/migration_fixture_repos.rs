@@ -10,8 +10,9 @@ mod support;
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 use lfs_cloud::{
-    LfsObject, check_local_migration_objects, enumerate_all_fetched_ref_lfs_pointers,
-    enumerate_current_checkout_lfs_pointers, enumerate_selected_ref_lfs_pointers,
+    LfsObject, MigrationError, check_local_migration_objects,
+    enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
+    enumerate_selected_ref_lfs_pointers,
 };
 use support::{TempGitRepo, lfs_object_for_bytes, write_lfs_pointer};
 
@@ -137,6 +138,64 @@ fn fixture_repo_selected_ref_scan_walks_branch_history() {
     assert_eq!(scan.refs[0].name, "feature/assets");
     assert!(objects.contains(&main_object));
     assert!(objects.contains(&branch_object));
+}
+
+#[test]
+fn fixture_repo_history_scans_reject_a_real_shallow_clone() {
+    let source = initialized_migration_repo();
+    let first_object = lfs_object_for_bytes(b"history before shallow boundary");
+    let latest_object = lfs_object_for_bytes(b"history at shallow boundary");
+
+    source.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+    write_lfs_pointer(
+        &source,
+        "asset/first.bin",
+        first_object.oid.as_hex(),
+        first_object.size.bytes(),
+    );
+    source.commit_all("add older pointer");
+    write_lfs_pointer(
+        &source,
+        "asset/latest.bin",
+        latest_object.oid.as_hex(),
+        latest_object.size.bytes(),
+    );
+    source.commit_all("add latest pointer");
+
+    let clone_root = tempfile::tempdir().expect("shallow clone root should be created");
+    let shallow_path = clone_root.path().join("shallow");
+    let clone = Command::new("git")
+        .args(["clone", "--depth", "1", "--no-local"])
+        .arg(source.path())
+        .arg(&shallow_path)
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .output()
+        .expect("shallow git clone should start");
+    assert!(
+        clone.status.success(),
+        "shallow clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert_eq!(
+        git_stdout(&shallow_path, ["rev-parse", "--is-shallow-repository"]),
+        "true"
+    );
+
+    let selected_error = enumerate_selected_ref_lfs_pointers(&shallow_path, ["main"])
+        .expect_err("selected-ref migration must reject truncated history");
+    let all_refs_error = enumerate_all_fetched_ref_lfs_pointers(&shallow_path)
+        .expect_err("all-ref migration must reject truncated history");
+
+    assert!(matches!(
+        selected_error,
+        MigrationError::ShallowRepository { .. }
+    ));
+    assert!(matches!(
+        all_refs_error,
+        MigrationError::ShallowRepository { .. }
+    ));
+    assert!(selected_error.to_string().contains("git fetch --unshallow"));
+    assert!(all_refs_error.to_string().contains("git fetch --unshallow"));
 }
 
 #[test]
@@ -310,6 +369,24 @@ fn git_status(repo: &Path) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("git status should be UTF-8")
+}
+
+fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git command should start");
+
+    assert!(
+        output.status.success(),
+        "git command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output should be UTF-8")
+        .trim()
+        .to_owned()
 }
 
 fn server_config(public_url: &str) -> String {

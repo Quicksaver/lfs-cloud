@@ -344,7 +344,12 @@ identity always comes from `origin`, and the plan reports both identities.
 When they differ, migration stops unless `--allow-cross-remote` explicitly
 acknowledges the cross-repository copy. `--all-refs` includes local branches,
 tags, and remote-tracking refs only for the selected source remote, rather than
-silently mixing histories from every configured remote.
+silently mixing histories from every configured remote. Selected-ref and
+all-ref planning require a non-shallow repository because a shallow clone
+cannot provide a complete inventory for those history scopes. Run
+`git fetch --unshallow` before using either mode. Current-checkout planning is
+still available in a shallow clone because it inventories only the current
+index.
 Use `--purge-source-lfs` with `--dry-run` to include GitHub Support cleanup
 instructions and object IDs/sizes for a post-migration source LFS purge
 request.

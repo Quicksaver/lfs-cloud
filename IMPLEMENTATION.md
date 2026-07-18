@@ -627,7 +627,7 @@ Suggested flow:
 1. Verify the current directory is a Git repository with Git LFS configured.
 2. Read existing LFS configuration, tracked patterns, and current LFS endpoint.
 3. Discover required LFS objects for the current checkout, selected refs, or all refs.
-4. For selected-ref or all-ref migration, enumerate LFS pointers from Git history, not only the working tree.
+4. For selected-ref or all-ref migration, reject shallow repositories before enumerating LFS pointers from Git history, because truncated history cannot produce a complete inventory.
 5. Ensure each object exists locally, fetching from the source LFS provider when needed.
 6. Upload each object to the configured lfs-cloud server/storage provider.
 7. Verify uploaded object SHA-256 and size.
@@ -644,12 +644,13 @@ current checkout
   migrate only objects needed by the current working tree
 
 selected refs
-  migrate objects reachable from specific branches/tags
+  migrate objects reachable from specific branches/tags in a non-shallow
+  repository
 
 all refs
   migrate every LFS object reachable from local branches, tags, and the
   explicit source remote's fetched refs, including objects not currently
-  checked out in the working tree
+  checked out in the working tree; requires a non-shallow repository
 ```
 
 The safest default should be to migrate the current checkout and warn if other refs still reference objects that have not been copied. For a full provider move, the user should choose an explicit all-refs mode. In all-refs mode, the command should fetch refs first, enumerate LFS pointers across those refs, fetch missing object bytes from the source LFS provider, and upload every discovered object to `lfs-cloud`.
@@ -1416,7 +1417,7 @@ Defer:
 > includes GitHub source LFS cleanup helper text, the GitHub Support flow, and
 > migrated object IDs/sizes without attempting automatic source deletion.
 > Fixture-repository tests now cover hydrated and sparse current checkouts,
-> selected refs, all refs, missing objects, and CLI dry-run no-op migration
+> selected refs, all refs, shallow-history rejection, missing objects, and CLI dry-run no-op migration
 > behavior. A local
 > fake-provider end-to-end test now covers repository init routing, fake GitHub
 > authorization, server-routed fake Drive upload/download actions, and checkout
@@ -1607,8 +1608,8 @@ Defer:
 
 - [x] [T] Detect existing Git LFS installation, filters, tracked patterns, and source LFS endpoint.
 - [x] [T] Enumerate LFS pointers for current checkout.
-- [x] [T] Enumerate LFS pointers for selected refs.
-- [x] [T] Enumerate LFS pointers for all fetched refs.
+- [x] [T] Enumerate LFS pointers for selected refs, rejecting shallow history.
+- [x] [T] Enumerate LFS pointers for all fetched refs, rejecting shallow history.
 
 #### Epic 7.2: Transfer
 

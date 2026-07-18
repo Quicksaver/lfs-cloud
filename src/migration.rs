@@ -458,8 +458,8 @@ pub fn enumerate_current_checkout_lfs_pointers(
 /// # Errors
 ///
 /// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree,
-/// any selected ref cannot be resolved to a commit, or Git returns malformed
-/// history, attribute, or object data.
+/// the repository is shallow, any selected ref cannot be resolved to a commit,
+/// or Git returns malformed history, attribute, or object data.
 pub fn enumerate_selected_ref_lfs_pointers<I, S>(
     start_dir: impl AsRef<Path>,
     refs: I,
@@ -470,6 +470,7 @@ where
 {
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
+    require_complete_history(&worktree_root)?;
     let mut scanned_refs = Vec::new();
     let mut pointers = Vec::new();
     let mut seen = BTreeSet::new();
@@ -531,14 +532,15 @@ pub fn enumerate_all_fetched_ref_lfs_pointers(
 /// # Errors
 ///
 /// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree,
-/// `source_remote` is invalid, Git cannot list refs, or a discovered ref cannot
-/// be scanned.
+/// the repository is shallow, `source_remote` is invalid, Git cannot list refs,
+/// or a discovered ref cannot be scanned.
 pub fn enumerate_fetched_ref_lfs_pointers_for_remote(
     start_dir: impl AsRef<Path>,
     source_remote: impl AsRef<str>,
 ) -> MigrationResult<GitLfsHistoryPointers> {
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
+    require_complete_history(&worktree_root)?;
     let source_remote = validate_source_remote_name(source_remote.as_ref())?;
     let refs = all_fetched_ref_names(&worktree_root, &source_remote)?;
     let mut scanned_refs = Vec::new();
@@ -1193,6 +1195,23 @@ fn detect_worktree_root(start_dir: &Path) -> MigrationResult<PathBuf> {
 
     let stdout = output_stdout(output, "git rev-parse --show-toplevel")?;
     Ok(PathBuf::from(stdout.trim_end_matches(['\n', '\r'])))
+}
+
+fn require_complete_history(worktree_root: &Path) -> MigrationResult<()> {
+    const COMMAND: &str = "git rev-parse --is-shallow-repository";
+    let output = run_git(worktree_root, ["rev-parse", "--is-shallow-repository"])?;
+    let stdout = required_success_stdout(output, COMMAND)?;
+
+    match stdout.trim() {
+        "false" => Ok(()),
+        "true" => Err(MigrationError::ShallowRepository {
+            path: worktree_root.to_path_buf(),
+        }),
+        _ => Err(MigrationError::ExternalCommandOutput {
+            command: COMMAND.to_owned(),
+            message: SanitizedMessage::new("git returned an invalid shallow-repository state"),
+        }),
+    }
 }
 
 fn migration_git_lfs_objects_dir(worktree_root: &Path) -> MigrationResult<PathBuf> {
@@ -3480,6 +3499,26 @@ mod tests {
     }
 
     #[test]
+    fn selected_ref_pointer_scan_rejects_shallow_repository_history() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('a', 123);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(object).to_pointer_file(),
+        );
+        repo.commit_all("add pointer at shallow boundary");
+        repo.mark_head_as_shallow_boundary();
+
+        let error = enumerate_selected_ref_lfs_pointers(repo.path(), ["main"])
+            .expect_err("selected-ref history must reject a shallow repository");
+
+        assert!(matches!(error, MigrationError::ShallowRepository { .. }));
+        assert!(error.to_string().contains("git fetch --unshallow"));
+    }
+
+    #[test]
     fn selected_ref_pointer_scan_finds_branch_only_history() {
         let repo = TempRepo::new();
         let main_object = test_lfs_object('d', 111);
@@ -3571,6 +3610,46 @@ mod tests {
         assert!(ref_names.contains("refs/tags/v-main"));
         assert!(objects.contains(&main_object));
         assert!(objects.contains(&branch_object));
+    }
+
+    #[test]
+    fn all_fetched_ref_pointer_scan_rejects_shallow_repository_history() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('f', 333);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(object).to_pointer_file(),
+        );
+        repo.commit_all("add pointer at shallow boundary");
+        repo.mark_head_as_shallow_boundary();
+
+        let error = enumerate_all_fetched_ref_lfs_pointers(repo.path())
+            .expect_err("all-ref history must reject a shallow repository");
+
+        assert!(matches!(error, MigrationError::ShallowRepository { .. }));
+        assert!(error.to_string().contains("git fetch --unshallow"));
+    }
+
+    #[test]
+    fn current_checkout_pointer_scan_accepts_shallow_repository() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('c', 321);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add current pointer at shallow boundary");
+        repo.mark_head_as_shallow_boundary();
+
+        let scan = enumerate_current_checkout_lfs_pointers(repo.path())
+            .expect("current-checkout inventory does not require repository history");
+
+        assert_eq!(scan.pointers.len(), 1);
+        assert_eq!(scan.pointers[0].object, object);
     }
 
     #[test]
@@ -4596,6 +4675,12 @@ mod tests {
                 .expect("git stdout should be UTF-8")
                 .trim()
                 .to_owned()
+        }
+
+        fn mark_head_as_shallow_boundary(&self) {
+            let head = self.git_stdout(["rev-parse", "HEAD"]);
+            fs::write(self.root.path().join(".git/shallow"), format!("{head}\n"))
+                .expect("shallow boundary should be written");
         }
     }
 

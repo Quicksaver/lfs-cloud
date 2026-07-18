@@ -230,11 +230,12 @@ struct MigrateCommand {
     #[arg(long)]
     allow_cross_remote: bool,
 
-    /// Scan one selected branch, tag, or ref. Can be repeated.
+    /// Scan one selected branch, tag, or ref from a non-shallow repository.
+    /// Can be repeated.
     #[arg(long = "ref", value_name = "REF", conflicts_with = "all_refs")]
     refs: Vec<String>,
 
-    /// Scan local branches, tags, and the source remote's fetched refs.
+    /// Scan local branches, tags, and source refs from a non-shallow repository.
     #[arg(long, conflicts_with = "refs")]
     all_refs: bool,
 

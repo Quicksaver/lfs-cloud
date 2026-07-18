@@ -675,6 +675,16 @@ pub enum MigrationError {
         object_id: String,
     },
 
+    /// A history migration was requested from a shallow Git repository.
+    #[error(
+        "migration history is incomplete because {} is a shallow repository; run `git fetch --unshallow` before scanning selected refs or all refs",
+        path.display()
+    )]
+    ShallowRepository {
+        /// Worktree whose local history is incomplete.
+        path: PathBuf,
+    },
+
     /// The caller supplied invalid migration input.
     #[error("invalid migration input: {message}")]
     InvalidInput {

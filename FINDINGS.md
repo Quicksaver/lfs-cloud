@@ -1551,11 +1551,33 @@ independently validated or adjudicated.
    assessed here and no invalid finding attributable separately, this was
    high-quality, safety-relevant feedback.
 
-4. **High — Shallow clones are treated as complete migration inventories.** The
-   history scan does not reject or prominently qualify truncated history
-   (`src/migration.rs:1956-2055`). Detect shallow repositories and block complete
-   modes or require an explicit incomplete-history override with warnings and
-   tests.
+4. **[DONE] Shallow clones are treated as complete migration inventories**
+   (High, `src/migration.rs`, `src/error.rs`, migration documentation, and
+   `AGENTS.md`): **Valid and actionable.** Selected-ref and all-ref discovery
+   previously walked only locally present commits without checking Git's
+   shallow-repository state, so either history scope could silently report a
+   truncated migration inventory as complete. Both history enumeration entry
+   points now fail closed before resolving or scanning refs unless
+   `git rev-parse --is-shallow-repository` reports `false`. The check uses the
+   shared read-only Git command boundary, so it also cannot trigger partial-
+   clone lazy fetching. A typed `MigrationError::ShallowRepository` names the
+   affected worktree and directs the operator to `git fetch --unshallow`.
+   Current-checkout planning remains available because its index-only scope
+   does not depend on older history. Test-first unit regressions cover selected-
+   ref rejection, all-ref rejection, and allowed current-checkout inventory;
+   an integration fixture also creates a real depth-one clone and proves both
+   history APIs reject it. CLI help, README, implementation guidance, the
+   checklist, and the repository learning now document the non-shallow history
+   requirement. Verification passed with `cargo fmt --all -- --check`,
+   `yarn lint:fix`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine high-severity
+   migration-completeness flaw, distinguished history scans from the safe
+   checkout scope, and proposed both acceptable policy directions. The
+   fail-closed remediation was the safer fit because migration planning has no
+   legitimate reason to label knowingly truncated history as complete. With
+   one valid finding assessed here and no invalid finding attributable
+   separately, this was high-quality, safety-relevant feedback.
 
 5. **High — Purge-manifest candidates are labeled complete without a verified
    migration receipt.** The CLI can present a destructive follow-up inventory
