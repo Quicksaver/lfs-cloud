@@ -1058,6 +1058,12 @@ pointer size before an object is accepted.
 
 Use Google Drive resumable uploads for large object writes. The first implementation may stage uploads to a local temp file so it can verify SHA-256 and size before uploading to Drive.
 
+Google provider clients bound connection establishment to 10 seconds. Object
+transfers intentionally have no total request timeout because healthy large
+uploads and downloads can run for a long time. Instead, a 30-second idle
+watchdog resets on upload body progress, upload response reads, and each Drive
+download read; a stalled operation returns a retryable storage failure.
+
 ### Transfer Mode
 
 MVP transfer mode is proxy mode:

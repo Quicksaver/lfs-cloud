@@ -416,6 +416,12 @@ each root is a live folder that can accept children before binding the HTTP
 listener. A failed credential or root probe prevents the server from reporting
 readiness.
 
+Google provider connections have a 10-second connect deadline. Large Drive
+uploads and downloads have no total transfer deadline, but must make progress
+at least every 30 seconds: upload body progress and response reads reset the
+upload watchdog, while each received download chunk resets the download
+watchdog. A stalled transfer fails as retryable without waiting indefinitely.
+
 The `.lfsconfig` file points only to the LFS Cloud endpoint. It should not contain Google Drive, S3, or other backend credentials.
 
 See [docs/configuration.md](docs/configuration.md) for full `lfs-cloud.yml`

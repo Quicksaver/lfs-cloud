@@ -810,12 +810,34 @@ independently validated or adjudicated.
    remedies. With one valid finding and no invalid finding attributable
    separately, this was high-quality, relevant feedback.
 
-3. **High — Drive upload and download clients lack connect and per-read idle
-   timeouts.** Network stalls can leave token-bearing operations awaiting
-   indefinitely (`src/google_drive.rs:853`, `src/google_drive.rs:903`,
-   `src/google_drive.rs:1015`, `src/google_drive.rs:1537`,
-   `src/google_drive.rs:1558`). Configure connect timeouts and per-read idle
-   watchdogs without imposing an inappropriate total timeout on large streams.
+3. **[DONE] Drive upload and download clients lack connect and per-read idle
+   timeouts** (High, `src/google_drive.rs`, `README.md`,
+   `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and actionable.** Default
+   Google provider clients now bound connection establishment to 10 seconds.
+   Large object transfers intentionally retain no total request deadline, but
+   enforce a 30-second progress deadline: Drive downloads use Reqwest's
+   resettable per-read timeout, while uploads use a body-aware watchdog that
+   resets as Reqwest consumes each staged-file chunk and remains active while
+   awaiting response headers. Upload response bodies also apply the same
+   per-chunk idle bound, and the small resumable-session initiation request
+   retains its separate metadata deadline. A client-level upload
+   `read_timeout` was deliberately avoided because Reqwest starts that timer
+   before response headers, which would turn a healthy long upload into a
+   time-to-first-response failure rather than measuring upload progress.
+   Regression coverage proves that stalled upload responses and download
+   streams terminate promptly, default transfer clients preserve the intended
+   idle-versus-total timeout contract, and existing truncated-stream behavior
+   remains intact. README and implementation guidance document the operational
+   limits, while the repository learning records the non-obvious Reqwest
+   boundary. Verification passed with `yarn lint:fix`, the all-crate Cargo
+   format check, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (562 passed, 3 ignored across
+   targets), `cargo test --doc`, and `git diff --check`. The focused reviewer
+   identified a genuine high-severity indefinite-stall path and correctly
+   required connect and resettable idle boundaries while warning against a
+   total deadline for large transfers. With one valid finding assessed here
+   and no invalid finding attributable separately, this was high-quality,
+   security- and availability-relevant feedback.
 
 4. **Medium — Valid repository IDs can exceed Drive app-property limits.** The
    configuration accepts IDs that, combined with the property key, exceed

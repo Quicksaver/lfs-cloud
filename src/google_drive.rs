@@ -15,7 +15,10 @@ use std::{
     time::Duration,
 };
 
-use axum::{body::Body as AxumBody, response::Response as AxumResponse};
+use axum::{
+    body::{Body as AxumBody, Bytes},
+    response::Response as AxumResponse,
+};
 use futures_util::StreamExt;
 use reqwest::{
     Body as ReqwestBody, Client, StatusCode,
@@ -27,6 +30,7 @@ use reqwest::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 use url::Url;
 
@@ -38,6 +42,8 @@ use crate::{
 const GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_OBJECT_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+const GOOGLE_DRIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GOOGLE_DRIVE_TRANSFER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_";
 const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
 const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
@@ -675,6 +681,7 @@ pub struct GoogleDriveObjectStore {
     upload_client: Client,
     download_client: Client,
     api_base_url: Url,
+    transfer_read_idle_timeout: Duration,
 }
 
 impl GoogleDriveObjectStore {
@@ -744,6 +751,7 @@ impl GoogleDriveObjectStore {
             upload_client,
             download_client,
             api_base_url: validate_drive_api_base_url(api_base_url.as_ref())?,
+            transfer_read_idle_timeout: GOOGLE_DRIVE_TRANSFER_READ_IDLE_TIMEOUT,
         })
     }
 
@@ -854,6 +862,7 @@ impl GoogleDriveObjectStore {
         let initiate_response = self
             .upload_client
             .post(drive_resumable_upload_url(self.api_base_url.clone())?)
+            .timeout(GOOGLE_DRIVE_OBJECT_METADATA_TIMEOUT)
             .header(ACCEPT, "application/json")
             .header(CONTENT_TYPE, "application/json")
             .header(
@@ -900,8 +909,8 @@ impl GoogleDriveObjectStore {
         };
 
         let file = tokio::fs::File::from_std(verified_file);
-        let upload_body = ReqwestBody::wrap_stream(ReaderStream::new(file));
-        let upload_response = self
+        let (upload_stream, upload_progress) = upload_progress_stream(file);
+        let upload_request = self
             .upload_client
             .put(session_url)
             .header(ACCEPT, "application/json")
@@ -911,14 +920,23 @@ impl GoogleDriveObjectStore {
             )
             .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
             .header(CONTENT_LENGTH, object.size.bytes().to_string())
-            .body(upload_body)
-            .send()
-            .await
-            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+            .body(ReqwestBody::wrap_stream(upload_stream));
+        let upload_response = send_drive_upload_with_idle_timeout(
+            &self.storage,
+            &self.token,
+            upload_request,
+            upload_progress,
+            self.transfer_read_idle_timeout,
+        )
+        .await?;
         let upload_status = upload_response.status();
-        let upload_body = read_google_response_body(upload_response)
-            .await
-            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        let upload_body = read_drive_response_body_with_idle_timeout(
+            &self.storage,
+            &self.token,
+            upload_response,
+            self.transfer_read_idle_timeout,
+        )
+        .await?;
 
         if !matches!(upload_status, StatusCode::OK | StatusCode::CREATED) {
             return Err(parse_drive_upload_error(
@@ -1215,6 +1233,92 @@ impl StorageProvider for GoogleDriveObjectStore {
             })
         })
     }
+}
+
+fn upload_progress_stream(
+    file: tokio::fs::File,
+) -> (
+    impl futures_util::Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+    watch::Receiver<()>,
+) {
+    let (progress_sender, progress_receiver) = watch::channel(());
+    let stream = futures_util::stream::unfold(
+        (ReaderStream::new(file), progress_sender),
+        |(mut source, progress_sender)| async move {
+            match source.next().await {
+                Some(chunk) => {
+                    progress_sender.send_modify(|()| {});
+                    Some((chunk, (source, progress_sender)))
+                }
+                None => None,
+            }
+        },
+    );
+
+    (stream, progress_receiver)
+}
+
+async fn send_drive_upload_with_idle_timeout(
+    storage: &GoogleDriveStorageConfig,
+    token: &GoogleDriveAccessToken,
+    request: reqwest::RequestBuilder,
+    mut progress: watch::Receiver<()>,
+    idle_timeout: Duration,
+) -> StorageResult<reqwest::Response> {
+    let mut request = Box::pin(request.send());
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+    let mut body_is_streaming = true;
+
+    loop {
+        tokio::select! {
+            response = &mut request => {
+                return response.map_err(|source| drive_transport_error(storage, token, source));
+            }
+            progress_result = progress.changed(), if body_is_streaming => {
+                if progress_result.is_err() {
+                    body_is_streaming = false;
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+            }
+            () = &mut idle => {
+                return Err(StorageError::Retryable {
+                    provider: storage.id.clone(),
+                    message: "Google Drive upload made no progress before the idle timeout"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+}
+
+async fn read_drive_response_body_with_idle_timeout(
+    storage: &GoogleDriveStorageConfig,
+    token: &GoogleDriveAccessToken,
+    mut response: reqwest::Response,
+    idle_timeout: Duration,
+) -> StorageResult<String> {
+    let mut body = Vec::new();
+    while body.len() < MAX_GOOGLE_ERROR_BODY_LEN {
+        let chunk = tokio::time::timeout(idle_timeout, response.chunk())
+            .await
+            .map_err(|_| StorageError::Retryable {
+                provider: storage.id.clone(),
+                message: "Google Drive upload response stalled before completion".to_owned(),
+            })?
+            .map_err(|source| drive_transport_error(storage, token, source))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_GOOGLE_ERROR_BODY_LEN - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 async fn verify_drive_download_response_to_tempfile(
@@ -1600,6 +1704,7 @@ fn default_google_drive_http_client_from(
 
     let client = Client::builder()
         .timeout(timeout)
+        .connect_timeout(GOOGLE_DRIVE_CONNECT_TIMEOUT)
         .redirect(Policy::none())
         .build()
         .map_err(|source| StorageError::Retryable {
@@ -1640,6 +1745,7 @@ fn default_google_drive_object_upload_http_client() -> StorageResult<Client> {
     }
 
     let client = Client::builder()
+        .connect_timeout(GOOGLE_DRIVE_CONNECT_TIMEOUT)
         .redirect(Policy::none())
         .build()
         .map_err(|source| StorageError::Retryable {
@@ -1662,6 +1768,8 @@ fn default_google_drive_object_download_http_client() -> StorageResult<Client> {
     }
 
     let client = Client::builder()
+        .connect_timeout(GOOGLE_DRIVE_CONNECT_TIMEOUT)
+        .read_timeout(GOOGLE_DRIVE_TRANSFER_READ_IDLE_TIMEOUT)
         .no_gzip()
         .no_brotli()
         .no_zstd()
@@ -2698,8 +2806,18 @@ mod tests {
         io::Cursor,
         str::FromStr,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
+    use super::{
+        GOOGLE_OAUTH_TOKEN_URL, GoogleDriveCredential, GoogleDriveCredentialLoader,
+        GoogleDriveObjectKey, GoogleDriveObjectStore, GoogleDriveRootValidator,
+        GoogleDriveTokenRefresher,
+    };
+    use crate::{
+        GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, StorageDeleteOutcome,
+        StorageError, StorageProvider,
+    };
     use axum::{
         Router,
         body::{Body, Bytes, to_bytes},
@@ -2714,16 +2832,6 @@ mod tests {
     use reqwest::StatusCode;
     use sha2::{Digest, Sha256};
     use tokio_util::io::ReaderStream;
-
-    use super::{
-        GOOGLE_OAUTH_TOKEN_URL, GoogleDriveCredential, GoogleDriveCredentialLoader,
-        GoogleDriveObjectKey, GoogleDriveObjectStore, GoogleDriveRootValidator,
-        GoogleDriveTokenRefresher,
-    };
-    use crate::{
-        GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, StorageDeleteOutcome,
-        StorageError, StorageProvider,
-    };
 
     const OBJECT_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -2750,6 +2858,34 @@ mod tests {
         assert_eq!(credential.refresh_token, "refresh-token");
         assert!(!format!("{credential:?}").contains("refresh-token"));
         assert!(!format!("{credential:?}").contains("client-secret"));
+    }
+
+    #[test]
+    fn default_drive_transfer_clients_bound_idle_reads_without_total_deadlines() {
+        let upload_client = super::default_google_drive_object_upload_http_client()
+            .expect("default Drive upload client should build");
+        let download_client = super::default_google_drive_object_download_http_client()
+            .expect("default Drive download client should build");
+
+        let upload_debug = format!("{upload_client:?}");
+        assert!(
+            !upload_debug.contains("read_timeout"),
+            "upload progress needs a body-aware watchdog, not a time-to-response limit: {upload_debug}"
+        );
+        assert!(
+            !upload_debug.contains("total_timeout"),
+            "large uploads must not impose a total request deadline: {upload_debug}"
+        );
+
+        let download_debug = format!("{download_client:?}");
+        assert!(
+            download_debug.contains("read_timeout: 30s"),
+            "downloads should reset a 30-second idle watchdog after each read: {download_debug}"
+        );
+        assert!(
+            !download_debug.contains("total_timeout"),
+            "large downloads must not impose a total request deadline: {download_debug}"
+        );
     }
 
     #[test]
@@ -3653,6 +3789,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_store_times_out_a_stalled_upload_response() {
+        let staged_bytes = b"upload response idle timeout bytes";
+        let object = lfs_object_for_bytes(staged_bytes);
+        let server = DriveUploadServer::start_with_upload_response_delay(
+            drive_object_json(
+                "drive-file-uploaded",
+                object.oid.as_hex(),
+                object.size.bytes(),
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        let staged_file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(staged_file.path(), staged_bytes).expect("staged file should be written");
+        let client = reqwest::Client::new();
+        let mut store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            client,
+            &server.base_url,
+        )
+        .expect("object store should build");
+        store.transfer_read_idle_timeout = Duration::from_millis(50);
+
+        let error = store
+            .upload_object(&object, staged_file.path())
+            .await
+            .expect_err("a stalled upload response should time out");
+
+        assert!(matches!(
+            error,
+            StorageError::Retryable {
+                ref provider,
+                ref message,
+            } if provider == "drive-user-a"
+                && message.contains("idle timeout")
+                && !message.contains("access-token")
+        ));
+        assert_eq!(server.upload_requests().len(), 1);
+    }
+
+    #[tokio::test]
     async fn object_store_storage_provider_trait_uploads_to_drive() {
         let staged_bytes = b"storage provider migration upload bytes";
         let object = lfs_object_for_bytes(staged_bytes);
@@ -3910,6 +4089,44 @@ mod tests {
         let query = form_pairs(&download_requests[0].query);
         assert_eq!(query["alt"], "media");
         assert_eq!(query["supportsAllDrives"], "true");
+    }
+
+    #[tokio::test]
+    async fn object_store_times_out_a_stalled_download_stream() {
+        let object_bytes = b"download stream idle timeout bytes";
+        let object = lfs_object_for_bytes(object_bytes);
+        let server = DriveDownloadServer::start_with_download_delay(
+            drive_object_list_json(
+                "drive-file-download",
+                object.oid.as_hex(),
+                object.size.bytes(),
+            ),
+            object_bytes.to_vec(),
+            Duration::from_secs(5),
+        )
+        .await;
+        let client = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(50))
+            .build()
+            .expect("test Drive client should build");
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            client,
+            &server.base_url,
+        )
+        .expect("object store should build");
+
+        let download = store
+            .download_object_response(&object)
+            .await
+            .expect("valid response metadata should begin proxying");
+        let error = to_bytes(download.into_response().into_body(), usize::MAX)
+            .await
+            .expect_err("a stalled Drive body should terminate the proxy stream");
+
+        assert!(error.to_string().contains("download stream failed"));
     }
 
     #[tokio::test]
@@ -4640,6 +4857,22 @@ mod tests {
             .await
         }
 
+        async fn start_with_download_delay(
+            list_body: impl Into<String>,
+            download_body: Vec<u8>,
+            download_delay: Duration,
+        ) -> Self {
+            let declared_download_content_length = download_body.len() as u64;
+            Self::start_with_declared_download_content_length_and_delay(
+                list_body,
+                StatusCode::OK,
+                download_body,
+                Some(declared_download_content_length),
+                download_delay,
+            )
+            .await
+        }
+
         async fn start_without_download_content_length(
             list_body: impl Into<String>,
             download_status: StatusCode,
@@ -4660,11 +4893,29 @@ mod tests {
             download_body: Vec<u8>,
             declared_download_content_length: Option<u64>,
         ) -> Self {
+            Self::start_with_declared_download_content_length_and_delay(
+                list_body,
+                download_status,
+                download_body,
+                declared_download_content_length,
+                Duration::ZERO,
+            )
+            .await
+        }
+
+        async fn start_with_declared_download_content_length_and_delay(
+            list_body: impl Into<String>,
+            download_status: StatusCode,
+            download_body: Vec<u8>,
+            declared_download_content_length: Option<u64>,
+            download_delay: Duration,
+        ) -> Self {
             let state = Arc::new(DriveDownloadServerState {
                 list_body: list_body.into(),
                 download_status,
                 download_body,
                 declared_download_content_length,
+                download_delay,
                 list_requests: Mutex::new(Vec::new()),
                 download_requests: Mutex::new(Vec::new()),
             });
@@ -4722,6 +4973,7 @@ mod tests {
         download_status: StatusCode,
         download_body: Vec<u8>,
         declared_download_content_length: Option<u64>,
+        download_delay: Duration,
         list_requests: Mutex<Vec<CapturedDriveFilesListRequest>>,
         download_requests: Mutex<Vec<CapturedDriveDownloadRequest>>,
     }
@@ -4771,11 +5023,24 @@ mod tests {
                 query: uri.query().unwrap_or_default().to_owned(),
             });
 
-        let stream = ReaderStream::new(Cursor::new(state.download_body.clone()));
+        let response_body = if state.download_delay.is_zero() {
+            Body::from_stream(ReaderStream::new(Cursor::new(state.download_body.clone())))
+        } else {
+            let download_delay = state.download_delay;
+            let stream = futures_util::stream::unfold(
+                Some(state.download_body.clone()),
+                move |body| async move {
+                    let body = body?;
+                    tokio::time::sleep(download_delay).await;
+                    Some((Ok::<_, std::io::Error>(Bytes::from(body)), None))
+                },
+            );
+            Body::from_stream(stream)
+        };
         let mut response = Response::builder()
             .status(state.download_status)
             .header(CONTENT_TYPE, "application/octet-stream")
-            .body(Body::from_stream(stream))
+            .body(response_body)
             .expect("streaming download response should build");
         if let Some(content_length) = state.declared_download_content_length {
             response.headers_mut().insert(
@@ -4975,6 +5240,19 @@ mod tests {
             Self::start_with_upload_response(StatusCode::CREATED, upload_body).await
         }
 
+        async fn start_with_upload_response_delay(
+            upload_body: impl Into<String>,
+            upload_response_delay: Duration,
+        ) -> Self {
+            Self::start_with_upload_response_session_url_and_delay(
+                StatusCode::CREATED,
+                upload_body,
+                None,
+                upload_response_delay,
+            )
+            .await
+        }
+
         async fn start_with_session_url(
             session_url: impl Into<String>,
             upload_body: impl Into<String>,
@@ -4999,6 +5277,21 @@ mod tests {
             upload_body: impl Into<String>,
             session_url: Option<String>,
         ) -> Self {
+            Self::start_with_upload_response_session_url_and_delay(
+                upload_status,
+                upload_body,
+                session_url,
+                Duration::ZERO,
+            )
+            .await
+        }
+
+        async fn start_with_upload_response_session_url_and_delay(
+            upload_status: StatusCode,
+            upload_body: impl Into<String>,
+            session_url: Option<String>,
+            upload_response_delay: Duration,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("test Drive upload server should bind");
@@ -5012,6 +5305,7 @@ mod tests {
                 initiate_body: String::new(),
                 upload_status,
                 upload_body: upload_body.into(),
+                upload_response_delay,
                 initiate_requests: Mutex::new(Vec::new()),
                 upload_requests: Mutex::new(Vec::new()),
             });
@@ -5067,6 +5361,7 @@ mod tests {
         initiate_body: String,
         upload_status: StatusCode,
         upload_body: String,
+        upload_response_delay: Duration,
         initiate_requests: Mutex<Vec<CapturedDriveUploadInitiateRequest>>,
         upload_requests: Mutex<Vec<CapturedDriveUploadRequest>>,
     }
@@ -5133,6 +5428,8 @@ mod tests {
                 headers,
                 body: body.to_vec(),
             });
+
+        tokio::time::sleep(state.upload_response_delay).await;
 
         (
             state.upload_status,
