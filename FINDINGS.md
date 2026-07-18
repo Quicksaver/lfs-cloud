@@ -1905,11 +1905,33 @@ independently validated or adjudicated.
     invalid finding attributable separately, this was high-quality,
     performance- and reliability-relevant feedback.
 
-16. **Low — Availability and upload paths repeatedly rehash the same object.**
-    Both Git LFS media and shared-cache candidates can be hashed, followed by
-    another upload verification pass (`src/migration.rs:558-573`,
-    `src/migration.rs:653-656`). Short-circuit after a verified source and carry
-    trusted verification metadata through the upload pipeline.
+16. **[DONE] Availability and upload paths repeatedly rehash the same object**
+    (Low, `src/migration.rs` and `AGENTS.md`): **Partly valid and actionable.**
+    Availability checking previously hashed the preferred Git LFS media copy
+    and then hashed the shared-cache copy even after the first source had
+    already proved local availability. It now checks Git LFS media first and
+    inspects the shared cache only as a fallback when media is missing or
+    invalid. A test-first regression failed against the eager two-location
+    check and now proves a verified media source suppresses the redundant cache
+    inspection; existing fallback coverage still proves missing, corrupt, and
+    unreadable media allow a verified cache source. The suggestion to carry an
+    earlier hash through upload and remove the immediate pre-upload recheck was
+    not valid: availability is a point-in-time snapshot, its public records do
+    not retain an open immutable file, and the selected path can change before
+    the later asynchronous provider transfer. The existing mutation regression
+    continues to prove that source bytes changed after availability checking
+    are rejected before upload. Public API documentation and the repository
+    learning now describe the preferred-media/fallback-cache order and why the
+    final safety recheck remains necessary. Verification passed with
+    `cargo fmt --all`, `yarn lint:fix`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets -- --test-threads=1` (all targets passed; 3 tests
+    ignored), `cargo test --doc` (39 passed), and `git diff --check`. The
+    focused reviewer identified a real low-severity duplicate-I/O opportunity
+    and correctly recommended short-circuiting once a verified source exists,
+    but its trusted-metadata proposal overlooked the stale-source integrity
+    boundary. With one partly valid finding and no separate invalid finding,
+    this was useful performance feedback of moderate precision.
 
 ## Git LFS protocol and provider abstractions
 

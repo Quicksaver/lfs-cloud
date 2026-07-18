@@ -194,7 +194,7 @@ pub struct LocalMigrationObjectAvailability {
     pub worktree_root: PathBuf,
     /// Repository-local Git LFS media object directory that was inspected.
     pub git_lfs_objects_dir: PathBuf,
-    /// Shared LFS Cloud cache root that was inspected, when supplied.
+    /// Shared LFS Cloud cache root available as a fallback, when supplied.
     pub shared_cache_root: Option<PathBuf>,
     /// Deduplicated object availability records in stable object order.
     pub objects: Vec<LocalMigrationObject>,
@@ -706,11 +706,11 @@ pub fn enumerate_fetched_ref_lfs_pointers_for_remote(
 
 /// Checks whether discovered migration objects already have verified local bytes.
 ///
-/// The repository's stock Git LFS media directory is always checked. When a
-/// shared LFS Cloud cache layout is supplied, that cache is checked too. The
-/// helper is intentionally read-only: missing or corrupt objects are reported
-/// in the returned availability records instead of fetching or rewriting local
-/// state.
+/// The repository's stock Git LFS media directory is always checked first.
+/// When it does not contain a verified copy and a shared LFS Cloud cache layout
+/// is supplied, that cache is checked as a fallback. The helper is
+/// intentionally read-only: missing or corrupt objects are reported in the
+/// returned availability records instead of fetching or rewriting local state.
 ///
 /// # Errors
 ///
@@ -741,13 +741,18 @@ where
     let objects = objects
         .into_iter()
         .map(|object| {
-            let mut locations = vec![check_local_migration_object_location(
+            let git_lfs_location = check_local_migration_object_location(
                 LocalMigrationObjectLocationKind::GitLfsMedia,
                 git_lfs_object_path(&git_lfs_objects_dir, &object.oid)?,
                 &object,
-            )?];
+            )?;
+            let git_lfs_media_is_available = matches!(
+                &git_lfs_location.status,
+                LocalMigrationObjectLocationStatus::Available
+            );
+            let mut locations = vec![git_lfs_location];
 
-            if let Some(layout) = shared_cache {
+            if !git_lfs_media_is_available && let Some(layout) = shared_cache {
                 locations.push(check_local_migration_object_location(
                     LocalMigrationObjectLocationKind::SharedCache,
                     layout.object_path(&object),
@@ -5599,6 +5604,29 @@ mod tests {
         );
         assert_eq!(
             availability.objects[0].locations[1].status,
+            LocalMigrationObjectLocationStatus::Available
+        );
+    }
+
+    #[test]
+    fn local_object_check_skips_shared_cache_after_verified_git_lfs_media() {
+        let repo = TempRepo::new();
+        let cache_root = tempfile::tempdir().expect("temporary cache root should be created");
+        let layout = LocalCacheLayout::new(cache_root.path());
+        let object = test_lfs_object_from_bytes(b"preferred media bytes");
+        write_git_lfs_source_object(&repo, &object, b"preferred media bytes");
+        write_file(&layout.object_path(&object), b"preferred media bytes");
+
+        let availability = check_local_migration_objects(repo.path(), [&object], Some(&layout))
+            .expect("verified media should satisfy local availability");
+
+        assert_eq!(availability.objects[0].locations.len(), 1);
+        assert_eq!(
+            availability.objects[0].locations[0].kind,
+            LocalMigrationObjectLocationKind::GitLfsMedia
+        );
+        assert_eq!(
+            availability.objects[0].locations[0].status,
             LocalMigrationObjectLocationStatus::Available
         );
     }
