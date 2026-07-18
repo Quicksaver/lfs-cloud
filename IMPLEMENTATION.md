@@ -1421,7 +1421,7 @@ Defer:
 
 - [x] [T] Implement idempotent object lookup by repo ID, storage provider ID, OID, and size.
 - [x] [T] Implement verified object insert/update after successful storage upload.
-- [x] [T] Record created-by user, timestamps, backend file ID, and verification status.
+- [x] [T] Record the original created-by user, timestamps, backend file ID, and verification status; later idempotent verification preserves creator provenance.
 - [x] [T] Add tests for duplicate uploads, missing objects, and stale backend IDs.
 
 ### Phase 5: LFS Server Protocol

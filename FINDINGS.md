@@ -619,11 +619,26 @@ independently validated or adjudicated.
    one valid finding assessed here and no invalid finding attributable
    separately, this was high-quality, operationally relevant feedback.
 
-8. **Medium — Idempotent verification rewrites original uploader attribution.**
-   The conflict update preserves `created_at` while replacing every
-   `created_by` field (`src/metadata.rs:447-490`,
-   `src/server.rs:1163-1190`). Preserve original creator fields and use separate
-   last-verified or updated attribution where needed.
+8. **[DONE] Idempotent verification rewrites original uploader attribution**
+   (Medium, `src/metadata.rs`, `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid
+   and actionable.** The object upsert preserved `created_at` but replaced all
+   three `created_by` columns with the user performing each later verification,
+   so an idempotent upload or stale-row repair silently rewrote provenance.
+   Conflict updates now refresh only the backend ID, verification status, and
+   `last_verified_at` timestamp; the original creator fields remain immutable.
+   The insert parameter and public record documentation clarify that creator
+   attribution applies only when the row is first created. Regression coverage
+   proves that both a duplicate upload by a different stable user and repair of
+   a stale row preserve the first recorded creator while updating backend and
+   verification metadata. Implementation guidance and the repository learning
+   now document the provenance contract. Verification passed with `cargo fmt`,
+   `yarn lint:fix`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, and `cargo test --doc`; the final diff check also
+   passed. The focused reviewer identified a genuine medium-severity audit
+   integrity flaw, correctly distinguished immutable creator provenance from
+   mutable verification metadata, and requested the decisive duplicate-update
+   behavior; with one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, relevant feedback.
 
 9. **Medium — Newer metadata schemas are silently accepted and may be
    modified.** Initial schema statements execute before the code validates

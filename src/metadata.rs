@@ -272,7 +272,7 @@ pub struct MetadataObjectRecord {
     pub object: LfsObject,
     /// Backend file ID or object key returned by the storage provider.
     pub backend_id: String,
-    /// Repository-provider user that created or last repaired this object row.
+    /// Repository-provider user that originally created this object row.
     pub created_by: RepositoryUser,
     /// Unix timestamp for the first time this metadata row was created.
     pub created_at_unix_seconds: i64,
@@ -519,7 +519,8 @@ impl MetadataDatabase {
     ///
     /// The operation is idempotent for the repository/storage/object key: it
     /// creates the object row when missing, or updates the existing row to point
-    /// at the newly verified backend ID and marks it `verified`.
+    /// at the newly verified backend ID and marks it `verified`. Repairing an
+    /// existing row preserves its original creator attribution.
     ///
     /// # Errors
     ///
@@ -531,7 +532,7 @@ impl MetadataDatabase {
         storage_provider_id: &str,
         object: &LfsObject,
         backend_id: &str,
-        created_by: &RepositoryUser,
+        creator_if_missing: &RepositoryUser,
     ) -> ServerResult<MetadataObjectRecord> {
         let size_bytes = sqlite_size_bytes(object)?;
         let verified_status = MetadataObjectVerificationStatus::Verified.as_database_str();
@@ -554,9 +555,6 @@ impl MetadataDatabase {
                 ON CONFLICT(repo_id, storage_provider_id, oid, size_bytes)
                 DO UPDATE SET
                     backend_id = excluded.backend_id,
-                    created_by_provider_id = excluded.created_by_provider_id,
-                    created_by_login = excluded.created_by_login,
-                    created_by_stable_id = excluded.created_by_stable_id,
                     verification_status = excluded.verification_status,
                     last_verified_at_unix_seconds = excluded.last_verified_at_unix_seconds
                 RETURNING
@@ -578,9 +576,9 @@ impl MetadataDatabase {
                     object.oid.as_hex(),
                     size_bytes,
                     backend_id,
-                    created_by.provider_id.as_str(),
-                    created_by.login.as_str(),
-                    created_by.stable_id.as_deref(),
+                    creator_if_missing.provider_id.as_str(),
+                    creator_if_missing.login.as_str(),
+                    creator_if_missing.stable_id.as_deref(),
                     verified_status,
                 ],
                 metadata_object_record_from_row,
@@ -1520,7 +1518,7 @@ repositories:
     }
 
     #[test]
-    fn duplicate_verified_upload_updates_existing_object_row() {
+    fn duplicate_verified_upload_preserves_original_creator() {
         let database = MetadataDatabase::open_in_memory().expect("metadata DB should open");
         insert_storage_provider_and_repository_mapping(
             &database
@@ -1557,7 +1555,7 @@ repositories:
             second.created_at_unix_seconds
         );
         assert_eq!(second.backend_id, "drive-file-second");
-        assert_eq!(second.created_by, second_user);
+        assert_eq!(second.created_by, first_user);
         assert_eq!(
             second.verification_status,
             MetadataObjectVerificationStatus::Verified
@@ -1601,7 +1599,10 @@ repositories:
 
         assert_eq!(repaired.id, stale.id);
         assert_eq!(repaired.backend_id, "drive-file-repaired");
-        assert_eq!(repaired.created_by, user);
+        assert_eq!(
+            repaired.created_by,
+            RepositoryUser::new("github-main", "octocat", None)
+        );
         assert_eq!(
             repaired.verification_status,
             MetadataObjectVerificationStatus::Verified
