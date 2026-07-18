@@ -255,7 +255,11 @@ operations are serialized. On macOS and Linux, publication atomically retains
 and verifies the displaced pointer, restoring it if a concurrent edit landed
 after the final check. Hydration accepts only regular files whose resolved
 parent remains inside the current worktree; symbolic links are never followed
-or replaced. Use `--cache-root` to target a non-default local cache root.
+or replaced. Hydration preserves the existing pointer file's mode, including
+its executable bit. On Unix, lower-level cache materialization into a new path
+uses owner-only `0600` permissions rather than making repository content
+readable by other local users. Use `--cache-root` to target a non-default local
+cache root.
 
 ### Dehydrate Files To Pointers
 

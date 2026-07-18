@@ -803,6 +803,10 @@ verified cache object already exists, without weakening concurrent-edit
 rollback. A failed rollback retains the displaced bytes at a reported recovery
 path rather than deleting them. Platforms without exchange-rename support
 retain the path lock and final identity check before atomic replacement.
+On Unix, cache materialization into a path that does not yet exist publishes it
+with owner-only `0600` permissions. Pointer hydration instead preserves the
+existing worktree mode, so Git's executable bit survives without broadening
+access beyond the checked-out file's permissions.
 
 There are two likely implementation strategies:
 

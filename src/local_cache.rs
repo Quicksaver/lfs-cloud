@@ -40,7 +40,7 @@ const WORKTREE_REGISTRY_LOCK_FILE: &str = "worktrees.json.lock";
 const WORKTREE_REGISTRY_VERSION: u32 = 1;
 const MAX_LFS_POINTER_FILE_SIZE: u64 = 64 * 1024;
 #[cfg(unix)]
-const DEFAULT_MATERIALIZED_FILE_MODE: u32 = 0o644;
+const DEFAULT_MATERIALIZED_FILE_MODE: u32 = 0o600;
 #[cfg(not(unix))]
 const DEFAULT_MATERIALIZED_FILE_MODE: () = ();
 
@@ -661,7 +661,10 @@ impl LocalCacheLayout {
     /// the exact requested object bytes. This keeps the lower-level helper from
     /// overwriting dirty worktree contents; pointer-file replacement is handled
     /// by [`Self::hydrate_pointer_file`], which proves the pointer identity
-    /// before replacing it.
+    /// before replacing it. On Unix, a destination created from scratch starts
+    /// owner-readable and owner-writable only. Hydrating an existing pointer
+    /// instead preserves that worktree file's mode, including its executable
+    /// bit.
     ///
     /// # Errors
     ///
@@ -3081,12 +3084,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn materialize_object_uses_worktree_file_mode_for_new_files() {
+    fn materialize_object_respects_restrictive_process_umask_for_new_files() {
         use std::os::unix::fs::PermissionsExt;
+
+        const UMASK_CHILD_ENV: &str = "LFS_CLOUD_MATERIALIZATION_UMASK_CHILD";
+        const TEST_NAME: &str = "local_cache::tests::materialize_object_respects_restrictive_process_umask_for_new_files";
+
+        if std::env::var_os(UMASK_CHILD_ENV).is_none() {
+            let current_exe = std::env::current_exe().expect("test executable should resolve");
+            let status = Command::new("sh")
+                .args([
+                    "-c",
+                    "umask 077; exec \"$1\" --exact \"$2\" --nocapture",
+                    "sh",
+                ])
+                .arg(current_exe)
+                .arg(TEST_NAME)
+                .env(UMASK_CHILD_ENV, "1")
+                .status()
+                .expect("restrictive-umask test subprocess should start");
+            assert!(status.success(), "restrictive-umask subprocess should pass");
+            return;
+        }
 
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
-        let bytes = b"cache bytes with normal worktree permissions";
+        let bytes = b"cache bytes with private worktree permissions";
         let object = object_for_bytes(bytes);
         let destination = temp.path().join("repo/assets/model.bin");
         write_file(&layout.object_path(&object), bytes);
@@ -3100,7 +3123,7 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, DEFAULT_MATERIALIZED_FILE_MODE);
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

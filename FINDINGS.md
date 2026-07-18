@@ -1406,12 +1406,30 @@ independently validated or adjudicated.
    accurate; with one valid finding and no invalid finding attributable
    separately, this was high-quality, relevant feedback.
 
-8. **Medium — New materialized files bypass a restrictive process umask.** The
-   implementation explicitly sets mode `0644`, potentially exposing private
-   repository content to other local users (`src/local_cache.rs:30`,
-   `src/local_cache.rs:1695-1701`, `src/local_cache.rs:2470-2489`). Respect the
-   process umask or default to `0600`, then apply only appropriate Git-index mode
-   bits. Test in a subprocess with umask `077`.
+8. **[DONE] New materialized files bypassed a restrictive process umask**
+   (Medium, `src/local_cache.rs`, `README.md`, `IMPLEMENTATION.md`, and
+   `AGENTS.md`): **Valid and actionable.** A newly created Unix destination
+   started as a private temporary file, but publication explicitly changed it
+   to `0644`, overriding a restrictive process umask and making cached
+   repository bytes readable by other local users. Fresh cache
+   materializations now publish with owner-only `0600` permissions. Hydration
+   of an existing Git LFS pointer remains a separate path that preserves the
+   pointer's current mode, including the Git executable bit, rather than
+   replacing it with the private default. A regression re-executes the focused
+   test binary in a subprocess with `umask 077` and verifies that a newly
+   materialized file is `0600`; the existing executable-pointer regression
+   continues to prove that hydration preserves mode `0755`. README,
+   implementation guidance, and the repository learning now document the
+   fresh-path versus pointer-replacement permission boundary. Verification
+   passed with `cargo fmt --all`, `yarn lint:fix`, the focused restrictive-umask
+   regression, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and
+   `scripts/manual/verify-local-cache-materialization.sh`. The focused reviewer
+   identified a genuine medium-severity local confidentiality flaw, accurately
+   traced it to the explicit mode broadening, and requested the decisive
+   subprocess regression. With one valid finding assessed here and no invalid
+   finding attributable separately, this was high-quality, security-relevant
+   feedback.
 
 9. **Low — The worktree registry cannot represent valid non-UTF-8 Unix roots.**
    Direct JSON serialization of `PathBuf` rejects such paths
