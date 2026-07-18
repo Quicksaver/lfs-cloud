@@ -44,9 +44,7 @@ const LIVE_DRIVE_CREDENTIAL_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON"
 #[tokio::test]
 #[ignore = "requires LFS_CLOUD_RUN_GITHUB_INTEGRATION=1 and a disposable-capable GitHub token"]
 async fn github_disposable_repo_permission_check() {
-    if skip_unless_enabled("LFS_CLOUD_RUN_GITHUB_INTEGRATION") {
-        return;
-    }
+    require_enabled("LFS_CLOUD_RUN_GITHUB_INTEGRATION");
 
     let token = required_env("LFS_CLOUD_GITHUB_TOKEN");
     let repo_owner = env::var("LFS_CLOUD_GITHUB_OWNER").ok();
@@ -114,9 +112,7 @@ async fn github_disposable_repo_permission_check() {
 #[tokio::test]
 #[ignore = "requires LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION=1 and disposable Drive credentials"]
 async fn google_drive_disposable_folder_root_validation() {
-    if skip_unless_enabled("LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION") {
-        return;
-    }
+    require_enabled("LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION");
 
     let credential_json = google_drive_credential_json();
     let provider_id =
@@ -169,9 +165,7 @@ async fn google_drive_disposable_folder_root_validation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION=1 plus disposable GitHub and Drive credentials"]
 async fn live_server_upload_download_records_drive_and_sqlite_state() {
-    if skip_unless_enabled("LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION") {
-        return;
-    }
+    require_enabled("LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION");
 
     run_live_provider_transfer_scenario()
         .await
@@ -744,14 +738,14 @@ fn finish_scenario_with_cleanup(
     }
 }
 
-fn skip_unless_enabled(env_name: &str) -> bool {
-    match env::var(env_name).as_deref() {
-        Ok("1" | "true" | "TRUE" | "yes" | "YES") => false,
-        _ => {
-            eprintln!("skipping external integration test; set {env_name}=1 to enable");
-            true
-        }
-    }
+fn require_enabled(env_name: &str) {
+    assert!(
+        matches!(
+            env::var(env_name).as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "YES")
+        ),
+        "set {env_name}=1 to run this explicitly selected external integration test"
+    );
 }
 
 fn required_env(name: &str) -> String {

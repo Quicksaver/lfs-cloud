@@ -2351,13 +2351,30 @@ independently validated or adjudicated.
    and no invalid finding attributable separately, this was high-quality,
    security-relevant feedback.
 
-5. **Medium — Missing prerequisites are reported as successful tests.** Many CLI
-   tests silently return without Git, and explicitly selected gated tests can
-   also return without their enable flag or Git LFS
-   (`src/cli.rs:3026`, `tests/external_integrations.rs:27`,
-   `src/migration.rs:4016`). Make CI prerequisites fail clearly; keep external
-   tests ignored by default but fail an explicitly requested run that lacks its
-   required tool or flag.
+5. **[DONE] Missing prerequisites were reported as successful tests** (Medium,
+   `src/cli.rs`, `src/migration.rs`, `tests/external_integrations.rs`, and
+   `AGENTS.md`): **Valid and actionable.** Forty Git-backed CLI regressions
+   previously returned successfully when `git --version` failed, while the
+   real Git LFS CLI regression and an ignored migration integration test did
+   the same when `git lfs version` failed. Those tests now call explicit
+   prerequisite assertions whose failure messages name Git or Git LFS and
+   retain the command diagnostic. External-provider tests remain ignored during
+   ordinary test runs, but an explicitly selected ignored test now asserts its
+   enable flag before reading credentials or contacting a provider; missing
+   flags can no longer turn a requested live check into a passing no-op. A
+   focused CLI test passed with its Git prerequisite, and explicitly selecting
+   the ignored GitHub test without its flag failed immediately with the
+   expected instruction to set `LFS_CLOUD_RUN_GITHUB_INTEGRATION=1`. The
+   repository learning records the fail-closed gate contract. Verification
+   passed with `yarn lint:fix`, `cargo fmt --all --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (647 passed, 4 ignored across targets),
+   `cargo test --doc` (39 passed), and `git diff --check`. The focused reviewer
+   identified a genuine medium-severity false-confidence flaw, cited all three
+   affected gate shapes, and prescribed the correct distinction between
+   default ignore behavior and explicitly requested execution. With one valid
+   finding and no invalid finding attributable separately, this was
+   high-quality, directly actionable feedback.
 
 6. **Medium — macOS copy-on-write tests accept ordinary copying.** The assertions
    allow either result even on environments intended to protect the CoW feature

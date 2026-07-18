@@ -6324,9 +6324,7 @@ mod tests {
     #[ignore = "manual verification requires git-lfs and a local source repository"]
     #[test]
     fn source_fetch_downloads_missing_objects_without_changing_worktree_files() {
-        if !git_lfs_is_available() {
-            return;
-        }
+        require_git_lfs();
 
         let source = TempRepo::new();
         source.git(["lfs", "install", "--local"]);
@@ -6730,11 +6728,16 @@ mod tests {
         fs::write(path, contents).expect("test file should be written");
     }
 
-    fn git_lfs_is_available() -> bool {
-        Command::new("git")
+    fn require_git_lfs() {
+        let output = Command::new("git")
             .args(["lfs", "version"])
             .output()
-            .is_ok_and(|output| output.status.success())
+            .expect("Git LFS is required to run the manual migration integration test");
+        assert!(
+            output.status.success(),
+            "Git LFS is required to run the manual migration integration test: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn assert_git_status_clean(worktree_root: &Path) {

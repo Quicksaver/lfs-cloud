@@ -4179,9 +4179,7 @@ mod tests {
 
     #[test]
     fn init_writes_lfsconfig_from_current_repo_origin() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
         run_git(repo.path(), &["init"]);
@@ -4227,9 +4225,7 @@ mod tests {
 
     #[test]
     fn init_updates_existing_lfsconfig_with_diff_output() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
         run_git(repo.path(), &["init"]);
@@ -4302,9 +4298,7 @@ mod tests {
 
     #[test]
     fn init_local_option_writes_local_git_config_without_lfsconfig() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
         run_git(repo.path(), &["init"]);
@@ -4349,9 +4343,7 @@ mod tests {
 
     #[test]
     fn status_reports_ready_repository_mapping_auth_storage_and_cache() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -4406,9 +4398,7 @@ mod tests {
 
     #[test]
     fn status_reports_failures_without_leaking_credential_secrets() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -4461,9 +4451,7 @@ mod tests {
 
     #[test]
     fn status_redacts_unsafe_server_override_before_route_validation() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -4541,9 +4529,7 @@ mod tests {
 
     #[test]
     fn migrate_dry_run_reports_current_checkout_plan_without_writes() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -4667,9 +4653,7 @@ mod tests {
 
     #[test]
     fn migrate_requires_acknowledgement_for_cross_remote_identity() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -4745,9 +4729,7 @@ mod tests {
 
     #[test]
     fn migrate_dry_run_reports_missing_objects_as_would_fetch_without_fetching() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -4815,9 +4797,7 @@ mod tests {
 
     #[test]
     fn migrate_dry_run_withholds_unverified_github_purge_manifest() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -4886,9 +4866,7 @@ mod tests {
 
     #[test]
     fn migrate_dry_run_reports_custom_source_as_unsupported_purge_provider() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -4947,9 +4925,7 @@ mod tests {
 
     #[test]
     fn migrate_dry_run_caps_object_listing_but_keeps_counts() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -5003,9 +4979,7 @@ mod tests {
 
     #[test]
     fn migrate_dry_run_purge_report_does_not_bypass_object_listing_limit() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -5097,9 +5071,7 @@ mod tests {
 
     #[test]
     fn pull_fetches_ingests_and_hydrates_current_checkout_pointers() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5163,9 +5135,7 @@ mod tests {
 
     #[test]
     fn pull_ingests_from_configured_git_lfs_storage_dir() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5211,9 +5181,7 @@ mod tests {
 
     #[test]
     fn pull_ingests_from_git_common_dir_for_linked_worktree() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5275,9 +5243,7 @@ mod tests {
 
     #[test]
     fn pull_propagates_git_lfs_fetch_failure_before_cache_mutation() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5373,9 +5339,7 @@ mod tests {
 
     #[test]
     fn pull_reports_failures_after_attempting_remaining_pointers() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5446,9 +5410,7 @@ mod tests {
 
     #[test]
     fn current_checkout_pointer_scan_uses_lfs_tracked_files_only() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -5495,9 +5457,7 @@ mod tests {
 
     #[test]
     fn current_checkout_pointer_scan_reports_tracked_and_pointer_counts() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -5532,9 +5492,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn current_checkout_pointer_scan_accepts_non_utf8_tracked_paths() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let repo = temp.path().join("repo");
@@ -5565,9 +5523,7 @@ mod tests {
 
     #[test]
     fn hydrate_replaces_pointer_file_with_verified_cache_object() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5607,9 +5563,7 @@ mod tests {
 
     #[test]
     fn dehydrate_caches_clean_file_and_writes_pointer() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5663,9 +5617,7 @@ mod tests {
 
     #[test]
     fn dehydrate_accepts_existing_pointer_as_idempotent() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5698,9 +5650,7 @@ mod tests {
 
     #[test]
     fn dehydrate_rejects_dirty_lfs_content_without_caching_it() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5744,9 +5694,7 @@ mod tests {
 
     #[test]
     fn dehydrate_rejects_untracked_and_non_lfs_paths() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5777,9 +5725,7 @@ mod tests {
 
     #[test]
     fn dehydrate_rejects_paths_outside_the_current_worktree() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5810,9 +5756,7 @@ mod tests {
 
     #[test]
     fn hydrate_rejects_paths_outside_the_current_worktree() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5849,9 +5793,7 @@ mod tests {
 
     #[test]
     fn dehydrate_republishes_cache_bytes_for_real_git_lfs_push() {
-        if !git_lfs_is_available() {
-            return;
-        }
+        require_git_lfs();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5916,9 +5858,7 @@ mod tests {
 
     #[test]
     fn hydrate_rejects_non_pointer_worktree_content_with_local_cache_error() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5949,9 +5889,7 @@ mod tests {
 
     #[test]
     fn hydrate_reports_missing_cache_object_as_local_cache_error() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -5986,9 +5924,7 @@ mod tests {
 
     #[test]
     fn dehydrate_rejects_non_file_path_before_cache_mutation() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -6013,9 +5949,7 @@ mod tests {
 
     #[test]
     fn hydrate_stops_when_one_of_multiple_paths_fails() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -6065,9 +5999,7 @@ mod tests {
 
     #[test]
     fn gc_removes_unreferenced_cache_objects_and_reports_summary() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -6105,9 +6037,7 @@ mod tests {
 
     #[test]
     fn gc_dry_run_reports_without_removing_cache_objects() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -6139,9 +6069,7 @@ mod tests {
 
     #[test]
     fn gc_requires_explicit_pruning_before_collecting_with_unavailable_worktrees() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let temp = TempDir::new().expect("temporary directory should be created");
         let cache_root = temp.path().join("cache");
@@ -6294,9 +6222,7 @@ mod tests {
 
     #[test]
     fn login_opens_browser_and_stores_local_lfs_token_for_current_repo() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
         run_git(repo.path(), &["init"]);
@@ -6370,9 +6296,7 @@ mod tests {
 
     #[test]
     fn login_no_open_skips_browser_but_stores_token() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
         run_git(repo.path(), &["init"]);
@@ -6494,9 +6418,7 @@ mod tests {
 
     #[test]
     fn logout_revokes_remote_session_before_erasing_local_credential() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
         run_git(repo.path(), &["init"]);
@@ -6565,9 +6487,7 @@ mod tests {
 
     #[test]
     fn logout_erases_stale_local_credential_when_session_is_already_inactive() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
         run_git(repo.path(), &["init"]);
@@ -6610,9 +6530,7 @@ mod tests {
 
     #[test]
     fn login_reports_missing_origin_remote_with_targeted_message() {
-        if !git_is_available() {
-            return;
-        }
+        require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
         run_git(repo.path(), &["init"]);
@@ -6736,18 +6654,28 @@ repositories:
         run_git(repo, &["add", ".gitattributes", relative_path]);
     }
 
-    fn git_is_available() -> bool {
-        ProcessCommand::new("git")
+    fn require_git() {
+        let output = ProcessCommand::new("git")
             .arg("--version")
             .output()
-            .is_ok_and(|output| output.status.success())
+            .expect("Git is required to run CLI integration tests");
+        assert!(
+            output.status.success(),
+            "Git is required to run CLI integration tests: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    fn git_lfs_is_available() -> bool {
-        ProcessCommand::new("git")
+    fn require_git_lfs() {
+        let output = ProcessCommand::new("git")
             .args(["lfs", "version"])
             .output()
-            .is_ok_and(|output| output.status.success())
+            .expect("Git LFS is required to run CLI integration tests");
+        assert!(
+            output.status.success(),
+            "Git LFS is required to run CLI integration tests: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn run_git(current_dir: &Path, args: &[&str]) {
