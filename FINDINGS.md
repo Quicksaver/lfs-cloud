@@ -941,12 +941,32 @@ independently validated or adjudicated.
 
 ## CLI, configuration, and Git integration
 
-1. **High — URL redaction can leak credentials in combined malformed or
-   scp-style inputs.** The redactor does not safely compose userinfo, query, and
-   scp-like sanitization (`src/git.rs:633-665`, `src/git.rs:785-813`,
-   `src/cli.rs:3250-3300`). Parse and redact all sensitive components before
-   truncation or display, and add cases combining userinfo, query, fragment, and
-   scp-like syntax.
+1. **[DONE] URL redaction leaked credentials in combined malformed or scp-style
+   inputs** (High, `src/git.rs`, `src/cli.rs`, and `AGENTS.md`): **Valid and
+   actionable.** The display redactor previously treated URL parsing, scp-like
+   userinfo redaction, and raw query/fragment redaction as mutually exclusive
+   strategies. A parseable scp-like value containing a query or fragment could
+   therefore return after redacting only those suffixes while exposing its
+   credential prefix; a malformed hierarchical URL could take the opposite
+   fallback and redact its userinfo while preserving secret-bearing suffixes.
+   Redaction now removes raw query and fragment data first, then continues
+   through either parsed URL userinfo redaction or the scp-like fallback, so no
+   successful strategy can bypass another sensitive component. Regression
+   coverage combines password userinfo, query secrets, and fragment secrets in
+   both parseable scp-like and malformed hierarchical inputs, and asserts that
+   none of the sentinel secrets survive display sanitization. The repository
+   learning records the ordering requirement for future display boundaries.
+   Verification passed with `cargo fmt --check`, focused redaction tests,
+   `yarn lint:fix`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. A default-parallel all-target run exposed two existing
+   load-sensitive credential-helper timeouts; both passed focused reruns before
+   the complete serial suite passed. The focused reviewer found a genuine
+   high-severity credential-disclosure flaw,
+   correctly identified the non-composable redaction strategies, and requested
+   the decisive combined-input regressions; with one valid finding assessed
+   here and no invalid finding attributable separately, this was high-quality,
+   security-relevant feedback.
 
 2. **Medium — GitHub owner and repository matching is case-sensitive.** Route
    and configuration identity can diverge for names GitHub treats

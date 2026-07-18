@@ -631,38 +631,30 @@ fn command_status_text(status: ExitStatus) -> String {
 }
 
 pub(crate) fn redacted_url_for_display(value: &str) -> String {
-    match Url::parse(value) {
+    // Query and fragment data can coexist with URL or scp-like credentials.
+    // Remove those suffixes first so choosing either userinfo strategy below
+    // cannot accidentally return the other secret-bearing components.
+    let fallback = redact_query_fragment_for_display(value);
+    match Url::parse(&fallback) {
         Ok(mut url) => {
-            let mut redacted = false;
+            let mut redacted_url_userinfo = false;
             if !url.username().is_empty() {
                 let _ = url.set_username("REDACTED");
-                redacted = true;
+                redacted_url_userinfo = true;
             }
             if url.password().is_some() {
                 let _ = url.set_password(Some("REDACTED"));
-                redacted = true;
-            }
-            if url.query().is_some() {
-                url.set_query(Some("REDACTED"));
-                redacted = true;
-            }
-            if url.fragment().is_some() {
-                url.set_fragment(Some("REDACTED"));
-                redacted = true;
+                redacted_url_userinfo = true;
             }
 
-            if redacted {
+            if redacted_url_userinfo {
                 url.to_string()
             } else {
-                redact_url_parse_fallback_for_display(value)
+                redact_scp_like_remote_url(&fallback).unwrap_or(fallback)
             }
         }
-        _ => redact_url_parse_fallback_for_display(value),
+        _ => redact_scp_like_remote_url(&fallback).unwrap_or(fallback),
     }
-}
-
-fn redact_url_parse_fallback_for_display(value: &str) -> String {
-    redact_scp_like_remote_url(value).unwrap_or_else(|| redact_query_fragment_for_display(value))
 }
 
 fn redact_scp_like_remote_url(value: &str) -> Option<String> {
@@ -810,6 +802,21 @@ mod tests {
         assert_eq!(rendered, "not a url?REDACTED#REDACTED");
         assert!(!rendered.contains("query-secret"));
         assert!(!rendered.contains("fragment-secret"));
+    }
+
+    #[test]
+    fn display_redaction_composes_scp_userinfo_query_and_fragment() {
+        for url in [
+            "user:password-secret@github.com:owner/repo.git?token=query-secret#fragment-secret",
+            "https://user:password-secret@github.com/owner/%zz?token=query-secret#fragment-secret",
+        ] {
+            let rendered = redacted_url_for_display(url);
+
+            assert!(rendered.contains("REDACTED"));
+            assert!(!rendered.contains("password-secret"));
+            assert!(!rendered.contains("query-secret"));
+            assert!(!rendered.contains("fragment-secret"));
+        }
     }
 
     #[test]
