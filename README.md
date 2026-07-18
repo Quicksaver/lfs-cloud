@@ -278,7 +278,10 @@ lfs-cloud pull
 This runs `git lfs fetch`, copies verified fetched objects from the repository
 Git LFS media storage into the shared `lfs-cloud` cache, and replaces
 LFS-tracked pointer files in the current checkout with verified cache bytes. Use
-`--cache-root` to target a non-default local cache root.
+`--cache-root` to target a non-default local cache root. The fetch has a
+six-hour execution deadline and retains at most 256 KiB from each output stream;
+a timeout or output overflow stops the fetch process tree before `pull` changes
+cache or worktree state.
 
 ### Plan Migration From Existing Git LFS
 

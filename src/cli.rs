@@ -15,7 +15,7 @@ use std::{
     io::{self, BufRead, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Component, Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Child, Command as ProcessCommand, ExitStatus, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -44,6 +44,10 @@ use crate::{
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_REVOCATION_TIMEOUT: Duration = Duration::from_secs(30);
+const PULL_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_PULL_FETCH_OUTPUT_BYTES: usize = 256 * 1024;
+const CHILD_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
+const CHILD_OUTPUT_DRAIN_AFTER_KILL: Duration = Duration::from_secs(1);
 const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
 const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
@@ -1610,14 +1614,14 @@ struct CurrentCheckoutLfsPointerScan {
 }
 
 fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
-    let output = ProcessCommand::new("git")
-        .args(["lfs", "fetch"])
-        .current_dir(worktree_root)
-        .output()
-        .map_err(|source| CliError::Io {
-            context: "failed to start git lfs fetch".to_owned(),
-            source,
-        })?;
+    let mut command = ProcessCommand::new("git");
+    command.args(["lfs", "fetch"]).current_dir(worktree_root);
+    let output = run_bounded_child_command(
+        &mut command,
+        "git lfs fetch",
+        PULL_FETCH_TIMEOUT,
+        MAX_PULL_FETCH_OUTPUT_BYTES,
+    )?;
 
     if output.status.success() {
         Ok(())
@@ -1629,6 +1633,286 @@ fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
         })
     }
 }
+
+#[derive(Debug)]
+struct BoundedChildOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct BoundedPipeOutput {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+#[derive(Debug)]
+enum BoundedPipeEvent {
+    Stdout(io::Result<BoundedPipeOutput>),
+    Stderr(io::Result<BoundedPipeOutput>),
+}
+
+/// Runs a child while bounding its lifetime and retained output.
+///
+/// Both output streams are drained on separate threads so a chatty stream
+/// cannot fill its OS pipe while the parent waits on the other stream. Each
+/// reader retains at most `max_output_bytes`; crossing either limit terminates
+/// the whole process tree instead of merely truncating an otherwise unbounded
+/// producer.
+fn run_bounded_child_command(
+    command: &mut ProcessCommand,
+    command_name: &str,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> CliResult<BoundedChildOutput> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_child_process_tree(command);
+
+    let mut child = command.spawn().map_err(|source| CliError::Io {
+        context: format!("failed to start {command_name}"),
+        source,
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| CliError::Io {
+        context: format!("failed to capture stdout for {command_name}"),
+        source: io::Error::other("child stdout was not piped"),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| CliError::Io {
+        context: format!("failed to capture stderr for {command_name}"),
+        source: io::Error::other("child stderr was not piped"),
+    })?;
+
+    let (sender, receiver) = mpsc::channel();
+    let stdout_sender = sender.clone();
+    let stdout_reader = std::thread::spawn(move || {
+        let result = read_pipe_with_hard_limit(stdout, max_output_bytes);
+        let _ = stdout_sender.send(BoundedPipeEvent::Stdout(result));
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let result = read_pipe_with_hard_limit(stderr, max_output_bytes);
+        let _ = sender.send(BoundedPipeEvent::Stderr(result));
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut drain_deadline = None;
+    let mut stdout = None;
+    let mut stderr = None;
+
+    loop {
+        while let Ok(event) = receiver.try_recv() {
+            let (stream_name, result, destination) = match event {
+                BoundedPipeEvent::Stdout(result) => ("stdout", result, &mut stdout),
+                BoundedPipeEvent::Stderr(result) => ("stderr", result, &mut stderr),
+            };
+            let output = match result {
+                Ok(output) => output,
+                Err(source) => {
+                    terminate_child_process_tree(&mut child, command_name)?;
+                    return Err(CliError::Io {
+                        context: format!("failed to read {stream_name} from {command_name}"),
+                        source,
+                    });
+                }
+            };
+            if output.exceeded_limit {
+                terminate_child_process_tree(&mut child, command_name)?;
+                return Err(CliError::ExternalCommandOutput {
+                    command: command_name.to_owned(),
+                    message: SanitizedMessage::new(format!(
+                        "{stream_name} exceeded the {max_output_bytes}-byte limit"
+                    )),
+                });
+            }
+            *destination = Some(output.bytes);
+        }
+
+        if status.is_none() {
+            status = child.try_wait().map_err(|source| CliError::Io {
+                context: format!("failed to wait for {command_name}"),
+                source,
+            })?;
+            if status.is_some() {
+                drain_deadline = Some(Instant::now() + CHILD_OUTPUT_DRAIN_GRACE);
+            }
+        }
+
+        if let Some(status) = status.filter(|_| stdout.is_some() && stderr.is_some()) {
+            let stdout = stdout.take().expect("stdout was checked above");
+            let stderr = stderr.take().expect("stderr was checked above");
+            stdout_reader.join().map_err(|_| CliError::Io {
+                context: format!("stdout reader thread panicked for {command_name}"),
+                source: io::Error::other("stdout reader thread panicked"),
+            })?;
+            stderr_reader.join().map_err(|_| CliError::Io {
+                context: format!("stderr reader thread panicked for {command_name}"),
+                source: io::Error::other("stderr reader thread panicked"),
+            })?;
+            return Ok(BoundedChildOutput {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+
+        if status.is_none() && Instant::now() >= deadline {
+            terminate_child_process_tree(&mut child, command_name)?;
+            collect_pipe_events_after_kill(
+                &receiver,
+                &mut stdout,
+                &mut stderr,
+                CHILD_OUTPUT_DRAIN_AFTER_KILL,
+            );
+            return Err(CliError::ExternalCommand {
+                command: command_name.to_owned(),
+                status: format!("timed out after {} seconds", timeout.as_secs_f64()),
+                stderr: sanitized_external_failure_output(
+                    stderr.as_deref().unwrap_or_default(),
+                    stdout.as_deref().unwrap_or_default(),
+                ),
+            });
+        }
+
+        if status.is_some_and(|_| drain_deadline.is_some_and(|deadline| Instant::now() >= deadline))
+        {
+            // A descendant inherited one of the pipes after the direct child
+            // exited. Terminate the remaining process group before waiting for
+            // EOF so this command boundary cannot hang on the descendant.
+            stop_child_process_tree(&child);
+            collect_pipe_events_after_kill(
+                &receiver,
+                &mut stdout,
+                &mut stderr,
+                CHILD_OUTPUT_DRAIN_AFTER_KILL,
+            );
+            if stdout.is_none() || stderr.is_none() {
+                return Err(CliError::Io {
+                    context: format!("timed out draining output from {command_name}"),
+                    source: io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "child output pipes remained open after process exit",
+                    ),
+                });
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_pipe_with_hard_limit(
+    mut pipe: impl Read,
+    max_output_bytes: usize,
+) -> io::Result<BoundedPipeOutput> {
+    let mut bytes = Vec::with_capacity(max_output_bytes.min(8192));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = pipe.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(BoundedPipeOutput {
+                bytes,
+                exceeded_limit: false,
+            });
+        }
+
+        let remaining = max_output_bytes.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..count.min(remaining)]);
+        if count > remaining {
+            return Ok(BoundedPipeOutput {
+                bytes,
+                exceeded_limit: true,
+            });
+        }
+    }
+}
+
+fn collect_pipe_events_after_kill(
+    receiver: &mpsc::Receiver<BoundedPipeEvent>,
+    stdout: &mut Option<Vec<u8>>,
+    stderr: &mut Option<Vec<u8>>,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while (stdout.is_none() || stderr.is_none()) && Instant::now() < deadline {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        let Ok(event) = receiver.recv_timeout(remaining) else {
+            break;
+        };
+        match event {
+            BoundedPipeEvent::Stdout(Ok(output)) => *stdout = Some(output.bytes),
+            BoundedPipeEvent::Stderr(Ok(output)) => *stderr = Some(output.bytes),
+            BoundedPipeEvent::Stdout(Err(_)) | BoundedPipeEvent::Stderr(Err(_)) => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_child_process_tree(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_tree(_command: &mut ProcessCommand) {}
+
+fn terminate_child_process_tree(child: &mut Child, command_name: &str) -> CliResult<()> {
+    stop_child_process_tree(child);
+    if child
+        .try_wait()
+        .map_err(|source| CliError::Io {
+            context: format!("failed to wait for stopped {command_name}"),
+            source,
+        })?
+        .is_none()
+    {
+        child.kill().map_err(|source| CliError::Io {
+            context: format!("failed to stop {command_name}"),
+            source,
+        })?;
+        child.wait().map_err(|source| CliError::Io {
+            context: format!("failed to reap stopped {command_name}"),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_child_process_tree(child: &Child) {
+    signal_child_process_group("TERM", child.id());
+    std::thread::sleep(Duration::from_millis(50));
+    signal_child_process_group("KILL", child.id());
+}
+
+#[cfg(unix)]
+fn signal_child_process_group(signal: &str, process_group_id: u32) {
+    let _ = ProcessCommand::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(format!("-{process_group_id}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(windows)]
+fn stop_child_process_tree(child: &Child) {
+    let _ = ProcessCommand::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stop_child_process_tree(_child: &Child) {}
 
 #[cfg(test)]
 fn current_checkout_lfs_pointer_files(
@@ -2521,6 +2805,7 @@ mod tests {
         path::{Path, PathBuf},
         process::Command as ProcessCommand,
         sync::{Arc, Mutex},
+        time::{Duration, Instant},
     };
 
     use clap::{CommandFactory, Parser};
@@ -2532,10 +2817,10 @@ mod tests {
         MigrateCommand, PullCommand, SessionRevocationStatus, StatusCommand,
         current_checkout_lfs_pointer_files, current_checkout_lfs_pointer_scan, dispatch,
         is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
-        run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
-        run_login_from_dir, run_logout_from_dir, run_migrate_from_dir, run_pull_from_dir,
-        run_status_from_dir, sanitize_browser_stderr, tracing_config, validate_status_storage,
-        write_init_change,
+        run_bounded_child_command, run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir,
+        run_init_from_dir, run_login_from_dir, run_logout_from_dir, run_migrate_from_dir,
+        run_pull_from_dir, run_status_from_dir, sanitize_browser_stderr, tracing_config,
+        validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
@@ -4263,6 +4548,62 @@ mod tests {
         assert!(
             !cache_root.exists(),
             "pull should not create cache state after fetch failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_process_runner_rejects_unbounded_concurrent_output() {
+        let mut command = ProcessCommand::new("/bin/sh");
+        command.args([
+            "-c",
+            "(while :; do printf 'stdout-data'; done) & \
+             (while :; do printf 'stderr-data' >&2; done) & wait",
+        ]);
+        let started = Instant::now();
+
+        let error = run_bounded_child_command(
+            &mut command,
+            "test pull fetch",
+            Duration::from_secs(5),
+            1024,
+        )
+        .expect_err("unbounded command output should be rejected");
+
+        assert!(
+            matches!(error, CliError::ExternalCommandOutput { message, .. }
+                if message.as_str().contains("exceeded the 1024-byte limit"))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "output overflow should stop the process before the timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_process_runner_terminates_descendants_on_timeout() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let escaped_marker = temp.path().join("escaped");
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", "(sleep 1; printf escaped > \"$1\") & wait", "sh"])
+            .arg(&escaped_marker);
+
+        let error = run_bounded_child_command(
+            &mut command,
+            "test pull fetch",
+            Duration::from_millis(50),
+            1024,
+        )
+        .expect_err("stalled command should time out");
+
+        assert!(matches!(error, CliError::ExternalCommand { status, .. }
+                if status.contains("timed out")));
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(
+            !escaped_marker.exists(),
+            "the timed-out command's descendant must not outlive the boundary"
         );
     }
 

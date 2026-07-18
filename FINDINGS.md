@@ -1055,10 +1055,32 @@ independently validated or adjudicated.
    finding assessed here and no invalid finding attributable separately, this
    was high-quality, relevant feedback.
 
-3. **Medium — `pull` can hang and buffers unbounded command output.** Child
-   process output is fully captured before truncation or timeout handling
-   (`src/cli.rs:1421-1439`, `src/cli.rs:2204-2239`). Read stdout/stderr
-   concurrently with hard caps and deterministic process-tree termination.
+3. **[DONE] `pull` could hang and buffer unbounded command output** (Medium,
+   `src/cli.rs`, `README.md`, `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and
+   actionable.** The production fetch path used `Command::output`, so neither
+   stdout nor stderr had a memory bound and a stalled `git lfs fetch` had no
+   deadline. Pull now runs the fetch in an owned process tree, drains stdout and
+   stderr concurrently, retains at most 256 KiB per stream, and terminates the
+   tree immediately when either cap is crossed. A six-hour execution deadline
+   bounds otherwise stalled fetches while leaving room for large LFS transfers.
+   If the direct child exits while a descendant still owns an output pipe, the
+   runner gives normal pipe closure a short grace period and then stops the
+   remaining process tree rather than blocking on reader completion. Fetch
+   still completes before cache registration or worktree mutation. Regression
+   coverage forces both streams to produce output without bound and verifies
+   early overflow termination, then creates a delayed descendant and proves it
+   cannot survive the timeout to write a marker. README and implementation
+   guidance document the deadline and output bounds, and the repository
+   learning records the process-tree ownership requirement. Verification
+   passed with `yarn lint:fix`, `cargo fmt`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`,
+   `scripts/manual/verify-pull-command.sh`, and `git diff --check`. The focused
+   reviewer identified a genuine medium-severity reliability and memory-safety
+   flaw, correctly connected pipe draining, retention limits, deadlines, and
+   descendant cleanup, and requested the decisive stress and process-tree
+   behavior; with one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, relevant feedback.
 
 4. **Medium — The login prompt echoes tokens and reads input without a bound.**
    Secret input can appear on the terminal and an unbounded line can consume

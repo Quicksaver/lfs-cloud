@@ -1305,7 +1305,9 @@ Defer:
 > `--dry-run` for review before deletion. The `pull` CLI command now runs
 > `git lfs fetch`, ingests fetched current-checkout objects from Git LFS media
 > storage into the shared cache, and hydrates LFS-tracked pointer files with
-> verified cache bytes.
+> verified cache bytes. Pull fetches drain stdout and stderr concurrently with
+> fixed retention limits, enforce a six-hour execution deadline, and terminate
+> the fetch process tree before returning on timeout or output overflow.
 > Migration discovery support can now inspect an existing Git worktree for
 > local Git LFS installation status, visible LFS filter config, repository LFS
 > endpoint config, and `.gitattributes` patterns that declare `filter=lfs`,
