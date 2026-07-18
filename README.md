@@ -366,7 +366,13 @@ while still letting validation report the exact missing key.
 `server.metadata_path` is optional. When omitted, the server resolves the
 SQLite metadata database to `.lfs-cloud/metadata.sqlite3` beside the config
 file, keeping routing, object, session, and transfer-attempt state in
-server-owned local storage.
+server-owned local storage. Upload handlers also keep object-keyed lock files in
+an `upload-locks` directory beside that database. Every server process that can
+write to the same Google Drive root must share this metadata location; the
+filesystem locks then serialize the existence check and backend write across
+processes. Exact duplicate Drive objects left by an interrupted historical
+race remain readable because lookup selects the smallest matching Drive file
+ID deterministically after validating every returned match.
 
 `server.max_batch_objects` defaults to 100 object entries per Git LFS batch,
 `server.max_provider_calls` defaults to 16 concurrent GitHub or storage

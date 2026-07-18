@@ -254,6 +254,15 @@ size against aggregate staging capacity and keeps that weighted reservation
 with the temporary file. A live filesystem free-space check with reserved
 headroom remains a secondary defense against non-server disk use.
 
+The metadata directory also owns durable object-keyed upload lock files. Every
+MVP server process writing to the same Google Drive root must share that
+metadata location. The lock spans the final existence check, Drive write, and
+metadata record, so retries and independent processes cannot both create the
+same object during normal operation. If an older race already left multiple
+exact Drive matches, lookup validates each returned candidate and consistently
+uses the lexicographically smallest Drive file ID instead of making the object
+unreadable. Cross-host multi-writer deployment remains outside the MVP.
+
 SIGINT and SIGTERM initiate graceful server shutdown: listener admission stops
 immediately, while active batch and object-transfer requests receive a bounded
 30-second drain period. Once the deadline expires, process shutdown proceeds;

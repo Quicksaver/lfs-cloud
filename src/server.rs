@@ -1904,6 +1904,28 @@ async fn handle_lfs_upload_request(
     };
     let upload_lock = state.upload_lock_for(&repository, &oid);
     let _upload_lock_guard = upload_lock.lock().await;
+    let _durable_upload_lock = match state.metadata_database.as_ref().map(|database| {
+        database.acquire_object_upload_lock(
+            repository.id.clone(),
+            repository.storage_provider.clone(),
+            object.clone(),
+        )
+    }) {
+        Some(lock) => match lock.await {
+            Ok(lock) => lock,
+            Err(error) => {
+                finish_failed_transfer_attempt(state, attempt_id, &error, false).await;
+                tracing::debug!(
+                    repo_id = repository.id.as_str(),
+                    oid = object.oid.as_hex(),
+                    %error,
+                    "Git LFS upload durable lock acquisition failed"
+                );
+                return git_lfs_storage_error_response(error);
+            }
+        },
+        None => None,
+    };
 
     match state.lookup_object(&repository, &object).await {
         Ok(Some(stored_object)) => {
@@ -5987,6 +6009,95 @@ repositories:
         let first_response = first.await.expect("first upload task should complete");
         let second_response = second.await.expect("second upload task should complete");
 
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(second_response.status(), StatusCode::OK);
+        assert_eq!(transfer_store.uploads().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn independent_server_states_serialize_retrying_uploads_durably() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let database_path = directory.path().join("metadata.sqlite3");
+        let config = test_config();
+        let first_database = Arc::new(
+            MetadataDatabase::open(&database_path).expect("first metadata DB should open"),
+        );
+        first_database
+            .sync_config(&config)
+            .expect("metadata config should sync");
+        let second_database = Arc::new(
+            MetadataDatabase::open(&database_path).expect("second metadata DB should open"),
+        );
+        let upload_started = Arc::new(Notify::new());
+        let upload_release = Arc::new(Barrier::new(2));
+        let transfer_store = RecordingTransferStore::blocking_missing(
+            upload_started.clone(),
+            upload_release.clone(),
+        );
+        let (first_sessions, first_token) = issued_session_token(Duration::from_secs(60));
+        let first_router = test_router_with_transfer_metadata(
+            config.clone(),
+            first_sessions,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+            first_database,
+        );
+        let (second_sessions, second_token) = issued_session_token(Duration::from_secs(60));
+        let second_router = test_router_with_transfer_metadata(
+            config,
+            second_sessions,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+            second_database,
+        );
+        let body = b"hello from independent lfs cloud states";
+        let oid = format!("{:x}", Sha256::digest(body));
+        let path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{oid}?size={}",
+            body.len()
+        );
+        let first_upload_started = upload_started.notified();
+
+        let first = tokio::spawn({
+            let path = path.clone();
+            async move {
+                first_router
+                    .oneshot(lfs_request_with_method_and_body(
+                        Method::PUT,
+                        &path,
+                        Some(&format!("Bearer {first_token}")),
+                        body.to_vec(),
+                    ))
+                    .await
+                    .expect("first router response should exist")
+            }
+        });
+        first_upload_started.await;
+
+        let second = tokio::spawn({
+            let path = path.clone();
+            async move {
+                second_router
+                    .oneshot(lfs_request_with_method_and_body(
+                        Method::PUT,
+                        &path,
+                        Some(&format!("Bearer {second_token}")),
+                        body.to_vec(),
+                    ))
+                    .await
+                    .expect("second router response should exist")
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            transfer_store.uploads().is_empty(),
+            "the second server state must wait outside the backend upload"
+        );
+        upload_release.wait().await;
+
+        let first_response = first.await.expect("first upload task should complete");
+        let second_response = second.await.expect("second upload task should complete");
         assert_eq!(first_response.status(), StatusCode::OK);
         assert_eq!(second_response.status(), StatusCode::OK);
         assert_eq!(transfer_store.uploads().len(), 1);

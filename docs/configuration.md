@@ -192,6 +192,14 @@ If `server.metadata_path` is omitted, the server stores SQLite metadata at:
 Relative `metadata_path` values resolve against the directory containing the
 config file.
 
+The server creates an `upload-locks` directory beside the metadata database.
+All `lfs-cloud` processes that can write to the same Google Drive root must use
+the same metadata location. Those OS-backed object-keyed locks serialize the
+final Drive existence check and upload across local processes and are released
+automatically if a process exits. Cross-host writers are not supported by the
+MVP. Lookup deterministically selects the smallest Drive file ID when an older
+race has already left multiple otherwise exact object matches.
+
 ## Validation Rules
 
 - `server.public_url` and GitHub `api_url` must be HTTP(S) URLs without

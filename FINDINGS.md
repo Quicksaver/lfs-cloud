@@ -759,16 +759,37 @@ independently validated or adjudicated.
 
 ## Google Drive storage
 
-1. **High — Concurrent or retried uploads can create duplicate Drive files and
-   make an object permanently unreadable.** The upload flow has no durable
-   idempotency boundary, serialization works only within one server process, and
-   lookup treats multiple matching files as a conflict
-   (`src/google_drive.rs:840`, `src/google_drive.rs:2103`,
-   `src/google_drive.rs:3276`, `src/server.rs:856-890`,
-   `src/server.rs:1158-1229`). Enforce and document single-writer operation with
-   a durable lock for the MVP, or introduce durable claims/reservations and
-   deterministic duplicate reconciliation for multi-instance operation. Test
-   concurrent and retried uploads across independent server states.
+1. **[DONE] Concurrent or retried uploads can create duplicate Drive files and
+   make an object permanently unreadable** (High, `src/metadata.rs`,
+   `src/server.rs`, `src/google_drive.rs`, and storage configuration
+   documentation): **Valid and actionable.** The final existence check and
+   backend write were protected only by a server-state-local mutex, so two
+   processes sharing the production metadata database could both observe a
+   missing object and create separate Drive files. The upload handler now
+   acquires a repository/storage/OID/size-keyed OS file lock rooted in the
+   shared metadata directory before its final lookup and retains it through the
+   Drive write and metadata record. Lock acquisition runs on Tokio's blocking
+   pool, a fixed stripe set bounds persistent lock files, and closing the file
+   releases the lock after normal completion or process exit. The documented
+   MVP contract requires every local process writing one Drive root to share
+   the metadata path; cross-host multi-writer operation remains out of scope.
+   Existing duplicates no longer make objects unreadable: lookup verifies every
+   returned exact match and deterministically selects the lexicographically
+   smallest Drive file ID. A test-first regression with two independent server
+   states and separate metadata connections to the same database failed before
+   the fix and now proves that concurrent retries perform one backend upload;
+   Drive lookup coverage proves reverse-ordered duplicates resolve to the same
+   canonical ID. README, implementation, configuration, and repository-learning
+   documentation record the single-writer and duplicate-recovery contracts.
+   Verification passed with `yarn lint:fix`, `cargo fmt --all --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (559 passed, 3 ignored across targets),
+   `cargo test --doc` (38 passed), and `git diff --check`. The focused reviewer
+   identified a genuine high-severity idempotency and availability flaw,
+   correctly distinguished process-local serialization from a durable boundary,
+   and requested the decisive independent-state and retry coverage. With one
+   valid finding assessed here and no invalid finding attributable separately,
+   this was high-quality, security- and availability-relevant feedback.
 
 2. **High — Downloads described as streaming are fully staged before the first
    response byte.** This increases disk use and time to first byte and conflicts

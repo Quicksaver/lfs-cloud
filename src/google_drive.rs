@@ -769,8 +769,8 @@ impl GoogleDriveObjectStore {
     /// # Errors
     ///
     /// Returns [`StorageError`] for backend authentication failures, retryable
-    /// Drive failures, malformed Drive responses, or conflicting duplicate
-    /// files for the same repository/OID/size tuple.
+    /// Drive failures or malformed Drive responses. Exact duplicate files are
+    /// reconciled by selecting the lexicographically smallest Drive file ID.
     pub async fn object_exists(&self, object: &LfsObject) -> StorageResult<bool> {
         Ok(self.lookup_object(object).await?.is_some())
     }
@@ -780,8 +780,8 @@ impl GoogleDriveObjectStore {
     /// # Errors
     ///
     /// Returns [`StorageError`] for backend authentication failures, retryable
-    /// Drive failures, malformed Drive responses, or conflicting duplicate
-    /// files for the same repository/OID/size tuple.
+    /// Drive failures or malformed Drive responses. Exact duplicate files are
+    /// reconciled by selecting the lexicographically smallest Drive file ID.
     pub async fn lookup_object(&self, object: &LfsObject) -> StorageResult<Option<StoredObject>> {
         let key = self.object_key(object)?;
         let expected_properties = key.expected_app_properties();
@@ -2104,17 +2104,20 @@ fn parse_drive_object_lookup_success(
             message: "Google Drive object lookup returned incomplete search results".to_owned(),
         });
     }
-    if response.next_page_token.is_some() || response.files.len() > 1 {
+    if response.next_page_token.is_some() {
         return Err(StorageError::Conflict {
             provider: storage.id.clone(),
             oid: key.object.oid.as_hex().to_owned(),
         });
     }
 
-    let Some(file) = response.files.into_iter().next() else {
-        return Ok(None);
-    };
-    verify_drive_object_file(storage, key, expected_properties, status, file).map(Some)
+    let mut stored_objects = response
+        .files
+        .into_iter()
+        .map(|file| verify_drive_object_file(storage, key, expected_properties, status, file))
+        .collect::<StorageResult<Vec<_>>>()?;
+    stored_objects.sort_unstable_by(|left, right| left.backend_id.cmp(&right.backend_id));
+    Ok(stored_objects.into_iter().next())
 }
 
 fn verify_drive_object_file(
@@ -3277,7 +3280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_store_rejects_duplicate_drive_matches() {
+    async fn object_store_selects_duplicate_drive_matches_deterministically() {
         let server = DriveFilesListServer::start(
             StatusCode::OK,
             format!(
@@ -3287,8 +3290,8 @@ mod tests {
                         {}
                     ]
                 }}"#,
-                drive_object_json("drive-file-a", OBJECT_OID, 42),
-                drive_object_json("drive-file-b", OBJECT_OID, 42)
+                drive_object_json("drive-file-b", OBJECT_OID, 42),
+                drive_object_json("drive-file-a", OBJECT_OID, 42)
             ),
         )
         .await;
@@ -3301,18 +3304,13 @@ mod tests {
         )
         .expect("object store should build");
 
-        let error = store
+        let stored_object = store
             .lookup_object(&lfs_object())
             .await
-            .expect_err("duplicate Drive matches should conflict");
+            .expect("duplicate Drive matches should reconcile")
+            .expect("an exact Drive match should be returned");
 
-        assert!(matches!(
-            error,
-            StorageError::Conflict {
-                ref provider,
-                ref oid,
-            } if provider == "drive-user-a" && oid == OBJECT_OID
-        ));
+        assert_eq!(stored_object.backend_id, "drive-file-a");
     }
 
     #[tokio::test]
