@@ -1180,13 +1180,33 @@ independently validated or adjudicated.
 
 ## Local cache
 
-1. **High — Concurrent GC can delete the only preserved bytes during
-   dehydration.** Dehydration publishes the cache object before replacing the
-   worktree file, but it does not share GC's registry/operation lock, allowing GC
-   to delete the new object in between (`src/local_cache.rs:692-701`,
-   `src/local_cache.rs:852-881`). Coordinate GC and mutations through
-   shared/exclusive operation locks or per-object pins held through pointer
-   publication, and add a barrier-based race test.
+1. **[DONE] Concurrent GC can delete the only preserved bytes during
+   dehydration** (High, `src/local_cache.rs`): **Valid and actionable.**
+   Dehydration durably published a cache object and only afterward replaced the
+   hydrated worktree file with its pointer, while GC synchronized solely on the
+   worktree registry. GC could therefore scan during that publication window,
+   see neither an existing pointer nor another cache reference, and delete the
+   newly preserved object before the worktree bytes were removed. Cache ingest,
+   materialization, hydration, and dehydration now take a shared cross-process
+   `objects.lock`, while real and dry-run garbage collection take it
+   exclusively. Dehydration retains its shared lock through pointer publication,
+   closing the only-copy deletion window while still allowing independent cache
+   operations to run concurrently. The existing registry lock remains nested
+   only inside GC's exclusive operation lock, keeping registry roots stable
+   without introducing a reverse lock order. A deterministic barrier regression
+   pauses dehydration after cache publication but before pointer publication,
+   starts GC, proves collection waits, then verifies GC retains the object after
+   the pointer becomes visible. README, implementation notes, and the repository
+   learning now document the cache-wide concurrency boundary. Verification
+   passed with `cargo fmt --all -- --check`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (591 passed, 3 ignored), `cargo test --doc`
+   (38 passed), and `git diff --check`. The focused reviewer identified a
+   genuine high-severity local data-loss race, pinpointed the exact two-step
+   publication window, and requested both the appropriate shared/exclusive
+   locking model and the decisive barrier regression. With one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, security- and integrity-relevant feedback.
 
 2. **High — CLI cleanliness verification is tautological, accepts unrelated
    files, and preserves bytes only in the private cache.** The current bytes

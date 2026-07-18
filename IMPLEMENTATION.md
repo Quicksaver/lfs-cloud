@@ -1309,7 +1309,11 @@ Defer:
 > from the shared cache while non-pointer worktree content is left untouched.
 > Clean hydrated worktree files can now be dehydrated back to canonical Git LFS
 > pointer files only after the full bytes are verified and preserved in the
-> shared cache; dirty or unrelated worktree content is left untouched.
+> shared cache; dirty or unrelated worktree content is left untouched. Cache
+> ingest and worktree materialization operations share a cross-process lock,
+> while garbage collection takes that lock exclusively. Dehydration retains
+> its shared lock from cache publication through pointer publication so GC
+> cannot delete the newly preserved object in between those steps.
 > The `hydrate` and `dehydrate` CLI commands now expose those local cache
 > operations for explicit path lists, including `--cache-root` overrides for
 > tests or non-default local cache locations. The `gc` CLI command now scans

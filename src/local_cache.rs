@@ -30,6 +30,7 @@ pub const LOCAL_CACHE_WORKTREES_FILE: &str = "worktrees.json";
 const OBJECT_SHARD_WIDTH: usize = 2;
 const OBJECT_SHARD_LEVELS: usize = 2;
 const OBJECT_SHARD_PREFIX_LENGTH: usize = OBJECT_SHARD_WIDTH * OBJECT_SHARD_LEVELS;
+const CACHE_OPERATION_LOCK_FILE: &str = "objects.lock";
 const WORKTREE_REGISTRY_LOCK_FILE: &str = "worktrees.json.lock";
 const WORKTREE_REGISTRY_VERSION: u32 = 1;
 const MAX_LFS_POINTER_FILE_SIZE: u64 = 64 * 1024;
@@ -608,6 +609,7 @@ impl LocalCacheLayout {
         object: &LfsObject,
         destination_path: impl AsRef<Path>,
     ) -> LocalCacheResult<LocalCacheMaterialization> {
+        let _operation_lock = self.lock_cache_operation_shared()?;
         let destination_path = destination_path.as_ref();
         let verified = self.verify_object(object)?;
 
@@ -630,6 +632,7 @@ impl LocalCacheLayout {
         &self,
         pointer_path: impl AsRef<Path>,
     ) -> LocalCacheResult<LocalCacheMaterialization> {
+        let _operation_lock = self.lock_cache_operation_shared()?;
         let pointer_path = pointer_path.as_ref();
         let pointer = read_lfs_pointer_file(pointer_path)?;
         let verified = self.verify_object(&pointer.object)?;
@@ -659,6 +662,22 @@ impl LocalCacheLayout {
         object: &LfsObject,
         worktree_path: impl AsRef<Path>,
     ) -> LocalCacheResult<LocalCacheDehydration> {
+        self.dehydrate_file_with_before_pointer_publish(object, worktree_path, || {})
+    }
+
+    fn dehydrate_file_with_before_pointer_publish<F>(
+        &self,
+        object: &LfsObject,
+        worktree_path: impl AsRef<Path>,
+        before_pointer_publish: F,
+    ) -> LocalCacheResult<LocalCacheDehydration>
+    where
+        F: FnOnce(),
+    {
+        // Hold a shared operation lock through pointer publication. GC takes
+        // the exclusive side, so it can never observe the cache object after
+        // publication but before the worktree reference becomes visible.
+        let _operation_lock = self.lock_cache_operation_shared()?;
         let worktree_path = worktree_path.as_ref();
         let cache_path = self.object_path(object);
 
@@ -698,6 +717,7 @@ impl LocalCacheLayout {
             LocalCacheDehydrationStatus::CachedAndReplacedWithPointer
         };
 
+        before_pointer_publish();
         publish_pointer_file(worktree_path, object)?;
 
         Ok(LocalCacheDehydration {
@@ -719,6 +739,7 @@ impl LocalCacheLayout {
         git_lfs_objects_dir: impl AsRef<Path>,
         object: &LfsObject,
     ) -> LocalCacheResult<LocalCacheIngest> {
+        let _operation_lock = self.lock_cache_operation_shared()?;
         let git_lfs_objects_dir = git_lfs_objects_dir.as_ref();
         let source_path = git_lfs_object_path(git_lfs_objects_dir, &object.oid);
         let cache_path = self.object_path(object);
@@ -850,6 +871,10 @@ impl LocalCacheLayout {
     /// written, a registered worktree cannot be scanned, or a cache object
     /// cannot be removed.
     pub fn garbage_collect(&self, dry_run: bool) -> LocalCacheResult<LocalCacheGarbageCollection> {
+        // Mutations and materializations take the shared side of this lock.
+        // Taking it exclusively gives GC a stable cache/worktree snapshot and
+        // keeps it out of multi-step publication windows.
+        let _operation_lock = self.lock_cache_operation_exclusive()?;
         // Keep registry roots stable while reachability is computed and cache
         // objects are deleted; otherwise a concurrent worktree registration
         // could lose cache bytes before its pointers are considered.
@@ -916,6 +941,55 @@ impl LocalCacheLayout {
 
     fn worktree_registry_lock_path(&self) -> PathBuf {
         self.root.join(WORKTREE_REGISTRY_LOCK_FILE)
+    }
+
+    fn cache_operation_lock_path(&self) -> PathBuf {
+        self.root.join(CACHE_OPERATION_LOCK_FILE)
+    }
+
+    fn open_cache_operation_lock(&self) -> LocalCacheResult<(File, PathBuf)> {
+        fs::create_dir_all(&self.root).map_err(|source| LocalCacheError::Io {
+            context: "failed to create local cache root",
+            path: self.root.clone(),
+            source,
+        })?;
+
+        let path = self.cache_operation_lock_path();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| LocalCacheError::Io {
+                context: "failed to open local cache operation lock",
+                path: path.clone(),
+                source,
+            })?;
+
+        Ok((lock, path))
+    }
+
+    fn lock_cache_operation_shared(&self) -> LocalCacheResult<File> {
+        let (lock, path) = self.open_cache_operation_lock()?;
+        FileExt::lock_shared(&lock).map_err(|source| LocalCacheError::Io {
+            context: "failed to lock local cache operation for shared access",
+            path,
+            source,
+        })?;
+
+        Ok(lock)
+    }
+
+    fn lock_cache_operation_exclusive(&self) -> LocalCacheResult<File> {
+        let (lock, path) = self.open_cache_operation_lock()?;
+        FileExt::lock(&lock).map_err(|source| LocalCacheError::Io {
+            context: "failed to lock local cache operation for exclusive access",
+            path,
+            source,
+        })?;
+
+        Ok(lock)
     }
 
     fn lock_worktree_registry(&self) -> LocalCacheResult<File> {
@@ -2211,7 +2285,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         str::FromStr,
-        sync::mpsc,
+        sync::{Arc, Barrier, mpsc},
         thread,
         time::Duration,
     };
@@ -2687,6 +2761,102 @@ mod tests {
         assert_eq!(
             fs::read(layout.object_path(&object)).expect("cache object should be readable"),
             bytes
+        );
+    }
+
+    #[test]
+    fn garbage_collect_waits_until_dehydration_publishes_its_pointer() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let repo = temp.path().join("repo");
+        let worktree_path = repo.join("assets/model.bin");
+        let bytes = b"only copy must survive concurrent garbage collection";
+        let object = object_for_bytes(bytes);
+        write_file(&worktree_path, bytes);
+        layout
+            .register_worktree(
+                LocalCacheWorktreeRegistration::new(
+                    "github-main:owner/repo",
+                    &repo,
+                    repo.join(".git"),
+                )
+                .expect("registration should validate"),
+            )
+            .expect("worktree should register");
+
+        let cache_published = Arc::new(Barrier::new(2));
+        let allow_pointer_publish = Arc::new(Barrier::new(2));
+        let dehydration_layout = layout.clone();
+        let dehydration_object = object.clone();
+        let dehydration_path = worktree_path.clone();
+        let dehydration_cache_published = Arc::clone(&cache_published);
+        let dehydration_allow_pointer_publish = Arc::clone(&allow_pointer_publish);
+        let dehydration = thread::spawn(move || {
+            dehydration_layout.dehydrate_file_with_before_pointer_publish(
+                &dehydration_object,
+                &dehydration_path,
+                || {
+                    dehydration_cache_published.wait();
+                    dehydration_allow_pointer_publish.wait();
+                },
+            )
+        });
+
+        cache_published.wait();
+        let cache_bytes_during_pause = fs::read(layout.object_path(&object));
+        let worktree_bytes_during_pause = fs::read(&worktree_path);
+
+        let collection_layout = layout.clone();
+        let (collection_started_tx, collection_started_rx) = mpsc::channel();
+        let (collection_done_tx, collection_done_rx) = mpsc::channel();
+        let collection = thread::spawn(move || {
+            collection_started_tx
+                .send(())
+                .expect("test should receive collector start");
+            collection_done_tx
+                .send(collection_layout.garbage_collect(false))
+                .expect("test should receive collection result");
+        });
+        let collection_started = collection_started_rx.recv();
+        let collection_during_pause = collection_done_rx.recv_timeout(Duration::from_millis(250));
+
+        allow_pointer_publish.wait();
+        let dehydration = dehydration
+            .join()
+            .expect("dehydration thread should not panic")
+            .expect("dehydration should finish");
+        let collection_report = collection_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("garbage collection should finish after dehydration")
+            .expect("garbage collection should succeed");
+        collection
+            .join()
+            .expect("collection thread should not panic");
+
+        assert_eq!(
+            cache_bytes_during_pause.expect("cache object should be published"),
+            bytes
+        );
+        assert_eq!(
+            worktree_bytes_during_pause
+                .expect("worktree bytes should remain until pointer publish"),
+            bytes
+        );
+        collection_started.expect("collector should report before locking");
+        assert!(
+            collection_during_pause.is_err(),
+            "garbage collection should wait for pointer publication"
+        );
+        assert_eq!(
+            dehydration.status,
+            LocalCacheDehydrationStatus::CachedAndReplacedWithPointer
+        );
+        assert_eq!(collection_report.retained_objects.len(), 1);
+        assert!(collection_report.deleted_objects.is_empty());
+        assert!(layout.object_path(&object).exists());
+        assert_eq!(
+            fs::read_to_string(&worktree_path).expect("pointer should be readable"),
+            LfsPointer::new(object).to_pointer_file()
         );
     }
 

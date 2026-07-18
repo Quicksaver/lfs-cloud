@@ -261,8 +261,10 @@ lfs-cloud dehydrate path/to/file.bin
 
 This hashes clean worktree bytes, preserves them in the shared local cache, and
 replaces the worktree file with a canonical Git LFS pointer. Existing matching
-pointer files are treated as already dehydrated. Use `--cache-root` to target a
-non-default local cache root.
+pointer files are treated as already dehydrated. A cache-wide operation lock
+prevents concurrent garbage collection from deleting newly preserved bytes
+before the pointer becomes visible. Use `--cache-root` to target a non-default
+local cache root.
 
 ### Garbage-Collect The Local Cache
 
@@ -273,7 +275,10 @@ lfs-cloud gc --dry-run
 This scans registered worktrees in the shared cache registry, keeps cached
 objects referenced by Git LFS pointer files in those worktrees, and removes
 unreferenced cached objects. It also prunes missing worktree registrations
-during a real run. Use `--cache-root` to target a non-default local cache root.
+during a real run. Garbage collection runs exclusively with respect to cache
+ingest, hydration, materialization, and dehydration so it sees completed object
+and pointer publication. Use `--cache-root` to target a non-default local cache
+root.
 
 ### Pull And Materialize LFS Objects
 
