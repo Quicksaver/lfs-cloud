@@ -25,6 +25,8 @@ pub const DEFAULT_METADATA_DB_FILE: &str = "metadata.sqlite3";
 
 const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const DEFAULT_BIND_PORT: u16 = 8080;
+const DEFAULT_MAX_BATCH_OBJECTS: usize = 100;
+const DEFAULT_MAX_PROVIDER_CALLS: usize = 16;
 
 /// Loaded and validated server configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,6 +261,17 @@ pub struct ServerSettings {
     /// untrusted network because those endpoints carry credentials and LFS
     /// object content.
     pub allow_insecure_http: bool,
+    /// Maximum number of object entries accepted in one Git LFS batch.
+    ///
+    /// Duplicate entries count toward this limit even though storage lookups
+    /// are deduplicated later, keeping both request work and response size
+    /// bounded.
+    pub max_batch_objects: usize,
+    /// Maximum number of concurrent repository or storage provider calls.
+    ///
+    /// The limit is shared across all repositories handled by this server
+    /// process so one client cannot monopolize upstream provider capacity.
+    pub max_provider_calls: usize,
     /// Local SQLite database file path for server-owned metadata.
     ///
     /// Relative configuration values are resolved against the server config
@@ -287,12 +300,20 @@ impl ServerSettings {
         if raw.port == 0 {
             return invalid_config("server.port", "must be greater than zero");
         }
+        if raw.max_batch_objects == 0 {
+            return invalid_config("server.max_batch_objects", "must be greater than zero");
+        }
+        if raw.max_provider_calls == 0 {
+            return invalid_config("server.max_provider_calls", "must be greater than zero");
+        }
 
         Ok(Self {
             host,
             port: raw.port,
             public_url,
             allow_insecure_http: raw.allow_insecure_http,
+            max_batch_objects: raw.max_batch_objects,
+            max_provider_calls: raw.max_provider_calls,
             metadata_path,
         })
     }
@@ -582,6 +603,10 @@ struct RawServerSettings {
     public_url: Option<String>,
     #[serde(default)]
     allow_insecure_http: bool,
+    #[serde(default = "default_max_batch_objects")]
+    max_batch_objects: usize,
+    #[serde(default = "default_max_provider_calls")]
+    max_provider_calls: usize,
     #[serde(default)]
     metadata_path: Option<String>,
 }
@@ -593,6 +618,8 @@ impl Default for RawServerSettings {
             port: default_bind_port(),
             public_url: None,
             allow_insecure_http: false,
+            max_batch_objects: default_max_batch_objects(),
+            max_provider_calls: default_max_provider_calls(),
             metadata_path: None,
         }
     }
@@ -661,6 +688,14 @@ fn default_bind_host() -> Option<String> {
 
 const fn default_bind_port() -> u16 {
     DEFAULT_BIND_PORT
+}
+
+const fn default_max_batch_objects() -> usize {
+    DEFAULT_MAX_BATCH_OBJECTS
+}
+
+const fn default_max_provider_calls() -> usize {
+    DEFAULT_MAX_PROVIDER_CALLS
 }
 
 fn resolve_required(
@@ -979,6 +1014,8 @@ repositories:
         assert_eq!(config.server.port, 8081);
         assert_eq!(config.server.public_url, "http://127.0.0.1:8081");
         assert!(!config.server.allow_insecure_http);
+        assert_eq!(config.server.max_batch_objects, 100);
+        assert_eq!(config.server.max_provider_calls, 16);
         assert_eq!(
             config.server.metadata_path,
             PathBuf::from(DEFAULT_METADATA_DIR).join(DEFAULT_METADATA_DB_FILE)
@@ -1010,6 +1047,40 @@ repositories:
         assert_eq!(credential_ref, "drive-credential");
         assert_eq!(root_folder_id, "drive-root-folder");
         assert_eq!(display_name.as_deref(), Some("Main Drive"));
+    }
+
+    #[test]
+    fn parses_server_provider_work_limits() {
+        let config = load_with_test_env(&valid_yaml().replace(
+            "  public_url: http://127.0.0.1:8081",
+            "  public_url: http://127.0.0.1:8081\n  max_batch_objects: 25\n  max_provider_calls: 4",
+        ));
+
+        assert_eq!(config.server.max_batch_objects, 25);
+        assert_eq!(config.server.max_provider_calls, 4);
+    }
+
+    #[test]
+    fn rejects_zero_server_provider_work_limits() {
+        for (key, expected) in [
+            (
+                "max_batch_objects",
+                "server.max_batch_objects must be greater than zero",
+            ),
+            (
+                "max_provider_calls",
+                "server.max_provider_calls must be greater than zero",
+            ),
+        ] {
+            let contents = valid_yaml().replace(
+                "  public_url: http://127.0.0.1:8081",
+                &format!("  public_url: http://127.0.0.1:8081\n  {key}: 0"),
+            );
+            let error = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", test_env)
+                .expect_err("zero provider work limits should be rejected");
+
+            assert_error_contains(&error, expected);
+        }
     }
 
     #[test]

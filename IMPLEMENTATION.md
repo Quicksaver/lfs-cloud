@@ -153,6 +153,8 @@ A YAML file is a reasonable starting point:
 ```yaml
 server:
   public_url: https://lfs.example.com
+  max_batch_objects: 100
+  max_provider_calls: 16
 
 repository_providers:
   github-main:
@@ -228,6 +230,14 @@ When a request arrives, the server should:
 ```
 
 If a repository is not listed in the server config, the server should deny it by default. This prevents arbitrary repositories from using the instance and makes storage routing explicit.
+
+The server bounds each batch's object-entry count and shares one concurrency
+limit across repository and storage provider calls. Duplicate object
+identities retain duplicate response entries but perform one storage lookup.
+Permission decisions may be cached only briefly and scoped to the exact local
+session, repository, and read/write operation. Google access-token refreshes
+are single-flight and reuse the token only until shortly before its reported
+expiry.
 
 Each mapping also persists the repository provider's stable repository ID.
 Authorization resolves the current repository at the configured owner/name and

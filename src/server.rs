@@ -8,12 +8,12 @@
 //! tasks.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -32,22 +32,22 @@ use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::ReaderStream;
 use url::{Url, form_urlencoded};
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
     GitHubOAuthStateRegistry, GitHubProviderConfig, GitHubRepositoryPermissionClient,
-    GoogleDriveCredentialLoader, GoogleDriveObjectStore, GoogleDriveTokenRefresher,
-    LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation,
-    LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid,
-    LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture, RepositoryHandle,
-    RepositoryIdentity, RepositoryMapping, RepositoryPermission, RepositoryProvider,
-    RepositoryProviderConfig, RepositoryProviderError, RepositoryUser, ServerConfig, ServerError,
-    ServerResult, StorageError, StorageProvider, StorageProviderConfig, StoredObject,
-    github_oauth_callback_router, github_oauth_login_router, parse_lfs_batch_request_json,
-    sessions::LfsSessionRecord,
+    GoogleDriveAccessToken, GoogleDriveCredential, GoogleDriveCredentialLoader,
+    GoogleDriveObjectStore, GoogleDriveTokenRefresher, LFS_BASIC_TRANSFER, LfsBatchDownloadObject,
+    LfsBatchObjectError, LfsBatchOperation, LfsBatchRequest, LfsBatchResponse,
+    LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore,
+    MetadataDatabase, ProviderFuture, RepositoryHandle, RepositoryIdentity, RepositoryMapping,
+    RepositoryPermission, RepositoryProvider, RepositoryProviderConfig, RepositoryProviderError,
+    RepositoryUser, ServerConfig, ServerError, ServerResult, StorageError, StorageProvider,
+    StorageProviderConfig, StoredObject, github_oauth_callback_router, github_oauth_login_router,
+    parse_lfs_batch_request_json, sessions::LfsSessionRecord,
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
@@ -58,6 +58,8 @@ const MAX_UPLOAD_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MIN_UPLOAD_STAGING_FREE_BYTES: u64 = 64 * 1024 * 1024;
 const UPLOAD_STAGING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const BATCH_STORAGE_LOOKUP_CONCURRENCY: usize = 16;
+const AUTHORIZATION_CACHE_TTL: Duration = Duration::from_secs(15);
+const GOOGLE_ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
 
 /// Runtime options supplied by `lfs-cloud serve`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -732,6 +734,7 @@ struct GoogleDriveTransferStore {
     metadata_database: Arc<MetadataDatabase>,
     credential_loader: GoogleDriveCredentialLoader,
     token_refresher: GoogleDriveTokenRefresher,
+    token_cache: GoogleDriveAccessTokenCache,
 }
 
 impl GoogleDriveTransferStore {
@@ -741,6 +744,7 @@ impl GoogleDriveTransferStore {
             metadata_database,
             credential_loader: GoogleDriveCredentialLoader::new(),
             token_refresher: GoogleDriveTokenRefresher::new()?,
+            token_cache: GoogleDriveAccessTokenCache::default(),
         })
     }
 
@@ -761,11 +765,66 @@ impl GoogleDriveTransferStore {
         };
         let credential = self.credential_loader.load_from_environment(&storage)?;
         let token = self
-            .token_refresher
-            .refresh_access_token(&credential)
+            .token_cache
+            .get_or_refresh(&storage.id, &credential, &self.token_refresher)
             .await?;
 
         GoogleDriveObjectStore::new(storage, &repository.id, token).map_err(ServerError::from)
+    }
+}
+
+#[derive(Clone, Default)]
+struct GoogleDriveAccessTokenCache {
+    tokens: Arc<AsyncMutex<HashMap<String, CachedGoogleDriveAccessToken>>>,
+}
+
+#[derive(Clone)]
+struct CachedGoogleDriveAccessToken {
+    token: GoogleDriveAccessToken,
+    refresh_at: Instant,
+}
+
+impl GoogleDriveAccessTokenCache {
+    async fn get_or_refresh(
+        &self,
+        provider_id: &str,
+        credential: &GoogleDriveCredential,
+        refresher: &GoogleDriveTokenRefresher,
+    ) -> ServerResult<GoogleDriveAccessToken> {
+        // Keep the lock through refresh so concurrent misses collapse into one
+        // token request. Refreshes happen only near expiry, and the server-wide
+        // provider semaphore bounds this path with all other upstream calls.
+        let mut tokens = self.tokens.lock().await;
+        let now = Instant::now();
+        if let Some(cached) = tokens.get(provider_id)
+            && cached.refresh_at > now
+        {
+            return Ok(cached.token.clone());
+        }
+
+        let token = refresher.refresh_access_token(credential).await?;
+        let refresh_at = token
+            .expires_in_seconds()
+            .and_then(|seconds| {
+                Duration::from_secs(seconds).checked_sub(GOOGLE_ACCESS_TOKEN_REFRESH_SKEW)
+            })
+            .and_then(|lifetime| now.checked_add(lifetime));
+
+        if let Some(refresh_at) = refresh_at
+            && refresh_at > now
+        {
+            tokens.insert(
+                provider_id.to_owned(),
+                CachedGoogleDriveAccessToken {
+                    token: token.clone(),
+                    refresh_at,
+                },
+            );
+        } else {
+            tokens.remove(provider_id);
+        }
+
+        Ok(token)
     }
 }
 
@@ -916,9 +975,20 @@ struct LfsServerState {
     routes: LfsRouteResolver,
     session_store: LocalLfsSessionStore,
     public_url: String,
+    max_batch_objects: usize,
     authorizer: Arc<dyn LfsBatchAuthorizer>,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
+    provider_calls: Arc<Semaphore>,
+    authorization_cache: Arc<std::sync::Mutex<HashMap<AuthorizationCacheKey, Instant>>>,
+    authorization_locks: Arc<std::sync::Mutex<HashMap<AuthorizationCacheKey, Arc<AsyncMutex<()>>>>>,
     upload_locks: Arc<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct AuthorizationCacheKey {
+    session_token: LfsSessionToken,
+    repository_id: String,
+    write: bool,
 }
 
 impl LfsServerState {
@@ -928,12 +998,18 @@ impl LfsServerState {
         authorizer: Arc<dyn LfsBatchAuthorizer>,
         transfer_store: Arc<dyn LfsObjectTransferStore>,
     ) -> Self {
+        let max_batch_objects = config.server.max_batch_objects;
+        let max_provider_calls = config.server.max_provider_calls;
         Self {
             routes: LfsRouteResolver::new(&config),
             session_store,
             public_url: config.server.public_url,
+            max_batch_objects,
             authorizer,
             transfer_store,
+            provider_calls: Arc::new(Semaphore::new(max_provider_calls)),
+            authorization_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            authorization_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -961,10 +1037,51 @@ impl LfsServerState {
         session: &AuthenticatedLfsSession,
         operation: LfsBatchOperation,
     ) -> ServerResult<()> {
+        let key = AuthorizationCacheKey {
+            session_token: session.token().clone(),
+            repository_id: repository.id.clone(),
+            write: operation == LfsBatchOperation::Upload,
+        };
+        if self.authorization_is_cached(&key) {
+            return Ok(());
+        }
+
+        let authorization_lock = {
+            let mut locks = self
+                .authorization_locks
+                .lock()
+                .expect("authorization lock map should not be poisoned");
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let authorization_guard = authorization_lock.lock().await;
+        if self.authorization_is_cached(&key) {
+            drop(authorization_guard);
+            self.remove_unused_authorization_lock(&key, &authorization_lock);
+            return Ok(());
+        }
+
+        let _provider_permit = self.provider_call_permit().await?;
         let result = self
             .authorizer
             .authorize(repository, session.record(), operation)
             .await;
+        if result.is_ok() {
+            let expires_at = Instant::now()
+                .checked_add(AUTHORIZATION_CACHE_TTL)
+                .expect("short authorization cache TTL should fit Instant");
+            let mut cache = self
+                .authorization_cache
+                .lock()
+                .expect("authorization cache should not be poisoned");
+            cache.retain(|_, expiry| *expiry > Instant::now());
+            cache.insert(key.clone(), expires_at);
+        }
+
+        drop(authorization_guard);
+        self.remove_unused_authorization_lock(&key, &authorization_lock);
         if matches!(
             &result,
             Err(ServerError::RepositoryProvider {
@@ -974,6 +1091,96 @@ impl LfsServerState {
             self.session_store.revoke(session.token())?;
         }
         result
+    }
+
+    fn authorization_is_cached(&self, key: &AuthorizationCacheKey) -> bool {
+        let now = Instant::now();
+        let mut cache = self
+            .authorization_cache
+            .lock()
+            .expect("authorization cache should not be poisoned");
+        match cache.get(key).copied() {
+            Some(expiry) if expiry > now => true,
+            Some(_) => {
+                cache.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn remove_unused_authorization_lock(
+        &self,
+        key: &AuthorizationCacheKey,
+        authorization_lock: &Arc<AsyncMutex<()>>,
+    ) {
+        let mut locks = self
+            .authorization_locks
+            .lock()
+            .expect("authorization lock map should not be poisoned");
+        if Arc::strong_count(authorization_lock) == 2
+            && locks
+                .get(key)
+                .is_some_and(|stored| Arc::ptr_eq(stored, authorization_lock))
+        {
+            locks.remove(key);
+        }
+    }
+
+    async fn provider_call_permit(&self) -> ServerResult<OwnedSemaphorePermit> {
+        self.provider_calls
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ServerError::Internal {
+                message: "provider call limiter closed unexpectedly".to_owned(),
+            })
+    }
+
+    async fn lookup_object(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+    ) -> ServerResult<Option<StoredObject>> {
+        let _provider_permit = self.provider_call_permit().await?;
+        self.transfer_store.lookup_object(repository, object).await
+    }
+
+    async fn upload_object(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+        source: &Path,
+        created_by: &RepositoryUser,
+    ) -> ServerResult<StoredObject> {
+        let _provider_permit = self.provider_call_permit().await?;
+        self.transfer_store
+            .upload_object(repository, object, source, created_by)
+            .await
+    }
+
+    async fn download_object_response(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+    ) -> ServerResult<LfsDownloadResponse> {
+        let _provider_permit = self.provider_call_permit().await?;
+        self.transfer_store
+            .download_object_response(repository, object)
+            .await
+    }
+
+    async fn record_verified_object(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+        backend_id: &str,
+        created_by: &RepositoryUser,
+    ) -> ServerResult<()> {
+        let _provider_permit = self.provider_call_permit().await?;
+        self.transfer_store
+            .record_verified_object(repository, object, backend_id, created_by)
+            .await
     }
 }
 
@@ -1141,19 +1348,6 @@ async fn handle_lfs_download_request(
     request: Request,
     state: &LfsServerState,
 ) -> Response {
-    if let Err(error) = state
-        .authorize(&repository, &session, LfsBatchOperation::Download)
-        .await
-    {
-        tracing::debug!(
-            repo_id = repository.id.as_str(),
-            oid = oid.as_hex(),
-            %error,
-            "Git LFS download transfer authorization failed"
-        );
-        return git_lfs_authorization_error_response(error);
-    }
-
     let expected_size = match transfer_request_expected_size(&request, "download") {
         Ok(size) => size,
         Err(error) => {
@@ -1170,12 +1364,21 @@ async fn handle_lfs_download_request(
         }
     };
 
-    let object = LfsObject::new(oid, LfsObjectSize::new(expected_size));
-    match state
-        .transfer_store
-        .download_object_response(&repository, &object)
+    if let Err(error) = state
+        .authorize(&repository, &session, LfsBatchOperation::Download)
         .await
     {
+        tracing::debug!(
+            repo_id = repository.id.as_str(),
+            oid = oid.as_hex(),
+            %error,
+            "Git LFS download transfer authorization failed"
+        );
+        return git_lfs_authorization_error_response(error);
+    }
+
+    let object = LfsObject::new(oid, LfsObjectSize::new(expected_size));
+    match state.download_object_response(&repository, &object).await {
         Ok(download) => {
             tracing::debug!(
                 repo_id = repository.id.as_str(),
@@ -1207,19 +1410,6 @@ async fn handle_lfs_upload_request(
     request: Request,
     state: &LfsServerState,
 ) -> Response {
-    if let Err(error) = state
-        .authorize(&repository, &session, LfsBatchOperation::Upload)
-        .await
-    {
-        tracing::debug!(
-            repo_id = repository.id.as_str(),
-            oid = oid.as_hex(),
-            %error,
-            "Git LFS upload transfer authorization failed"
-        );
-        return git_lfs_authorization_error_response(error);
-    }
-
     let expected_size = match transfer_request_expected_size(&request, "upload") {
         Ok(size) => size,
         Err(error) => {
@@ -1250,6 +1440,19 @@ async fn handle_lfs_upload_request(
         return upload_payload_too_large_response();
     }
 
+    if let Err(error) = state
+        .authorize(&repository, &session, LfsBatchOperation::Upload)
+        .await
+    {
+        tracing::debug!(
+            repo_id = repository.id.as_str(),
+            oid = oid.as_hex(),
+            %error,
+            "Git LFS upload transfer authorization failed"
+        );
+        return git_lfs_authorization_error_response(error);
+    }
+
     let upload_lock = state.upload_lock_for(&repository, &oid);
     let _upload_lock_guard = upload_lock.lock().await;
     let object = LfsObject::new(oid.clone(), LfsObjectSize::new(expected_size));
@@ -1259,11 +1462,7 @@ async fn handle_lfs_upload_request(
         session.metadata().stable_id.clone(),
     );
 
-    match state
-        .transfer_store
-        .lookup_object(&repository, &object)
-        .await
-    {
+    match state.lookup_object(&repository, &object).await {
         Ok(Some(stored_object)) => {
             tracing::debug!(
                 repo_id = repository.id.as_str(),
@@ -1274,7 +1473,6 @@ async fn handle_lfs_upload_request(
                 "Git LFS upload transfer found an existing object"
             );
             if let Err(error) = state
-                .transfer_store
                 .record_verified_object(
                     &repository,
                     &object,
@@ -1329,7 +1527,6 @@ async fn handle_lfs_upload_request(
     };
 
     match state
-        .transfer_store
         .upload_object(&repository, &object, staged_upload.path(), &created_by)
         .await
     {
@@ -1694,17 +1891,14 @@ async fn handle_parsed_lfs_batch_request(
     state: &LfsServerState,
     request: LfsBatchRequest,
 ) -> Response {
-    if let Err(error) = state
-        .authorize(&repository, &session, request.operation)
-        .await
-    {
-        tracing::debug!(
-            repo_id = repository.id.as_str(),
-            operation = ?request.operation,
-            %error,
-            "Git LFS batch authorization failed"
+    if request.objects.len() > state.max_batch_objects {
+        return git_lfs_json_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Git LFS batch contains more than {} object entries",
+                state.max_batch_objects
+            ),
         );
-        return git_lfs_authorization_error_response(error);
     }
 
     if !request.transfers.is_empty()
@@ -1717,6 +1911,28 @@ async fn handle_parsed_lfs_batch_request(
             StatusCode::CONFLICT,
             "unsupported Git LFS transfer requested; only basic is available",
         );
+    }
+
+    if request.operation == LfsBatchOperation::Upload
+        && request
+            .objects
+            .iter()
+            .any(|object| object.size.bytes() > MAX_UPLOAD_OBJECT_BYTES)
+    {
+        return upload_payload_too_large_response();
+    }
+
+    if let Err(error) = state
+        .authorize(&repository, &session, request.operation)
+        .await
+    {
+        tracing::debug!(
+            repo_id = repository.id.as_str(),
+            operation = ?request.operation,
+            %error,
+            "Git LFS batch authorization failed"
+        );
+        return git_lfs_authorization_error_response(error);
     }
 
     match request.operation {
@@ -1761,24 +1977,32 @@ async fn download_batch_response_with_storage_lookup(
     state: &LfsServerState,
     request: LfsBatchRequest,
 ) -> ServerResult<LfsBatchResponse> {
-    let objects = stream::iter(request.objects)
+    let requested_objects = request.objects;
+    let unique_objects = requested_objects.iter().cloned().collect::<BTreeSet<_>>();
+    let outcomes = stream::iter(unique_objects)
         .map(|object| async move {
-            match state
-                .transfer_store
-                .lookup_object(repository, &object)
-                .await
-            {
+            let outcome = match state.lookup_object(repository, &object).await {
                 Ok(Some(_)) => LfsBatchDownloadObject::available(object),
                 Ok(None) => LfsBatchDownloadObject::missing(object),
                 Err(error) => LfsBatchDownloadObject::error(
                     object,
                     lfs_batch_object_error_from_server_error(&error),
                 ),
-            }
+            };
+            (outcome_object(&outcome).clone(), outcome)
         })
         .buffered(BATCH_STORAGE_LOOKUP_CONCURRENCY)
-        .collect::<Vec<_>>()
+        .collect::<BTreeMap<_, _>>()
         .await;
+    let objects = requested_objects
+        .into_iter()
+        .map(|object| {
+            outcomes
+                .get(&object)
+                .expect("every requested object should have one lookup outcome")
+                .clone()
+        })
+        .collect::<Vec<_>>();
 
     Ok(LfsBatchResponse::download(
         &state.public_url,
@@ -1792,28 +2016,54 @@ async fn upload_batch_response_with_storage_lookup(
     state: &LfsServerState,
     request: LfsBatchRequest,
 ) -> ServerResult<LfsBatchResponse> {
-    let mut objects = Vec::with_capacity(request.objects.len());
-
-    for object in request.objects {
-        match state
-            .transfer_store
-            .lookup_object(repository, &object)
-            .await
-        {
-            Ok(Some(_)) => objects.push(LfsBatchUploadObject::present(object)),
-            Ok(None) => objects.push(LfsBatchUploadObject::needed(object)),
-            Err(error) => objects.push(LfsBatchUploadObject::error(
-                object,
-                lfs_batch_object_error_from_server_error(&error),
-            )),
-        }
-    }
+    let requested_objects = request.objects;
+    let unique_objects = requested_objects.iter().cloned().collect::<BTreeSet<_>>();
+    let outcomes = stream::iter(unique_objects)
+        .map(|object| async move {
+            let outcome = match state.lookup_object(repository, &object).await {
+                Ok(Some(_)) => LfsBatchUploadObject::present(object),
+                Ok(None) => LfsBatchUploadObject::needed(object),
+                Err(error) => LfsBatchUploadObject::error(
+                    object,
+                    lfs_batch_object_error_from_server_error(&error),
+                ),
+            };
+            (upload_outcome_object(&outcome).clone(), outcome)
+        })
+        .buffered(BATCH_STORAGE_LOOKUP_CONCURRENCY)
+        .collect::<BTreeMap<_, _>>()
+        .await;
+    let objects = requested_objects
+        .into_iter()
+        .map(|object| {
+            outcomes
+                .get(&object)
+                .expect("every requested object should have one lookup outcome")
+                .clone()
+        })
+        .collect::<Vec<_>>();
 
     Ok(LfsBatchResponse::upload(
         &state.public_url,
         repository.route_path(),
         objects,
     ))
+}
+
+fn outcome_object(outcome: &LfsBatchDownloadObject) -> &LfsObject {
+    match outcome {
+        LfsBatchDownloadObject::Available { object }
+        | LfsBatchDownloadObject::Missing { object }
+        | LfsBatchDownloadObject::Error { object, .. } => object,
+    }
+}
+
+fn upload_outcome_object(outcome: &LfsBatchUploadObject) -> &LfsObject {
+    match outcome {
+        LfsBatchUploadObject::Needed { object }
+        | LfsBatchUploadObject::Present { object }
+        | LfsBatchUploadObject::Error { object, .. } => object,
+    }
 }
 
 fn git_lfs_json_response(response: LfsBatchResponse) -> Response {
@@ -2432,10 +2682,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, LFS_AUTH_CHALLENGE, LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer,
-        LfsDownloadResponse, LfsObjectTransferStore, LfsRouteEndpoint, LfsRouteResolver,
-        LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind, UploadStagingGuardrails,
-        advertised_server_urls, authenticate_lfs_session,
+        BASE64_STANDARD, GoogleDriveAccessTokenCache, LFS_AUTH_CHALLENGE, LFS_SESSION_REVOKE_PATH,
+        LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore, LfsRouteEndpoint,
+        LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind,
+        UploadStagingGuardrails, advertised_server_urls, authenticate_lfs_session,
         ensure_temp_space_for_upload_with_available_space, lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store, production_session_store,
         render_server_startup_message, server_router_with_sessions, stage_upload_request_body,
@@ -2447,11 +2697,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use crate::{
-        DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, LfsBatchOperation,
-        LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore,
-        MetadataDatabase, ProviderFuture, RepositoryMapping, RepositoryPermission,
-        RepositoryProviderError, RepositoryUser, ServerConfig, ServerError, ServerResult,
-        StorageError, StoredObject,
+        DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, GoogleDriveCredential,
+        GoogleDriveTokenRefresher, LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize,
+        LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture,
+        RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
+        ServerConfig, ServerError, ServerResult, StorageError, StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -2517,6 +2767,73 @@ repositories:
 "#,
         ))
         .expect("test config should load")
+    }
+
+    fn test_config_with_work_limits(
+        max_batch_objects: usize,
+        max_provider_calls: usize,
+    ) -> ServerConfig {
+        let mut config = test_config();
+        config.server.max_batch_objects = max_batch_objects;
+        config.server.max_provider_calls = max_provider_calls;
+        config
+    }
+
+    #[tokio::test]
+    async fn google_drive_access_token_cache_single_flights_refreshes() {
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_refreshes = refreshes.clone();
+        let app = Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let handler_refreshes = handler_refreshes.clone();
+                async move {
+                    handler_refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "access_token": "cached-access-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "scope": "https://www.googleapis.com/auth/drive.file"
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("token server should bind");
+        let address = listener
+            .local_addr()
+            .expect("token server address should be available");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("token server should run");
+        });
+        let credential = GoogleDriveCredential::from_json(
+            "drive-user-a",
+            "test-ref",
+            &serde_json::json!({
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "refresh_token": "refresh-token",
+                "token_uri": format!("http://{address}/token")
+            })
+            .to_string(),
+        )
+        .expect("test credential should parse");
+        let refresher = GoogleDriveTokenRefresher::new().expect("token refresher should build");
+        let cache = GoogleDriveAccessTokenCache::default();
+
+        let (first, second, third) = tokio::join!(
+            cache.get_or_refresh("drive-user-a", &credential, &refresher),
+            cache.get_or_refresh("drive-user-a", &credential, &refresher),
+            cache.get_or_refresh("drive-user-a", &credential, &refresher),
+        );
+
+        let first = first.expect("first refresh should succeed");
+        assert_eq!(second.expect("second refresh should succeed"), first);
+        assert_eq!(third.expect("third refresh should succeed"), first);
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[derive(Clone, Default)]
@@ -2601,6 +2918,10 @@ repositories:
     struct RecordingTransferStore {
         lookup_object: Arc<Mutex<Option<StoredObject>>>,
         lookup_unsupported: bool,
+        lookups: Arc<Mutex<Vec<LfsObject>>>,
+        lookup_delay: Option<Duration>,
+        active_lookups: Arc<std::sync::atomic::AtomicUsize>,
+        peak_lookups: Arc<std::sync::atomic::AtomicUsize>,
         download_body: Arc<Mutex<Option<Vec<u8>>>>,
         download_integrity_mismatch: bool,
         downloads: Arc<Mutex<Vec<RecordedDownload>>>,
@@ -2643,6 +2964,13 @@ repositories:
         fn lookup_unsupported() -> Self {
             Self {
                 lookup_unsupported: true,
+                ..Self::default()
+            }
+        }
+
+        fn missing_with_lookup_delay(delay: Duration) -> Self {
+            Self {
+                lookup_delay: Some(delay),
                 ..Self::default()
             }
         }
@@ -2710,6 +3038,17 @@ repositories:
                 .clone()
         }
 
+        fn lookups(&self) -> Vec<LfsObject> {
+            self.lookups
+                .lock()
+                .expect("lookup records should not be poisoned")
+                .clone()
+        }
+
+        fn peak_lookups(&self) -> usize {
+            self.peak_lookups.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn uploads(&self) -> Vec<RecordedUpload> {
             self.uploads
                 .lock()
@@ -2754,6 +3093,22 @@ repositories:
             object: &'a LfsObject,
         ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
             Box::pin(async move {
+                self.lookups
+                    .lock()
+                    .expect("lookup records should not be poisoned")
+                    .push(object.clone());
+                let active = self
+                    .active_lookups
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.peak_lookups
+                    .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                if let Some(delay) = self.lookup_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                self.active_lookups
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
                 if self.lookup_unsupported {
                     return Err(ServerError::Storage {
                         source: StorageError::Unsupported {
@@ -2913,8 +3268,22 @@ repositories:
         authorizer: RecordingBatchAuthorizer,
         transfer_store: RecordingTransferStore,
     ) -> Router {
-        lfs_server_router_with_sessions_authorizer_and_transfer_store(
+        test_router_with_config_authorizer_and_transfer_store(
             test_config(),
+            store,
+            authorizer,
+            transfer_store,
+        )
+    }
+
+    fn test_router_with_config_authorizer_and_transfer_store(
+        config: ServerConfig,
+        store: LocalLfsSessionStore,
+        authorizer: RecordingBatchAuthorizer,
+        transfer_store: RecordingTransferStore,
+    ) -> Router {
+        lfs_server_router_with_sessions_authorizer_and_transfer_store(
+            config,
             store,
             Arc::new(authorizer),
             Arc::new(transfer_store),
@@ -3300,6 +3669,130 @@ repositories:
     }
 
     #[tokio::test]
+    async fn batch_route_rejects_object_count_before_provider_calls() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let authorizer = RecordingBatchAuthorizer::allow();
+        let transfer_store = RecordingTransferStore::missing();
+        let router = test_router_with_config_authorizer_and_transfer_store(
+            test_config_with_work_limits(1, 16),
+            store,
+            authorizer.clone(),
+            transfer_store.clone(),
+        );
+        let body = serde_json::json!({
+            "operation": "download",
+            "objects": [
+                { "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 42 },
+                { "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 42 }
+            ]
+        })
+        .to_string();
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                body,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Git LFS batch contains more than 1 object entries",
+        )
+        .await;
+        assert!(authorizer.required_permissions().is_empty());
+        assert!(transfer_store.lookups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_route_deduplicates_storage_lookups_and_preserves_results() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let authorizer = RecordingBatchAuthorizer::allow();
+        let transfer_store = RecordingTransferStore::missing();
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            authorizer.clone(),
+            transfer_store.clone(),
+        );
+        let body = serde_json::json!({
+            "operation": "download",
+            "objects": [
+                { "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 42 },
+                { "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 42 },
+                { "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 42 }
+            ]
+        })
+        .to_string();
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                body,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        let body: LfsBatchResponse =
+            serde_json::from_slice(&body).expect("response should be Git LFS batch JSON");
+        assert_eq!(body.objects.len(), 3);
+        assert_eq!(transfer_store.lookups().len(), 1);
+        assert_eq!(
+            authorizer.required_permissions(),
+            vec![RepositoryPermission::Read]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_provider_calls_obey_the_server_wide_concurrency_limit() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let transfer_store =
+            RecordingTransferStore::missing_with_lookup_delay(Duration::from_millis(40));
+        let router = test_router_with_config_authorizer_and_transfer_store(
+            test_config_with_work_limits(10, 2),
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store.clone(),
+        );
+        let objects = (1_u8..=6)
+            .map(|value| {
+                serde_json::json!({
+                    "oid": format!("{value:064x}"),
+                    "size": 42
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = serde_json::json!({
+            "operation": "download",
+            "objects": objects
+        })
+        .to_string();
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                body,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(transfer_store.lookups().len(), 6);
+        assert_eq!(transfer_store.peak_lookups(), 2);
+    }
+
+    #[tokio::test]
     async fn authenticated_download_batch_route_returns_download_actions_for_existing_objects() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
         let router = test_router_with_authorizer_and_transfer_store(
@@ -3378,7 +3871,8 @@ repositories:
     #[tokio::test]
     async fn authenticated_batch_route_rejects_unsupported_transfers() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
-        let router = test_router_with_authorizer(store, RecordingBatchAuthorizer::allow());
+        let authorizer = RecordingBatchAuthorizer::allow();
+        let router = test_router_with_authorizer(store, authorizer.clone());
 
         let response = router
             .oneshot(lfs_request_with_method_and_body(
@@ -3408,6 +3902,7 @@ repositories:
             body.get("message").and_then(|value| value.as_str()),
             Some("unsupported Git LFS transfer requested; only basic is available")
         );
+        assert!(authorizer.required_permissions().is_empty());
     }
 
     #[tokio::test]
@@ -4205,6 +4700,70 @@ repositories:
             authorizer.required_permissions(),
             vec![RepositoryPermission::Read, RepositoryPermission::Write]
         );
+    }
+
+    #[tokio::test]
+    async fn batch_authorization_is_reused_by_its_download_action() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let authorizer = RecordingBatchAuthorizer::allow();
+        let router = test_router_with_authorizer_and_transfer_store(
+            store,
+            authorizer.clone(),
+            RecordingTransferStore::existing(),
+        );
+
+        let batch_response = router
+            .clone()
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                VALID_BATCH_REQUEST,
+            ))
+            .await
+            .expect("batch request should receive a response");
+        assert_eq!(batch_response.status(), StatusCode::OK);
+
+        let download_response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::GET,
+                "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?size=42",
+                Some(&format!("Bearer {token}")),
+                Body::empty(),
+            ))
+            .await
+            .expect("download action should receive a response");
+
+        assert_eq!(download_response.status(), StatusCode::OK);
+        assert_eq!(
+            authorizer.required_permissions(),
+            vec![RepositoryPermission::Read]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_transfer_action_is_rejected_before_authorization() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let authorizer = RecordingBatchAuthorizer::allow();
+        let router = test_router_with_authorizer(store, authorizer.clone());
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::GET,
+                "/github.com/owner/repo.git/info/lfs/objects/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Some(&format!("Bearer {token}")),
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "Git LFS download action did not include a valid size query parameter",
+        )
+        .await;
+        assert!(authorizer.required_permissions().is_empty());
     }
 
     #[tokio::test]

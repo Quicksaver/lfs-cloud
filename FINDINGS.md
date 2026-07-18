@@ -414,19 +414,39 @@ independently validated or adjudicated.
 
 ## Server and metadata
 
-1. **High — Unbounded batches and per-object authorization can amplify into
-   thousands of GitHub, OAuth, and Drive API calls.** Object count and duplicates
-   are not bounded; each lookup reloads credentials, refreshes a Google token,
-   and queries Drive, while a batch and each subsequent GET or PUT can perform
-   separate GitHub permission checks, sometimes before cheap local validation
-   (`src/server.rs:682-703`, `src/server.rs:840-842`,
-   `src/server.rs:976-986`, `src/server.rs:1038-1064`,
-   `src/server.rs:1105-1135`, `src/server.rs:1593-1616`,
-   `src/server.rs:1656-1707`, `src/lfs.rs:568`). Enforce a configurable object
-   count, deduplicate identities, validate locally first, cache Google tokens
-   with single-flight refresh, add a server-wide provider-call semaphore, and
-   use a short-lived scoped authorization grant or conservative permission
-   cache. Test provider-call counts for malformed and multi-object requests.
+1. **[DONE] Unbounded batches and per-object authorization can amplify into
+   thousands of GitHub, OAuth, and Drive API calls** (High, `src/server.rs`,
+   `src/server_config.rs`, and server configuration documentation): **Valid and
+   actionable.** Batch requests now accept at most the configured
+   `server.max_batch_objects` entries (100 by default); duplicate entries count
+   toward that request/response bound, but storage lookups are collapsed by
+   exact OID and size while duplicate response entries and ordering are
+   preserved. Unsupported transfers, oversized upload objects, and malformed
+   transfer size queries are rejected before GitHub authorization or storage
+   work. One process-wide semaphore, configured by
+   `server.max_provider_calls` (16 by default), bounds repository and storage
+   provider calls across every repository. Successful permission decisions are
+   cached for only 15 seconds and keyed by the exact local session token,
+   repository ID, and read/write operation; per-key locking single-flights
+   concurrent misses, so a batch action can reuse its immediately preceding
+   authorization without widening access. Google Drive access tokens are
+   cached only until 60 seconds before their reported expiry, and concurrent
+   refresh misses collapse into one OAuth request. Regression coverage proves
+   over-limit and unsupported batches make no provider calls, duplicate entries
+   perform one lookup, the global provider-call peak respects configuration,
+   batch-to-transfer authorization performs one permission check, malformed
+   actions do not authorize, invalid zero limits are rejected, and concurrent
+   Drive token requests refresh once. README, implementation notes, full config
+   documentation, and the repository learning now describe these boundaries.
+   Verification passed with `yarn lint:fix`, `cargo fmt --all --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine high-severity
+   cross-provider amplification path, traced each compounding call boundary,
+   and prescribed the complete layered remediation plus call-count tests. With
+   one valid finding assessed here and no invalid finding attributable
+   separately, this was high-quality, security- and availability-relevant
+   feedback.
 
 2. **High — Authenticated batch bodies have no read timeout or global request
    limit.** `Bytes::from_request` can wait indefinitely for a valid session

@@ -317,6 +317,8 @@ server:
   host: 127.0.0.1
   port: 8080
   public_url: http://127.0.0.1:8080
+  max_batch_objects: 100
+  max_provider_calls: 16
   metadata_path: ./.lfs-cloud/metadata.sqlite3
 
 repository_providers:
@@ -357,6 +359,13 @@ while still letting validation report the exact missing key.
 SQLite metadata database to `.lfs-cloud/metadata.sqlite3` beside the config
 file, keeping routing, object, session, and transfer-attempt state in
 server-owned local storage.
+
+`server.max_batch_objects` defaults to 100 object entries per Git LFS batch,
+and `server.max_provider_calls` defaults to 16 concurrent GitHub or storage
+operations across the process. Duplicate batch identities count toward the
+batch limit but share one storage lookup. Successful permission checks are
+reused briefly for the same local session, repository, and operation so an
+advertised transfer does not immediately repeat the batch's GitHub request.
 
 Keep `oauth_client_secret` stable while issued sessions remain active. LFS
 Cloud uses it as the root secret for a dedicated durable-session encryption
