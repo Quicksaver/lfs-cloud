@@ -1468,9 +1468,12 @@ Defer:
 > rules. The README now distinguishes implemented commands from the remaining
 > full migration execution work, and install/build docs define the current
 > local binary and release-artifact expectations. Gated external integration
-> checks now cover disposable GitHub repository permission validation and
-> disposable Google Drive folder root validation when explicitly enabled with
-> real provider credentials.
+> checks now cover disposable GitHub repository permission validation,
+> disposable Google Drive folder root validation, and a GitHub-authorized
+> production server upload/download through Google Drive. The full transfer
+> scenario verifies private Drive object properties, durable SQLite metadata,
+> downloaded byte integrity, and provider-resource cleanup when explicitly
+> enabled with real credentials.
 
 ### Progress Summary
 
@@ -1684,7 +1687,7 @@ Defer:
 
 - [x] [T] Add local end-to-end test for init, upload, download, and checkout using fake GitHub/Drive providers.
 - [x] [M] Add gated GitHub integration test using a disposable repo. Manual verification: `scripts/manual/verify-github-integration.sh`.
-- [x] [M] Add gated Google Drive integration test using a disposable folder. Manual verification: `scripts/manual/verify-google-drive-integration.sh`.
+- [x] [M] Add gated Google Drive integration tests using a disposable folder, including a GitHub-authorized production server upload/download with Drive-property, SQLite-metadata, integrity, and cleanup assertions. Manual verification: `scripts/manual/verify-google-drive-integration.sh` and `scripts/manual/verify-live-provider-transfer.sh`.
 - [x] [M] Add manual LAN smoke test checklist. Manual verification: `scripts/manual/verify-lan-smoke-test.sh`.
 
 #### Epic 9.2: Security And Documentation

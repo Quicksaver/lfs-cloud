@@ -2291,12 +2291,39 @@ independently validated or adjudicated.
    and no invalid finding attributable separately, this was high-quality,
    highly relevant feedback.
 
-3. **High — Live-provider tests stop before object transfer.** GitHub coverage
-   checks identity and permission, while Drive coverage checks only root-folder
-   validation (`tests/external_integrations.rs:29`,
-   `tests/external_integrations.rs:98`). Add a disposable live scenario covering
-   server upload, Drive properties, SQLite metadata, action download, integrity,
-   and cleanup.
+3. **[DONE] Live-provider tests stopped before object transfer** (High,
+   `tests/external_integrations.rs`,
+   `scripts/manual/verify-live-provider-transfer.sh`, `README.md`, and
+   `IMPLEMENTATION.md`): **Valid and actionable.** The existing gated GitHub
+   test stopped after identity and permission authorization, while the Drive
+   test stopped after creating and validating a writable root folder. Neither
+   exercised the production server's authorization, transfer, or metadata
+   composition against both real providers. A new credential-gated scenario
+   now creates a disposable private GitHub repository and Drive folder, seeds a
+   durable local LFS session with the real GitHub identity/token, and starts the
+   public production `serve` path. It obtains and follows an authenticated
+   upload action, verifies the resulting private Drive version, repository
+   namespace, OID, and size properties, and proves SQLite recorded the exact
+   backend ID, verified status, and stable creator identity. It then obtains a
+   download action and compares the returned bytes with the original object,
+   aborts the local server, and deletes both disposable provider resources even
+   when the scenario reports a normal error. A non-network regression validates
+   the generated production configuration during ordinary test runs, while the
+   new manual script supports JSON or file-backed Drive credentials and makes
+   the destructive live run explicit. README, implementation status, and the
+   repository learning now document this full-provider boundary. Verification
+   passed with `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, `yarn lint:check`, the
+   non-network live-config fixture, the disabled-path manual verifier, and
+   `git diff --check`. The live provider scenario compiled but was not executed
+   because disposable GitHub and Google Drive credentials were not present in
+   this environment; it remains ignored and explicitly gated for a future
+   credentialed run. The reviewer identified a genuine high-severity production
+   integration blind spot and specified the decisive provider state, metadata,
+   download-integrity, and cleanup assertions. With one valid finding and no
+   invalid finding attributable separately, this was high-quality, highly
+   relevant feedback.
 
 4. **Medium — Redaction tests do not inspect emitted tracing events.** Server
    failure paths interpolate errors into tracing fields, but tests inspect only
