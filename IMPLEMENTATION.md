@@ -1063,7 +1063,14 @@ validates every candidate before deciding absence or selecting the
 lexicographically smallest exact-match file ID. Repeated page tokens are
 rejected as retryable provider failures rather than allowed to loop forever.
 
-Use Google Drive resumable uploads for large object writes. The first implementation may stage uploads to a local temp file so it can verify SHA-256 and size before uploading to Drive.
+Use Google Drive resumable uploads for large object writes. Stage uploads to a
+local temp file so SHA-256 and size are verified before opening a Drive session.
+Send the verified file in 256 KiB-aligned chunks, except for the final chunk.
+After an interrupted transfer or retryable provider response, query the same
+session for its committed range and continue from Drive's reported next byte.
+Bound consecutive recovery probes with exponential backoff; an expired session
+returns a retryable failure so the outer idempotent upload path can re-check
+existence before creating a replacement session.
 
 Google provider clients bound connection establishment to 10 seconds. Object
 transfers intentionally have no total request timeout because healthy large

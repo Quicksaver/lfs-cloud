@@ -23,15 +23,15 @@ use futures_util::StreamExt;
 use reqwest::{
     Body as ReqwestBody, Client, StatusCode,
     header::{
-        ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION,
+        ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+        HeaderMap, HeaderValue, LOCATION, RANGE,
     },
     redirect::Policy,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
-use tokio_util::io::ReaderStream;
 use url::Url;
 
 use crate::{
@@ -44,6 +44,9 @@ const GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_OBJECT_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GOOGLE_DRIVE_TRANSFER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const GOOGLE_DRIVE_RESUMABLE_UPLOAD_CHUNK_SIZE: usize = 256 * 1024;
+const GOOGLE_DRIVE_RESUMABLE_UPLOAD_MAX_RECOVERY_ATTEMPTS: u32 = 4;
+const GOOGLE_DRIVE_RESUMABLE_UPLOAD_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_";
 const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
 const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
@@ -725,6 +728,7 @@ pub struct GoogleDriveObjectStore {
     download_client: Client,
     api_base_url: Url,
     transfer_read_idle_timeout: Duration,
+    upload_retry_initial_backoff: Duration,
 }
 
 impl GoogleDriveObjectStore {
@@ -795,6 +799,7 @@ impl GoogleDriveObjectStore {
             download_client,
             api_base_url: validate_drive_api_base_url(api_base_url.as_ref())?,
             transfer_read_idle_timeout: GOOGLE_DRIVE_TRANSFER_READ_IDLE_TIMEOUT,
+            upload_retry_initial_backoff: GOOGLE_DRIVE_RESUMABLE_UPLOAD_INITIAL_BACKOFF,
         })
     }
 
@@ -901,10 +906,10 @@ impl GoogleDriveObjectStore {
     /// Uploads a staged and locally verified object file through Drive resumable upload.
     ///
     /// The staged file is read before any Drive request so its SHA-256 and
-    /// byte count can be checked against the LFS pointer metadata. The current
-    /// implementation sends the resumable upload content in one request after
-    /// session initiation; if Drive reports an interrupted session, callers get
-    /// a retryable storage error and may retry the whole upload.
+    /// byte count can be checked against the LFS pointer metadata. Uploads use
+    /// bounded 256 KiB-aligned chunks. Interrupted transfers query the existing
+    /// session's committed offset and continue from Drive's authoritative
+    /// `Range` response instead of creating a new backend file.
     ///
     /// # Errors
     ///
@@ -973,54 +978,112 @@ impl GoogleDriveObjectStore {
             ));
         };
 
-        let file = tokio::fs::File::from_std(verified_file);
-        let (upload_stream, upload_progress) = upload_progress_stream(file);
-        let upload_request = self
-            .upload_client
-            .put(session_url)
-            .header(ACCEPT, "application/json")
-            .header(
-                AUTHORIZATION,
-                self.token.authorization_header_value(&self.storage.id)?,
-            )
-            .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
-            .header(CONTENT_LENGTH, object.size.bytes().to_string())
-            .body(ReqwestBody::wrap_stream(upload_stream));
-        let upload_response = send_drive_upload_with_idle_timeout(
-            &self.storage,
-            &self.token,
-            upload_request,
-            upload_progress,
-            self.transfer_read_idle_timeout,
-        )
-        .await?;
-        let upload_status = upload_response.status();
-        let upload_body = read_drive_response_body_with_idle_timeout(
-            &self.storage,
-            &self.token,
-            upload_response,
-            self.transfer_read_idle_timeout,
-        )
-        .await?;
+        let mut file = tokio::fs::File::from_std(verified_file);
+        let total_size = object.size.bytes();
+        let mut committed_offset = 0_u64;
+        let mut recovery_attempts = 0_u32;
 
-        if !matches!(upload_status, StatusCode::OK | StatusCode::CREATED) {
-            return Err(parse_drive_upload_error(
+        loop {
+            let chunk = read_drive_upload_chunk(
+                &self.storage,
+                &source,
+                &mut file,
+                committed_offset,
+                total_size,
+            )
+            .await?;
+            let chunk_end = committed_offset
+                .checked_add(chunk.len() as u64)
+                .and_then(|end| end.checked_sub(1));
+            let (upload_stream, upload_progress) = upload_chunk_progress_stream(chunk);
+            let mut upload_request = self
+                .upload_client
+                .put(session_url.clone())
+                .header(ACCEPT, "application/json")
+                .header(
+                    AUTHORIZATION,
+                    self.token.authorization_header_value(&self.storage.id)?,
+                )
+                .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
+                .header(
+                    CONTENT_LENGTH,
+                    chunk_end
+                        .map_or(0, |end| end - committed_offset + 1)
+                        .to_string(),
+                );
+            if let Some(chunk_end) = chunk_end {
+                upload_request = upload_request.header(
+                    CONTENT_RANGE,
+                    format!("bytes {committed_offset}-{chunk_end}/{total_size}"),
+                );
+            }
+            let upload_result = match send_drive_upload_with_idle_timeout(
                 &self.storage,
                 &self.token,
-                object,
-                DriveUploadPhase::Transfer,
-                upload_status,
-                &upload_body,
-            ));
-        }
+                upload_request.body(ReqwestBody::wrap_stream(upload_stream)),
+                upload_progress,
+                self.transfer_read_idle_timeout,
+            )
+            .await
+            {
+                Ok(response) => {
+                    parse_drive_resumable_upload_response(
+                        self,
+                        object,
+                        &key,
+                        &expected_properties,
+                        response,
+                        chunk_end.map_or(0, |end| end + 1),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            let upload_progress = match upload_result {
+                Ok(progress) => progress,
+                Err(error) if is_retryable_storage_error(&error) => {
+                    recover_drive_resumable_upload(
+                        self,
+                        object,
+                        &key,
+                        &expected_properties,
+                        &session_url,
+                        &mut recovery_attempts,
+                        error,
+                    )
+                    .await?
+                }
+                Err(error) => return Err(error),
+            };
 
-        parse_drive_upload_success(
-            &self.storage,
-            &key,
-            &expected_properties,
-            upload_status,
-            &upload_body,
-        )
+            match upload_progress {
+                DriveResumableUploadProgress::Complete(stored_object) => {
+                    return Ok(stored_object);
+                }
+                DriveResumableUploadProgress::Incomplete(next_offset) => {
+                    if next_offset < committed_offset {
+                        return Err(drive_resumable_upload_protocol_error(
+                            &self.storage,
+                            "Google Drive resumable upload moved its committed offset backwards",
+                        ));
+                    }
+                    if next_offset > committed_offset {
+                        committed_offset = next_offset;
+                        recovery_attempts = 0;
+                        continue;
+                    }
+                    if recovery_attempts >= GOOGLE_DRIVE_RESUMABLE_UPLOAD_MAX_RECOVERY_ATTEMPTS {
+                        return Err(StorageError::Retryable {
+                            provider: self.storage.id.clone(),
+                            message: "Google Drive resumable upload made no committed progress"
+                                .to_owned(),
+                        });
+                    }
+                    sleep_drive_upload_backoff(self, recovery_attempts).await;
+                    recovery_attempts += 1;
+                }
+            }
+        }
     }
 
     /// Downloads a verified Drive object into a local destination path.
@@ -1300,27 +1363,213 @@ impl StorageProvider for GoogleDriveObjectStore {
     }
 }
 
-fn upload_progress_stream(
-    file: tokio::fs::File,
+#[derive(Debug)]
+enum DriveResumableUploadProgress {
+    Complete(StoredObject),
+    Incomplete(u64),
+}
+
+async fn read_drive_upload_chunk(
+    storage: &GoogleDriveStorageConfig,
+    source: &Path,
+    file: &mut tokio::fs::File,
+    offset: u64,
+    total_size: u64,
+) -> StorageResult<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(|error| staged_file_read_error(storage, source, error))?;
+    let chunk_len = (total_size - offset).min(GOOGLE_DRIVE_RESUMABLE_UPLOAD_CHUNK_SIZE as u64);
+    let mut chunk = vec![0_u8; chunk_len as usize];
+    file.read_exact(&mut chunk)
+        .await
+        .map_err(|error| staged_file_read_error(storage, source, error))?;
+    Ok(chunk)
+}
+
+fn upload_chunk_progress_stream(
+    chunk: Vec<u8>,
 ) -> (
     impl futures_util::Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
     watch::Receiver<()>,
 ) {
     let (progress_sender, progress_receiver) = watch::channel(());
-    let stream = futures_util::stream::unfold(
-        (ReaderStream::new(file), progress_sender),
-        |(mut source, progress_sender)| async move {
-            match source.next().await {
-                Some(chunk) => {
-                    progress_sender.send_modify(|()| {});
-                    Some((chunk, (source, progress_sender)))
-                }
-                None => None,
-            }
-        },
-    );
+    let stream = futures_util::stream::once(async move {
+        progress_sender.send_modify(|()| {});
+        Ok(Bytes::from(chunk))
+    });
 
     (stream, progress_receiver)
+}
+
+async fn parse_drive_resumable_upload_response(
+    store: &GoogleDriveObjectStore,
+    object: &LfsObject,
+    key: &GoogleDriveObjectKey,
+    expected_properties: &GoogleDriveObjectProperties,
+    response: reqwest::Response,
+    maximum_committed_offset: u64,
+) -> StorageResult<DriveResumableUploadProgress> {
+    let status = response.status();
+    if status.as_u16() == 308 {
+        let committed_offset = parse_drive_resumable_upload_offset(
+            &store.storage,
+            response.headers(),
+            object.size.bytes(),
+            maximum_committed_offset,
+        )?;
+        return Ok(DriveResumableUploadProgress::Incomplete(committed_offset));
+    }
+
+    let body = read_drive_response_body_with_idle_timeout(
+        &store.storage,
+        &store.token,
+        response,
+        store.transfer_read_idle_timeout,
+    )
+    .await?;
+    if matches!(status, StatusCode::OK | StatusCode::CREATED) {
+        return parse_drive_upload_success(&store.storage, key, expected_properties, status, &body)
+            .map(DriveResumableUploadProgress::Complete);
+    }
+
+    Err(parse_drive_upload_error(
+        &store.storage,
+        &store.token,
+        object,
+        DriveUploadPhase::Transfer,
+        status,
+        &body,
+    ))
+}
+
+fn parse_drive_resumable_upload_offset(
+    storage: &GoogleDriveStorageConfig,
+    headers: &HeaderMap,
+    total_size: u64,
+    maximum_committed_offset: u64,
+) -> StorageResult<u64> {
+    let Some(range) = headers.get(RANGE) else {
+        return Ok(0);
+    };
+    let range = range.to_str().map_err(|_| {
+        drive_resumable_upload_protocol_error(
+            storage,
+            "Google Drive resumable upload returned a non-text Range header",
+        )
+    })?;
+    let Some(last_byte) = range.trim().strip_prefix("bytes=0-") else {
+        return Err(drive_resumable_upload_protocol_error(
+            storage,
+            "Google Drive resumable upload returned an invalid Range header",
+        ));
+    };
+    let last_byte = last_byte.parse::<u64>().map_err(|_| {
+        drive_resumable_upload_protocol_error(
+            storage,
+            "Google Drive resumable upload returned an invalid Range header",
+        )
+    })?;
+    let committed_offset = last_byte.checked_add(1).ok_or_else(|| {
+        drive_resumable_upload_protocol_error(
+            storage,
+            "Google Drive resumable upload returned an overflowing Range header",
+        )
+    })?;
+    if committed_offset > maximum_committed_offset
+        || committed_offset >= total_size
+        || total_size == 0
+    {
+        return Err(drive_resumable_upload_protocol_error(
+            storage,
+            "Google Drive resumable upload returned an impossible Range header",
+        ));
+    }
+    Ok(committed_offset)
+}
+
+async fn recover_drive_resumable_upload(
+    store: &GoogleDriveObjectStore,
+    object: &LfsObject,
+    key: &GoogleDriveObjectKey,
+    expected_properties: &GoogleDriveObjectProperties,
+    session_url: &Url,
+    recovery_attempts: &mut u32,
+    mut last_error: StorageError,
+) -> StorageResult<DriveResumableUploadProgress> {
+    let total_size = object.size.bytes();
+    loop {
+        if *recovery_attempts >= GOOGLE_DRIVE_RESUMABLE_UPLOAD_MAX_RECOVERY_ATTEMPTS {
+            return Err(last_error);
+        }
+        sleep_drive_upload_backoff(store, *recovery_attempts).await;
+        *recovery_attempts += 1;
+
+        let (progress_sender, progress_receiver) = watch::channel(());
+        drop(progress_sender);
+        let probe_request = store
+            .upload_client
+            .put(session_url.clone())
+            .header(ACCEPT, "application/json")
+            .header(
+                AUTHORIZATION,
+                store.token.authorization_header_value(&store.storage.id)?,
+            )
+            .header(CONTENT_LENGTH, "0")
+            .header(CONTENT_RANGE, format!("bytes */{total_size}"));
+        let probe_result = match send_drive_upload_with_idle_timeout(
+            &store.storage,
+            &store.token,
+            probe_request,
+            progress_receiver,
+            store.transfer_read_idle_timeout,
+        )
+        .await
+        {
+            Ok(response) => {
+                parse_drive_resumable_upload_response(
+                    store,
+                    object,
+                    key,
+                    expected_properties,
+                    response,
+                    total_size,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match probe_result {
+            Ok(progress) => return Ok(progress),
+            Err(error) if is_retryable_storage_error(&error) => last_error = error,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn sleep_drive_upload_backoff(store: &GoogleDriveObjectStore, attempt: u32) {
+    let multiplier = 1_u32 << attempt.min(8);
+    tokio::time::sleep(
+        store
+            .upload_retry_initial_backoff
+            .saturating_mul(multiplier),
+    )
+    .await;
+}
+
+fn is_retryable_storage_error(error: &StorageError) -> bool {
+    matches!(error, StorageError::Retryable { .. })
+}
+
+fn drive_resumable_upload_protocol_error(
+    storage: &GoogleDriveStorageConfig,
+    message: &'static str,
+) -> StorageError {
+    StorageError::Upstream {
+        provider: storage.id.clone(),
+        status: Some(308),
+        message: SanitizedMessage::new(message),
+    }
 }
 
 async fn send_drive_upload_with_idle_timeout(
@@ -4015,6 +4264,7 @@ mod tests {
         )
         .expect("object store should build");
         store.transfer_read_idle_timeout = Duration::from_millis(50);
+        store.upload_retry_initial_backoff = Duration::ZERO;
 
         let error = store
             .upload_object(&object, staged_file.path())
@@ -4030,7 +4280,10 @@ mod tests {
                 && message.contains("idle timeout")
                 && !message.contains("access-token")
         ));
-        assert_eq!(server.upload_requests().len(), 1);
+        assert_eq!(
+            server.upload_requests().len(),
+            super::GOOGLE_DRIVE_RESUMABLE_UPLOAD_MAX_RECOVERY_ATTEMPTS as usize + 1
+        );
     }
 
     #[tokio::test]
@@ -4067,16 +4320,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_store_maps_resume_incomplete_upload_to_retryable_error() {
-        let staged_bytes = b"0123456789abcdef0123456789abcdef0123456789";
-        let object = lfs_object_for_bytes(staged_bytes);
-        let server = DriveUploadServer::start_with_upload_response(
-            StatusCode::from_u16(308).expect("308 should be a valid HTTP status"),
-            r#"{"error":{"message":"resume incomplete access-token"}}"#,
+    async fn object_store_uploads_large_files_in_drive_aligned_chunks() {
+        let staged_bytes = vec![b'x'; super::GOOGLE_DRIVE_RESUMABLE_UPLOAD_CHUNK_SIZE * 2 + 17];
+        let object = lfs_object_for_bytes(&staged_bytes);
+        let first_chunk_end = super::GOOGLE_DRIVE_RESUMABLE_UPLOAD_CHUNK_SIZE - 1;
+        let second_chunk_end = super::GOOGLE_DRIVE_RESUMABLE_UPLOAD_CHUNK_SIZE * 2 - 1;
+        let server = DriveUploadServer::start_with_upload_responses(
+            vec![
+                StubDriveUploadResponse {
+                    status: StatusCode::from_u16(308).expect("308 should be valid"),
+                    body: String::new(),
+                    range: Some(format!("bytes=0-{first_chunk_end}")),
+                    delay: Duration::ZERO,
+                },
+                StubDriveUploadResponse {
+                    status: StatusCode::from_u16(308).expect("308 should be valid"),
+                    body: String::new(),
+                    range: Some(format!("bytes=0-{second_chunk_end}")),
+                    delay: Duration::ZERO,
+                },
+                StubDriveUploadResponse {
+                    status: StatusCode::CREATED,
+                    body: drive_object_json(
+                        "drive-file-uploaded",
+                        object.oid.as_hex(),
+                        object.size.bytes(),
+                    ),
+                    range: None,
+                    delay: Duration::ZERO,
+                },
+            ],
+            None,
         )
         .await;
         let staged_file = tempfile::NamedTempFile::new().expect("temp file should be created");
-        std::fs::write(staged_file.path(), staged_bytes).expect("staged file should be written");
+        std::fs::write(staged_file.path(), &staged_bytes).expect("staged file should be written");
         let store = GoogleDriveObjectStore::with_client_and_api_base_url(
             storage_config("google-drive-user-a"),
             "github.com/owner/repo",
@@ -4086,21 +4364,161 @@ mod tests {
         )
         .expect("object store should build");
 
+        store
+            .upload_object(&object, staged_file.path())
+            .await
+            .expect("chunked upload should succeed");
+
+        let requests = server.upload_requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].body, staged_bytes[..=first_chunk_end]);
+        assert_eq!(
+            requests[1].body,
+            staged_bytes[first_chunk_end + 1..=second_chunk_end]
+        );
+        assert_eq!(requests[2].body, staged_bytes[second_chunk_end + 1..]);
+        assert_eq!(
+            requests[0].headers.get("content-range").unwrap(),
+            &format!("bytes 0-{first_chunk_end}/{}", staged_bytes.len())
+        );
+        assert_eq!(
+            requests[1].headers.get("content-range").unwrap(),
+            &format!(
+                "bytes {}-{second_chunk_end}/{}",
+                first_chunk_end + 1,
+                staged_bytes.len()
+            )
+        );
+        assert_eq!(
+            requests[2].headers.get("content-range").unwrap(),
+            &format!(
+                "bytes {}-{}/{}",
+                second_chunk_end + 1,
+                staged_bytes.len() - 1,
+                staged_bytes.len()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_probes_and_resumes_an_interrupted_upload_session() {
+        let chunk_size = super::GOOGLE_DRIVE_RESUMABLE_UPLOAD_CHUNK_SIZE;
+        let staged_bytes = vec![b'r'; chunk_size * 2];
+        let object = lfs_object_for_bytes(&staged_bytes);
+        let first_chunk_end = chunk_size - 1;
+        let partial_second_chunk_end = chunk_size + chunk_size / 2 - 1;
+        let server = DriveUploadServer::start_with_upload_responses(
+            vec![
+                StubDriveUploadResponse {
+                    status: StatusCode::from_u16(308).expect("308 should be valid"),
+                    body: String::new(),
+                    range: Some(format!("bytes=0-{first_chunk_end}")),
+                    delay: Duration::ZERO,
+                },
+                StubDriveUploadResponse {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    body: r#"{"error":{"message":"retry access-token"}}"#.to_owned(),
+                    range: None,
+                    delay: Duration::ZERO,
+                },
+                StubDriveUploadResponse {
+                    status: StatusCode::from_u16(308).expect("308 should be valid"),
+                    body: String::new(),
+                    range: Some(format!("bytes=0-{partial_second_chunk_end}")),
+                    delay: Duration::ZERO,
+                },
+                StubDriveUploadResponse {
+                    status: StatusCode::CREATED,
+                    body: drive_object_json(
+                        "drive-file-uploaded",
+                        object.oid.as_hex(),
+                        object.size.bytes(),
+                    ),
+                    range: None,
+                    delay: Duration::ZERO,
+                },
+            ],
+            None,
+        )
+        .await;
+        let staged_file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(staged_file.path(), &staged_bytes).expect("staged file should be written");
+        let mut store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+        store.upload_retry_initial_backoff = Duration::ZERO;
+
+        store
+            .upload_object(&object, staged_file.path())
+            .await
+            .expect("interrupted upload should resume");
+
+        let requests = server.upload_requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].body, staged_bytes[..chunk_size]);
+        assert_eq!(requests[1].body, staged_bytes[chunk_size..]);
+        assert!(requests[2].body.is_empty());
+        assert_eq!(
+            requests[2].headers.get("content-range").unwrap(),
+            &format!("bytes */{}", staged_bytes.len())
+        );
+        assert_eq!(
+            requests[3].body,
+            staged_bytes[partial_second_chunk_end + 1..]
+        );
+        assert_eq!(
+            requests[3].headers.get("content-range").unwrap(),
+            &format!(
+                "bytes {}-{}/{}",
+                partial_second_chunk_end + 1,
+                staged_bytes.len() - 1,
+                staged_bytes.len()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_bounds_resumable_upload_recovery_attempts() {
+        let staged_bytes = b"bounded Drive resumable upload retries";
+        let object = lfs_object_for_bytes(staged_bytes);
+        let server = DriveUploadServer::start_with_upload_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"message":"still unavailable access-token"}}"#,
+        )
+        .await;
+        let staged_file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(staged_file.path(), staged_bytes).expect("staged file should be written");
+        let mut store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo",
+            access_token(),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("object store should build");
+        store.upload_retry_initial_backoff = Duration::ZERO;
+
         let error = store
             .upload_object(&object, staged_file.path())
             .await
-            .expect_err("resume incomplete should be retryable");
+            .expect_err("repeated upload failures should stop");
 
         assert!(matches!(
             error,
-            StorageError::Retryable {
-                provider,
-                message,
-            } if provider == "drive-user-a"
-                && message.contains("resume incomplete")
-                && !message.contains("access-token")
+            StorageError::Retryable { provider, message }
+                if provider == "drive-user-a"
+                    && message.contains("still unavailable")
+                    && !message.contains("access-token")
         ));
-        assert_eq!(server.upload_requests().len(), 1);
+        assert!(
+            server.upload_requests().len()
+                <= (super::GOOGLE_DRIVE_RESUMABLE_UPLOAD_MAX_RECOVERY_ATTEMPTS as usize * 2) + 1
+        );
     }
 
     #[test]
@@ -5526,6 +5944,23 @@ mod tests {
             session_url: Option<String>,
             upload_response_delay: Duration,
         ) -> Self {
+            Self::start_with_upload_responses(
+                vec![StubDriveUploadResponse {
+                    status: upload_status,
+                    body: upload_body.into(),
+                    range: None,
+                    delay: upload_response_delay,
+                }],
+                session_url,
+            )
+            .await
+        }
+
+        async fn start_with_upload_responses(
+            upload_responses: Vec<StubDriveUploadResponse>,
+            session_url: Option<String>,
+        ) -> Self {
+            assert!(!upload_responses.is_empty());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("test Drive upload server should bind");
@@ -5537,9 +5972,7 @@ mod tests {
                     .unwrap_or_else(|| format!("http://{address}/upload_session/session-1")),
                 initiate_status: StatusCode::OK,
                 initiate_body: String::new(),
-                upload_status,
-                upload_body: upload_body.into(),
-                upload_response_delay,
+                upload_responses,
                 initiate_requests: Mutex::new(Vec::new()),
                 upload_requests: Mutex::new(Vec::new()),
             });
@@ -5593,11 +6026,17 @@ mod tests {
         session_url: String,
         initiate_status: StatusCode,
         initiate_body: String,
-        upload_status: StatusCode,
-        upload_body: String,
-        upload_response_delay: Duration,
+        upload_responses: Vec<StubDriveUploadResponse>,
         initiate_requests: Mutex<Vec<CapturedDriveUploadInitiateRequest>>,
         upload_requests: Mutex<Vec<CapturedDriveUploadRequest>>,
+    }
+
+    #[derive(Clone)]
+    struct StubDriveUploadResponse {
+        status: StatusCode,
+        body: String,
+        range: Option<String>,
+        delay: Duration,
     }
 
     #[derive(Clone)]
@@ -5653,23 +6092,40 @@ mod tests {
         headers: HeaderMap,
         body: Bytes,
     ) -> Response {
-        state
-            .upload_requests
-            .lock()
-            .expect("test Drive upload requests lock should not poison")
-            .push(CapturedDriveUploadRequest {
+        let request_index = {
+            let mut upload_requests = state
+                .upload_requests
+                .lock()
+                .expect("test Drive upload requests lock should not poison");
+            let request_index = upload_requests.len();
+            upload_requests.push(CapturedDriveUploadRequest {
                 session_id,
                 headers,
                 body: body.to_vec(),
             });
+            request_index
+        };
 
-        tokio::time::sleep(state.upload_response_delay).await;
+        let stub_response = state
+            .upload_responses
+            .get(request_index)
+            .or_else(|| state.upload_responses.last())
+            .expect("test Drive upload response sequence should not be empty")
+            .clone();
+        tokio::time::sleep(stub_response.delay).await;
 
-        (
-            state.upload_status,
+        let mut response = (
+            stub_response.status,
             [(CONTENT_TYPE, "application/json")],
-            state.upload_body.clone(),
+            stub_response.body.clone(),
         )
-            .into_response()
+            .into_response();
+        if let Some(range) = &stub_response.range {
+            response.headers_mut().insert(
+                "range",
+                HeaderValue::from_str(range).expect("test upload range should be valid"),
+            );
+        }
+        response
     }
 }

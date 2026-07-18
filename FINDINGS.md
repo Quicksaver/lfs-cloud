@@ -892,12 +892,40 @@ independently validated or adjudicated.
    valid finding assessed here and no invalid finding attributable separately,
    this was high-quality, relevant feedback.
 
-6. **Medium — The resumable upload implementation does not actually resume.** A
-   failed upload starts over instead of querying or continuing the existing
-   session (`src/google_drive.rs:827`, `src/google_drive.rs:901`,
-   `src/google_drive.rs:2307`, `src/google_drive.rs:3589`). Upload in chunks,
-   probe the committed offset, retry with bounded backoff, and test interrupted
-   sessions.
+6. **[DONE] The resumable upload implementation did not actually resume**
+   (Medium, `src/google_drive.rs`, `README.md`, `IMPLEMENTATION.md`, and
+   `AGENTS.md`): **Valid and actionable.** The upload path previously opened a
+   resumable session but sent the complete staged file in one request, mapped
+   HTTP 308 to a retryable error, and required the outer operation to create a
+   new session. It now sends the verified file in 256 KiB-aligned chunks except
+   for the final chunk, includes exact `Content-Range` metadata, and treats
+   Drive's HTTP 308 `Range` response as the authoritative committed offset.
+   Transport and retryable provider failures trigger an empty status `PUT` to
+   the same session; a completed probe returns the verified Drive object, while
+   an incomplete probe seeks the staged file to Drive's next byte and resumes
+   without creating another backend file. Consecutive recovery attempts use
+   bounded exponential backoff, malformed or backward ranges fail closed, and
+   an expired session eventually returns a retryable failure so the outer
+   idempotent upload path can re-check existence before opening a replacement
+   session. Regression coverage proves protocol-aligned chunk boundaries,
+   partial second-chunk commitment followed by probe-and-resume, bounded
+   repeated failures, and continued idle-timeout enforcement. README,
+   implementation guidance, and the repository learning now document the
+   recovery contract. Verification passed with `yarn lint:fix`,
+   `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, the 64-test Google Drive module suite,
+   `cargo test --all-targets -- --test-threads=1` (567 passed, 3 ignored across
+   targets), `cargo test --doc` (38 passed), and `git diff --check`. The
+   existing manual checklist still documents real-Drive validation; the gated
+   provider test remained ignored because external credentials were not
+   supplied. The focused reviewer identified a genuine medium-severity
+   reliability and duplicate-write risk, precisely distinguished creating a
+   resumable session from implementing resumable transfer behavior, and
+   requested the decisive chunk, committed-offset, backoff, and interruption
+   tests. With one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, relevant feedback. See
+   Google's [resumable upload
+   guidance](https://developers.google.com/drive/api/guides/manage-uploads#resume-upload).
 
 7. **Medium — Drive error classification omits important quota and permission
    reasons.** Errors that should drive retry, denial, or operator remediation can

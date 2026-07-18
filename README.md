@@ -420,7 +420,10 @@ Google provider connections have a 10-second connect deadline. Large Drive
 uploads and downloads have no total transfer deadline, but must make progress
 at least every 30 seconds: upload body progress and response reads reset the
 upload watchdog, while each received download chunk resets the download
-watchdog. A stalled transfer fails as retryable without waiting indefinitely.
+watchdog. Drive uploads use 256 KiB-aligned resumable chunks; after an
+interruption, LFS Cloud probes the existing session and continues from Drive's
+committed offset with bounded exponential backoff. A transfer that remains
+stalled fails as retryable without waiting indefinitely.
 
 The `.lfsconfig` file points only to the LFS Cloud endpoint. It should not contain Google Drive, S3, or other backend credentials.
 
