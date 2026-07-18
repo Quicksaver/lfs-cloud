@@ -786,6 +786,11 @@ lfs-cloud gc
   remove local cached objects not referenced by any registered repo/worktree
 ```
 
+The versioned worktree registry encodes platform-native path units rather than
+requiring UTF-8. This keeps valid non-UTF-8 Unix worktree and Git-directory
+paths eligible for garbage-collection tracking while retaining read
+compatibility with the original UTF-8-only registry schema.
+
 Hydration and dehydration serialize operations for the same worktree path.
 Their CLI boundary canonicalizes the requested file's parent and proves it
 remains under the discovered worktree. The final path component must be a

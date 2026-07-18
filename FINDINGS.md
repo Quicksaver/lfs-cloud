@@ -1431,11 +1431,36 @@ independently validated or adjudicated.
    finding attributable separately, this was high-quality, security-relevant
    feedback.
 
-9. **Low — The worktree registry cannot represent valid non-UTF-8 Unix roots.**
-   Direct JSON serialization of `PathBuf` rejects such paths
-   (`src/local_cache.rs:232-244`, `src/local_cache.rs:978-1008`). Introduce a
-   versioned platform-safe encoding, or explicitly reject and document the
-   limitation with a targeted error and Unix-only test.
+9. **[DONE] The worktree registry cannot represent valid non-UTF-8 Unix roots**
+   (Low, `src/local_cache.rs`, `README.md`, `IMPLEMENTATION.md`, and
+   `AGENTS.md`): **Valid and actionable.** Registration validation accepted
+   every absolute `PathBuf`, but the v1 registry delegated path serialization
+   directly to Serde JSON, so saving a valid non-UTF-8 Unix worktree failed with
+   `path contains invalid UTF-8 characters`. Registry v2 now encodes native
+   path units explicitly: Unix paths use base64-encoded bytes and Windows paths
+   use base64-encoded little-endian wide units. The loader still accepts v1
+   UTF-8 string paths and normalizes them in memory so the next registry
+   mutation upgrades the file through the existing atomic save path. A
+   test-first Unix regression reproduced the encoding failure and now proves a
+   non-UTF-8 worktree and Git directory can be registered, reloaded, and
+   removed without changing their bytes. Separate compatibility coverage loads
+   a v1 registry and proves a later mutation writes v2. README, implementation
+   guidance, and the repository learning document the native-path and legacy
+   read contract. Verification passed with `cargo fmt --all -- --check`,
+   `yarn lint:fix`, focused worktree-registry tests,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`,
+   `scripts/manual/verify-local-cache-gc.sh`, and `git diff --check`. An
+   additional Windows cross-target check could not reach crate compilation
+   because the installed Rust target lacks the external
+   `x86_64-w64-mingw32-gcc` toolchain required by dependency build scripts;
+   this was not part of the required native verification. The focused reviewer
+   identified a genuine low-severity platform correctness gap, pinpointed
+   Serde's `PathBuf` boundary, and proposed both valid remediation choices. The
+   versioned encoding recommendation led directly to the compatibility-
+   preserving repair and decisive Unix regression; with one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, relevant feedback.
 
 ## Migration
 

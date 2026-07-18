@@ -293,11 +293,13 @@ This asks Git for NUL-delimited tracked paths in every registered worktree,
 keeps cached objects referenced by pointer files whose effective index
 attribute is `filter=lfs`, and removes unreferenced cached objects. Ignored,
 untracked, generated, and tracked non-LFS pointer-shaped files do not pin cache
-objects. If any registered worktree is unavailable, such as on a disconnected
-volume, ordinary garbage collection preserves its registry entry and every
-object that the unavailable worktree might reference. Restore the worktree and
-rerun GC, or use `--prune-unavailable-worktrees` only after confirming that
-every reported unavailable worktree is permanently abandoned.
+objects. Worktree registrations preserve native filesystem path units,
+including non-UTF-8 roots on Unix. If any registered worktree is unavailable,
+such as on a disconnected volume, ordinary garbage collection preserves its
+registry entry and every object that the unavailable worktree might reference.
+Restore the worktree and rerun GC, or use `--prune-unavailable-worktrees` only
+after confirming that every reported unavailable worktree is permanently
+abandoned.
 Garbage collection runs exclusively with respect to cache ingest, hydration,
 materialization, and dehydration so it sees completed object and pointer
 publication. Use `--cache-root` to target a non-default local cache root.

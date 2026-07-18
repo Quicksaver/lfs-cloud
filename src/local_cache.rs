@@ -16,11 +16,21 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+use std::{
+    ffi::OsString,
+    os::unix::ffi::{OsStrExt, OsStringExt},
+};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD};
 use fs4::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+
+#[cfg(windows)]
+use std::{
+    ffi::OsString,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+};
 
 use crate::{LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer};
 
@@ -37,7 +47,8 @@ const OBJECT_SHARD_PREFIX_LENGTH: usize = OBJECT_SHARD_WIDTH * OBJECT_SHARD_LEVE
 const CACHE_OPERATION_LOCK_FILE: &str = "objects.lock";
 const WORKTREE_PATH_LOCKS_DIR: &str = "worktree-path-locks";
 const WORKTREE_REGISTRY_LOCK_FILE: &str = "worktrees.json.lock";
-const WORKTREE_REGISTRY_VERSION: u32 = 1;
+const LEGACY_WORKTREE_REGISTRY_VERSION: u32 = 1;
+const WORKTREE_REGISTRY_VERSION: u32 = 2;
 const MAX_LFS_POINTER_FILE_SIZE: u64 = 64 * 1024;
 #[cfg(unix)]
 const DEFAULT_MATERIALIZED_FILE_MODE: u32 = 0o600;
@@ -298,9 +309,120 @@ pub struct LocalCacheWorktreeRegistration {
     /// Stable repository mapping ID or provider-derived repository identity.
     pub repository_id: String,
     /// Absolute worktree root path.
+    #[serde(
+        serialize_with = "serialize_worktree_registry_path",
+        deserialize_with = "deserialize_worktree_registry_path"
+    )]
     pub worktree_root: PathBuf,
     /// Absolute Git directory path for the worktree.
+    #[serde(
+        serialize_with = "serialize_worktree_registry_path",
+        deserialize_with = "deserialize_worktree_registry_path"
+    )]
     pub git_dir: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SerializedWorktreeRegistryPath {
+    Legacy(PathBuf),
+    Encoded { encoding: String, value: String },
+}
+
+#[derive(Serialize)]
+struct EncodedWorktreeRegistryPath {
+    encoding: &'static str,
+    value: String,
+}
+
+fn serialize_worktree_registry_path<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    #[cfg(unix)]
+    let encoded = EncodedWorktreeRegistryPath {
+        encoding: "unix_bytes_base64",
+        value: BASE64_STANDARD_NO_PAD.encode(path.as_os_str().as_bytes()),
+    };
+
+    #[cfg(windows)]
+    let encoded = {
+        let wide_bytes = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        EncodedWorktreeRegistryPath {
+            encoding: "windows_wide_base64",
+            value: BASE64_STANDARD_NO_PAD.encode(wide_bytes),
+        }
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let encoded = EncodedWorktreeRegistryPath {
+        encoding: "utf8",
+        value: path
+            .to_str()
+            .ok_or_else(|| {
+                serde::ser::Error::custom(
+                    "worktree registry path cannot be represented as UTF-8 on this platform",
+                )
+            })?
+            .to_owned(),
+    };
+
+    encoded.serialize(serializer)
+}
+
+fn deserialize_worktree_registry_path<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match SerializedWorktreeRegistryPath::deserialize(deserializer)? {
+        SerializedWorktreeRegistryPath::Legacy(path) => Ok(path),
+        SerializedWorktreeRegistryPath::Encoded { encoding, value } => {
+            decode_worktree_registry_path::<D::Error>(&encoding, &value)
+        }
+    }
+}
+
+fn decode_worktree_registry_path<E>(encoding: &str, value: &str) -> Result<PathBuf, E>
+where
+    E: serde::de::Error,
+{
+    #[cfg(unix)]
+    if encoding == "unix_bytes_base64" {
+        let bytes = BASE64_STANDARD_NO_PAD
+            .decode(value)
+            .map_err(|_| E::custom("invalid base64 in Unix worktree registry path"))?;
+        return Ok(PathBuf::from(OsString::from_vec(bytes)));
+    }
+
+    #[cfg(windows)]
+    if encoding == "windows_wide_base64" {
+        let bytes = BASE64_STANDARD_NO_PAD
+            .decode(value)
+            .map_err(|_| E::custom("invalid base64 in Windows worktree registry path"))?;
+        let mut chunks = bytes.chunks_exact(2);
+        let wide = chunks
+            .by_ref()
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        if !chunks.remainder().is_empty() {
+            return Err(E::custom(
+                "Windows worktree registry path has an incomplete wide unit",
+            ));
+        }
+        return Ok(PathBuf::from(OsString::from_wide(&wide)));
+    }
+
+    if encoding == "utf8" {
+        return Ok(PathBuf::from(value));
+    }
+
+    Err(E::custom(format!(
+        "unsupported worktree registry path encoding {encoding:?} on this platform"
+    )))
 }
 
 impl LocalCacheWorktreeRegistration {
@@ -378,7 +500,7 @@ impl LocalCacheWorktreeRegistry {
     }
 
     fn validate_for_path(&self, path: &Path) -> LocalCacheResult<()> {
-        if self.version != WORKTREE_REGISTRY_VERSION {
+        if !(LEGACY_WORKTREE_REGISTRY_VERSION..=WORKTREE_REGISTRY_VERSION).contains(&self.version) {
             return Err(LocalCacheError::UnsupportedWorktreeRegistryVersion {
                 path: path.to_path_buf(),
                 version: self.version,
@@ -889,15 +1011,16 @@ impl LocalCacheLayout {
 
         match File::open(&path) {
             Ok(file) => {
-                let registry: LocalCacheWorktreeRegistry =
-                    serde_json::from_reader(file).map_err(|source| {
-                        LocalCacheError::WorktreeRegistryJson {
-                            context: "failed to decode local cache worktree registry",
-                            path: path.clone(),
-                            source,
-                        }
+                let mut registry: LocalCacheWorktreeRegistry = serde_json::from_reader(file)
+                    .map_err(|source| LocalCacheError::WorktreeRegistryJson {
+                        context: "failed to decode local cache worktree registry",
+                        path: path.clone(),
+                        source,
                     })?;
                 registry.validate_for_path(&path)?;
+                // In-memory registries always use the latest schema so the
+                // next mutation upgrades a legacy v1 file atomically.
+                registry.version = WORKTREE_REGISTRY_VERSION;
 
                 Ok(registry)
             }
@@ -3932,7 +4055,94 @@ mod tests {
         assert!(
             fs::read_to_string(layout.worktree_registry_path())
                 .expect("registry should be readable")
-                .contains("\"version\": 1")
+                .contains("\"version\": 2")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_registry_round_trips_non_utf8_unix_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let mut worktree_root = temp.path().as_os_str().as_bytes().to_vec();
+        worktree_root.extend_from_slice(b"/repo-\xff");
+        let worktree_root = PathBuf::from(OsString::from_vec(worktree_root));
+        let registration = LocalCacheWorktreeRegistration::new(
+            "github-main:owner/repo",
+            &worktree_root,
+            worktree_root.join(".git"),
+        )
+        .expect("absolute non-UTF-8 registration should validate");
+
+        layout
+            .register_worktree(registration.clone())
+            .expect("non-UTF-8 worktree should register");
+
+        assert_eq!(
+            layout
+                .load_worktree_registry()
+                .expect("registry should reload")
+                .worktrees(),
+            std::slice::from_ref(&registration)
+        );
+        assert_eq!(
+            layout
+                .remove_worktree_registration(&worktree_root)
+                .expect("non-UTF-8 worktree should remove"),
+            Some(registration)
+        );
+    }
+
+    #[test]
+    fn worktree_registry_loads_legacy_utf8_paths_and_upgrades_on_change() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let existing_root = temp.path().join("existing");
+        let added_root = temp.path().join("added");
+        let legacy_registry = serde_json::json!({
+            "version": 1,
+            "worktrees": [{
+                "repository_id": "github-main:owner/existing",
+                "worktree_root": existing_root,
+                "git_dir": temp.path().join("existing/.git"),
+            }],
+        });
+        write_file(
+            &layout.worktree_registry_path(),
+            &serde_json::to_vec_pretty(&legacy_registry)
+                .expect("legacy registry fixture should encode"),
+        );
+
+        let loaded = layout
+            .load_worktree_registry()
+            .expect("legacy registry should load");
+        assert_eq!(loaded.worktrees()[0].worktree_root, existing_root);
+
+        layout
+            .register_worktree(
+                LocalCacheWorktreeRegistration::new(
+                    "github-main:owner/added",
+                    &added_root,
+                    added_root.join(".git"),
+                )
+                .expect("added registration should validate"),
+            )
+            .expect("registry mutation should upgrade the legacy file");
+
+        let upgraded: serde_json::Value = serde_json::from_slice(
+            &fs::read(layout.worktree_registry_path()).expect("registry should be readable"),
+        )
+        .expect("upgraded registry should decode as JSON");
+        assert_eq!(upgraded["version"], 2);
+        assert_eq!(
+            upgraded["worktrees"][0]["worktree_root"]["encoding"],
+            if cfg!(unix) {
+                "unix_bytes_base64"
+            } else if cfg!(windows) {
+                "windows_wide_base64"
+            } else {
+                "utf8"
+            }
         );
     }
 
