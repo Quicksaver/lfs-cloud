@@ -1935,13 +1935,32 @@ independently validated or adjudicated.
 
 ## Git LFS protocol and provider abstractions
 
-1. **Medium — Batch parsing ignores `hash_algo` and accepts prefixed OIDs.** The
-   protocol parser can accept identities outside the intended Git LFS SHA-256
-   shape (`src/lfs.rs:128-146`, `src/lfs.rs:200-207`,
-   `src/lfs.rs:507-520`, `src/lfs.rs:568-573`). Require the supported hash
-   algorithm, accept only the canonical 64-hex OID representation, and add
-   compatibility tests against the [Git LFS batch
-   API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md).
+1. **[DONE] Batch parsing ignored `hash_algo` and accepted non-canonical OIDs**
+   (Medium, `src/lfs.rs`, `src/lib.rs`, and `AGENTS.md`): **Valid and
+   actionable.** The typed request previously omitted `hash_algo`, so Serde
+   silently ignored an unsupported value, while `LfsOid` deserialization used
+   the tolerant programmatic constructor that trims whitespace, accepts the
+   pointer-only `sha256:` prefix, and normalizes uppercase hex. The official
+   [Git LFS Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md)
+   defines `hash_algo` as optional with a `sha256` default, so omission remains
+   compatible but any other algorithm now fails typed parsing through the new
+   `LfsBatchHashAlgorithm` enum. Serialized OID deserialization now requires
+   exactly 64 raw lowercase hexadecimal characters, while the intentionally
+   tolerant `LfsOid` constructor remains available for internal and pointer
+   contexts. Test-first regressions failed against the ignored algorithm and
+   normalized prefixed/uppercase/whitespace OIDs; they now prove explicit and
+   omitted SHA-256 requests succeed while unsupported algorithms and every
+   non-canonical OID form fail. Public API documentation and the repository
+   learning record the protocol boundary. Verification passed with
+   `yarn lint:fix`, `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (all targets passed; 3 tests
+   ignored), `cargo test --doc` (39 passed), and `git diff --check`. The focused
+   reviewer identified a genuine medium-severity interoperability and identity
+   validation flaw, cited the exact permissive deserialization boundaries, and
+   requested the decisive algorithm/default and canonical-OID compatibility
+   tests. With one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, protocol-relevant feedback.
 
 2. **Medium — The empty canonical Git LFS pointer representation is wrong.** The
    pointer parser/rendering path does not match the specification's canonical

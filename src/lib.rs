@@ -51,9 +51,10 @@ pub use google_drive::{
 pub use init::LfsInitRoute;
 pub use lfs::{
     LFS_BASIC_TRANSFER, LFS_POINTER_VERSION, LfsBatchAction, LfsBatchDownloadObject,
-    LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation, LfsBatchRef, LfsBatchRequest,
-    LfsBatchRequestParseError, LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectError,
-    LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
+    LfsBatchHashAlgorithm, LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation,
+    LfsBatchRef, LfsBatchRequest, LfsBatchRequestParseError, LfsBatchResponse,
+    LfsBatchUploadObject, LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer,
+    parse_lfs_batch_request_json,
 };
 pub use local_cache::{
     DEFAULT_LOCAL_CACHE_HOME_DIR, LOCAL_CACHE_OBJECTS_DIR, LOCAL_CACHE_WORKTREES_FILE,

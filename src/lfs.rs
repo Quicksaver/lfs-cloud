@@ -46,6 +46,13 @@ pub enum LfsObjectError {
         index: usize,
     },
 
+    /// A serialized SHA-256 object identifier was not canonical lowercase hex.
+    #[error("non-canonical SHA-256 object identifier: expected lowercase hex at byte {index}")]
+    NonCanonicalSha256Hex {
+        /// Byte index of the first character outside `0-9` and `a-f`.
+        index: usize,
+    },
+
     /// The pointer file was missing the required version line.
     #[error("LFS pointer is missing the version line")]
     PointerMissingVersion,
@@ -161,6 +168,22 @@ impl LfsOid {
         Ok(Self(hex.to_ascii_lowercase()))
     }
 
+    fn from_canonical_sha256_hex(hex: &str) -> Result<Self, LfsObjectError> {
+        if hex.len() != SHA256_HEX_LENGTH {
+            return Err(LfsObjectError::InvalidSha256Length { actual: hex.len() });
+        }
+
+        if let Some((index, _)) = hex
+            .bytes()
+            .enumerate()
+            .find(|(_, byte)| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte))
+        {
+            return Err(LfsObjectError::NonCanonicalSha256Hex { index });
+        }
+
+        Ok(Self(hex.to_owned()))
+    }
+
     /// Returns the raw 64-character SHA-256 hex digest.
     #[must_use]
     pub fn as_hex(&self) -> &str {
@@ -203,7 +226,7 @@ impl<'de> Deserialize<'de> for LfsOid {
         D: serde::Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
+        Self::from_canonical_sha256_hex(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -504,6 +527,19 @@ pub struct LfsBatchRef {
     pub name: String,
 }
 
+/// Hash algorithm used to identify objects in a Git LFS batch request.
+///
+/// Git LFS currently defines SHA-256 as the default and only supported object
+/// hash algorithm. Modeling the value as an enum makes an unsupported
+/// algorithm fail during typed request parsing instead of being ignored.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LfsBatchHashAlgorithm {
+    /// SHA-256 object identities represented by 64 lowercase hex characters.
+    #[default]
+    Sha256,
+}
+
 /// Git LFS batch request payload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LfsBatchRequest {
@@ -515,6 +551,11 @@ pub struct LfsBatchRequest {
     /// Optional ref context for future ref-aware authorization.
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub ref_context: Option<LfsBatchRef>,
+    /// Hash algorithm used by every object identity in the request.
+    ///
+    /// Omitted values default to SHA-256 as required by the Git LFS Batch API.
+    #[serde(default)]
+    pub hash_algo: LfsBatchHashAlgorithm,
     /// Objects included in this batch request.
     pub objects: Vec<LfsObject>,
 }
@@ -535,8 +576,9 @@ pub enum LfsBatchRequestParseError {
 /// Parses a Git LFS batch API request body.
 ///
 /// The Git LFS batch endpoint accepts JSON whose `operation` is `download` or
-/// `upload`, whose objects carry SHA-256 OIDs and exact sizes, and whose
-/// optional `ref` field is preserved for later authorization decisions.
+/// `upload`, whose optional `hash_algo` is SHA-256, whose objects carry
+/// canonical raw lowercase SHA-256 OIDs and exact sizes, and whose optional
+/// `ref` field is preserved for later authorization decisions.
 ///
 /// # Errors
 ///
@@ -970,9 +1012,9 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchObjectResponse, LfsBatchOperation,
-        LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectError, LfsObjectSize, LfsOid,
-        LfsPointer, parse_lfs_batch_request_json,
+        LfsBatchDownloadObject, LfsBatchHashAlgorithm, LfsBatchObjectError, LfsBatchObjectResponse,
+        LfsBatchOperation, LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectError,
+        LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
     };
 
     const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1407,6 +1449,7 @@ mod tests {
                 "operation": "download",
                 "transfers": ["basic"],
                 "ref": { "name": "refs/heads/main" },
+                "hash_algo": "sha256",
                 "objects": [
                     {
                         "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1418,6 +1461,7 @@ mod tests {
         .expect("valid batch request should parse");
 
         assert_eq!(request.operation, LfsBatchOperation::Download);
+        assert_eq!(request.hash_algo, LfsBatchHashAlgorithm::Sha256);
         assert_eq!(request.transfers, ["basic"]);
         assert_eq!(
             request
@@ -1429,6 +1473,58 @@ mod tests {
         assert_eq!(request.objects.len(), 1);
         assert_eq!(request.objects[0].oid.as_hex(), OID);
         assert_eq!(request.objects[0].size.bytes(), 42);
+    }
+
+    #[test]
+    fn batch_request_json_defaults_to_sha256_and_rejects_unsupported_hash_algorithms() {
+        let omitted_hash_algorithm = br#"{
+            "operation": "download",
+            "objects": [
+                {
+                    "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 42
+                }
+            ]
+        }"#;
+        let unsupported_hash_algorithm = br#"{
+            "operation": "download",
+            "hash_algo": "sha512",
+            "objects": [
+                {
+                    "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 42
+                }
+            ]
+        }"#;
+
+        assert_eq!(
+            parse_lfs_batch_request_json(omitted_hash_algorithm)
+                .expect("omitted hash algorithm should default to SHA-256")
+                .hash_algo,
+            LfsBatchHashAlgorithm::Sha256
+        );
+        assert!(parse_lfs_batch_request_json(unsupported_hash_algorithm).is_err());
+    }
+
+    #[test]
+    fn batch_request_json_requires_canonical_sha256_oids() {
+        for oid in [
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+        ] {
+            let request = serde_json::json!({
+                "operation": "download",
+                "hash_algo": "sha256",
+                "objects": [{ "oid": oid, "size": 42 }]
+            });
+
+            assert!(
+                parse_lfs_batch_request_json(serde_json::to_vec(&request).unwrap()).is_err(),
+                "batch request accepted non-canonical OID {oid:?}"
+            );
+        }
     }
 
     #[test]
