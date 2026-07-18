@@ -1132,11 +1132,24 @@ independently validated or adjudicated.
    assessed here and no invalid finding attributable separately, this was
    high-quality, relevant feedback.
 
-6. **Medium — The manual hydrate/dehydrate verification script cannot exercise
-   the workflow.** Its fixture is not initialized as a Git repository, while the
-   CLI requires worktree registration (`scripts/manual/verify-local-cache-cli.sh:21-52`,
-   `src/cli.rs:728-753`). Build a real temporary Git/LFS repository and make the
-   script fail on unmet prerequisites instead of reporting misleading success.
+6. **[DONE] The manual hydrate/dehydrate verification script could not exercise
+   the workflow** (Medium, `scripts/manual/verify-local-cache-cli.sh`): **Valid
+   and actionable.** The verifier previously wrote a pointer into an ordinary
+   temporary directory, so the CLI failed during worktree registration before
+   either local-cache operation ran. It now fails up front when Cargo, Git, Git
+   LFS, or Python 3 is unavailable; initializes a temporary Git repository with
+   an `origin`; installs Git LFS locally; tracks and commits the fixture; and
+   obtains the canonical pointer from Git's index. The verifier replaces the
+   hydrated worktree file with that pointer, proves `hydrate` restores the
+   committed bytes, then proves `dehydrate` restores the exact indexed pointer
+   while preserving the verified cache object. Verification passed with
+   `bash -n scripts/manual/verify-local-cache-cli.sh`,
+   `scripts/manual/verify-local-cache-cli.sh`, `yarn lint:fix`, and
+   `git diff --check`. The focused reviewer identified a genuine
+   medium-severity manual-verification gap, pinpointed the missing repository
+   prerequisite, and prescribed both a realistic Git LFS fixture and fail-fast
+   prerequisite handling; with one valid finding assessed here and no invalid
+   finding attributable separately, this was high-quality, relevant feedback.
 
 7. **Low — Browser launch during login can block the CLI.** The browser command
    is invoked synchronously and may not return on some desktop integrations

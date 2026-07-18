@@ -5,6 +5,21 @@ project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo is required to run the manual local-cache CLI verifier" >&2
+  exit 1
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "git is required to run the manual local-cache CLI verifier" >&2
+  exit 1
+fi
+
+if ! git lfs version >/dev/null 2>&1; then
+  echo "git lfs is required to run the manual local-cache CLI verifier" >&2
+  exit 1
+fi
+
 # Python 3 is used only to create binary fixtures and compute the expected OID.
 python_bin="$(command -v python3 || command -v python || true)"
 
@@ -22,34 +37,39 @@ repo_dir="$tmp_dir/repo"
 cache_root="$tmp_dir/cache"
 payload_file="$tmp_dir/payload.bin"
 oid_file="$tmp_dir/oid"
+pointer_file="$tmp_dir/pointer"
 
-"$python_bin" - "$repo_dir" "$cache_root" "$payload_file" "$oid_file" <<'PY'
+"$python_bin" - "$cache_root" "$payload_file" "$oid_file" <<'PY'
 import hashlib
 import pathlib
 import sys
 
-repo_dir = pathlib.Path(sys.argv[1])
-cache_root = pathlib.Path(sys.argv[2])
-payload_file = pathlib.Path(sys.argv[3])
-oid_file = pathlib.Path(sys.argv[4])
+cache_root = pathlib.Path(sys.argv[1])
+payload_file = pathlib.Path(sys.argv[2])
+oid_file = pathlib.Path(sys.argv[3])
 payload = b"lfs-cloud hydrate/dehydrate CLI manual verifier\n"
 oid = hashlib.sha256(payload).hexdigest()
-size = len(payload)
 cache_path = cache_root / "objects" / oid[:2] / oid[2:4] / oid
-worktree_file = repo_dir / "asset" / "model.bin"
-pointer = (
-    "version https://git-lfs.github.com/spec/v1\n"
-    f"oid sha256:{oid}\n"
-    f"size {size}\n"
-)
 
 cache_path.parent.mkdir(parents=True, exist_ok=True)
-worktree_file.parent.mkdir(parents=True, exist_ok=True)
 cache_path.write_bytes(payload)
 payload_file.write_bytes(payload)
-worktree_file.write_text(pointer, encoding="utf-8")
 oid_file.write_text(oid, encoding="utf-8")
 PY
+
+git -C "$tmp_dir" init --quiet repo
+git -C "$repo_dir" config user.name "LFS Cloud Manual Verifier"
+git -C "$repo_dir" config user.email "lfs-cloud-manual@example.invalid"
+git -C "$repo_dir" config commit.gpgSign false
+git -C "$repo_dir" remote add origin git@github.com:lfs-cloud/manual-verifier.git
+git -C "$repo_dir" lfs install --local >/dev/null
+git -C "$repo_dir" lfs track "asset/model.bin" >/dev/null
+mkdir -p "$repo_dir/asset"
+cp "$payload_file" "$repo_dir/asset/model.bin"
+git -C "$repo_dir" add .gitattributes asset/model.bin
+git -C "$repo_dir" commit --quiet -m "Add Git LFS fixture"
+git -C "$repo_dir" show HEAD:asset/model.bin >"$pointer_file"
+cp "$pointer_file" "$repo_dir/asset/model.bin"
 
 (
   cd "$repo_dir"
@@ -67,7 +87,7 @@ cmp "$payload_file" "$repo_dir/asset/model.bin" >/dev/null
 
 oid="$(cat "$oid_file")"
 cmp "$payload_file" "$cache_root/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
-grep -F "oid sha256:$oid" "$repo_dir/asset/model.bin" >/dev/null
+cmp "$pointer_file" "$repo_dir/asset/model.bin" >/dev/null
 grep -F "hydrated" "$tmp_dir/hydrate-output" >/dev/null
 grep -F "asset/model.bin" "$tmp_dir/hydrate-output" >/dev/null
 grep -F "dehydrated" "$tmp_dir/dehydrate-output" >/dev/null
