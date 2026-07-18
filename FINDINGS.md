@@ -1082,10 +1082,32 @@ independently validated or adjudicated.
    behavior; with one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, relevant feedback.
 
-4. **Medium — The login prompt echoes tokens and reads input without a bound.**
-   Secret input can appear on the terminal and an unbounded line can consume
-   memory (`src/cli.rs:436-450`). Disable terminal echo for secret entry, cap
-   input length, trim safely, and test both terminal and piped-input behavior.
+4. **[DONE] The login prompt echoed tokens and read input without a bound**
+   (Medium, `src/cli.rs`, `Cargo.toml`, `README.md`, `IMPLEMENTATION.md`, and
+   `AGENTS.md`): **Valid and actionable.** Production used unbounded
+   `BufRead::read_line` for the local bearer token and made no distinction
+   between an interactive terminal and piped automation input. Login now
+   detects an interactive stdin, reads through a cross-platform terminal
+   handle with echo disabled, restores the prior echo state before continuing,
+   and retains the terminal handle's drop-time restoration as a failure-path
+   fallback. Interactive and piped paths share a reader that retains at most
+   1,027 bytes, rejects raw token input above the 1,024-byte session-token
+   limit, accepts LF and CRLF delimiters, trims surrounding ASCII whitespace,
+   and rejects invalid UTF-8 without reflecting input. Deterministic tests prove
+   that terminal reads occur only while echo is disabled and that echo is
+   restored, while piped-input tests cover the exact limit, bounded rejection,
+   CRLF, and safe trimming. User and implementation documentation now describe
+   the interactive and automation contracts, and the repository learning
+   records why both paths must share the same bounded reader. Verification
+   passed with `yarn lint:fix`, `cargo fmt`, focused login tests,
+   `scripts/manual/verify-login-command.sh`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`.
+   The focused reviewer identified a genuine medium-severity local secret
+   exposure and memory-boundary flaw, specified the relevant terminal and
+   piped cases, and requested the decisive regressions; with one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, security-relevant feedback.
 
 5. **Medium — URL safety rules differ between `init` and server configuration.**
    An endpoint accepted in one path can be rejected or interpreted differently

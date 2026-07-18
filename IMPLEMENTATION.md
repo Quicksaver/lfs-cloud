@@ -480,6 +480,13 @@ Preferred flow:
 6. Git LFS uses that credential for batch/upload/download requests.
 ```
 
+Interactive CLI token entry must disable terminal echo before reading the
+local bearer token and restore the previous terminal mode afterward. Piped
+input remains available for automation. Both paths enforce the local session
+token's 1,024-byte maximum while reading, rather than allocating an unbounded
+line, strip the final LF or CRLF delimiter, and trim only surrounding ASCII
+whitespace before validation.
+
 GitHub login must return the authenticated account's immutable numeric user ID.
 The local session retains that ID, and repository permission checks compare it
 with the collaborator response's nested user ID before granting access. The

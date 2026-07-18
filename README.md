@@ -185,9 +185,12 @@ lfs-cloud login --server http://127.0.0.1:8080
 
 This opens the running server's GitHub OAuth login URL for the current
 repository. After the browser callback returns JSON, paste the `lfs_token`
-value into the CLI prompt. The CLI stores that local LFS Cloud token in Git's
-credential helper for the repository-scoped LFS URL. It does not store the
-GitHub OAuth access token in Git credentials. The server binds the local
+value into the CLI prompt. Interactive terminal entry disables echo while the
+token is read. Piped input remains supported for automation; both input paths
+accept at most 1,024 token bytes and remove only the final LF or CRLF line
+ending before trimming surrounding ASCII whitespace. The CLI then stores that
+local LFS Cloud token in Git's repository-scoped credential helper. It does not
+store the GitHub OAuth access token in Git credentials. The server binds the local
 session to GitHub's immutable numeric user ID and rejects repository permission
 responses for a different account, even if the mutable login was reused.
 Each browser authorization uses S256 PKCE; the server retains the one-time code

@@ -12,7 +12,7 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     future::Future,
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Component, Path, PathBuf},
     process::{Child, Command as ProcessCommand, ExitStatus, Stdio},
@@ -52,6 +52,7 @@ const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
 const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
 const MAX_CLI_POINTER_CANDIDATE_SIZE: u64 = 64 * 1024;
+const MAX_LOGIN_TOKEN_INPUT_BYTES: usize = 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "lfs-cloud", version, about, propagate_version = true)]
@@ -346,10 +347,15 @@ fn run_init_to_stdout(command: InitCommand) -> anyhow::Result<()> {
 }
 
 fn run_login_to_stdio(command: LoginCommand) -> anyhow::Result<()> {
-    let mut input = io::stdin().lock();
+    let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
 
-    run_login(command, &mut input, &mut stdout)
+    if stdin.is_terminal() {
+        run_login_with_token_reader(command, &mut stdout, read_login_token_from_terminal)
+    } else {
+        let mut input = stdin.lock();
+        run_login(command, &mut input, &mut stdout)
+    }
 }
 
 fn run_logout_to_stdout(command: LogoutCommand) -> anyhow::Result<()> {
@@ -456,30 +462,67 @@ where
     R: BufRead,
     W: Write,
 {
+    run_login_with_token_reader(command, output, || read_bounded_login_token(input))
+}
+
+fn run_login_with_token_reader<W, T>(
+    command: LoginCommand,
+    output: &mut W,
+    read_token: T,
+) -> anyhow::Result<()>
+where
+    W: Write,
+    T: FnMut() -> CliResult<String>,
+{
     let current_dir = std::env::current_dir().context("failed to determine current directory")?;
 
-    run_login_from_dir(
+    run_login_from_dir_with_token_reader(
         command,
         &current_dir,
-        input,
         output,
+        read_token,
         open_url_in_default_browser,
         |approval| approval.approve_in_dir(&current_dir),
     )
     .map_err(anyhow::Error::from)
 }
 
+#[cfg(test)]
 fn run_login_from_dir<R, W, O, A>(
     command: LoginCommand,
     start_dir: impl AsRef<Path>,
     input: &mut R,
     output: &mut W,
-    mut open_browser: O,
-    mut approve_credential: A,
+    open_browser: O,
+    approve_credential: A,
 ) -> CliResult<()>
 where
     R: BufRead,
     W: Write,
+    O: FnMut(&str) -> CliResult<()>,
+    A: FnMut(GitCredentialApproval) -> CliResult<()>,
+{
+    run_login_from_dir_with_token_reader(
+        command,
+        start_dir,
+        output,
+        || read_bounded_login_token(input),
+        open_browser,
+        approve_credential,
+    )
+}
+
+fn run_login_from_dir_with_token_reader<W, T, O, A>(
+    command: LoginCommand,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+    mut read_token: T,
+    mut open_browser: O,
+    mut approve_credential: A,
+) -> CliResult<()>
+where
+    W: Write,
+    T: FnMut() -> CliResult<String>,
     O: FnMut(&str) -> CliResult<()>,
     A: FnMut(GitCredentialApproval) -> CliResult<()>,
 {
@@ -509,15 +552,11 @@ where
     write!(output, "lfs_token: ").map_err(output_error)?;
     output.flush().map_err(output_error)?;
 
-    let mut token = String::new();
-    input.read_line(&mut token).map_err(|source| CliError::Io {
-        context: "failed to read lfs_token from stdin".to_owned(),
-        source,
+    let token = read_token()?;
+    writeln!(output).map_err(output_error)?;
+    let token = LfsSessionToken::from_secret(token).map_err(|_| CliError::InvalidArguments {
+        message: "lfs_token was invalid or blank".to_owned(),
     })?;
-    let token =
-        LfsSessionToken::from_secret(token.trim()).map_err(|_| CliError::InvalidArguments {
-            message: "lfs_token was invalid or blank".to_owned(),
-        })?;
     let approval = GitCredentialApproval::new_with_insecure_http(
         &route.lfs_url,
         token,
@@ -536,6 +575,104 @@ where
     writeln!(output, "  username: {approval_username}").map_err(output_error)?;
 
     Ok(())
+}
+
+trait LoginTerminal: BufRead {
+    fn is_echo_enabled(&self) -> io::Result<bool>;
+
+    fn set_echo_enabled(&mut self, enabled: bool) -> io::Result<()>;
+}
+
+impl LoginTerminal for terminal_prompt::Terminal {
+    fn is_echo_enabled(&self) -> io::Result<bool> {
+        terminal_prompt::Terminal::is_echo_enabled(self)
+    }
+
+    fn set_echo_enabled(&mut self, enabled: bool) -> io::Result<()> {
+        if enabled {
+            terminal_prompt::Terminal::enable_echo(self)
+        } else {
+            terminal_prompt::Terminal::disable_echo(self)
+        }
+    }
+}
+
+fn read_login_token_from_terminal() -> CliResult<String> {
+    let mut terminal = terminal_prompt::Terminal::open().map_err(|source| CliError::Io {
+        context: "failed to open terminal for hidden lfs_token input".to_owned(),
+        source,
+    })?;
+
+    read_hidden_login_token(&mut terminal)
+}
+
+fn read_hidden_login_token<T>(terminal: &mut T) -> CliResult<String>
+where
+    T: LoginTerminal,
+{
+    let echo_was_enabled = terminal
+        .is_echo_enabled()
+        .map_err(|source| terminal_echo_error("inspect", source))?;
+    if echo_was_enabled {
+        terminal
+            .set_echo_enabled(false)
+            .map_err(|source| terminal_echo_error("disable", source))?;
+    }
+
+    let read_result = read_bounded_login_token(terminal);
+    let restore_result = if echo_was_enabled {
+        terminal
+            .set_echo_enabled(true)
+            .map_err(|source| terminal_echo_error("restore", source))
+    } else {
+        Ok(())
+    };
+
+    match (read_result, restore_result) {
+        (Ok(token), Ok(())) => Ok(token),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn terminal_echo_error(action: &str, source: io::Error) -> CliError {
+    CliError::Io {
+        context: format!("failed to {action} terminal echo for lfs_token input"),
+        source,
+    }
+}
+
+fn read_bounded_login_token<R>(input: &mut R) -> CliResult<String>
+where
+    R: BufRead + ?Sized,
+{
+    let maximum_line_bytes = MAX_LOGIN_TOKEN_INPUT_BYTES + 2;
+    let mut bytes = Vec::with_capacity(maximum_line_bytes + 1);
+    input
+        .take((maximum_line_bytes + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|source| CliError::Io {
+            context: "failed to read lfs_token input".to_owned(),
+            source,
+        })?;
+
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > MAX_LOGIN_TOKEN_INPUT_BYTES {
+        return Err(CliError::InvalidArguments {
+            message: format!("lfs_token input must not exceed {MAX_LOGIN_TOKEN_INPUT_BYTES} bytes"),
+        });
+    }
+
+    String::from_utf8(bytes)
+        .map(|token| token.trim_ascii().to_owned())
+        .map_err(|_| CliError::InvalidArguments {
+            message: "lfs_token input must be valid UTF-8".to_owned(),
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2813,14 +2950,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, LogoutCommand,
-        MigrateCommand, PullCommand, SessionRevocationStatus, StatusCommand,
-        current_checkout_lfs_pointer_files, current_checkout_lfs_pointer_scan, dispatch,
-        is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
-        run_bounded_child_command, run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir,
-        run_init_from_dir, run_login_from_dir, run_logout_from_dir, run_migrate_from_dir,
-        run_pull_from_dir, run_status_from_dir, sanitize_browser_stderr, tracing_config,
-        validate_status_storage, write_init_change,
+        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, LoginTerminal,
+        LogoutCommand, MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, PullCommand,
+        SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
+        current_checkout_lfs_pointer_scan, dispatch, is_git_worktree_discovery_error,
+        login_url_for_server, probe_server_reachable, read_bounded_login_token,
+        read_hidden_login_token, run_bounded_child_command, run_dehydrate_from_dir,
+        run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir, run_login_from_dir,
+        run_logout_from_dir, run_migrate_from_dir, run_pull_from_dir, run_status_from_dir,
+        sanitize_browser_stderr, tracing_config, validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
@@ -5352,6 +5490,86 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("browser open skipped"));
+    }
+
+    #[test]
+    fn piped_login_token_input_is_bounded_and_trimmed() {
+        let maximum_token = "x".repeat(MAX_LOGIN_TOKEN_INPUT_BYTES);
+        let mut input = io::Cursor::new(format!("{maximum_token}\r\n"));
+
+        assert_eq!(
+            read_bounded_login_token(&mut input).expect("maximum token should be accepted"),
+            maximum_token
+        );
+
+        let mut oversized = io::Cursor::new("x".repeat(MAX_LOGIN_TOKEN_INPUT_BYTES + 1));
+        let error = read_bounded_login_token(&mut oversized)
+            .expect_err("oversized piped input should be rejected");
+
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments { message }
+                if message.contains("must not exceed")
+        ));
+        assert!(oversized.position() <= (MAX_LOGIN_TOKEN_INPUT_BYTES + 3) as u64);
+
+        let mut padded = io::Cursor::new(b" local-lfs-token \n".to_vec());
+        assert_eq!(
+            read_bounded_login_token(&mut padded)
+                .expect("line reader should trim pasted ASCII whitespace"),
+            "local-lfs-token"
+        );
+    }
+
+    struct TrackingLoginTerminal {
+        input: io::Cursor<Vec<u8>>,
+        echo_enabled: bool,
+        read_while_hidden: bool,
+    }
+
+    impl io::Read for TrackingLoginTerminal {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.read_while_hidden |= !self.echo_enabled;
+            self.input.read(buffer)
+        }
+    }
+
+    impl io::BufRead for TrackingLoginTerminal {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.read_while_hidden |= !self.echo_enabled;
+            self.input.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.input.consume(amount);
+        }
+    }
+
+    impl LoginTerminal for TrackingLoginTerminal {
+        fn is_echo_enabled(&self) -> io::Result<bool> {
+            Ok(self.echo_enabled)
+        }
+
+        fn set_echo_enabled(&mut self, enabled: bool) -> io::Result<()> {
+            self.echo_enabled = enabled;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn terminal_login_token_input_is_hidden_and_restores_echo() {
+        let mut terminal = TrackingLoginTerminal {
+            input: io::Cursor::new(b"terminal-lfs-token\n".to_vec()),
+            echo_enabled: true,
+            read_while_hidden: false,
+        };
+
+        assert_eq!(
+            read_hidden_login_token(&mut terminal).expect("hidden terminal token should be read"),
+            "terminal-lfs-token"
+        );
+        assert!(terminal.read_while_hidden);
+        assert!(terminal.echo_enabled);
     }
 
     #[test]
