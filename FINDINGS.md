@@ -2184,10 +2184,28 @@ independently validated or adjudicated.
    no invalid finding attributable separately, this was high-quality, relevant
    feedback.
 
-9. **Medium — Upload batch lookups are sequential while downloads are bounded
-   concurrent.** Large upload batches incur avoidable provider latency
-   (`src/server.rs:1656-1677`, `src/server.rs:1687-1707`). Use the same bounded
-   concurrency and stable result ordering for both operations.
+9. **[DONE] Upload batch lookups are sequential while downloads are bounded
+   concurrent** (Medium, `src/server.rs`): **No longer actionable; already
+   addressed by an earlier review solution.** Commit `c0040ed7` fixed the
+   broader provider-work amplification finding before this item was assessed.
+   The current upload and download batch builders both deduplicate requested
+   objects through the same `BTreeSet` pipeline, perform storage lookups with
+   `buffered(BATCH_STORAGE_LOOKUP_CONCURRENCY)`, collect outcomes by object
+   identity, and rebuild the response by iterating the original request. Upload
+   lookups therefore have the same bounded concurrency as downloads while
+   preserving duplicate entries and stable request order. Every lookup also
+   acquires the shared configurable provider-call semaphore, so concurrency is
+   bounded both within a batch and across the server. The existing batch tests
+   cover deduplicated stable responses and the configured provider-call peak;
+   focused batch tests passed on the current tree. No additional code, test, or
+   learning change is warranted because the behavior and its regression
+   boundary are already implemented and documented by the broader completed
+   finding. The reviewer identified a genuine medium-severity latency issue in
+   the code originally reviewed and prescribed the correct symmetry and
+   ordering requirements. The feedback was accurate and relevant, but it
+   became a duplicate of a broader high-severity finding whose solution already
+   covered it; this was good focused feedback with no remaining actionable
+   defect in the current tree.
 
 10. **Low — Provider tests are tautological and fake an inaccurate permission
     hierarchy.** Tests mostly restate mock behavior rather than enforce a
