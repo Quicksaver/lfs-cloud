@@ -206,8 +206,10 @@ configuration, verifies that the configured server URL is reachable at the TCP
 level, confirms that Git's credential helper can return a local `lfs-cloud`
 token for the repository LFS URL, validates that the configured Google Drive
 credential reference can be loaded, and reports whether the local cache objects
-directory already exists. Use `--server` to check a different reachable server
-base URL, or `--cache-root` to inspect a non-default local cache root.
+directory already exists. Credential lookup is non-interactive: a cache miss
+fails without opening terminal, askpass, or credential-manager prompts. Use
+`--server` to check a different reachable server base URL, or `--cache-root` to
+inspect a non-default local cache root.
 
 ### Hydrate Cached Files
 

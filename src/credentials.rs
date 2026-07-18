@@ -180,6 +180,16 @@ impl GitCredentialLookup {
     ) -> CliResult<GitCredential> {
         let command_name = "git credential fill";
         let mut command = git_command(git_program.as_ref());
+        // A lookup is a read-only cache probe. Disable every standard Git and
+        // Git Credential Manager prompt path so a miss fails instead of
+        // blocking an unattended CLI command or opening credential UI.
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_ASKPASS")
+            .env_remove("SSH_ASKPASS")
+            .env("GCM_INTERACTIVE", "0")
+            .env("GCM_GUI_PROMPT", "0")
+            .args(["-c", "core.askPass=", "-c", "credential.interactive=false"]);
         let mut child = command
             .args(["credential", "fill"])
             .stdin(Stdio::piped())
@@ -1443,7 +1453,9 @@ mod tests {
             temp.path(),
             &format!(
                 r#"#!/bin/sh
-if [ "$1" != "credential" ] || [ "$2" != "fill" ]; then
+if [ "$1" != "-c" ] || [ "$2" != "core.askPass=" ] ||
+   [ "$3" != "-c" ] || [ "$4" != "credential.interactive=false" ] ||
+   [ "$5" != "credential" ] || [ "$6" != "fill" ]; then
   echo "unexpected args: $*" >&2
   exit 64
 fi
@@ -1634,6 +1646,44 @@ exit 1
         assert!(display.contains("credential helper stderr suppressed"));
         assert!(!display.contains("credential helper rejected"));
         assert!(!display.contains("stored-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lookup_cache_miss_disables_interactive_prompts() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let environment_path = temp.path().join("environment.txt");
+        let fake_git = write_fake_git(
+            temp.path(),
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' \
+  "$GIT_TERMINAL_PROMPT" \
+  "${{GIT_ASKPASS-unset}}" \
+  "${{SSH_ASKPASS-unset}}" \
+  "$GCM_INTERACTIVE" \
+  "$GCM_GUI_PROMPT" \
+  "$*" > '{}'
+cat >/dev/null
+exit 1
+"#,
+                environment_path.display()
+            ),
+        );
+        let lookup =
+            GitCredentialLookup::new("https://lfs.example.com/github.com/owner/repo.git/info/lfs")
+                .expect("lookup should parse");
+
+        let error = lookup
+            .lookup_with_git_program(&fake_git)
+            .expect_err("cache miss should return without prompting");
+
+        assert!(matches!(error, CliError::ExternalCommand { .. }));
+        assert_eq!(
+            fs::read_to_string(environment_path)
+                .expect("fake Git environment capture should be readable"),
+            "0\nunset\nunset\n0\n0\n-c core.askPass= -c credential.interactive=false credential fill\n"
+        );
     }
 
     #[test]

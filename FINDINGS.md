@@ -249,11 +249,28 @@ independently validated or adjudicated.
     invalid finding attributable separately, this was high-quality,
     security-relevant feedback.
 
-11. **Medium — Credential lookup is not non-interactive.** A cache miss can
-    invoke terminal prompting, askpass, or credential-manager UI
-    (`src/credentials.rs:166-196`, `src/credentials.rs:877-879`). Set
-    `GIT_TERMINAL_PROMPT=0` and appropriate askpass/GCM controls, then add a
-    cache-miss regression test.
+11. **[DONE] Credential lookup was not non-interactive** (Medium,
+    `src/credentials.rs`, `README.md`, and `AGENTS.md`): **Valid and
+    actionable.** Credential fill previously inherited the caller's prompt
+    environment, so a local-token cache miss could invoke Git's configured
+    askpass program, fall back to a terminal prompt, or allow Git Credential
+    Manager to open terminal or GUI authentication. Lookup now sets
+    `GIT_TERMINAL_PROMPT=0`, removes inherited `GIT_ASKPASS` and `SSH_ASKPASS`,
+    overrides `core.askPass` to empty for the command, and disables GCM through
+    both `credential.interactive=false` and the `GCM_INTERACTIVE=0` and
+    `GCM_GUI_PROMPT=0` environment controls. A cache-miss regression captures
+    the exact child-process arguments and environment, returns no credential,
+    and proves lookup fails immediately without retaining any prompt path. The
+    README now documents that status credential checks are non-interactive, and
+    the repository learning records why terminal, askpass, and GCM controls
+    must be disabled together. Verification passed with `cargo fmt`,
+    `yarn lint:fix`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+    focused reviewer identified a genuine medium-severity unattended-command
+    availability flaw and prescribed the correct layered prompt controls plus
+    the decisive cache-miss regression; with one valid finding assessed here
+    and no invalid finding attributable separately, this was high-quality,
+    relevant feedback.
 
 12. **Medium — The OAuth authorization flow omits PKCE.** Authorization requests
     send state and use a client secret but no code challenge or verifier
