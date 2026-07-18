@@ -1641,11 +1641,33 @@ independently validated or adjudicated.
    issue completely; with one valid finding and no invalid finding attributable
    separately, this was high-quality, relevant feedback.
 
-7. **Medium — Dry-run upload counts ignore objects already present at the
-   destination.** Planning reports every available source object as an upload,
-   although execution skips existing targets (`src/cli.rs:1162-1232`,
-   `src/migration.rs:646-650`). Perform bounded target existence checks and
-   report new, existing, missing, and unknown counts separately.
+7. **[DONE] Dry-run upload counts ignored objects already present at the
+   destination** (Medium, `src/cli.rs`, `README.md`, `IMPLEMENTATION.md`, and
+   `AGENTS.md`): **Valid and actionable.** Planning previously labeled every
+   locally available source object as ready to upload and every locally missing
+   object as an upload after fetch, although execution first checks destination
+   storage and skips objects already present there. The suggested bounded live
+   existence checks conflict with the established dry-run guarantee that the
+   command does not contact the configured storage provider, so the report now
+   keeps source availability and destination existence separate: local and
+   locally missing source counts remain explicit, while every discovered target
+   object is reported as unknown and the output explains that execution performs
+   the existence check. Confirmed-new and confirmed-existing counts remain zero
+   rather than being inferred from source availability. Regression coverage
+   proves locally present, locally missing, and listing-capped plans all retain
+   accurate counts, disclose the unprobed target boundary, and never use the
+   misleading `objects uploaded` label. README, implementation guidance,
+   checklist wording, and the repository learning now preserve this contract.
+   Verification passed with `cargo test migrate_dry_run -- --nocapture`,
+   `cargo fmt`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine medium-severity
+   planning-accuracy flaw and correctly required distinct destination states.
+   Its live-probe recommendation overlooked the documented no-provider-contact
+   dry-run boundary, but the requested unknown state supplied the compatible
+   remediation; with one valid finding assessed here and no invalid finding
+   attributable separately, this was high-quality, relevant feedback.
 
 8. **High — History discovery is O(commits × full tree) and launches many Git
    subprocesses.** Large repositories can make all-ref migration impractical

@@ -1629,7 +1629,16 @@ where
     )?;
     writeln!(
         output,
-        "  objects uploaded: {available_count} ready to upload, {fetch_count} after fetch"
+        "  source objects: {available_count} local, {fetch_count} missing locally"
+    )?;
+    writeln!(
+        output,
+        "  target objects: 0 confirmed new, 0 confirmed existing, {} unknown",
+        report.scan.objects.len()
+    )?;
+    writeln!(
+        output,
+        "    target storage not probed during dry-run; execution checks existence before upload"
     )?;
     writeln!(
         output,
@@ -4449,7 +4458,12 @@ mod tests {
         assert!(rendered.contains("pointer files: 1"));
         assert!(rendered.contains("objects discovered: 1"));
         assert!(rendered.contains("objects fetched: 0 would fetch, 1 already local"));
-        assert!(rendered.contains("objects uploaded: 1 ready to upload, 0 after fetch"));
+        assert!(rendered.contains("source objects: 1 local, 0 missing locally"));
+        assert!(
+            rendered.contains("target objects: 0 confirmed new, 0 confirmed existing, 1 unknown")
+        );
+        assert!(rendered.contains("target storage not probed during dry-run"));
+        assert!(!rendered.contains("objects uploaded:"));
         assert!(rendered.contains("local readiness checks (no remote access probes):"));
         assert!(rendered.contains("source-config"));
         assert!(rendered.contains("server-tcp"));
@@ -4592,7 +4606,12 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("objects fetched: 1 would fetch, 0 already local"));
-        assert!(rendered.contains("objects uploaded: 0 ready to upload, 1 after fetch"));
+        assert!(rendered.contains("source objects: 0 local, 1 missing locally"));
+        assert!(
+            rendered.contains("target objects: 0 confirmed new, 0 confirmed existing, 1 unknown")
+        );
+        assert!(rendered.contains("target storage not probed during dry-run"));
+        assert!(!rendered.contains("objects uploaded:"));
         assert!(rendered.contains("server-tcp warning"));
     }
 
@@ -4777,7 +4796,11 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("objects discovered: 101"));
         assert!(rendered.contains("... 1 more objects omitted"));
-        assert!(rendered.contains("objects uploaded: 0 ready to upload, 101 after fetch"));
+        assert!(
+            rendered.contains("target objects: 0 confirmed new, 0 confirmed existing, 101 unknown")
+        );
+        assert!(rendered.contains("target storage not probed during dry-run"));
+        assert!(!rendered.contains("objects uploaded:"));
     }
 
     #[test]

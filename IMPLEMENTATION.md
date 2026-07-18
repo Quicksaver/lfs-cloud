@@ -584,7 +584,8 @@ lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 - LFS pointers discovered
 - objects already present locally
 - objects that would be fetched from the source LFS provider
-- objects that would be uploaded to `lfs-cloud`
+- local source-object availability and target-object existence as unknown until
+  execution checks the configured storage provider
 - local files and config files that would be touched
 - source endpoint configuration and local Git LFS availability
 - target `lfs-cloud` server TCP reachability
@@ -596,7 +597,10 @@ The dry-run readiness section is intentionally local and must label that scope
 explicitly. It does not verify source repository access, target server
 authentication or repository permission, or Drive root access, because the
 dry-run must not contact remote providers. Live access validation remains a
-server startup/runtime or future execution preflight responsibility.
+server startup/runtime or future execution preflight responsibility. Target
+object counts must therefore remain explicitly unknown during dry-run; do not
+infer uploads from local source availability because execution skips objects
+already present at the destination.
 
 Migration uses one explicit source Git remote, defaulting to `origin`, for
 remote-scoped LFS endpoint discovery, source fetches, and remote-tracking refs
@@ -1629,7 +1633,7 @@ Defer:
 #### Epic 7.3: Migration Safety
 
 - [x] [T] Implement `migrate --dry-run` with no filesystem, Git config, DB, or storage writes.
-- [x] [T] `--dry-run` reports refs scanned, files touched, objects fetched, objects uploaded, and explicitly local readiness results.
+- [x] [T] `--dry-run` reports refs scanned, files touched, objects fetched, local source availability, unknown target existence, and explicitly local readiness results.
 - [x] [T] Implement GitHub-specific `--purge-source-lfs` guidance that withholds purge input until a durable, integrity-verified migration receipt exists.
 - [x] [T] Add fixture-repo tests for current checkout, selected refs, all refs, missing objects, and dry-run no-op behavior.
 
