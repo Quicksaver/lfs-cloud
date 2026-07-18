@@ -7,7 +7,9 @@ yet.
 ## Prerequisites
 
 - Rust toolchain compatible with the crate's `rust-version`.
-- Git.
+- Git. Historical migration scans with `lfs-cloud migrate --ref ...` or
+  `--all-refs` require Git 2.40.0 or newer because they evaluate attributes with
+  `git check-attr --source`. Current-checkout planning does not use that option.
 - Git LFS for `lfs-cloud pull` and migration source-fetch steps. Read-only
   migration planning can still report repository config without fetching, but
   fetching missing source objects depends on `git lfs fetch`.

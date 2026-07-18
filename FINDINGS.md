@@ -1751,11 +1751,34 @@ independently validated or adjudicated.
     remediation; with one valid finding assessed here and no invalid finding
     attributable separately, this was high-quality, relevant feedback.
 
-11. **Medium — Migration silently requires Git 2.40 or newer.** Historical
-    attribute discovery uses `git check-attr --source`, but installation docs do
-    not declare or preflight the version (`src/migration.rs:1633-1651`,
-    `README.md:9-13`). Add a version check, document the minimum, and return an
-    actionable compatibility error.
+11. **[DONE] Migration silently required Git 2.40 or newer** (Medium,
+    `src/migration.rs`, `src/error.rs`, `README.md`, `IMPLEMENTATION.md`,
+    `docs/install-release.md`, and `AGENTS.md`): **Valid and actionable.**
+    Selected-ref and all-ref scans evaluate historical attributes with
+    `git check-attr --source`, an option first present in Git 2.40.0, but the
+    implementation previously reached that command with no compatibility
+    preflight and the installation guidance declared only an unspecified Git
+    dependency. Both historical scan entry points now read the bounded output
+    of `git --version`, accept common upstream, Apple, Windows, and future-major
+    version forms, and fail before history work when the installed version is
+    too old or cannot be determined. The typed compatibility error names the
+    installed and required versions, explains the historical-attribute feature,
+    and gives both recovery paths: upgrade Git or use current-checkout planning
+    without `--ref`/`--all-refs`. Current-checkout discovery intentionally
+    retains older-Git compatibility because it does not use `--source`.
+    Installation, migration, implementation, and repository-learning
+    documentation now preserve the 2.40.0 boundary. Regression coverage proves
+    rejection of Git 2.39.5 with the actionable diagnostic, acceptance of Git
+    2.40.0 plus Apple/Windows version strings and future major versions, and
+    fail-closed handling of unrecognized version output. Verification passed
+    with `cargo fmt`, `yarn lint:fix`, `git diff --check`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, and `cargo test --doc`. The focused reviewer
+    identified a genuine medium-severity compatibility and operator-experience
+    flaw, named the exact unsupported Git feature, and recommended the complete
+    preflight, diagnostic, and documentation fix; with one valid finding
+    assessed here and no invalid finding attributable separately, this was
+    high-quality, relevant feedback.
 
 12. **Medium — Source fetch scope can expand through
     `lfs.fetchrecentalways=true`.** Migration fetch commands do not override the

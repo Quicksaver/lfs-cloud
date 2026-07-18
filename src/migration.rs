@@ -43,6 +43,25 @@ const MIGRATION_SOURCE_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60
 const MIGRATION_SOURCE_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MIGRATION_GIT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MIGRATION_GIT_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+const MINIMUM_HISTORICAL_SCAN_GIT_VERSION: GitVersion = GitVersion::new(2, 40, 0);
+const MINIMUM_HISTORICAL_SCAN_GIT_VERSION_TEXT: &str = "2.40.0";
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GitVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl GitVersion {
+    const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
 
 /// Read-only discovery result for an existing Git LFS repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -461,8 +480,9 @@ pub fn enumerate_current_checkout_lfs_pointers(
 /// # Errors
 ///
 /// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree,
-/// the repository is shallow, any selected ref cannot be resolved to a commit,
-/// or Git returns malformed history, attribute, or object data.
+/// Git is older than 2.40, the repository is shallow, any selected ref cannot
+/// be resolved to a commit, or Git returns malformed history, attribute, or
+/// object data.
 pub fn enumerate_selected_ref_lfs_pointers<I, S>(
     start_dir: impl AsRef<Path>,
     refs: I,
@@ -484,6 +504,7 @@ where
 {
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
+    require_historical_scan_git_version(&worktree_root)?;
     require_complete_history(&worktree_root)?;
     let mut scanned_refs = Vec::new();
 
@@ -529,14 +550,15 @@ pub fn enumerate_all_fetched_ref_lfs_pointers(
 /// # Errors
 ///
 /// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree,
-/// the repository is shallow, `source_remote` is invalid, Git cannot list refs,
-/// or a discovered ref cannot be scanned.
+/// Git is older than 2.40, the repository is shallow, `source_remote` is
+/// invalid, Git cannot list refs, or a discovered ref cannot be scanned.
 pub fn enumerate_fetched_ref_lfs_pointers_for_remote(
     start_dir: impl AsRef<Path>,
     source_remote: impl AsRef<str>,
 ) -> MigrationResult<GitLfsHistoryPointers> {
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
+    require_historical_scan_git_version(&worktree_root)?;
     require_complete_history(&worktree_root)?;
     let source_remote = validate_source_remote_name(source_remote.as_ref())?;
     let refs = all_fetched_ref_names(&worktree_root, &source_remote)?;
@@ -1175,6 +1197,55 @@ fn detect_worktree_root(start_dir: &Path) -> MigrationResult<PathBuf> {
 
     let stdout = output_stdout(output, "git rev-parse --show-toplevel")?;
     Ok(PathBuf::from(stdout.trim_end_matches(['\n', '\r'])))
+}
+
+fn require_historical_scan_git_version(worktree_root: &Path) -> MigrationResult<()> {
+    const COMMAND: &str = "git --version";
+    let output = run_git(worktree_root, ["--version"])?;
+    let stdout = required_success_stdout(output, COMMAND)?;
+    validate_historical_scan_git_version(&stdout)
+}
+
+fn validate_historical_scan_git_version(output: &str) -> MigrationResult<()> {
+    let version_text = output
+        .trim()
+        .strip_prefix("git version ")
+        .and_then(|version| version.split_ascii_whitespace().next())
+        .ok_or_else(git_version_parse_error)?;
+    let version = parse_git_version(version_text).ok_or_else(git_version_parse_error)?;
+
+    if version < MINIMUM_HISTORICAL_SCAN_GIT_VERSION {
+        return Err(MigrationError::UnsupportedGitVersion {
+            installed: version_text.to_owned(),
+            required: MINIMUM_HISTORICAL_SCAN_GIT_VERSION_TEXT,
+            feature: "historical migration attribute discovery",
+        });
+    }
+
+    Ok(())
+}
+
+fn parse_git_version(version: &str) -> Option<GitVersion> {
+    let mut components = version.split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch_text = components.next()?;
+    let patch_digits = patch_text
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .collect::<Vec<_>>();
+    let patch = std::str::from_utf8(&patch_digits).ok()?.parse().ok()?;
+
+    Some(GitVersion::new(major, minor, patch))
+}
+
+fn git_version_parse_error() -> MigrationError {
+    MigrationError::ExternalCommandOutput {
+        command: "git --version".to_owned(),
+        message: SanitizedMessage::new(
+            "could not determine whether Git 2.40.0 or newer is installed; upgrade Git before scanning selected refs or all refs",
+        ),
+    }
 }
 
 fn require_complete_history(worktree_root: &Path) -> MigrationResult<()> {
@@ -3514,8 +3585,9 @@ mod tests {
         hash_migration_object_file, migration_source_fetch_command,
         parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
         parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
-        upload_migration_objects_to_storage, validate_history_ref_name,
-        verified_migration_upload_source_path, wait_for_git_lfs_fetch_command,
+        upload_migration_objects_to_storage, validate_historical_scan_git_version,
+        validate_history_ref_name, verified_migration_upload_source_path,
+        wait_for_git_lfs_fetch_command,
     };
 
     #[cfg(unix)]
@@ -4222,6 +4294,49 @@ mod tests {
             MigrationError::ExternalCommandOutput { command, .. }
                 if command == "git check-attr -z --stdin --source=abc123 filter"
         ));
+    }
+
+    #[test]
+    fn historical_scan_rejects_git_older_than_2_40() {
+        let error = validate_historical_scan_git_version("git version 2.39.5")
+            .expect_err("Git 2.39 should not support historical attribute sources");
+
+        assert!(matches!(
+            &error,
+            MigrationError::UnsupportedGitVersion {
+                installed,
+                required: "2.40.0",
+                ..
+            } if installed == "2.39.5"
+        ));
+        assert!(error.to_string().contains("upgrade Git"));
+        assert!(error.to_string().contains("current-checkout"));
+    }
+
+    #[test]
+    fn historical_scan_accepts_supported_git_version_variants() {
+        for output in [
+            "git version 2.40.0\n",
+            "git version 2.52.0 (Apple Git-154)\n",
+            "git version 2.40.0.windows.1\n",
+            "git version 3.0.0\n",
+        ] {
+            validate_historical_scan_git_version(output)
+                .unwrap_or_else(|error| panic!("{output:?} should be supported: {error}"));
+        }
+    }
+
+    #[test]
+    fn historical_scan_rejects_unrecognized_git_version_output() {
+        let error = validate_historical_scan_git_version("vendor git build")
+            .expect_err("unrecognized output should not bypass the compatibility preflight");
+
+        assert!(matches!(
+            &error,
+            MigrationError::ExternalCommandOutput { command, .. }
+                if command == "git --version"
+        ));
+        assert!(error.to_string().contains("Git 2.40.0 or newer"));
     }
 
     #[test]

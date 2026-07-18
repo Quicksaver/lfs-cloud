@@ -685,6 +685,19 @@ pub enum MigrationError {
         path: PathBuf,
     },
 
+    /// The installed Git version cannot support the requested migration mode.
+    #[error(
+        "Git {installed} does not support {feature}; Git {required} or newer is required; upgrade Git or use current-checkout migration without `--ref` or `--all-refs`"
+    )]
+    UnsupportedGitVersion {
+        /// Installed Git version reported by `git --version`.
+        installed: String,
+        /// Minimum Git version required by the requested migration feature.
+        required: &'static str,
+        /// Migration feature that needs the newer Git version.
+        feature: &'static str,
+    },
+
     /// The caller supplied invalid migration input.
     #[error("invalid migration input: {message}")]
     InvalidInput {

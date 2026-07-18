@@ -631,7 +631,7 @@ Suggested flow:
 1. Verify the current directory is a Git repository with Git LFS configured.
 2. Read existing LFS configuration, tracked patterns, and current LFS endpoint.
 3. Discover required LFS objects for the current checkout, selected refs, or all refs.
-4. For selected-ref or all-ref migration, reject shallow repositories before enumerating LFS pointers from Git history, because truncated history cannot produce a complete inventory.
+4. For selected-ref or all-ref migration, require Git 2.40.0 for `git check-attr --source` and reject shallow repositories before enumerating LFS pointers from Git history, because older Git cannot evaluate historical attributes and truncated history cannot produce a complete inventory.
 5. Ensure each object exists locally, fetching from the source LFS provider when needed.
 6. Upload each object to the configured lfs-cloud server/storage provider.
 7. Verify uploaded object SHA-256 and size.

@@ -357,6 +357,10 @@ still available in a shallow clone because it inventories only the current
 index. When neither `--ref` nor `--all-refs` is selected, the report prominently
 warns that other refs were not scanned and may reference additional LFS
 objects. Use `--all-refs` for a full provider move.
+Selected-ref and all-ref planning also require Git 2.40.0 or newer because
+historical attribute evaluation uses `git check-attr --source`. LFS Cloud checks
+the installed version before scanning and reports how to upgrade Git or fall
+back to current-checkout planning.
 Historical scans reuse unchanged Git tree and blob objects across commits and
 cache equivalent historical attribute queries. This keeps large selected-ref
 and all-ref plans proportional to changed tree state plus reported pointer
