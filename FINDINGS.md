@@ -359,10 +359,33 @@ independently validated or adjudicated.
     one valid finding assessed here and no invalid finding attributable
     separately, this was high-quality, relevant feedback.
 
-15. **Low — GitHub REST requests do not pin an API version.** Requests set
-    `Accept` but omit `X-GitHub-Api-Version`
-    (`src/github_auth.rs:543-549`, `src/github_auth.rs:644-650`). Configure a
-    supported version header centrally and assert it in mocked requests.
+15. **[DONE] GitHub REST requests did not pin an API version** (Low,
+    `src/github_auth.rs`): **Valid and actionable.** Authenticated-user lookup,
+    repository identity verification, and collaborator permission checks all
+    set GitHub's recommended `Accept` media type but omitted
+    `X-GitHub-Api-Version`, leaving response semantics tied to GitHub's moving
+    unversioned default. GitHub's official
+    [API-version documentation](https://docs.github.com/en/rest/about-the-rest-api/api-versions)
+    currently lists `2022-11-28` as supported through March 10, 2028; pinning
+    that version preserves the behavior the unversioned requests already
+    received while avoiding an unreviewed move to the newer breaking API
+    version. A single
+    `github_api_request` helper now applies both the media type and version
+    headers to every GitHub REST request, including requests made with injected
+    clients. The mocked user and permission servers capture and assert the
+    exact version header for user lookup, repository identity lookup, and
+    collaborator permission lookup. The new assertions failed before the
+    implementation and passed afterward. Verification passed with `cargo fmt`,
+    `yarn lint:fix`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets -- --test-threads=1`, and `cargo test --doc`. An
+    earlier default-parallel run overlapped a detached invocation of the same
+    suite and produced credential-helper timeouts; after stopping only those
+    two overlapping test process groups, the isolated serial suite passed with
+    512 unit tests, all integration targets, and the expected ignored external
+    tests. The focused reviewer identified a genuine low-severity forward-
+    compatibility risk and prescribed the precise centralized-header and mock-
+    assertion remediation; with one valid finding assessed here and no invalid
+    finding attributable separately, this was high-quality, relevant feedback.
 
 16. **Low — Credential-helper descendants can leave blocked reader threads.** A
     successful direct child can exit while a descendant retains stdout or

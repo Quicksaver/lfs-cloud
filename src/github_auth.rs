@@ -24,7 +24,7 @@ use oauth2::{
     basic::BasicClient, url::ParseError as UrlParseError,
 };
 use reqwest::{
-    Client, StatusCode,
+    Client, RequestBuilder, StatusCode,
     header::{ACCEPT, CONTENT_TYPE, HeaderValue},
     redirect::Policy,
 };
@@ -48,6 +48,8 @@ const GITHUB_OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PENDING_GITHUB_OAUTH_STATES: usize = 1024;
 const GITHUB_USER_AGENT: &str = concat!("lfs-cloud/", env!("CARGO_PKG_VERSION"));
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
+const GITHUB_API_VERSION_HEADER: &str = "x-github-api-version";
+const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_SSO_HEADER: &str = "x-github-sso";
 
 static DEFAULT_GITHUB_OAUTH_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
@@ -590,10 +592,7 @@ impl GitHubUserClient {
         token: &GitHubOAuthAccessToken,
     ) -> ServerResult<RepositoryUser> {
         let endpoint = github_user_endpoint(provider)?;
-        let response = self
-            .client
-            .get(endpoint)
-            .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
+        let response = github_api_request(self.client.get(endpoint))
             .bearer_auth(token.as_str())
             .timeout(GITHUB_USER_FETCH_TIMEOUT)
             .send()
@@ -693,10 +692,7 @@ impl GitHubRepositoryPermissionClient {
         self.verify_repository_identity(provider, token, repository)
             .await?;
         let endpoint = github_repository_permission_endpoint(provider, repository, user)?;
-        let response = self
-            .client
-            .get(endpoint)
-            .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
+        let response = github_api_request(self.client.get(endpoint))
             .bearer_auth(token.as_str())
             .timeout(GITHUB_PERMISSION_CHECK_TIMEOUT)
             .send()
@@ -819,10 +815,7 @@ impl GitHubRepositoryPermissionClient {
                 ),
             })?;
         let endpoint = github_repository_identity_endpoint(provider, repository)?;
-        let response = self
-            .client
-            .get(endpoint)
-            .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
+        let response = github_api_request(self.client.get(endpoint))
             .bearer_auth(token.as_str())
             .timeout(GITHUB_PERMISSION_CHECK_TIMEOUT)
             .send()
@@ -2350,6 +2343,15 @@ fn default_github_api_http_client() -> ServerResult<Client> {
     }
 }
 
+fn github_api_request(request: RequestBuilder) -> RequestBuilder {
+    request
+        .header(ACCEPT, HeaderValue::from_static(GITHUB_API_ACCEPT))
+        .header(
+            GITHUB_API_VERSION_HEADER,
+            HeaderValue::from_static(GITHUB_API_VERSION),
+        )
+}
+
 fn build_github_oauth_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
         .timeout(GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT)
@@ -3047,6 +3049,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.accept.as_deref(), Some(super::GITHUB_API_ACCEPT));
+        assert_eq!(request.api_version.as_deref(), Some("2022-11-28"));
         assert_eq!(request.authorization.as_deref(), Some("Bearer gho_token"));
     }
 
@@ -3298,7 +3301,20 @@ mod tests {
         assert_eq!(request.repo, "public-repo");
         assert_eq!(request.username, "octocat");
         assert_eq!(request.accept.as_deref(), Some(super::GITHUB_API_ACCEPT));
+        assert_eq!(request.api_version.as_deref(), Some("2022-11-28"));
         assert_eq!(request.authorization.as_deref(), Some("Bearer gho_token"));
+        let identity_requests = permission_server.identity_requests.lock().await;
+        assert_eq!(identity_requests.len(), 1);
+        let identity_request = &identity_requests[0];
+        assert_eq!(
+            identity_request.accept.as_deref(),
+            Some(super::GITHUB_API_ACCEPT)
+        );
+        assert_eq!(identity_request.api_version.as_deref(), Some("2022-11-28"));
+        assert_eq!(
+            identity_request.authorization.as_deref(),
+            Some("Bearer gho_token")
+        );
     }
 
     #[tokio::test]
@@ -4652,6 +4668,7 @@ mod tests {
     #[derive(Debug, Eq, PartialEq)]
     struct CapturedUserRequest {
         accept: Option<String>,
+        api_version: Option<String>,
         authorization: Option<String>,
     }
 
@@ -4660,7 +4677,15 @@ mod tests {
         status: StatusCode,
         body: String,
         sso_header: Option<String>,
+        identity_requests: Mutex<Vec<CapturedRepositoryIdentityRequest>>,
         requests: Mutex<Vec<CapturedPermissionRequest>>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CapturedRepositoryIdentityRequest {
+        accept: Option<String>,
+        api_version: Option<String>,
+        authorization: Option<String>,
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -4669,6 +4694,7 @@ mod tests {
         repo: String,
         username: String,
         accept: Option<String>,
+        api_version: Option<String>,
         authorization: Option<String>,
     }
 
@@ -4767,12 +4793,13 @@ mod tests {
             status,
             body: body.into(),
             sso_header: sso_header.map(ToOwned::to_owned),
+            identity_requests: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
         });
         let app = Router::new()
             .route(
                 "/api/v3/repos/{owner}/{repo}",
-                get(|| async { Json(serde_json::json!({ "id": 8675309_u64 })) }),
+                get(capture_repository_identity_request),
             )
             .route(
                 "/api/v3/repos/{owner}/{repo}/collaborators/{username}/permission",
@@ -4902,6 +4929,10 @@ mod tests {
             .get(axum::http::header::ACCEPT)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
+        let api_version = headers
+            .get("x-github-api-version")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
         let authorization = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -4909,6 +4940,7 @@ mod tests {
 
         state.requests.lock().await.push(CapturedUserRequest {
             accept,
+            api_version,
             authorization,
         });
 
@@ -4919,6 +4951,36 @@ mod tests {
         )
     }
 
+    async fn capture_repository_identity_request(
+        State(state): State<Arc<PermissionServerState>>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let api_version = headers
+            .get("x-github-api-version")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let authorization = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+
+        state
+            .identity_requests
+            .lock()
+            .await
+            .push(CapturedRepositoryIdentityRequest {
+                accept,
+                api_version,
+                authorization,
+            });
+
+        Json(serde_json::json!({ "id": 8675309_u64 }))
+    }
+
     async fn capture_permission_request(
         State(state): State<Arc<PermissionServerState>>,
         Path((owner, repo, username)): Path<(String, String, String)>,
@@ -4926,6 +4988,10 @@ mod tests {
     ) -> impl IntoResponse {
         let accept = headers
             .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let api_version = headers
+            .get("x-github-api-version")
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
         let authorization = headers
@@ -4938,6 +5004,7 @@ mod tests {
             repo,
             username,
             accept,
+            api_version,
             authorization,
         });
 
