@@ -633,7 +633,9 @@ Suggested flow:
 3. Discover required LFS objects for the current checkout, selected refs, or all refs.
 4. For selected-ref or all-ref migration, require Git 2.40.0 for `git check-attr --source` and reject shallow repositories before enumerating LFS pointers from Git history, because older Git cannot evaluate historical attributes and truncated history cannot produce a complete inventory.
 5. Ensure each object exists locally, fetching from the source LFS provider when needed.
-6. Upload each object to the configured lfs-cloud server/storage provider.
+6. Upload objects to the configured lfs-cloud server/storage provider with
+   bounded concurrency, recording each completed object durably before
+   reporting it and retaining structured failures for retry.
 7. Verify uploaded object SHA-256 and size.
 8. Write or update .lfsconfig to point to the lfs-cloud endpoint.
 9. Configure local lfs-cloud cache and CoW materialization behavior.
@@ -1425,7 +1427,11 @@ Defer:
 > files. Locally available migration objects can now be uploaded idempotently
 > to the configured storage provider, with source bytes rechecked against
 > pointer hashes and sizes before upload and provider-returned identities
-> validated after upload. The `migrate --dry-run` CLI command can now build a
+> validated after upload. The upload helper bounds concurrent transfers,
+> synchronizes completed objects into a provider-specific JSON Lines checkpoint,
+> resumes durable completions without repeating provider work, and reports
+> per-object failures while independent transfers finish. The
+> `migrate --dry-run` CLI command can now build a
 > read-only migration plan for the current checkout, selected refs, or all
 > fetched refs, reporting tracked LFS patterns, scanned refs, planned config
 > writes, discovered objects, source fetch/upload counts, byte totals, separate
@@ -1640,6 +1646,7 @@ Defer:
 - [x] [T] Check which discovered objects already exist locally.
 - [x] [M] Fetch missing objects from the source LFS provider without changing working tree files or inheriting recent-fetch scope expansion. Manual verification: `scripts/manual/verify-migration-source-fetch.sh`.
 - [x] [T] Upload discovered objects to the configured storage-provider boundary idempotently. Focused fake-provider verification: `scripts/manual/verify-migration-upload-simulation.sh`. This script does not contact Google Drive; live migration-transfer coverage remains part of the gated external integration work.
+- [x] [T] Bound concurrent migration uploads and checkpoint each completed object durably so interrupted runs retry only incomplete outcomes.
 - [x] [T] Verify uploaded hashes and sizes against pointers.
 
 #### Epic 7.3: Migration Safety

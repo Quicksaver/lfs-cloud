@@ -73,17 +73,19 @@ pub use metadata::{
     MetadataObjectVerificationStatus,
 };
 pub use migration::{
-    CurrentCheckoutLfsPointer, CurrentCheckoutLfsPointers, GitLfsFilterConfig,
-    GitLfsHistoryPointer, GitLfsHistoryPointers, GitLfsInstallation, GitLfsMigrationDiscovery,
-    GitLfsScannedRef, GitLfsSourceEndpoint, GitLfsSourceEndpointSource, GitLfsTrackedPattern,
-    LocalMigrationObject, LocalMigrationObjectAvailability, LocalMigrationObjectLocation,
-    LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus, MigrationFetchMode,
-    MigrationSourceFetch, MigrationStorageUpload, check_local_migration_objects,
+    CurrentCheckoutLfsPointer, CurrentCheckoutLfsPointers, DEFAULT_MIGRATION_UPLOAD_CONCURRENCY,
+    GitLfsFilterConfig, GitLfsHistoryPointer, GitLfsHistoryPointers, GitLfsInstallation,
+    GitLfsMigrationDiscovery, GitLfsScannedRef, GitLfsSourceEndpoint, GitLfsSourceEndpointSource,
+    GitLfsTrackedPattern, LocalMigrationObject, LocalMigrationObjectAvailability,
+    LocalMigrationObjectLocation, LocalMigrationObjectLocationKind,
+    LocalMigrationObjectLocationStatus, MigrationFetchMode, MigrationObjectUploadFailure,
+    MigrationObjectUploadOutcome, MigrationObjectUploadStatus, MigrationSourceFetch,
+    MigrationStorageUpload, MigrationStorageUploadOptions, check_local_migration_objects,
     discover_git_lfs_migration, discover_git_lfs_migration_from_remote,
     enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
     enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
     fetch_missing_migration_objects, fetch_missing_migration_objects_from_remote,
-    upload_migration_objects_to_storage,
+    upload_migration_objects_to_storage, upload_migration_objects_to_storage_with_options,
 };
 pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,

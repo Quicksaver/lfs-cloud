@@ -6,21 +6,25 @@
 //! can build dry-run and transfer plans from one consistent snapshot.
 
 #[cfg(unix)]
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::{ffi::OsStringExt, fs::OpenOptionsExt};
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
-    fs,
     fs::File,
+    fs::{self, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio},
+    str::FromStr,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
+use fs4::FileExt;
+use futures_util::{StreamExt, stream};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -45,6 +49,9 @@ const MIGRATION_GIT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MIGRATION_GIT_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const MINIMUM_HISTORICAL_SCAN_GIT_VERSION: GitVersion = GitVersion::new(2, 40, 0);
 const MINIMUM_HISTORICAL_SCAN_GIT_VERSION_TEXT: &str = "2.40.0";
+/// Default number of migration objects uploaded concurrently.
+pub const DEFAULT_MIGRATION_UPLOAD_CONCURRENCY: usize = 4;
+const MIGRATION_UPLOAD_CHECKPOINT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GitVersion {
@@ -291,8 +298,130 @@ pub struct MigrationStorageUpload {
     pub storage_provider_id: String,
     /// Objects skipped because the configured storage provider already has them.
     pub already_present_objects: Vec<LfsObject>,
-    /// Objects newly uploaded during this migration transfer step.
+    /// Objects uploaded during this run or restored from its durable checkpoint.
     pub uploaded_objects: Vec<StoredObject>,
+    /// Objects that could not complete, with retry-safe diagnostics.
+    pub failed_objects: Vec<MigrationObjectUploadFailure>,
+    /// One terminal outcome per requested object, in discovery order.
+    pub outcomes: Vec<MigrationObjectUploadOutcome>,
+    /// Durable checkpoint used to resume completed objects.
+    pub checkpoint_path: PathBuf,
+}
+
+/// Options controlling bounded migration uploads and durable progress.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationStorageUploadOptions {
+    checkpoint_path: PathBuf,
+    max_concurrent_uploads: usize,
+}
+
+impl MigrationStorageUploadOptions {
+    /// Creates upload options using the supplied durable checkpoint path.
+    ///
+    /// The default concurrency is [`DEFAULT_MIGRATION_UPLOAD_CONCURRENCY`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::MigrationStorageUploadOptions;
+    ///
+    /// let options = MigrationStorageUploadOptions::new(".git/lfs/migration.jsonl")
+    ///     .with_max_concurrent_uploads(2);
+    /// assert_eq!(options.max_concurrent_uploads(), 2);
+    /// ```
+    #[must_use]
+    pub fn new(checkpoint_path: impl Into<PathBuf>) -> Self {
+        Self {
+            checkpoint_path: checkpoint_path.into(),
+            max_concurrent_uploads: DEFAULT_MIGRATION_UPLOAD_CONCURRENCY,
+        }
+    }
+
+    /// Sets the maximum number of simultaneous object transfers.
+    ///
+    /// A zero value is rejected when upload execution starts.
+    #[must_use]
+    pub fn with_max_concurrent_uploads(mut self, max_concurrent_uploads: usize) -> Self {
+        self.max_concurrent_uploads = max_concurrent_uploads;
+        self
+    }
+
+    /// Returns the durable checkpoint path.
+    #[must_use]
+    pub fn checkpoint_path(&self) -> &Path {
+        &self.checkpoint_path
+    }
+
+    /// Returns the maximum number of simultaneous object transfers.
+    #[must_use]
+    pub fn max_concurrent_uploads(&self) -> usize {
+        self.max_concurrent_uploads
+    }
+}
+
+/// Structured result for one requested migration object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct MigrationObjectUploadOutcome {
+    /// Object requested by the migration inventory.
+    pub object: LfsObject,
+    /// Terminal status observed during this run.
+    pub status: MigrationObjectUploadStatus,
+}
+
+/// Terminal migration-upload status for one object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MigrationObjectUploadStatus {
+    /// Storage already contained the object before upload.
+    AlreadyPresent {
+        /// True when this completion was restored without contacting storage.
+        resumed: bool,
+    },
+    /// Storage accepted and verified the object.
+    Uploaded {
+        /// Verified provider metadata returned for the stored object.
+        stored_object: StoredObject,
+        /// True when this completion was restored without contacting storage.
+        resumed: bool,
+    },
+    /// This object failed while other independent objects continued.
+    Failed {
+        /// Secret-safe failure diagnostic suitable for a retry report.
+        message: SanitizedMessage,
+    },
+}
+
+/// One migration object that should be retried.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct MigrationObjectUploadFailure {
+    /// Object whose transfer did not complete durably.
+    pub object: LfsObject,
+    /// Secret-safe reason the object should be retried.
+    pub message: SanitizedMessage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MigrationUploadCheckpointCompletion {
+    AlreadyPresent,
+    Uploaded { backend_id: String },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MigrationUploadCheckpointRecord {
+    version: u32,
+    storage_provider_id: String,
+    oid: String,
+    size: u64,
+    completion: MigrationUploadCheckpointRecordCompletion,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+enum MigrationUploadCheckpointRecordCompletion {
+    AlreadyPresent,
+    Uploaded { backend_id: String },
 }
 
 /// Local availability details for one discovered Git LFS object.
@@ -712,44 +841,479 @@ where
 /// local source bytes against the pointer OID and size immediately before
 /// delegating to the storage provider.
 ///
-/// Uploads run sequentially so the report preserves discovery order and avoids
-/// imposing provider-wide concurrency before provider-specific rate-limit and
-/// batch APIs exist. The pre-upload existence check is a best-effort
-/// idempotence guard; concurrent writers still rely on each storage provider's
-/// own upload semantics to avoid duplicate backend objects.
+/// Uploads run with [`DEFAULT_MIGRATION_UPLOAD_CONCURRENCY`] simultaneous
+/// transfers. Each success is appended and synchronized to a provider-specific
+/// checkpoint under the repository's Git LFS media directory before it is
+/// reported. A later invocation resumes those completions without contacting
+/// storage, while failed objects are retried. Outcomes retain discovery order
+/// even though provider work completes out of order.
 ///
 /// # Errors
 ///
-/// Returns [`MigrationError`] when a discovered object has no verified local
-/// source bytes, when the local source no longer matches the pointer identity,
-/// or when the storage provider lookup/upload fails.
+/// Returns [`MigrationError`] when the checkpoint cannot be initialized or
+/// parsed, or when upload options are invalid. Per-object source, provider, and
+/// checkpoint-append failures are returned in
+/// [`MigrationStorageUpload::failed_objects`] so independent work can finish.
 pub async fn upload_migration_objects_to_storage(
     availability: &LocalMigrationObjectAvailability,
     storage: &dyn StorageProvider,
 ) -> MigrationResult<MigrationStorageUpload> {
-    let mut already_present_objects = Vec::new();
-    let mut uploaded_objects = Vec::new();
+    let checkpoint_path =
+        default_migration_upload_checkpoint_path(availability, storage.provider_id());
+    let options = MigrationStorageUploadOptions::new(checkpoint_path);
+    upload_migration_objects_to_storage_with_options(availability, storage, &options).await
+}
 
-    for local_object in &availability.objects {
-        let object = &local_object.object;
-        if storage.object_exists(object).await? {
-            already_present_objects.push(object.clone());
-            continue;
-        }
-
-        let source = verified_migration_upload_source_path(local_object)?;
-        verify_migration_upload_source(source, object).await?;
-
-        let stored_object = storage.upload_object(object, source).await?;
-        validate_migration_uploaded_object(object, storage.provider_id(), &stored_object)?;
-        uploaded_objects.push(stored_object);
+/// Uploads migration objects with an explicit checkpoint and concurrency bound.
+///
+/// This variant is useful when a migration coordinator owns the durable state
+/// location or needs a provider-specific concurrency limit. Completed outcomes
+/// are appended as JSON Lines records and synchronized individually, making the
+/// checkpoint safe to reuse after interruption. A partial final line left by a
+/// process crash is ignored; malformed complete records fail closed.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when the concurrency limit is zero, the
+/// checkpoint cannot be initialized or parsed, or its completed records do not
+/// match the configured storage provider. Per-object failures are reported as
+/// structured outcomes instead of aborting the remaining work.
+pub async fn upload_migration_objects_to_storage_with_options(
+    availability: &LocalMigrationObjectAvailability,
+    storage: &dyn StorageProvider,
+    options: &MigrationStorageUploadOptions,
+) -> MigrationResult<MigrationStorageUpload> {
+    if options.max_concurrent_uploads == 0 {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new(
+                "migration upload concurrency must be greater than zero",
+            ),
+        });
     }
 
+    let storage_provider_id = storage.provider_id().to_owned();
+    let checkpoint_path = options.checkpoint_path.clone();
+    let checkpointed =
+        load_migration_upload_checkpoint(checkpoint_path.clone(), storage_provider_id.clone())
+            .await?;
+    let mut indexed_outcomes = stream::iter(availability.objects.iter().cloned().enumerate())
+        .map(|(index, local_object)| {
+            let checkpointed = checkpointed.get(&local_object.object).cloned();
+            let checkpoint_path = checkpoint_path.clone();
+            let storage_provider_id = storage_provider_id.clone();
+            async move {
+                let outcome = if let Some(completion) = checkpointed {
+                    resumed_migration_upload_outcome(
+                        local_object.object.clone(),
+                        &storage_provider_id,
+                        completion,
+                    )
+                } else {
+                    let status = upload_one_migration_object(&local_object, storage).await;
+                    checkpoint_migration_upload_outcome(
+                        &checkpoint_path,
+                        &storage_provider_id,
+                        local_object.object.clone(),
+                        status,
+                    )
+                    .await
+                };
+                (index, outcome)
+            }
+        })
+        .buffer_unordered(options.max_concurrent_uploads)
+        .collect::<Vec<_>>()
+        .await;
+    indexed_outcomes.sort_by_key(|(index, _)| *index);
+    let outcomes = indexed_outcomes
+        .into_iter()
+        .map(|(_, outcome)| outcome)
+        .collect::<Vec<_>>();
+
+    let already_present_objects = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome.status,
+                MigrationObjectUploadStatus::AlreadyPresent { .. }
+            )
+        })
+        .map(|outcome| outcome.object.clone())
+        .collect();
+    let uploaded_objects = outcomes
+        .iter()
+        .filter_map(|outcome| match &outcome.status {
+            MigrationObjectUploadStatus::Uploaded { stored_object, .. } => {
+                Some(stored_object.clone())
+            }
+            MigrationObjectUploadStatus::AlreadyPresent { .. }
+            | MigrationObjectUploadStatus::Failed { .. } => None,
+        })
+        .collect();
+    let failed_objects = outcomes
+        .iter()
+        .filter_map(|outcome| match &outcome.status {
+            MigrationObjectUploadStatus::Failed { message } => Some(MigrationObjectUploadFailure {
+                object: outcome.object.clone(),
+                message: message.clone(),
+            }),
+            MigrationObjectUploadStatus::AlreadyPresent { .. }
+            | MigrationObjectUploadStatus::Uploaded { .. } => None,
+        })
+        .collect();
+
     Ok(MigrationStorageUpload {
-        storage_provider_id: storage.provider_id().to_owned(),
+        storage_provider_id,
         already_present_objects,
         uploaded_objects,
+        failed_objects,
+        outcomes,
+        checkpoint_path,
     })
+}
+
+async fn upload_one_migration_object(
+    local_object: &LocalMigrationObject,
+    storage: &dyn StorageProvider,
+) -> MigrationResult<MigrationObjectUploadStatus> {
+    let object = &local_object.object;
+    if storage.object_exists(object).await? {
+        return Ok(MigrationObjectUploadStatus::AlreadyPresent { resumed: false });
+    }
+
+    let source = verified_migration_upload_source_path(local_object)?;
+    verify_migration_upload_source(source, object).await?;
+    let stored_object = storage.upload_object(object, source).await?;
+    validate_migration_uploaded_object(object, storage.provider_id(), &stored_object)?;
+    Ok(MigrationObjectUploadStatus::Uploaded {
+        stored_object,
+        resumed: false,
+    })
+}
+
+async fn checkpoint_migration_upload_outcome(
+    checkpoint_path: &Path,
+    storage_provider_id: &str,
+    object: LfsObject,
+    status: MigrationResult<MigrationObjectUploadStatus>,
+) -> MigrationObjectUploadOutcome {
+    let status = match status {
+        Ok(status) => {
+            let completion = match &status {
+                MigrationObjectUploadStatus::AlreadyPresent { .. } => {
+                    Some(MigrationUploadCheckpointCompletion::AlreadyPresent)
+                }
+                MigrationObjectUploadStatus::Uploaded { stored_object, .. } => {
+                    Some(MigrationUploadCheckpointCompletion::Uploaded {
+                        backend_id: stored_object.backend_id.clone(),
+                    })
+                }
+                MigrationObjectUploadStatus::Failed { .. } => None,
+            };
+            if let Some(completion) = completion
+                && let Err(error) = append_migration_upload_checkpoint(
+                    checkpoint_path.to_path_buf(),
+                    storage_provider_id.to_owned(),
+                    object.clone(),
+                    completion,
+                )
+                .await
+            {
+                MigrationObjectUploadStatus::Failed {
+                    message: SanitizedMessage::new(format!(
+                        "object completed in storage but durable checkpoint failed: {error}"
+                    )),
+                }
+            } else {
+                status
+            }
+        }
+        Err(error) => MigrationObjectUploadStatus::Failed {
+            message: SanitizedMessage::new(error.to_string()),
+        },
+    };
+
+    MigrationObjectUploadOutcome { object, status }
+}
+
+fn resumed_migration_upload_outcome(
+    object: LfsObject,
+    storage_provider_id: &str,
+    completion: MigrationUploadCheckpointCompletion,
+) -> MigrationObjectUploadOutcome {
+    let status = match completion {
+        MigrationUploadCheckpointCompletion::AlreadyPresent => {
+            MigrationObjectUploadStatus::AlreadyPresent { resumed: true }
+        }
+        MigrationUploadCheckpointCompletion::Uploaded { backend_id } => {
+            MigrationObjectUploadStatus::Uploaded {
+                stored_object: StoredObject::new(storage_provider_id, object.clone(), backend_id),
+                resumed: true,
+            }
+        }
+    };
+    MigrationObjectUploadOutcome { object, status }
+}
+
+fn default_migration_upload_checkpoint_path(
+    availability: &LocalMigrationObjectAvailability,
+    storage_provider_id: &str,
+) -> PathBuf {
+    let provider_digest = Sha256::digest(storage_provider_id.as_bytes());
+    let filename = format!("lfs-cloud-migration-upload-{provider_digest:x}.jsonl");
+    availability
+        .git_lfs_objects_dir
+        .parent()
+        .unwrap_or(&availability.git_lfs_objects_dir)
+        .join(filename)
+}
+
+async fn load_migration_upload_checkpoint(
+    checkpoint_path: PathBuf,
+    storage_provider_id: String,
+) -> MigrationResult<BTreeMap<LfsObject, MigrationUploadCheckpointCompletion>> {
+    tokio::task::spawn_blocking(move || {
+        load_migration_upload_checkpoint_blocking(&checkpoint_path, &storage_provider_id)
+    })
+    .await
+    .map_err(|error| MigrationError::InvalidInput {
+        message: SanitizedMessage::new(format!(
+            "migration checkpoint loading task failed: {error}"
+        )),
+    })?
+}
+
+fn load_migration_upload_checkpoint_blocking(
+    checkpoint_path: &Path,
+    storage_provider_id: &str,
+) -> MigrationResult<BTreeMap<LfsObject, MigrationUploadCheckpointCompletion>> {
+    create_migration_checkpoint_parent(checkpoint_path)?;
+    let mut file = open_migration_checkpoint(checkpoint_path)?;
+    FileExt::lock(&file).map_err(|source| {
+        migration_checkpoint_io_error(
+            checkpoint_path,
+            "failed to lock migration upload checkpoint",
+            source,
+        )
+    })?;
+    let result = (|| {
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).map_err(|source| {
+            migration_checkpoint_io_error(
+                checkpoint_path,
+                "failed to read migration upload checkpoint",
+                source,
+            )
+        })?;
+        parse_migration_upload_checkpoint(&contents, checkpoint_path, storage_provider_id)
+    })();
+    let unlock_result = FileExt::unlock(&file).map_err(|source| {
+        migration_checkpoint_io_error(
+            checkpoint_path,
+            "failed to unlock migration upload checkpoint",
+            source,
+        )
+    });
+    match (result, unlock_result) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(completed), Ok(())) => Ok(completed),
+    }
+}
+
+fn parse_migration_upload_checkpoint(
+    contents: &str,
+    checkpoint_path: &Path,
+    storage_provider_id: &str,
+) -> MigrationResult<BTreeMap<LfsObject, MigrationUploadCheckpointCompletion>> {
+    let mut completed = BTreeMap::new();
+    let chunks = contents.split_inclusive('\n').collect::<Vec<_>>();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let line = chunk
+            .strip_suffix('\n')
+            .unwrap_or(chunk)
+            .trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let record = match serde_json::from_str::<MigrationUploadCheckpointRecord>(line) {
+            Ok(record) => record,
+            Err(_) if index + 1 == chunks.len() && !chunk.ends_with('\n') => break,
+            Err(source) => {
+                return Err(MigrationError::InvalidInput {
+                    message: SanitizedMessage::new(format!(
+                        "migration upload checkpoint {} contains invalid record {}: {source}",
+                        checkpoint_path.display(),
+                        index + 1
+                    )),
+                });
+            }
+        };
+        if record.version != MIGRATION_UPLOAD_CHECKPOINT_VERSION {
+            return Err(MigrationError::InvalidInput {
+                message: SanitizedMessage::new(format!(
+                    "migration upload checkpoint {} uses unsupported version {}",
+                    checkpoint_path.display(),
+                    record.version
+                )),
+            });
+        }
+        if record.storage_provider_id != storage_provider_id {
+            return Err(MigrationError::InvalidInput {
+                message: SanitizedMessage::new(format!(
+                    "migration upload checkpoint {} belongs to a different storage provider",
+                    checkpoint_path.display()
+                )),
+            });
+        }
+        let oid = LfsOid::from_str(&record.oid).map_err(|source| MigrationError::InvalidInput {
+            message: SanitizedMessage::new(format!(
+                "migration upload checkpoint {} contains an invalid object ID: {source}",
+                checkpoint_path.display()
+            )),
+        })?;
+        let object = LfsObject::new(oid, LfsObjectSize::new(record.size));
+        let completion = match record.completion {
+            MigrationUploadCheckpointRecordCompletion::AlreadyPresent => {
+                MigrationUploadCheckpointCompletion::AlreadyPresent
+            }
+            MigrationUploadCheckpointRecordCompletion::Uploaded { backend_id } => {
+                if backend_id.trim().is_empty() {
+                    return Err(MigrationError::InvalidInput {
+                        message: SanitizedMessage::new(format!(
+                            "migration upload checkpoint {} contains an empty backend object ID",
+                            checkpoint_path.display()
+                        )),
+                    });
+                }
+                MigrationUploadCheckpointCompletion::Uploaded { backend_id }
+            }
+        };
+        completed.insert(object, completion);
+    }
+    Ok(completed)
+}
+
+async fn append_migration_upload_checkpoint(
+    checkpoint_path: PathBuf,
+    storage_provider_id: String,
+    object: LfsObject,
+    completion: MigrationUploadCheckpointCompletion,
+) -> MigrationResult<()> {
+    tokio::task::spawn_blocking(move || {
+        append_migration_upload_checkpoint_blocking(
+            &checkpoint_path,
+            &storage_provider_id,
+            &object,
+            completion,
+        )
+    })
+    .await
+    .map_err(|error| MigrationError::InvalidInput {
+        message: SanitizedMessage::new(format!("migration checkpoint write task failed: {error}")),
+    })?
+}
+
+fn append_migration_upload_checkpoint_blocking(
+    checkpoint_path: &Path,
+    storage_provider_id: &str,
+    object: &LfsObject,
+    completion: MigrationUploadCheckpointCompletion,
+) -> MigrationResult<()> {
+    create_migration_checkpoint_parent(checkpoint_path)?;
+    let mut file = open_migration_checkpoint(checkpoint_path)?;
+    FileExt::lock(&file).map_err(|source| {
+        migration_checkpoint_io_error(
+            checkpoint_path,
+            "failed to lock migration upload checkpoint",
+            source,
+        )
+    })?;
+    let result = (|| {
+        let completion = match completion {
+            MigrationUploadCheckpointCompletion::AlreadyPresent => {
+                MigrationUploadCheckpointRecordCompletion::AlreadyPresent
+            }
+            MigrationUploadCheckpointCompletion::Uploaded { backend_id } => {
+                MigrationUploadCheckpointRecordCompletion::Uploaded { backend_id }
+            }
+        };
+        let record = MigrationUploadCheckpointRecord {
+            version: MIGRATION_UPLOAD_CHECKPOINT_VERSION,
+            storage_provider_id: storage_provider_id.to_owned(),
+            oid: object.oid.as_hex().to_owned(),
+            size: object.size.bytes(),
+            completion,
+        };
+        let mut encoded =
+            serde_json::to_vec(&record).map_err(|source| MigrationError::InvalidInput {
+                message: SanitizedMessage::new(format!(
+                    "failed to encode migration upload checkpoint record: {source}"
+                )),
+            })?;
+        encoded.push(b'\n');
+        file.write_all(&encoded).map_err(|source| {
+            migration_checkpoint_io_error(
+                checkpoint_path,
+                "failed to append migration upload checkpoint",
+                source,
+            )
+        })?;
+        file.sync_data().map_err(|source| {
+            migration_checkpoint_io_error(
+                checkpoint_path,
+                "failed to synchronize migration upload checkpoint",
+                source,
+            )
+        })
+    })();
+    let unlock_result = FileExt::unlock(&file).map_err(|source| {
+        migration_checkpoint_io_error(
+            checkpoint_path,
+            "failed to unlock migration upload checkpoint",
+            source,
+        )
+    });
+    result.and(unlock_result)
+}
+
+fn create_migration_checkpoint_parent(checkpoint_path: &Path) -> MigrationResult<()> {
+    let parent = checkpoint_path
+        .parent()
+        .ok_or_else(|| MigrationError::InvalidInput {
+            message: SanitizedMessage::new("migration upload checkpoint has no parent directory"),
+        })?;
+    fs::create_dir_all(parent).map_err(|source| {
+        migration_checkpoint_io_error(
+            checkpoint_path,
+            "failed to create migration upload checkpoint directory",
+            source,
+        )
+    })
+}
+
+fn open_migration_checkpoint(checkpoint_path: &Path) -> MigrationResult<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(checkpoint_path).map_err(|source| {
+        migration_checkpoint_io_error(
+            checkpoint_path,
+            "failed to open migration upload checkpoint",
+            source,
+        )
+    })
+}
+
+fn migration_checkpoint_io_error(
+    checkpoint_path: &Path,
+    context: &str,
+    source: io::Error,
+) -> MigrationError {
+    MigrationError::Io {
+        context: format!("{context} {}", checkpoint_path.display()),
+        source,
+    }
 }
 
 fn verified_migration_upload_source_path(
@@ -3574,7 +4138,10 @@ mod tests {
         fs, io,
         path::{Path, PathBuf},
         process::{Command, Stdio},
-        sync::Mutex,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -3591,7 +4158,8 @@ mod tests {
         GitLfsSourceEndpointSource, LocalMigrationObject, LocalMigrationObjectLocation,
         LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus,
         MAX_GIT_ATTRIBUTES_BYTES, MAX_MIGRATION_GIT_OUTPUT_BYTES, MigrationError,
-        MigrationFetchMode, check_local_migration_objects, default_lfs_endpoint_for_remote_url,
+        MigrationFetchMode, MigrationObjectUploadStatus, MigrationStorageUploadOptions,
+        check_local_migration_objects, default_lfs_endpoint_for_remote_url,
         discover_git_lfs_migration, discover_git_lfs_migration_from_remote, display_git_command,
         enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
         enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
@@ -3600,9 +4168,9 @@ mod tests {
         hash_migration_object_file, migration_source_fetch_command,
         parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
         parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
-        upload_migration_objects_to_storage, validate_historical_scan_git_version,
-        validate_history_ref_name, verified_migration_upload_source_path,
-        wait_for_git_lfs_fetch_command,
+        upload_migration_objects_to_storage, upload_migration_objects_to_storage_with_options,
+        validate_historical_scan_git_version, validate_history_ref_name,
+        verified_migration_upload_source_path, wait_for_git_lfs_fetch_command,
     };
 
     #[cfg(unix)]
@@ -3658,6 +4226,11 @@ mod tests {
         returned_object_override: Mutex<Option<LfsObject>>,
         returned_provider_id_override: Mutex<Option<String>>,
         returned_backend_id_override: Mutex<Option<String>>,
+        upload_failures: Mutex<BTreeSet<LfsObject>>,
+        upload_attempts: Mutex<Vec<LfsObject>>,
+        upload_delay: Mutex<Option<Duration>>,
+        active_uploads: AtomicUsize,
+        max_active_uploads: AtomicUsize,
     }
 
     impl FakeMigrationStorageProvider {
@@ -3669,6 +4242,11 @@ mod tests {
                 returned_object_override: Mutex::new(None),
                 returned_provider_id_override: Mutex::new(None),
                 returned_backend_id_override: Mutex::new(None),
+                upload_failures: Mutex::new(BTreeSet::new()),
+                upload_attempts: Mutex::new(Vec::new()),
+                upload_delay: Mutex::new(None),
+                active_uploads: AtomicUsize::new(0),
+                max_active_uploads: AtomicUsize::new(0),
             }
         }
 
@@ -3684,6 +4262,31 @@ mod tests {
                 .lock()
                 .expect("fake upload lock should not poison")
                 .clone()
+        }
+
+        fn fail_upload(&self, object: LfsObject) {
+            self.upload_failures
+                .lock()
+                .expect("fake failure lock should not poison")
+                .insert(object);
+        }
+
+        fn upload_attempts(&self) -> Vec<LfsObject> {
+            self.upload_attempts
+                .lock()
+                .expect("fake attempt lock should not poison")
+                .clone()
+        }
+
+        fn delay_uploads_by(&self, delay: Duration) {
+            *self
+                .upload_delay
+                .lock()
+                .expect("fake delay lock should not poison") = Some(delay);
+        }
+
+        fn max_active_uploads(&self) -> usize {
+            self.max_active_uploads.load(Ordering::SeqCst)
         }
 
         fn override_returned_object(&self, object: LfsObject) {
@@ -3732,6 +4335,34 @@ mod tests {
             source: &'a Path,
         ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
             Box::pin(async move {
+                self.upload_attempts
+                    .lock()
+                    .expect("fake attempt lock should not poison")
+                    .push(object.clone());
+                let active_uploads = self.active_uploads.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active_uploads
+                    .fetch_max(active_uploads, Ordering::SeqCst);
+                let delay = *self
+                    .upload_delay
+                    .lock()
+                    .expect("fake delay lock should not poison");
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                self.active_uploads.fetch_sub(1, Ordering::SeqCst);
+
+                if self
+                    .upload_failures
+                    .lock()
+                    .expect("fake failure lock should not poison")
+                    .contains(object)
+                {
+                    return Err(StorageError::Retryable {
+                        provider: self.provider_id.clone(),
+                        message: "simulated migration upload failure".to_owned(),
+                    });
+                }
+
                 let (actual_oid, actual_size) =
                     hash_migration_object_file(source).map_err(|source| {
                         StorageError::IntegrityMismatch {
@@ -5149,6 +5780,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_uploads_use_bounded_concurrency() {
+        let repo = TempRepo::new();
+        let objects = [
+            test_lfs_object_from_bytes(b"parallel migration object one"),
+            test_lfs_object_from_bytes(b"parallel migration object two"),
+            test_lfs_object_from_bytes(b"parallel migration object three"),
+        ];
+        for (object, bytes) in objects.iter().zip([
+            b"parallel migration object one".as_slice(),
+            b"parallel migration object two".as_slice(),
+            b"parallel migration object three".as_slice(),
+        ]) {
+            write_git_lfs_source_object(&repo, object, bytes);
+        }
+        let availability = check_local_migration_objects(repo.path(), &objects, None)
+            .expect("migration objects should be available");
+        let storage = FakeMigrationStorageProvider::new("drive-user-a");
+        storage.delay_uploads_by(Duration::from_millis(50));
+        let options = MigrationStorageUploadOptions::new(repo.path().join("checkpoint.jsonl"))
+            .with_max_concurrent_uploads(2);
+
+        let report =
+            upload_migration_objects_to_storage_with_options(&availability, &storage, &options)
+                .await
+                .expect("bounded migration uploads should complete");
+
+        assert!(report.failed_objects.is_empty());
+        assert_eq!(report.uploaded_objects.len(), 3);
+        assert_eq!(storage.max_active_uploads(), 2);
+    }
+
+    #[tokio::test]
+    async fn migration_uploads_checkpoint_successes_and_retry_failures() {
+        let repo = TempRepo::new();
+        let completed = test_lfs_object_from_bytes(b"durably completed migration object");
+        let failed = test_lfs_object_from_bytes(b"retryable migration object");
+        write_git_lfs_source_object(&repo, &completed, b"durably completed migration object");
+        write_git_lfs_source_object(&repo, &failed, b"retryable migration object");
+        let availability = check_local_migration_objects(repo.path(), [&completed, &failed], None)
+            .expect("migration objects should be available");
+        let checkpoint_path = repo.path().join("checkpoint.jsonl");
+        let options =
+            MigrationStorageUploadOptions::new(&checkpoint_path).with_max_concurrent_uploads(2);
+        let first_storage = FakeMigrationStorageProvider::new("drive-user-a");
+        first_storage.fail_upload(failed.clone());
+
+        let first_report = upload_migration_objects_to_storage_with_options(
+            &availability,
+            &first_storage,
+            &options,
+        )
+        .await
+        .expect("one object failure should still return accumulated outcomes");
+
+        assert_eq!(first_report.uploaded_objects.len(), 1);
+        assert_eq!(first_report.failed_objects.len(), 1);
+        assert_eq!(first_report.failed_objects[0].object, failed);
+        assert!(checkpoint_path.is_file());
+
+        let resumed_storage = FakeMigrationStorageProvider::new("drive-user-a");
+        let resumed_report = upload_migration_objects_to_storage_with_options(
+            &availability,
+            &resumed_storage,
+            &options,
+        )
+        .await
+        .expect("a resumed upload should reuse durable completions");
+
+        assert!(resumed_report.failed_objects.is_empty());
+        assert_eq!(resumed_storage.upload_attempts(), vec![failed.clone()]);
+        assert!(matches!(
+            resumed_report.outcomes[0].status,
+            MigrationObjectUploadStatus::Uploaded { resumed: true, .. }
+        ));
+        assert!(matches!(
+            resumed_report.outcomes[1].status,
+            MigrationObjectUploadStatus::Uploaded { resumed: false, .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn upload_migration_objects_rechecks_source_bytes_before_upload() {
         let repo = TempRepo::new();
         let object = test_lfs_object_from_bytes(b"stable source bytes");
@@ -5158,12 +5870,17 @@ mod tests {
         write_git_lfs_source_object(&repo, &object, b"corrupt source bytes");
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
 
-        let error = upload_migration_objects_to_storage(&availability, &storage)
+        let report = upload_migration_objects_to_storage(&availability, &storage)
             .await
-            .expect_err("stale or corrupt local bytes should be rejected");
+            .expect("per-object failures should return a retry report");
 
-        assert!(matches!(error, MigrationError::InvalidInput { message }
-            if message.as_str().contains("no longer matches")));
+        assert_eq!(report.failed_objects.len(), 1);
+        assert!(
+            report.failed_objects[0]
+                .message
+                .as_str()
+                .contains("no longer matches")
+        );
         assert!(storage.uploaded_objects().is_empty());
     }
 
@@ -5178,12 +5895,17 @@ mod tests {
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
         storage.override_returned_object(returned);
 
-        let error = upload_migration_objects_to_storage(&availability, &storage)
+        let report = upload_migration_objects_to_storage(&availability, &storage)
             .await
-            .expect_err("storage providers must return the requested identity");
+            .expect("per-object failures should return a retry report");
 
-        assert!(matches!(error, MigrationError::InvalidInput { message }
-            if message.as_str().contains("returned object")));
+        assert_eq!(report.failed_objects.len(), 1);
+        assert!(
+            report.failed_objects[0]
+                .message
+                .as_str()
+                .contains("returned object")
+        );
     }
 
     #[tokio::test]
@@ -5196,12 +5918,17 @@ mod tests {
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
         storage.override_returned_provider_id("drive-user-b");
 
-        let error = upload_migration_objects_to_storage(&availability, &storage)
+        let report = upload_migration_objects_to_storage(&availability, &storage)
             .await
-            .expect_err("storage providers must return their configured provider ID");
+            .expect("per-object failures should return a retry report");
 
-        assert!(matches!(error, MigrationError::InvalidInput { message }
-            if message.as_str().contains("returned provider ID drive-user-b")));
+        assert_eq!(report.failed_objects.len(), 1);
+        assert!(
+            report.failed_objects[0]
+                .message
+                .as_str()
+                .contains("returned provider ID drive-user-b")
+        );
     }
 
     #[tokio::test]
@@ -5214,12 +5941,17 @@ mod tests {
         let storage = FakeMigrationStorageProvider::new("drive-user-a");
         storage.override_returned_backend_id(" ");
 
-        let error = upload_migration_objects_to_storage(&availability, &storage)
+        let report = upload_migration_objects_to_storage(&availability, &storage)
             .await
-            .expect_err("storage providers must return backend object metadata");
+            .expect("per-object failures should return a retry report");
 
-        assert!(matches!(error, MigrationError::InvalidInput { message }
-            if message.as_str().contains("empty backend object ID")));
+        assert_eq!(report.failed_objects.len(), 1);
+        assert!(
+            report.failed_objects[0]
+                .message
+                .as_str()
+                .contains("empty backend object ID")
+        );
     }
 
     #[test]

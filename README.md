@@ -63,6 +63,10 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > migration objects can also be uploaded idempotently to the configured LFS
 > Cloud storage provider, rechecking source bytes against pointer identities
 > before upload and validating provider-returned object identities afterward.
+> The transfer helper bounds concurrent uploads, synchronizes each completed
+> object to a provider-specific JSON Lines checkpoint, resumes those durable
+> completions after interruption, and returns per-object retry outcomes without
+> discarding independent successes.
 > `lfs-cloud migrate --dry-run` can report a read-only migration plan for the
 > current checkout, selected refs, or all fetched refs without fetching,
 > uploading, writing Git config, creating cache state, opening metadata, or

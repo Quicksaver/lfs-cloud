@@ -1868,11 +1868,42 @@ independently validated or adjudicated.
     provider evidence; with one valid finding assessed here and no invalid
     finding attributable separately, this was high-quality, relevant feedback.
 
-15. **Medium — Large migration uploads are serialized and lose accumulated
-    progress on failure.** One failed object aborts the run without a durable
-    per-object result ledger (`src/migration.rs:639-665`). Add bounded
-    concurrency, checkpoint completed objects, and return structured outcomes
-    for retry.
+15. **[DONE] Large migration uploads are serialized and lose accumulated
+    progress on failure** (Medium, `src/migration.rs`, `src/lib.rs`, migration
+    documentation, and `AGENTS.md`): **Valid and actionable.** The transfer
+    helper explicitly processed objects one at a time and returned on the first
+    source or provider error, so successful earlier uploads existed only in the
+    in-memory report and a restarted migration had to rediscover them through
+    provider calls. Migration uploads now run with a configurable bound of four
+    concurrent object transfers by default while preserving discovery order in
+    the returned report. Each uploaded or confirmed-present object is appended
+    under an exclusive file lock and synchronized individually to a
+    provider-specific JSON Lines checkpoint beside the repository's Git LFS
+    media store; callers may supply a different checkpoint path and concurrency
+    limit. A resumed run reconstructs only durable completions without
+    contacting storage, retries incomplete objects, rejects malformed complete
+    records or records for another provider, and safely ignores a partial final
+    record left by interruption. Source, provider, validation, and checkpoint
+    append failures are retained as secret-safe per-object outcomes while
+    independent transfers continue, so the final report is a structured retry
+    ledger rather than an all-or-nothing result. Test-first regressions failed
+    against the sequential API and now prove that the configured bound permits
+    two simultaneous uploads, one failed object does not discard a successful
+    peer, and a fresh provider instance resumes the durable success while
+    retrying only the prior failure. Existing source-integrity and
+    provider-metadata regressions now assert the structured failure contract.
+    README, implementation status/checklist, public exports, and the repository
+    learning document the checkpoint and retry boundary. Verification passed
+    with `cargo fmt --all`, `yarn lint:fix`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets -- --test-threads=1` (all targets passed; 3 tests
+    ignored), `cargo test --doc` (39 passed), and `git diff --check`. The
+    focused reviewer identified a genuine medium-severity scalability and
+    restart-recovery flaw, pinpointed the all-or-nothing loop, and recommended
+    the complete combination of bounded concurrency, durable completion state,
+    and structured retry outcomes; with one valid finding assessed here and no
+    invalid finding attributable separately, this was high-quality,
+    performance- and reliability-relevant feedback.
 
 16. **Low — Availability and upload paths repeatedly rehash the same object.**
     Both Git LFS media and shared-cache candidates can be hashed, followed by
