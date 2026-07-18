@@ -1,0 +1,42 @@
+name: Dependency audit
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/dependency-audit.yml
+      - Cargo.lock
+      - Cargo.toml
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/dependency-audit.yml
+      - Cargo.lock
+      - Cargo.toml
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rustsec:
+    name: RustSec advisory audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Select Rust toolchain
+        run: rustup default 1.88.0
+
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit locked Rust dependencies
+        run: cargo audit

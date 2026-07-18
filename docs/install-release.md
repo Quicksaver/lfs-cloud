@@ -13,6 +13,9 @@ yet.
 - Git LFS for `lfs-cloud pull` and migration source-fetch steps. Read-only
   migration planning can still report repository config without fetching, but
   fetching missing source objects depends on `git lfs fetch`.
+- `cargo-audit` 0.22.2 for local RustSec scans. Install the same pinned version
+  used by CI with
+  `cargo install cargo-audit --locked --version 0.22.2`.
 - Node.js/Yarn only for repository formatting checks.
 
 For real GitHub and Google Drive operation you also need:
@@ -29,6 +32,7 @@ cargo build
 cargo test --all-targets
 cargo test --doc
 cargo clippy --all-targets -- -D warnings
+cargo audit
 yarn lint:check
 ```
 
@@ -37,6 +41,22 @@ documentation-test gates natively on Linux, macOS, and Windows. The test suite
 uses platform-native child processes for timeout and process-tree cleanup
 coverage, so Windows exercises the same recursive termination boundary as Unix
 rather than only compiling it.
+
+The separate dependency-audit workflow installs the repository-pinned
+`cargo-audit` version and fails when the locked Rust graph contains an
+applicable RustSec vulnerability. It runs for dependency changes on pull
+requests and `main`, and on a weekly schedule so a newly published advisory is
+detected even when the lockfile has not changed. Informational warnings remain
+visible in the job output and require maintainer triage, but do not fail the
+audit unless they apply to code the project uses.
+
+Repository maintainers own both advisory remediation and updates to the pinned
+`cargo-audit` version. A failing advisory audit blocks merge. Prefer updating
+the affected direct requirement or the smallest transitive lockfile package,
+then run the full verification set below. An advisory may be ignored only when
+the repository documents why the affected code is unreachable, links a
+tracking issue, and records a review or expiry date; there are currently no
+ignored advisories.
 
 Run the CLI from the workspace:
 
@@ -104,5 +124,6 @@ cargo build
 cargo test --all-targets
 cargo test --doc
 cargo clippy --all-targets -- -D warnings
+cargo audit
 yarn lint:check
 ```

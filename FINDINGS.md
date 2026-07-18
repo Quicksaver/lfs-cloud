@@ -2536,12 +2536,35 @@ independently validated or adjudicated.
    remediation were accurate; with one valid finding and no invalid finding
    attributable separately, this was high-quality, release-relevant feedback.
 
-2. **Medium — CI lacks an explicit dependency-advisory gate.** The repository
-   does not enforce ongoing vulnerability review, and `cargo audit` is not
-   available in the documented workflow (`README.md:67`). Add a pinned
-   `cargo-audit` or equivalent supply-chain job, define update ownership, and
-   fail on applicable advisories. Track relevant RustSec advisories, including
-   [RUSTSEC-2026-0048](https://rustsec.org/advisories/RUSTSEC-2026-0048.html),
-   [RUSTSEC-2026-0049](https://rustsec.org/advisories/RUSTSEC-2026-0049.html),
-   and
-   [RUSTSEC-2025-0047](https://rustsec.org/advisories/RUSTSEC-2025-0047.html).
+2. **[DONE] CI lacks an explicit dependency-advisory gate** (Medium,
+   `.github/workflows/dependency-audit.yml`, `Cargo.lock`,
+   `docs/install-release.md`, and `AGENTS.md`): **Valid and actionable.** The
+   repository's only CI workflow formatted, linted, built, and tested the Rust
+   package but never compared `Cargo.lock` with the RustSec advisory database.
+   A dedicated audit workflow now installs the exact `cargo-audit` 0.22.2
+   release with its locked dependencies and fails on applicable advisories. It
+   runs when Rust dependency or audit-workflow files change on pull requests
+   and `main`, and also runs every week so a newly published advisory is
+   detected without a lockfile commit. Release documentation assigns
+   remediation and audit-tool pin updates to repository maintainers, makes a
+   failed audit merge-blocking, and permits an ignore only with reachability
+   evidence, a tracking issue, and a review or expiry date; no advisories are
+   currently ignored. The three examples cited by the reviewer are already
+   patched in the current lockfile: `aws-lc-sys` 0.41.0 satisfies
+   RUSTSEC-2026-0048's 0.39.0 fix, `rustls-webpki` 0.103.13 satisfies
+   RUSTSEC-2026-0049's 0.103.10 fix, and `slab` 0.4.12 satisfies
+   RUSTSEC-2025-0047's 0.4.11 fix. The first live audit also found
+   RUSTSEC-2026-0185 in the locked `quinn-proto` 0.11.14, which is now updated
+   to the patched 0.11.15. The final audit reports no vulnerabilities. It still
+   surfaces the allowed, function-specific RUSTSEC-2026-0190 warning for
+   `anyhow` 1.0.102: the declared fix is the not yet released 1.0.103, and this
+   codebase does not call the affected `Error::downcast_mut`. Verification
+   passed with the pinned `cargo audit`, workflow YAML parsing,
+   `yarn lint:fix`, `yarn lint:check`, full Rust build, lint, test, and
+   documentation-test gates, and `git diff --check`. The focused reviewer found
+   a genuine medium-severity supply-chain detection gap and requested the right
+   continuous gate and ownership policy. Its stale README line reference did
+   not affect the finding's validity, while its named advisories were useful
+   regression targets rather than current vulnerabilities; with one valid
+   finding and no invalid finding attributable separately, this was
+   high-quality, release-relevant feedback.
