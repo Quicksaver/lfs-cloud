@@ -592,12 +592,32 @@ independently validated or adjudicated.
    assessed here and no invalid finding attributable separately, this was
    high-quality, operationally relevant feedback.
 
-7. **Medium — Metadata config synchronization retains stale routes and can block
-   legitimate renames.** Synchronization only upserts, so a removed mapping can
-   retain the unique route and make a renamed mapping fail startup
-   (`src/metadata.rs:394-417`, `src/metadata.rs:602-641`). Reconcile active and
-   persisted configuration transactionally, using an active/generation marker
-   if historical rows must remain.
+7. **[DONE] Metadata config synchronization retained stale routes and could
+   block legitimate renames** (Medium, `src/metadata.rs`, `IMPLEMENTATION.md`,
+   and `AGENTS.md`): **Valid and actionable.** A test-first replacement-mapping
+   regression reproduced the startup failure as
+   `UNIQUE constraint failed: repository_mappings.route_path`: synchronization
+   upserted only current IDs, so a removed mapping continued to reserve its
+   route indefinitely. Metadata schema version 4 now adds an `is_active`
+   marker. In the existing configuration-sync transaction, removed mappings and
+   mappings whose route changed are first marked inactive and assigned a
+   non-routable `inactive:<mapping-id>` tombstone; current mappings are then
+   upserted as active with their configured routes. The inactive parent rows
+   remain in place, preserving object and transfer-attempt foreign-key history
+   instead of deleting it through cascades, while the unique public route can
+   be reused safely. Upgrade coverage proves version-3 mappings become active,
+   and the replacement regression proves a new mapping can claim a removed
+   mapping's route without losing the original mapping's verified object row.
+   Implementation guidance and the repository learning now document the
+   reconciliation contract. Verification passed with `yarn lint:fix`,
+   `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, `cargo test --all-targets`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine
+   medium-severity startup availability and configuration-lifecycle flaw,
+   correctly connected the unique route to stale persisted state, and proposed
+   the right transactional active-marker design while preserving history; with
+   one valid finding assessed here and no invalid finding attributable
+   separately, this was high-quality, operationally relevant feedback.
 
 8. **Medium — Idempotent verification rewrites original uploader attribution.**
    The conflict update preserves `created_at` while replacing every

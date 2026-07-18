@@ -1062,6 +1062,12 @@ Direct signed URLs are not part of the MVP. They are a future optimization for S
 
 Use SQLite for MVP metadata.
 
+Startup reconciles the current repository configuration transactionally.
+Mappings removed from configuration remain as inactive historical parents for
+object and transfer records, while their route keys are tombstoned before the
+current mappings are upserted so a rename or route reassignment cannot be
+blocked by stale metadata.
+
 Start with repo-scoped object records:
 
 ```text

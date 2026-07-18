@@ -5,6 +5,7 @@
 //! attempts without becoming part of any Git repository's committed config.
 
 use std::{
+    collections::HashMap,
     fmt, fs,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
@@ -19,7 +20,7 @@ use crate::{
 };
 
 /// Current metadata schema version installed by the migration runner.
-pub const METADATA_SCHEMA_VERSION: u32 = 3;
+pub const METADATA_SCHEMA_VERSION: u32 = 4;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OBJECT_RECORD_BY_IDENTITY_SQL: &str = "SELECT
@@ -207,6 +208,17 @@ INSERT OR IGNORE INTO schema_migrations(version, name)
 VALUES (3, 'protected_session_tokens');
 
 PRAGMA user_version = 3;
+"#;
+
+const ACTIVE_REPOSITORY_MAPPING_MIGRATION: &str = r#"
+ALTER TABLE repository_mappings
+    ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1
+    CHECK (is_active IN (0, 1));
+
+INSERT OR IGNORE INTO schema_migrations(version, name)
+VALUES (4, 'active_repository_mappings');
+
+PRAGMA user_version = 4;
 "#;
 
 /// Verification state recorded for a repository-scoped object mapping.
@@ -406,6 +418,14 @@ impl MetadataDatabase {
                     source,
                 })?;
         }
+        if schema_version < 4 {
+            transaction
+                .execute_batch(ACTIVE_REPOSITORY_MAPPING_MIGRATION)
+                .map_err(|source| ServerError::MetadataMigration {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
         transaction
             .commit()
             .map_err(|source| ServerError::MetadataMigration {
@@ -432,7 +452,9 @@ impl MetadataDatabase {
     ///
     /// Object metadata references repository and storage-provider rows through
     /// foreign keys. The server calls this during startup before transfer
-    /// handlers can record verified uploads.
+    /// handlers can record verified uploads. Removed repository mappings remain
+    /// as inactive history, but their route keys are released for the current
+    /// configuration.
     ///
     /// # Errors
     ///
@@ -447,6 +469,8 @@ impl MetadataDatabase {
                     path: self.path.clone(),
                     source,
                 })?;
+
+        release_inactive_repository_routes(&transaction, config, &self.path)?;
 
         for storage in config.storage_providers.values() {
             upsert_storage_provider(&transaction, storage, &self.path)?;
@@ -786,8 +810,9 @@ fn upsert_repository_mapping(
                 owner,
                 name,
                 storage_provider_id,
-                route_path
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                route_path,
+                is_active
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
             ON CONFLICT(id)
             DO UPDATE SET
                 repo_provider_id = excluded.repo_provider_id,
@@ -796,6 +821,7 @@ fn upsert_repository_mapping(
                 name = excluded.name,
                 storage_provider_id = excluded.storage_provider_id,
                 route_path = excluded.route_path,
+                is_active = 1,
                 updated_at_unix_seconds = unixepoch()",
             params![
                 repository.id.as_str(),
@@ -812,6 +838,65 @@ fn upsert_repository_mapping(
             path: path.to_path_buf(),
             source,
         })
+}
+
+fn release_inactive_repository_routes(
+    connection: &Connection,
+    config: &ServerConfig,
+    path: &Path,
+) -> ServerResult<()> {
+    let configured_routes = config
+        .repositories
+        .iter()
+        .map(|repository| (repository.id.as_str(), repository.route_path()))
+        .collect::<HashMap<_, _>>();
+    let persisted_mappings = {
+        let mut statement = connection
+            .prepare("SELECT id, route_path FROM repository_mappings")
+            .map_err(|source| ServerError::MetadataOperation {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| ServerError::MetadataOperation {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| ServerError::MetadataOperation {
+                path: path.to_path_buf(),
+                source,
+            })?
+    };
+
+    for (id, persisted_route) in persisted_mappings {
+        let retains_route = configured_routes
+            .get(id.as_str())
+            .is_some_and(|configured_route| *configured_route == persisted_route);
+        if retains_route {
+            continue;
+        }
+
+        connection
+            .execute(
+                "UPDATE repository_mappings
+                 SET route_path = 'inactive:' || id,
+                     is_active = 0,
+                     updated_at_unix_seconds = unixepoch()
+                 WHERE id = ?1
+                   AND (route_path != 'inactive:' || id OR is_active != 0)",
+                [&id],
+            )
+            .map_err(|source| ServerError::MetadataOperation {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+
+    Ok(())
 }
 
 fn query_optional_object_record(
@@ -916,7 +1001,11 @@ mod tests {
 
     use crate::{LfsObject, LfsObjectSize, LfsOid, RepositoryUser, ServerConfig, ServerError};
 
-    use super::{METADATA_SCHEMA_VERSION, MetadataDatabase, MetadataObjectVerificationStatus};
+    use super::{
+        INITIAL_SCHEMA, METADATA_SCHEMA_VERSION, MetadataDatabase,
+        MetadataObjectVerificationStatus, NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION,
+        PROTECTED_SESSION_TOKEN_MIGRATION,
+    };
 
     const LEGACY_SCHEMA_WITH_NON_NULL_VERIFICATION_TIMESTAMP: &str = r#"
 CREATE TABLE schema_migrations (
@@ -1024,7 +1113,7 @@ PRAGMA user_version = 1;
                 row.get(0)
             })
             .expect("migration count should load");
-        assert_eq!(migration_count, 3);
+        assert_eq!(migration_count, 4);
         assert_eq!(
             database
                 .schema_version()
@@ -1070,6 +1159,44 @@ PRAGMA user_version = 1;
             )
             .expect("verification timestamp should load");
         assert_eq!(last_verified_at, None);
+    }
+
+    #[test]
+    fn migration_upgrades_v3_repository_mappings_as_active() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let db_path = directory.path().join("metadata.sqlite3");
+        let legacy_connection =
+            rusqlite::Connection::open(&db_path).expect("legacy metadata DB should open");
+        legacy_connection
+            .execute_batch(INITIAL_SCHEMA)
+            .expect("initial schema should be created");
+        legacy_connection
+            .execute_batch(NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION)
+            .expect("version 2 migration should apply");
+        legacy_connection
+            .execute_batch(PROTECTED_SESSION_TOKEN_MIGRATION)
+            .expect("version 3 migration should apply");
+        insert_storage_provider_and_repository_mapping(&legacy_connection);
+        drop(legacy_connection);
+
+        let database = MetadataDatabase::open(&db_path).expect("metadata DB should migrate");
+        assert_eq!(
+            database
+                .schema_version()
+                .expect("schema version should load"),
+            METADATA_SCHEMA_VERSION
+        );
+        let is_active: bool = database
+            .connection
+            .lock()
+            .expect("metadata connection should lock")
+            .query_row(
+                "SELECT is_active FROM repository_mappings WHERE id = ?1",
+                ["github-main:owner/repo"],
+                |row| row.get(0),
+            )
+            .expect("migrated repository activity should load");
+        assert!(is_active);
     }
 
     #[test]
@@ -1280,6 +1407,75 @@ repositories:
 
         assert_eq!(record.repo_id, "github-main:owner/repo");
         assert_eq!(record.storage_provider_id, "drive-user-a");
+    }
+
+    #[test]
+    fn sync_config_releases_removed_routes_without_deleting_object_history() {
+        let database = MetadataDatabase::open_in_memory().expect("metadata DB should open");
+        let original_config =
+            server_config_with_repository("github-main:owner/archived", "owner", "repo", "8675309");
+        database
+            .sync_config(&original_config)
+            .expect("original metadata config sync should succeed");
+        let object = lfs_object('e', 42);
+        database
+            .record_verified_object(
+                "github-main:owner/archived",
+                "drive-user-a",
+                &object,
+                "drive-file-verified",
+                &RepositoryUser::new("github-main", "octocat", Some("user-1".to_owned())),
+            )
+            .expect("verified object should record for original mapping");
+
+        let replacement_config = server_config_with_repository(
+            "github-main:owner/replacement",
+            "owner",
+            "repo",
+            "97531",
+        );
+        database
+            .sync_config(&replacement_config)
+            .expect("replacement mapping should claim the released route");
+
+        let connection = database
+            .connection
+            .lock()
+            .expect("metadata connection should lock");
+        let original_mapping: (String, bool) = connection
+            .query_row(
+                "SELECT route_path, is_active
+                 FROM repository_mappings
+                 WHERE id = ?1",
+                ["github-main:owner/archived"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("original mapping should remain as history");
+        let replacement_mapping: (String, bool) = connection
+            .query_row(
+                "SELECT route_path, is_active
+                 FROM repository_mappings
+                 WHERE id = ?1",
+                ["github-main:owner/replacement"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("replacement mapping should be persisted");
+        drop(connection);
+
+        assert_eq!(
+            original_mapping,
+            ("inactive:github-main:owner/archived".to_owned(), false)
+        );
+        assert_eq!(
+            replacement_mapping,
+            ("/github.com/owner/repo.git/info/lfs".to_owned(), true)
+        );
+        assert!(
+            database
+                .lookup_object("github-main:owner/archived", "drive-user-a", &object)
+                .expect("historical object lookup should succeed")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1553,6 +1749,40 @@ repositories:
             LfsOid::new(oid_character.to_string().repeat(64)).expect("fixture OID should be valid"),
             LfsObjectSize::new(size_bytes),
         )
+    }
+
+    fn server_config_with_repository(
+        repository_id: &str,
+        owner: &str,
+        name: &str,
+        provider_repository_id: &str,
+    ) -> ServerConfig {
+        ServerConfig::load_from_str(&format!(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    oauth_client_id: test-client
+    oauth_client_secret: test-secret
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials_ref: google-drive-user-a
+    root_folder_id: drive-root
+repositories:
+  - id: {repository_id}
+    repo_provider: github-main
+    host: github.com
+    owner: {owner}
+    name: {name}
+    provider_repository_id: "{provider_repository_id}"
+    storage_provider: drive-user-a
+"#
+        ))
+        .expect("test config should load")
     }
 
     fn insert_object_without_verification_timestamp(
