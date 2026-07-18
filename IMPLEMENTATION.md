@@ -845,7 +845,8 @@ Initial download flow:
 4. lfs-cloud resolves each object OID to a backend object.
 5. lfs-cloud returns download actions.
 6. Client downloads bytes from lfs-cloud.
-7. lfs-cloud streams bytes from the configured storage provider.
+7. lfs-cloud proxies bytes from the configured storage provider with bounded
+   memory, terminating the response if end-to-end hash or size verification fails.
 ```
 
 For Google Drive, avoid exposing public or broadly shared Drive links unless there is a strong reason. Proxying downloads through `lfs-cloud` keeps authorization centralized and avoids relying on Drive sharing semantics.
@@ -1227,8 +1228,9 @@ Defer:
 > stage bytes to a temp file, verify SHA-256 and size, write to Google Drive,
 > and record verified metadata. Download batches check configured storage
 > availability and return download actions for existing objects, while
-> authenticated object `GET` downloads stream verified Google Drive bytes
-> through `lfs-cloud`. LFS route, authentication, method, body-size, parse,
+> authenticated object `GET` downloads directly proxy Google Drive bytes with
+> bounded memory and terminate on end-of-stream integrity failure. LFS route,
+> authentication, method, body-size, parse,
 > authorization, upload-integrity, and storage failures now use Git LFS JSON
 > error payloads with matching HTTP statuses. Upload staging now rejects object
 > sizes over the configured server cap, atomically reserves aggregate local

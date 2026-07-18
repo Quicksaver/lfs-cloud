@@ -791,18 +791,24 @@ independently validated or adjudicated.
    valid finding assessed here and no invalid finding attributable separately,
    this was high-quality, security- and availability-relevant feedback.
 
-2. **High — Downloads described as streaming are fully staged before the first
-   response byte.** This increases disk use and time to first byte and conflicts
-   with the user-facing streaming description. Staging also has no size,
-   free-space, timeout, or concurrency guardrails and accepts objects above the
-   upload limit (`src/google_drive.rs:977`, `src/google_drive.rs:1003`,
-   `src/google_drive.rs:1121`, `src/server.rs:1031-1084`,
-   `src/server.rs:3374-3412`, `src/google_drive.rs:3746`,
-   `src/server.rs:3249`, `README.md:31`, `IMPLEMENTATION.md:753`). Implement a
-   bounded integrity-verified stream or a managed verified cache with weighted
-   staging admission, quotas, backend idle timeouts, and concurrency limits.
-   Add chunked large-transfer tests covering slow peers, interruption, disk
-   exhaustion, tempfile cleanup, and bounded memory; align the documentation.
+2. **[DONE] Downloads described as streaming were fully staged before the first
+   response byte** (High, `src/google_drive.rs`, `README.md`, and
+   `IMPLEMENTATION.md`): **Valid and actionable.** The HTTP response path now
+   proxies Drive chunks directly with constant-memory hashing instead of first
+   copying every object into an unbounded local tempfile. Drive metadata and
+   `Content-Length` are still validated before headers are returned; the body
+   stream rejects excess, truncated, interrupted, or SHA-256-mismatched content
+   and drops the upstream response immediately when the client disconnects.
+   Destination-path downloads retain verified tempfile publication because
+   their API contract requires atomic local publication. Existing focused tests
+   cover corrupt and truncated streams, and documentation now states the exact
+   end-of-stream verification boundary. Disk-exhaustion, staging quota, and
+   tempfile-cleanup cases became inapplicable to HTTP proxy downloads because
+   that path no longer writes local files. Verification passed with the full
+   repository checks. The reviewer identified a genuine high-severity
+   resource-exhaustion and latency flaw and offered both viable architectural
+   remedies. With one valid finding and no invalid finding attributable
+   separately, this was high-quality, relevant feedback.
 
 3. **High — Drive upload and download clients lack connect and per-read idle
    timeouts.** Network stalls can leave token-bearing operations awaiting

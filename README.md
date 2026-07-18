@@ -31,8 +31,9 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > advertise upload actions for missing objects, and accept authenticated object
 > `PUT` uploads through temp-file staging, SHA-256 verification, Google Drive
 > storage, and metadata recording. Download batches check configured storage
-> availability, advertise download actions for existing objects, and stream
-> authenticated object `GET` downloads from Google Drive through `lfs-cloud`.
+> availability, advertise download actions for existing objects, and proxy
+> authenticated object `GET` downloads directly from Google Drive through
+> `lfs-cloud` with bounded memory and end-of-stream integrity verification.
 > LFS route, authentication, method, body-size, parse, authorization,
 > upload-integrity, local staging-capacity, idle upload timeout, and storage
 > failures return Git LFS JSON error payloads with matching HTTP statuses.

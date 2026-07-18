@@ -631,8 +631,8 @@ enum DriveUploadPhase {
 
 /// A verified Google Drive object download exposed as an HTTP response body.
 ///
-/// The response streams locally staged bytes after the Drive media response has
-/// been checked against the requested LFS object hash and size. It intentionally
+/// The response proxies Drive bytes directly while checking the requested LFS
+/// object hash and size. It intentionally
 /// does not expose Drive file IDs, URLs, or credentials to Git LFS clients. The
 /// current scaffold uses Axum as its HTTP server boundary; this wrapper can move
 /// behind a server crate boundary when the package is split.
@@ -979,9 +979,107 @@ impl GoogleDriveObjectStore {
         &self,
         object: &LfsObject,
     ) -> StorageResult<GoogleDriveDownloadResponse> {
-        let (stored_object, verified_file) = self.download_object_to_verified_file(object).await?;
-        let response_body =
-            AxumBody::from_stream(ReaderStream::new(tokio::fs::File::from_std(verified_file)));
+        let stored_object =
+            self.lookup_object(object)
+                .await?
+                .ok_or_else(|| StorageError::ObjectNotFound {
+                    provider: self.storage.id.clone(),
+                    oid: object.oid.as_hex().to_owned(),
+                    size: object.size.bytes(),
+                })?;
+        let download_response = self
+            .download_client
+            .get(drive_media_download_url(
+                self.api_base_url.clone(),
+                &stored_object.backend_id,
+            )?)
+            .header(ACCEPT, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
+            .header(
+                AUTHORIZATION,
+                self.token.authorization_header_value(&self.storage.id)?,
+            )
+            .header(ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+        let status = download_response.status();
+        if !status.is_success() {
+            let response_body = read_google_response_body(download_response)
+                .await
+                .map_err(|source| drive_transport_error(&self.storage, &self.token, source))?;
+            return Err(parse_drive_download_error(
+                &self.storage,
+                &self.token,
+                object,
+                status,
+                &response_body,
+            ));
+        }
+        let Some(actual_size) = download_response.content_length() else {
+            return Err(StorageError::Upstream {
+                provider: self.storage.id.clone(),
+                status: None,
+                message: SanitizedMessage::new(
+                    "Google Drive download response omitted Content-Length",
+                ),
+            });
+        };
+        if actual_size != object.size.bytes() {
+            return Err(StorageError::Upstream {
+                provider: self.storage.id.clone(),
+                status: None,
+                message: SanitizedMessage::new(format!(
+                    "Google Drive download response Content-Length {actual_size} did not match requested size {}",
+                    object.size.bytes()
+                )),
+            });
+        }
+
+        let expected_oid = object.oid.as_hex().to_owned();
+        let expected_size = object.size.bytes();
+        let stream = futures_util::stream::try_unfold(
+            (
+                download_response.bytes_stream(),
+                Sha256::new(),
+                0_u64,
+                false,
+            ),
+            move |(mut source, mut hasher, mut actual_size, finished)| {
+                let expected_oid = expected_oid.clone();
+                async move {
+                    if finished {
+                        return Ok(None);
+                    }
+                    match source.next().await {
+                        Some(Ok(chunk)) => {
+                            hasher.update(&chunk);
+                            actual_size = actual_size.saturating_add(chunk.len() as u64);
+                            if actual_size > expected_size {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Google Drive download exceeded the requested object size",
+                                ));
+                            }
+                            Ok(Some((chunk, (source, hasher, actual_size, false))))
+                        }
+                        Some(Err(_)) => {
+                            Err(io::Error::other("Google Drive download stream failed"))
+                        }
+                        None => {
+                            let actual_oid = format!("{:x}", hasher.finalize());
+                            if actual_size != expected_size || actual_oid != expected_oid {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Google Drive download failed LFS integrity verification",
+                                ));
+                            }
+                            Ok(None)
+                        }
+                    }
+                }
+            },
+        );
+        let response_body = AxumBody::from_stream(stream);
         let response = AxumResponse::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
@@ -4028,11 +4126,14 @@ mod tests {
         )
         .expect("object store should build");
 
-        let error = store
+        let download = store
             .download_object_response(&lfs_object())
             .await
-            .expect_err("hash mismatch should fail before proxying");
-        assert!(error.to_string().contains("integrity mismatch"));
+            .expect("valid response metadata should begin proxying");
+        let error = to_bytes(download.into_response().into_body(), usize::MAX)
+            .await
+            .expect_err("hash mismatch should terminate the response stream");
+        assert!(error.to_string().contains("integrity verification"));
     }
 
     #[tokio::test]
