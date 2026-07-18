@@ -842,6 +842,14 @@ impl LocalCacheLayout {
         let pointer_path = pointer_path.as_ref();
         let _path_lock = self.lock_worktree_path(pointer_path)?;
         let pointer = read_lfs_pointer_file(pointer_path)?;
+        if pointer.is_empty() {
+            return Ok(LocalCacheMaterialization {
+                cache_path: self.object_path(&pointer.object),
+                destination_path: pointer_path.to_path_buf(),
+                object: pointer.object,
+                status: LocalCacheMaterializationStatus::AlreadyMaterialized,
+            });
+        }
         let verified = self.verify_object(&pointer.object)?;
 
         materialize_verified_object(
@@ -1657,7 +1665,9 @@ fn collect_pointer_oid_from_file(
     let Ok(contents) = std::str::from_utf8(&contents) else {
         return Ok(());
     };
-    if let Ok(pointer) = LfsPointer::parse(contents) {
+    if let Ok(pointer) = LfsPointer::parse(contents)
+        && !pointer.is_empty()
+    {
         referenced.insert(pointer.object.oid);
     }
 
@@ -3322,6 +3332,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hydrate_empty_pointer_is_already_materialized_without_cache_bytes() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let object = object_for_bytes(b"");
+        let destination = temp.path().join("repo/assets/empty.bin");
+        write_file(&destination, b"");
+
+        let materialization = layout
+            .hydrate_pointer_file(&destination)
+            .expect("an empty pointer should already be materialized");
+
+        assert_eq!(materialization.object, object);
+        assert_eq!(materialization.destination_path, destination);
+        assert_eq!(
+            materialization.status,
+            LocalCacheMaterializationStatus::AlreadyMaterialized
+        );
+        assert!(!materialization.cache_path.exists());
+    }
+
     #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn hydrate_pointer_file_preserves_edit_after_final_pointer_check() {
@@ -3605,6 +3636,30 @@ mod tests {
             fs::read(layout.object_path(&object)).expect("cache object should be readable"),
             bytes
         );
+    }
+
+    #[test]
+    fn dehydrate_empty_file_preserves_the_canonical_empty_pointer() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let object = object_for_bytes(b"");
+        let worktree_path = temp.path().join("repo/assets/empty.bin");
+        write_file(&worktree_path, b"");
+
+        let dehydration = layout
+            .dehydrate_file(&object, &worktree_path)
+            .expect("an empty file should already be its canonical pointer");
+
+        assert_eq!(dehydration.object, object);
+        assert_eq!(
+            dehydration.status,
+            LocalCacheDehydrationStatus::AlreadyDehydrated
+        );
+        assert_eq!(
+            fs::read(&dehydration.pointer_path).expect("empty pointer should remain readable"),
+            b""
+        );
+        assert!(!dehydration.cache_path.exists());
     }
 
     #[test]
@@ -4396,6 +4451,7 @@ mod tests {
         let tracked_lfs = object_for_bytes(b"tracked LFS object");
         let tracked_non_lfs = object_for_bytes(b"tracked non-LFS object");
         let ignored = object_for_bytes(b"ignored generated object");
+        let empty = object_for_bytes(b"");
         initialize_git_worktree(&repo);
         write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(&repo.join(".gitignore"), b"generated/\n");
@@ -4417,11 +4473,13 @@ mod tests {
                 .to_pointer_file()
                 .as_bytes(),
         );
+        write_file(&repo.join("asset/empty.bin"), b"");
         git_add(
             &repo,
             &[
                 Path::new(".gitattributes"),
                 Path::new(".gitignore"),
+                Path::new("asset/empty.bin"),
                 Path::new("asset/keep.bin"),
                 Path::new("docs/pointer.txt"),
             ],
@@ -4432,6 +4490,7 @@ mod tests {
             b"tracked non-LFS object",
         );
         write_file(&layout.object_path(&ignored), b"ignored generated object");
+        write_file(&layout.object_path(&empty), b"");
         let registration =
             LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
                 .expect("registration should validate");
@@ -4451,10 +4510,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![tracked_lfs.oid.clone()]
         );
-        assert_eq!(report.deleted_objects.len(), 2);
+        assert_eq!(report.deleted_objects.len(), 3);
         assert!(layout.object_path(&tracked_lfs).exists());
         assert!(!layout.object_path(&tracked_non_lfs).exists());
         assert!(!layout.object_path(&ignored).exists());
+        assert!(!layout.object_path(&empty).exists());
     }
 
     #[test]

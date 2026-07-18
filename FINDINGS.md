@@ -1962,11 +1962,35 @@ independently validated or adjudicated.
    tests. With one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, protocol-relevant feedback.
 
-2. **Medium — The empty canonical Git LFS pointer representation is wrong.** The
-   pointer parser/rendering path does not match the specification's canonical
-   empty representation (`src/lfs.rs:325-328`, `src/lfs.rs:401-413`,
-   `src/local_cache.rs:1426-1444`). Correct parsing/rendering and add fixture
-   round trips from the upstream pointer specification.
+2. **[DONE] The empty canonical Git LFS pointer representation was wrong**
+   (Medium, `src/lfs.rs`, `src/local_cache.rs`, `src/cli.rs`, and
+   `src/migration.rs`): **Valid and actionable.** The official
+   [Git LFS specification](https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md)
+   defines a zero-byte file as its own pointer, while the reference
+   [pointer implementation](https://github.com/git-lfs/git-lfs/blob/main/lfs/pointer.go)
+   decodes it to the SHA-256 identity of empty content and renders zero-size
+   pointer metadata as zero bytes. LFS Cloud previously rejected an empty file
+   as missing its version line and rendered a normal three-line pointer for a
+   zero-size object. `LfsPointer` now recognizes the canonical empty file,
+   exposes that state through `is_empty`, assigns the standard empty-content
+   SHA-256 identity, and renders zero-size pointers as zero bytes. Local cache
+   hydration and dehydration treat an empty pointer as already materialized or
+   dehydrated without requiring a cache object; cache GC, pull scans, and
+   current or historical migration inventories exclude empty files from
+   object-transfer work while retaining their tracked-path counts. Test-first
+   regressions cover the upstream empty fixture, normalization of three-line
+   zero-size metadata, cache hydrate/dehydrate behavior, GC reachability, pull
+   scanning, and current/historical migration discovery. The repository
+   learning records the special compatibility boundary. Verification passed
+   with `yarn lint:fix`, `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (all targets passed; 3 tests
+   ignored), `cargo test --doc` (39 passed), and `git diff --check`. The focused
+   reviewer identified a genuine medium-severity interoperability issue,
+   supplied the correct specification behavior, and pointed to both parser and
+   local publication consequences. With one valid finding assessed here and no
+   invalid finding attributable separately, this was high-quality,
+   protocol-relevant feedback.
 
 3. **Medium — Pointer detection uses a 64 KiB cutoff instead of Git LFS's 1,024
    byte limit.** Multiple call sites will treat larger pointer-shaped files as

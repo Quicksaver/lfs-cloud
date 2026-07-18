@@ -2880,7 +2880,9 @@ impl<'a> HistoryScanner<'a> {
             return Ok(None);
         };
 
-        Ok(LfsPointer::parse(contents).ok())
+        Ok(LfsPointer::parse(contents)
+            .ok()
+            .filter(|pointer| !pointer.is_empty()))
     }
 
     fn finish(mut self) -> MigrationResult<(Vec<GitLfsHistoryPointer>, HistoryScanMetrics)> {
@@ -3570,7 +3572,9 @@ fn read_history_pointer_blob_candidate(
         return Ok(None);
     };
 
-    Ok(LfsPointer::parse(contents).ok())
+    Ok(LfsPointer::parse(contents)
+        .ok()
+        .filter(|pointer| !pointer.is_empty()))
 }
 
 fn is_git_object_id(value: &str) -> bool {
@@ -4724,6 +4728,7 @@ mod tests {
             "asset/model.bin",
             &LfsPointer::new(pointer_object.clone()).to_pointer_file(),
         );
+        repo.write_file("asset/empty.bin", "");
         repo.write_file(
             "docs/pointer-example.txt",
             &LfsPointer::new(non_lfs_pointer_object).to_pointer_file(),
@@ -4731,6 +4736,7 @@ mod tests {
         repo.git([
             "add",
             ".gitattributes",
+            "asset/empty.bin",
             "asset/model.bin",
             "docs/pointer-example.txt",
         ]);
@@ -4738,7 +4744,7 @@ mod tests {
         let scan = enumerate_current_checkout_lfs_pointers(repo.path())
             .expect("current checkout pointer scan should succeed");
 
-        assert_eq!(scan.tracked_path_count, 1);
+        assert_eq!(scan.tracked_path_count, 2);
         assert_eq!(scan.pointers.len(), 1);
         assert_eq!(scan.pointers[0].relative_path, Path::new("asset/model.bin"));
         assert_eq!(
@@ -5033,6 +5039,7 @@ mod tests {
             "asset/old.bin",
             &LfsPointer::new(old_object.clone()).to_pointer_file(),
         );
+        repo.write_file("asset/empty.bin", "");
         repo.write_file(
             "docs/pointer-example.txt",
             &LfsPointer::new(non_lfs_object).to_pointer_file(),
@@ -5057,6 +5064,11 @@ mod tests {
         assert!(scan.pointers.iter().any(|pointer| {
             pointer.relative_path == Path::new("asset/old.bin") && pointer.object == old_object
         }));
+        assert!(
+            scan.pointers
+                .iter()
+                .all(|pointer| pointer.relative_path != Path::new("asset/empty.bin"))
+        );
         assert!(
             scan.pointers
                 .iter()

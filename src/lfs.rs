@@ -16,6 +16,7 @@ pub const LFS_BASIC_TRANSFER: &str = "basic";
 
 const SHA256_PREFIX: &str = "sha256:";
 const SHA256_HEX_LENGTH: usize = 64;
+const EMPTY_SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Error returned when Git LFS object or pointer metadata is invalid.
 #[non_exhaustive]
@@ -309,6 +310,16 @@ impl LfsPointer {
         &self.extensions
     }
 
+    /// Returns whether this pointer represents Git LFS's canonical empty file.
+    ///
+    /// Git LFS passes zero-byte files through unchanged, so their canonical
+    /// pointer representation is also a zero-byte file rather than the usual
+    /// version, OID, and size records.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.object.size.bytes() == 0
+    }
+
     /// Inserts an extension pointer record.
     ///
     /// The `version`, `oid`, and `size` keys are owned by the core pointer
@@ -331,6 +342,9 @@ impl LfsPointer {
 
     /// Parses a Git LFS pointer file.
     ///
+    /// A zero-byte file parses as Git LFS's canonical pointer for empty
+    /// content, whose object identity is the SHA-256 digest of zero bytes.
+    ///
     /// # Examples
     ///
     /// ```
@@ -346,6 +360,13 @@ impl LfsPointer {
     /// # Ok::<(), lfs_cloud::LfsObjectError>(())
     /// ```
     pub fn parse(contents: &str) -> Result<Self, LfsObjectError> {
+        if contents.is_empty() {
+            return Ok(Self::new(LfsObject::new(
+                LfsOid(EMPTY_SHA256_HEX.to_owned()),
+                LfsObjectSize::new(0),
+            )));
+        }
+
         let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
 
         let version_line = lines.next().ok_or(LfsObjectError::PointerMissingVersion)?;
@@ -422,8 +443,15 @@ impl LfsPointer {
     }
 
     /// Renders this pointer in the canonical Git LFS form.
+    ///
+    /// Zero-size pointers render as a zero-byte file, matching the Git LFS
+    /// pass-through representation for empty content.
     #[must_use]
     pub fn to_pointer_file(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+
         let mut pointer = format!("version {}\n", self.version);
         let mut fields = self.extensions.clone();
 
@@ -1066,6 +1094,29 @@ mod tests {
         assert_eq!(pointer.object.oid.as_hex(), OID);
         assert_eq!(pointer.object.size.bytes(), 42);
         assert_eq!(pointer.to_pointer_file(), contents);
+    }
+
+    #[test]
+    fn pointer_parses_and_renders_the_canonical_empty_file() {
+        let pointer = LfsPointer::parse("").expect("an empty file is a Git LFS pointer");
+
+        assert_eq!(
+            pointer.object.oid.as_hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(pointer.object.size.bytes(), 0);
+        assert_eq!(pointer.to_pointer_file(), "");
+    }
+
+    #[test]
+    fn pointer_renders_zero_size_metadata_as_the_canonical_empty_file() {
+        let contents = "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+             size 0\n";
+
+        let pointer = LfsPointer::parse(contents).expect("zero-size metadata should parse");
+
+        assert_eq!(pointer.to_pointer_file(), "");
     }
 
     #[test]

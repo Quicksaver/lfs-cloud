@@ -2308,6 +2308,9 @@ fn current_checkout_lfs_pointer_scan(
         let Some(pointer) = read_current_checkout_pointer_candidate(&path)? else {
             continue;
         };
+        if pointer.is_empty() {
+            continue;
+        }
 
         pointer_files.push(CurrentCheckoutLfsPointerFile {
             path,
@@ -5506,6 +5509,7 @@ mod tests {
             &repo.join("asset/pointer.bin"),
             LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
+        write_file(&repo.join("asset/empty.bin"), b"");
         write_file(&repo.join("asset/hydrated.bin"), b"already hydrated bytes");
         run_git(
             &repo,
@@ -5513,6 +5517,7 @@ mod tests {
                 "add",
                 ".gitattributes",
                 "asset/pointer.bin",
+                "asset/empty.bin",
                 "asset/hydrated.bin",
             ],
         );
@@ -5520,7 +5525,7 @@ mod tests {
         let scan = current_checkout_lfs_pointer_scan(&repo)
             .expect("pointer scan should inspect tracked files");
 
-        assert_eq!(scan.tracked_path_count, 2);
+        assert_eq!(scan.tracked_path_count, 3);
         assert_eq!(scan.pointer_files.len(), 1);
         assert_eq!(scan.pointer_files[0].object, object);
     }
