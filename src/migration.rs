@@ -913,7 +913,22 @@ fn migration_source_fetch_command(
     mode: &MigrationFetchMode,
 ) -> MigrationResult<MigrationSourceFetchCommand> {
     let source_remote = validate_source_remote_name(source_remote)?;
-    let mut args = vec![OsString::from("lfs"), OsString::from("fetch")];
+    // Migration fetch scope must be determined only by `mode`. Repository or
+    // user configuration can otherwise turn every fetch into `--recent`,
+    // expanding downloads beyond the reviewed migration inventory and making
+    // `--all` fail because Git LFS forbids combining it with recent mode.
+    let mut args = vec![
+        OsString::from("-c"),
+        OsString::from("lfs.fetchrecentalways=false"),
+        OsString::from("-c"),
+        OsString::from("lfs.fetchrecentrefsdays=0"),
+        OsString::from("-c"),
+        OsString::from("lfs.fetchrecentremoterefs=false"),
+        OsString::from("-c"),
+        OsString::from("lfs.fetchrecentcommitsdays=0"),
+        OsString::from("lfs"),
+        OsString::from("fetch"),
+    ];
 
     match mode {
         MigrationFetchMode::CurrentCheckout => {
@@ -5021,6 +5036,14 @@ mod tests {
         assert_eq!(
             command.args,
             vec![
+                OsString::from("-c"),
+                OsString::from("lfs.fetchrecentalways=false"),
+                OsString::from("-c"),
+                OsString::from("lfs.fetchrecentrefsdays=0"),
+                OsString::from("-c"),
+                OsString::from("lfs.fetchrecentremoterefs=false"),
+                OsString::from("-c"),
+                OsString::from("lfs.fetchrecentcommitsdays=0"),
                 OsString::from("lfs"),
                 OsString::from("fetch"),
                 OsString::from("--include="),
@@ -5031,7 +5054,9 @@ mod tests {
         );
         assert_eq!(
             report.command.as_deref(),
-            Some("git lfs fetch --include= --exclude= origin main")
+            Some(
+                "git -c lfs.fetchrecentalways=false -c lfs.fetchrecentrefsdays=0 -c lfs.fetchrecentremoterefs=false -c lfs.fetchrecentcommitsdays=0 lfs fetch --include= --exclude= origin main"
+            )
         );
         assert_eq!(report.fetched_objects, vec![object]);
         assert!(report.unavailable_objects.is_empty());
@@ -5066,6 +5091,14 @@ mod tests {
         assert_eq!(
             command.args,
             vec![
+                OsString::from("-c"),
+                OsString::from("lfs.fetchrecentalways=false"),
+                OsString::from("-c"),
+                OsString::from("lfs.fetchrecentrefsdays=0"),
+                OsString::from("-c"),
+                OsString::from("lfs.fetchrecentremoterefs=false"),
+                OsString::from("-c"),
+                OsString::from("lfs.fetchrecentcommitsdays=0"),
                 OsString::from("lfs"),
                 OsString::from("fetch"),
                 OsString::from("--all"),
@@ -5074,7 +5107,9 @@ mod tests {
         );
         assert_eq!(
             report.command.as_deref(),
-            Some("git lfs fetch --all origin")
+            Some(
+                "git -c lfs.fetchrecentalways=false -c lfs.fetchrecentrefsdays=0 -c lfs.fetchrecentremoterefs=false -c lfs.fetchrecentcommitsdays=0 lfs fetch --all origin"
+            )
         );
         assert_eq!(report.fetched_objects, vec![object]);
         assert!(report.unavailable_objects.is_empty());
@@ -5234,7 +5269,9 @@ mod tests {
 
         assert_eq!(
             report.command.as_deref(),
-            Some("git lfs fetch --include= --exclude= origin")
+            Some(
+                "git -c lfs.fetchrecentalways=false -c lfs.fetchrecentrefsdays=0 -c lfs.fetchrecentremoterefs=false -c lfs.fetchrecentcommitsdays=0 lfs fetch --include= --exclude= origin"
+            )
         );
         assert!(report.fetched_objects.is_empty());
         assert_eq!(report.unavailable_objects, vec![object]);
@@ -5247,7 +5284,7 @@ mod tests {
                 .expect("current checkout fetch command should be built");
         assert_eq!(
             current.display,
-            "git lfs fetch --include= --exclude= upstream"
+            "git -c lfs.fetchrecentalways=false -c lfs.fetchrecentrefsdays=0 -c lfs.fetchrecentremoterefs=false -c lfs.fetchrecentcommitsdays=0 lfs fetch --include= --exclude= upstream"
         );
 
         let selected = migration_source_fetch_command(
@@ -5257,13 +5294,42 @@ mod tests {
         .expect("selected-ref fetch command should be built");
         assert_eq!(
             selected.display,
-            "git lfs fetch --include= --exclude= upstream main refs/tags/v1"
+            "git -c lfs.fetchrecentalways=false -c lfs.fetchrecentrefsdays=0 -c lfs.fetchrecentremoterefs=false -c lfs.fetchrecentcommitsdays=0 lfs fetch --include= --exclude= upstream main refs/tags/v1"
         );
 
         let all_refs =
             migration_source_fetch_command("upstream", &MigrationFetchMode::AllFetchedRefs)
                 .expect("all-ref fetch command should be built");
-        assert_eq!(all_refs.display, "git lfs fetch --all upstream");
+        assert_eq!(
+            all_refs.display,
+            "git -c lfs.fetchrecentalways=false -c lfs.fetchrecentrefsdays=0 -c lfs.fetchrecentremoterefs=false -c lfs.fetchrecentcommitsdays=0 lfs fetch --all upstream"
+        );
+    }
+
+    #[test]
+    fn source_fetch_commands_disable_recent_fetch_configuration() {
+        for mode in [
+            MigrationFetchMode::CurrentCheckout,
+            MigrationFetchMode::selected_refs(["main"]),
+            MigrationFetchMode::AllFetchedRefs,
+        ] {
+            let command = migration_source_fetch_command("origin", &mode)
+                .expect("migration source fetch command should be built");
+
+            assert_eq!(
+                &command.args[..8],
+                [
+                    OsString::from("-c"),
+                    OsString::from("lfs.fetchrecentalways=false"),
+                    OsString::from("-c"),
+                    OsString::from("lfs.fetchrecentrefsdays=0"),
+                    OsString::from("-c"),
+                    OsString::from("lfs.fetchrecentremoterefs=false"),
+                    OsString::from("-c"),
+                    OsString::from("lfs.fetchrecentcommitsdays=0"),
+                ]
+            );
+        }
     }
 
     #[test]
@@ -5348,6 +5414,11 @@ mod tests {
         source.git(["lfs", "track", "*.bin"]);
         source.write_bytes("asset/model.bin", b"real source lfs bytes");
         source.commit_all("add source lfs object");
+        source.git(["switch", "-c", "recent-extra"]);
+        source.write_bytes("asset/recent-extra.bin", b"out-of-scope recent lfs bytes");
+        source.commit_all("add recent out-of-scope lfs object");
+        source.git(["switch", "main"]);
+        let out_of_scope_object = test_lfs_object_from_bytes(b"out-of-scope recent lfs bytes");
 
         let temp = tempfile::tempdir().expect("temporary clone parent should be created");
         let clone_path = temp.path().join("clone");
@@ -5368,6 +5439,23 @@ mod tests {
             Ok(()) => {}
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => panic!("clone LFS media storage should be removable: {source}"),
+        }
+        for (key, value) in [
+            ("lfs.fetchrecentalways", "true"),
+            ("lfs.fetchrecentrefsdays", "36500"),
+            ("lfs.fetchrecentremoterefs", "true"),
+            ("lfs.fetchrecentcommitsdays", "36500"),
+        ] {
+            let output = Command::new("git")
+                .args(["config", "--local", key, value])
+                .current_dir(&clone_path)
+                .output()
+                .expect("hostile recent-fetch configuration should start");
+            assert!(
+                output.status.success(),
+                "hostile recent-fetch configuration failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         let pointer_path = clone_path.join("asset/model.bin");
         let pointer_before =
@@ -5391,6 +5479,15 @@ mod tests {
         );
         assert_eq!(report.fetched_objects.len(), 1);
         assert!(report.unavailable_objects.is_empty());
+        assert!(
+            !git_lfs_object_path(
+                &clone_path.join(".git/lfs/objects"),
+                &out_of_scope_object.oid
+            )
+            .expect("out-of-scope Git LFS object path should be valid")
+            .exists(),
+            "hostile recent-fetch configuration must not expand migration scope"
+        );
         assert_git_status_clean(&clone_path);
     }
 

@@ -361,6 +361,11 @@ Selected-ref and all-ref planning also require Git 2.40.0 or newer because
 historical attribute evaluation uses `git check-attr --source`. LFS Cloud checks
 the installed version before scanning and reports how to upgrade Git or fall
 back to current-checkout planning.
+Migration source fetches explicitly disable Git LFS recent-fetch behavior for
+the command. User, system, or repository settings such as
+`lfs.fetchrecentalways=true` therefore cannot add recent branches or commits to
+the selected migration scope, or make an all-ref fetch fail by implicitly
+combining `--recent` with `--all`.
 Historical scans reuse unchanged Git tree and blob objects across commits and
 cache equivalent historical attribute queries. This keeps large selected-ref
 and all-ref plans proportional to changed tree state plus reported pointer

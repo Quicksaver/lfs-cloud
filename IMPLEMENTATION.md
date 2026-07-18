@@ -641,6 +641,11 @@ Suggested flow:
 11. Report source-provider cleanup options.
 ```
 
+Source fetch commands must override all Git LFS recent-fetch settings so the
+reviewed migration mode alone determines which refs and commits are fetched.
+In particular, inherited `lfs.fetchrecentalways=true` must not widen a current
+or selected-ref migration, or implicitly combine recent mode with `--all`.
+
 Migration modes:
 
 ```text
@@ -1630,7 +1635,7 @@ Defer:
 #### Epic 7.2: Transfer
 
 - [x] [T] Check which discovered objects already exist locally.
-- [x] [M] Fetch missing objects from the source LFS provider without changing working tree files. Manual verification: `scripts/manual/verify-migration-source-fetch.sh`.
+- [x] [M] Fetch missing objects from the source LFS provider without changing working tree files or inheriting recent-fetch scope expansion. Manual verification: `scripts/manual/verify-migration-source-fetch.sh`.
 - [x] [M] Upload discovered objects to `lfs-cloud` idempotently. Manual verification: `scripts/manual/verify-migration-upload.sh`.
 - [x] [T] Verify uploaded hashes and sizes against pointers.
 

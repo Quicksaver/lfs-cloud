@@ -1780,11 +1780,35 @@ independently validated or adjudicated.
     assessed here and no invalid finding attributable separately, this was
     high-quality, relevant feedback.
 
-12. **Medium — Source fetch scope can expand through
-    `lfs.fetchrecentalways=true`.** Migration fetch commands do not override the
-    setting, allowing unexpected extra downloads (`src/migration.rs:821-860`).
-    Set the relevant Git LFS recent-fetch options explicitly and test hostile
-    repository configuration.
+12. **[DONE] Source fetch scope could expand through
+    `lfs.fetchrecentalways=true`** (Medium, `src/migration.rs`, `README.md`,
+    `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and actionable.** Migration
+    fetch commands previously cleared path filters for current/selected-ref
+    modes, but inherited Git LFS recent-fetch configuration. A repository,
+    user, or system setting of `lfs.fetchrecentalways=true` could therefore add
+    recent branches and commits outside the reviewed migration inventory; it
+    could also make all-ref migration fail because Git LFS forbids combining
+    implicit recent mode with `--all`. Every migration source fetch now applies
+    command-scoped overrides for `lfs.fetchrecentalways`,
+    `lfs.fetchrecentrefsdays`, `lfs.fetchrecentremoterefs`, and
+    `lfs.fetchrecentcommitsdays`, so the explicit migration mode alone defines
+    fetch scope without mutating persistent Git configuration. Unit coverage
+    verifies all four overrides for current-checkout, selected-ref, and all-ref
+    commands. The real Git LFS manual fixture creates a recent remote branch,
+    enables hostile values for all four settings in the clone, fetches the
+    current-checkout object, and proves the out-of-scope branch object remains
+    absent while the worktree stays unchanged and clean. README,
+    implementation guidance/checklist, and the repository learning now preserve
+    the command-scoped fetch boundary. Verification passed with `cargo fmt`,
+    `yarn lint:fix`, `git diff --check`, focused source-fetch tests,
+    `scripts/manual/verify-migration-source-fetch.sh`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets -- --test-threads=1`, and `cargo test --doc`.
+    The focused reviewer identified a genuine medium-severity scope and
+    reliability flaw, named the exact hostile configuration, and requested the
+    decisive persistent-config regression; with one valid finding assessed here
+    and no invalid finding attributable separately, this was high-quality,
+    relevant feedback.
 
 13. **Medium — Required dry-run report fields are missing.** Reports omit
     tracked LFS patterns, Git LFS/filter readiness, quota or missing-object
