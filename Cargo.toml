@@ -3,7 +3,7 @@ name = "lfs-cloud"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-license = "UNLICENSED"
+license = "MIT"
 publish = false
 description = "Git LFS-compatible server and CLI for routing LFS objects to user-controlled storage."
 

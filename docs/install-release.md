@@ -80,6 +80,22 @@ The current repository does not yet define:
 - CI release publishing
 - Homebrew, Cargo registry, or OS package distribution
 
+## Licensing
+
+LFS Cloud source is licensed under the [MIT License](../LICENSE). The Rust and
+repository-tooling package metadata use the matching SPDX identifier. The
+`publish = false` and `private: true` settings remain intentional until release
+packaging exists; they control registry publication rather than source-code
+license rights.
+
+The current locked Rust dependency graph declares only permissive license
+terms, or multi-license expressions with a permissive option. Prettier, the
+only JavaScript development dependency, is also MIT-licensed and is not part of
+the compiled artifact. Before distributing a release, regenerate the
+dependency inventory from the final lockfiles and preserve any notices
+required by dependencies whose terms include Apache-2.0, BSD, ISC, Unicode,
+CDLA-Permissive, or other notice-bearing licenses.
+
 Release automation should run the full verification set before publishing:
 
 ```bash

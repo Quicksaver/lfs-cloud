@@ -3,7 +3,7 @@
   "displayName": "LFS Cloud",
   "version": "0.1.0",
   "publisher": "Quicksaver",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": true,
   "packageManager": "yarn@4.14.1",
   "scripts": {

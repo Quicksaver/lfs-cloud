@@ -2510,10 +2510,31 @@ independently validated or adjudicated.
 
 ## Release readiness
 
-1. **High — The repository's licensing state blocks public release.** Both Rust
-   and JavaScript package metadata declare the project unlicensed/private
-   (`Cargo.toml:6`, `package.json:6-7`). Choose and add a license, update package
-   metadata, and confirm third-party license compatibility before publication.
+1. **[DONE] The repository's licensing state blocks public release** (High,
+   `LICENSE`, `Cargo.toml`, `package.json`, `README.md`,
+   `docs/install-release.md`, and `AGENTS.md`): **Valid and actionable in its
+   core conclusion.** The repository had no license grant, and both package
+   metadata files explicitly said `UNLICENSED`, so public recipients had no
+   permission to use, modify, or distribute the source. The chosen MIT license
+   is now present at the repository root, both metadata files use the matching
+   `MIT` SPDX identifier, and the README links to the license. The Rust
+   `publish = false` and JavaScript `private: true` controls remain because
+   release packaging is still intentionally unavailable; those fields prevent
+   registry publication but do not declare the source unlicensed. Release
+   guidance records that distinction and requires a fresh dependency-license
+   inventory plus preservation of applicable third-party notices before
+   distribution. `cargo metadata --locked` confirmed that every crate in the
+   current lockfile declares permissive terms or a multi-license expression
+   with a permissive option, with no missing license metadata; Prettier is the
+   only JavaScript development dependency, is MIT-licensed, and is not shipped
+   in the Rust artifact. Verification passed with `cargo metadata --locked`,
+   package-metadata assertions, `yarn lint:fix`, `yarn lint:check`, and
+   `git diff --check`. The focused reviewer correctly identified a genuine
+   high-severity release blocker and requested the necessary license,
+   metadata, and dependency-compatibility checks. Its description slightly
+   conflated publication guards with licensing, but the core finding and
+   remediation were accurate; with one valid finding and no invalid finding
+   attributable separately, this was high-quality, release-relevant feedback.
 
 2. **Medium — CI lacks an explicit dependency-advisory gate.** The repository
    does not enforce ongoing vulnerability review, and `cargo audit` is not

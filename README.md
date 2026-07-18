@@ -541,6 +541,10 @@ documented in [docs/install-release.md](docs/install-release.md).
 Published packages, signed archives, checksums, and installer scripts are not
 defined yet.
 
+## License
+
+LFS Cloud is available under the [MIT License](LICENSE).
+
 ## Deployment Notes
 
 For early use, prefer:
