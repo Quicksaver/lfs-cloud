@@ -25,6 +25,7 @@ use axum::{
         header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
     },
     response::{IntoResponse, Response},
+    routing::delete,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{StreamExt, stream};
@@ -50,6 +51,8 @@ use crate::{
 };
 
 const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
+/// Authenticated endpoint for revoking the presented local LFS session.
+pub const LFS_SESSION_REVOKE_PATH: &str = "/auth/session";
 const GIT_LFS_JSON_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 const MAX_UPLOAD_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MIN_UPLOAD_STAGING_FREE_BYTES: u64 = 64 * 1024 * 1024;
@@ -178,11 +181,12 @@ pub fn server_router_with_sessions(
     session_store: LocalLfsSessionStore,
 ) -> ServerResult<Router> {
     let lfs_router = lfs_server_router_with_sessions(config.clone(), session_store.clone());
+    let session_router = lfs_session_revoke_router(session_store.clone());
     let Some(auth_router) = github_oauth_router(config, session_store)? else {
-        return Ok(lfs_router);
+        return Ok(session_router.merge(lfs_router));
     };
 
-    Ok(auth_router.merge(lfs_router))
+    Ok(auth_router.merge(session_router).merge(lfs_router))
 }
 
 fn server_router_with_sessions_and_transfer_store(
@@ -196,11 +200,47 @@ fn server_router_with_sessions_and_transfer_store(
         Arc::new(GitHubBatchAuthorizer::new(&config)),
         transfer_store,
     );
+    let session_router = lfs_session_revoke_router(session_store.clone());
     let Some(auth_router) = github_oauth_router(config, session_store)? else {
-        return Ok(lfs_router);
+        return Ok(session_router.merge(lfs_router));
     };
 
-    Ok(auth_router.merge(lfs_router))
+    Ok(auth_router.merge(session_router).merge(lfs_router))
+}
+
+fn lfs_session_revoke_router(session_store: LocalLfsSessionStore) -> Router {
+    Router::new()
+        .route(LFS_SESSION_REVOKE_PATH, delete(revoke_lfs_session_route))
+        .with_state(session_store)
+}
+
+async fn revoke_lfs_session_route(
+    State(session_store): State<LocalLfsSessionStore>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match authenticate_lfs_session(&headers, &session_store) {
+        Ok(session) => session,
+        Err(ServerError::Unauthorized { .. }) => return authentication_required_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to authenticate LFS session revocation");
+            return git_lfs_json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "LFS Cloud session revocation failed",
+            );
+        }
+    };
+
+    match session_store.revoke(session.token()) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => authentication_required_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to revoke LFS session");
+            git_lfs_json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "LFS Cloud session revocation failed",
+            )
+        }
+    }
 }
 
 /// Builds the Axum router with an explicit local LFS session store.
@@ -914,6 +954,47 @@ impl LfsServerState {
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     }
+
+    async fn authorize(
+        &self,
+        repository: &RepositoryMapping,
+        session: &AuthenticatedLfsSession,
+        operation: LfsBatchOperation,
+    ) -> ServerResult<()> {
+        let result = self
+            .authorizer
+            .authorize(repository, session.record(), operation)
+            .await;
+        if matches!(
+            &result,
+            Err(ServerError::RepositoryProvider {
+                source: RepositoryProviderError::AuthenticationRequired { .. },
+            })
+        ) {
+            self.session_store.revoke(session.token())?;
+        }
+        result
+    }
+}
+
+#[derive(Debug)]
+struct AuthenticatedLfsSession {
+    token: LfsSessionToken,
+    record: LfsSessionRecord,
+}
+
+impl AuthenticatedLfsSession {
+    fn token(&self) -> &LfsSessionToken {
+        &self.token
+    }
+
+    fn record(&self) -> &LfsSessionRecord {
+        &self.record
+    }
+
+    fn metadata(&self) -> &crate::LfsSessionMetadata {
+        self.record.metadata()
+    }
 }
 
 async fn handle_lfs_request(
@@ -961,7 +1042,7 @@ async fn handle_lfs_request(
 
 async fn handle_authenticated_lfs_request(
     route: ResolvedLfsRoute,
-    session: LfsSessionRecord,
+    session: AuthenticatedLfsSession,
     method: Method,
     request: Request,
     state: &LfsServerState,
@@ -982,7 +1063,7 @@ async fn handle_authenticated_lfs_request(
 
 async fn handle_lfs_batch_request(
     repository: RepositoryMapping,
-    session: LfsSessionRecord,
+    session: AuthenticatedLfsSession,
     method: Method,
     request: Request,
     state: &LfsServerState,
@@ -1032,7 +1113,7 @@ async fn handle_lfs_batch_request(
 async fn handle_lfs_object_request(
     repository: RepositoryMapping,
     oid: LfsOid,
-    session: LfsSessionRecord,
+    session: AuthenticatedLfsSession,
     method: Method,
     request: Request,
     state: &LfsServerState,
@@ -1056,12 +1137,11 @@ async fn handle_lfs_object_request(
 async fn handle_lfs_download_request(
     repository: RepositoryMapping,
     oid: LfsOid,
-    session: LfsSessionRecord,
+    session: AuthenticatedLfsSession,
     request: Request,
     state: &LfsServerState,
 ) -> Response {
     if let Err(error) = state
-        .authorizer
         .authorize(&repository, &session, LfsBatchOperation::Download)
         .await
     {
@@ -1123,12 +1203,11 @@ async fn handle_lfs_download_request(
 async fn handle_lfs_upload_request(
     repository: RepositoryMapping,
     oid: LfsOid,
-    session: LfsSessionRecord,
+    session: AuthenticatedLfsSession,
     request: Request,
     state: &LfsServerState,
 ) -> Response {
     if let Err(error) = state
-        .authorizer
         .authorize(&repository, &session, LfsBatchOperation::Upload)
         .await
     {
@@ -1611,12 +1690,11 @@ impl From<StorageError> for UploadStagingError {
 
 async fn handle_parsed_lfs_batch_request(
     repository: RepositoryMapping,
-    session: LfsSessionRecord,
+    session: AuthenticatedLfsSession,
     state: &LfsServerState,
     request: LfsBatchRequest,
 ) -> Response {
     if let Err(error) = state
-        .authorizer
         .authorize(&repository, &session, request.operation)
         .await
     {
@@ -1927,12 +2005,13 @@ struct LfsErrorResponse {
 fn authenticate_lfs_session(
     headers: &HeaderMap,
     session_store: &LocalLfsSessionStore,
-) -> ServerResult<LfsSessionRecord> {
+) -> ServerResult<AuthenticatedLfsSession> {
     let token = lfs_session_token_from_authorization_header(headers)?;
-
-    session_store
+    let record = session_store
         .verify_record(&token)
-        .ok_or_else(|| unauthorized("invalid or expired lfs session token"))
+        .ok_or_else(|| unauthorized("invalid or expired lfs session token"))?;
+
+    Ok(AuthenticatedLfsSession { token, record })
 }
 
 fn lfs_session_token_from_authorization_header(
@@ -2353,11 +2432,11 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, LFS_AUTH_CHALLENGE, LfsBatchAuthorizer, LfsDownloadResponse,
-        LfsObjectTransferStore, LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord,
-        MAX_UPLOAD_OBJECT_BYTES, ServerBind, UploadStagingGuardrails, advertised_server_urls,
-        authenticate_lfs_session, ensure_temp_space_for_upload_with_available_space,
-        lfs_server_router_with_sessions,
+        BASE64_STANDARD, LFS_AUTH_CHALLENGE, LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer,
+        LfsDownloadResponse, LfsObjectTransferStore, LfsRouteEndpoint, LfsRouteResolver,
+        LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind, UploadStagingGuardrails,
+        advertised_server_urls, authenticate_lfs_session,
+        ensure_temp_space_for_upload_with_available_space, lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store, production_session_store,
         render_server_startup_message, server_router_with_sessions, stage_upload_request_body,
         stage_upload_request_body_with_guardrails, stage_upload_request_body_with_limit,
@@ -2369,9 +2448,10 @@ mod tests {
 
     use crate::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, LfsBatchOperation,
-        LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LocalLfsSessionStore, MetadataDatabase,
-        ProviderFuture, RepositoryMapping, RepositoryPermission, RepositoryProviderError,
-        RepositoryUser, ServerConfig, ServerError, ServerResult, StorageError, StoredObject,
+        LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore,
+        MetadataDatabase, ProviderFuture, RepositoryMapping, RepositoryPermission,
+        RepositoryProviderError, RepositoryUser, ServerConfig, ServerError, ServerResult,
+        StorageError, StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -2494,6 +2574,25 @@ repositories:
                 }
 
                 Ok(())
+            })
+        }
+    }
+
+    struct AuthenticationRequiredBatchAuthorizer;
+
+    impl LfsBatchAuthorizer for AuthenticationRequiredBatchAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            repository: &'a RepositoryMapping,
+            _session: &'a LfsSessionRecord,
+            _operation: LfsBatchOperation,
+        ) -> ProviderFuture<'a, ServerResult<()>> {
+            Box::pin(async move {
+                Err(ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: repository.repo_provider.clone(),
+                    },
+                })
             })
         }
     }
@@ -3086,6 +3185,75 @@ repositories:
             "Git LFS endpoint routing is configured; transfer handling is not implemented yet",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_session_route_revokes_the_presented_token() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = server_router_with_sessions(test_config(), store.clone())
+            .expect("server router should build");
+
+        let response = router
+            .clone()
+            .oneshot(lfs_request_with_method_and_body(
+                Method::DELETE,
+                LFS_SESSION_REVOKE_PATH,
+                Some(&format!("Bearer {token}")),
+                "",
+            ))
+            .await
+            .expect("router should respond");
+        let replay = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::DELETE,
+                LFS_SESSION_REVOKE_PATH,
+                Some(&format!("Bearer {token}")),
+                "",
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            store
+                .verify(
+                    &LfsSessionToken::from_secret(token)
+                        .expect("issued token should remain valid syntax")
+                )
+                .is_none()
+        );
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn definitive_upstream_authentication_failure_revokes_local_session() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions_authorizer_and_transfer_store(
+            test_config(),
+            store.clone(),
+            Arc::new(AuthenticationRequiredBatchAuthorizer),
+            Arc::new(RecordingTransferStore::missing()),
+        );
+
+        let response = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::POST,
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                Some(&format!("Bearer {token}")),
+                VALID_BATCH_REQUEST,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            store
+                .verify(
+                    &LfsSessionToken::from_secret(token)
+                        .expect("issued token should remain valid syntax")
+                )
+                .is_none()
+        );
     }
 
     #[tokio::test]

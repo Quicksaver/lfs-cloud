@@ -463,6 +463,14 @@ issuances per minute for each stable provider user, plus 1,024 active
 credentials process-wide. Capacity exhaustion returns HTTP 429 with a
 `Retry-After` value rather than evicting an unrelated active credential.
 
+The authenticated `DELETE /auth/session` endpoint revokes the presented local
+LFS credential. `lfs-cloud logout` calls that endpoint before erasing the
+repository-scoped Git credential, while an already expired or revoked session
+still permits local cleanup. Unexpected server failures preserve the local
+credential for retry. A definitive upstream GitHub authentication rejection
+also revokes the corresponding local session so a stale local bearer token
+cannot keep retrying with invalid private provider credentials.
+
 Avoid asking users to paste personal access tokens into the LFS server if possible. That can work for a quick prototype, but it means `lfs-cloud` receives and handles powerful user repository-host credentials.
 
 Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service can use one Google account's OAuth refresh token to access the backing Drive folder. For a multi-tenant or shared instance, each configured storage provider should have its own credential reference and policy boundary.
@@ -1180,6 +1188,9 @@ Defer:
 > command opens or prints the server GitHub OAuth login URL, accepts the
 > returned local `lfs-cloud` token, and stores only that local token in Git's
 > credential helper for the current repository's LFS URL.
+> The `lfs-cloud logout` command authenticates session revocation with that
+> local token before erasing the repository-scoped Git credential, and the
+> server also revokes sessions after definitive upstream authentication denial.
 > The `lfs-cloud status` command now checks the current Git repository against
 > loaded server config, probes configured server TCP reachability, verifies a
 > local LFS credential for the derived repository LFS URL, validates the
@@ -1255,19 +1266,19 @@ Defer:
 
 ### Progress Summary
 
-| Phase                                    | Total Tasks | Done   | Remaining |
-| ---------------------------------------- | ----------- | ------ | --------- |
-| 0. Foundations                           | 8           | 8      | 0         |
-| 1. Server Config                         | 8           | 8      | 0         |
-| 2. GitHub Auth                           | 13          | 13     | 0         |
-| 3. Google Drive Storage                  | 9           | 9      | 0         |
-| 4. Metadata DB                           | 8           | 8      | 0         |
-| 5. LFS Server Protocol                   | 12          | 12     | 0         |
-| 6. CLI Commands                          | 13          | 13     | 0         |
-| 7. Migration                             | 12          | 12     | 0         |
-| 8. Local Cache And Materialization       | 8           | 8      | 0         |
-| 9. Verification, Docs, And Release Shape | 8           | 8      | 0         |
-| **Total**                                | **99**      | **99** | **0**     |
+| Phase                                    | Total Tasks | Done    | Remaining |
+| ---------------------------------------- | ----------- | ------- | --------- |
+| 0. Foundations                           | 8           | 8       | 0         |
+| 1. Server Config                         | 8           | 8       | 0         |
+| 2. GitHub Auth                           | 14          | 14      | 0         |
+| 3. Google Drive Storage                  | 9           | 9       | 0         |
+| 4. Metadata DB                           | 8           | 8       | 0         |
+| 5. LFS Server Protocol                   | 12          | 12      | 0         |
+| 6. CLI Commands                          | 13          | 13      | 0         |
+| 7. Migration                             | 12          | 12      | 0         |
+| 8. Local Cache And Materialization       | 8           | 8       | 0         |
+| 9. Verification, Docs, And Release Shape | 8           | 8       | 0         |
+| **Total**                                | **100**     | **100** | **0**     |
 
 ### Legend
 
@@ -1329,6 +1340,7 @@ Defer:
 
 - [x] [M] Implement `git credential approve` integration for the configured LFS URL. Manual verification: `scripts/manual/verify-git-credential-approve.sh`.
 - [x] [T] Implement credential lookup/verification for the local CLI.
+- [x] [M] Implement authenticated session revocation plus repository-scoped credential erasure. Manual verification: `scripts/manual/verify-logout-command.sh`.
 - [x] [M] Add clear fallback instructions if no Git credential helper is configured. Manual verification: `scripts/manual/verify-git-credential-helper-fallback.sh`.
 
 #### Epic 2.3: Repository Permission Checks

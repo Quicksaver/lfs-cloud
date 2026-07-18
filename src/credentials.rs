@@ -42,6 +42,18 @@ pub struct GitCredentialApproval {
     token: LfsSessionToken,
 }
 
+/// Credential-helper payload for erasing one local LFS Cloud token.
+///
+/// The token is included in the helper protocol so helpers can reject the
+/// exact repository-scoped credential without receiving it as a process
+/// argument.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitCredentialRejection {
+    lfs_url: Url,
+    username: String,
+    token: LfsSessionToken,
+}
+
 /// Credential retrieved from Git's credential helper for one LFS URL.
 ///
 /// The token is restored as an [`LfsSessionToken`] so callers do not need to
@@ -160,7 +172,17 @@ impl GitCredentialLookup {
     /// written, the helper exits unsuccessfully, or the returned credential is
     /// not scoped to the configured LFS URL and username.
     pub fn lookup(&self) -> CliResult<GitCredential> {
-        self.lookup_with_git_program(Path::new("git"))
+        self.lookup_in_dir(Path::new("."))
+    }
+
+    /// Retrieves a credential in an explicit repository context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git cannot be started, the helper fails, or
+    /// the returned credential does not match the configured URL and username.
+    pub fn lookup_in_dir(&self, repository_dir: impl AsRef<Path>) -> CliResult<GitCredential> {
+        self.lookup_with_git_program_in_dir(Path::new("git"), repository_dir)
     }
 
     /// Retrieves and validates a credential with a caller-selected Git
@@ -178,6 +200,21 @@ impl GitCredentialLookup {
         &self,
         git_program: impl AsRef<Path>,
     ) -> CliResult<GitCredential> {
+        self.lookup_with_git_program_in_dir(git_program, Path::new("."))
+    }
+
+    /// Retrieves a credential in an explicit repository context with a
+    /// caller-selected Git executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when the process cannot be started, the helper
+    /// fails, or the returned credential is invalid for this request.
+    pub fn lookup_with_git_program_in_dir(
+        &self,
+        git_program: impl AsRef<Path>,
+        repository_dir: impl AsRef<Path>,
+    ) -> CliResult<GitCredential> {
         let command_name = "git credential fill";
         let mut command = git_command(git_program.as_ref());
         // A lookup is a read-only cache probe. Disable every standard Git and
@@ -192,6 +229,7 @@ impl GitCredentialLookup {
             .args(["-c", "core.askPass=", "-c", "credential.interactive=false"]);
         let mut child = command
             .args(["credential", "fill"])
+            .current_dir(repository_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // A failing helper can echo the stored password before stdout is
@@ -248,6 +286,183 @@ impl GitCredentialLookup {
         input.push_str(&self.username);
         input.push_str("\n\n");
         input
+    }
+}
+
+impl GitCredentialRejection {
+    /// Creates a rejection for the default LFS Cloud credential username.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::{GitCredentialRejection, LfsSessionToken};
+    ///
+    /// let rejection = GitCredentialRejection::new(
+    ///     "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+    ///     LfsSessionToken::from_secret("local-lfs-token")?,
+    /// )?;
+    ///
+    /// assert_eq!(rejection.username(), "lfs-cloud");
+    /// # Ok::<(), lfs_cloud::LfsCloudError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when `lfs_url` is not a protected absolute HTTP(S)
+    /// URL.
+    pub fn new(lfs_url: impl AsRef<str>, token: LfsSessionToken) -> CliResult<Self> {
+        Self::with_username(lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME, token)
+    }
+
+    /// Creates a rejection after an explicit plaintext-HTTP CLI opt-in.
+    pub(crate) fn new_with_insecure_http(
+        lfs_url: impl AsRef<str>,
+        token: LfsSessionToken,
+        allow_insecure_http: bool,
+    ) -> CliResult<Self> {
+        Ok(Self {
+            lfs_url: validate_lfs_credential_url(lfs_url.as_ref(), allow_insecure_http)?,
+            username: DEFAULT_GIT_CREDENTIAL_USERNAME.to_owned(),
+            token,
+        })
+    }
+
+    /// Creates a rejection with an explicit credential username.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when the URL or username is invalid.
+    pub fn with_username(
+        lfs_url: impl AsRef<str>,
+        username: impl Into<String>,
+        token: LfsSessionToken,
+    ) -> CliResult<Self> {
+        Ok(Self {
+            lfs_url: validate_lfs_credential_url(lfs_url.as_ref(), false)?,
+            username: validate_credential_field("git credential username", username.into())?,
+            token,
+        })
+    }
+
+    /// Returns the LFS URL whose credential will be erased.
+    #[must_use]
+    pub fn lfs_url(&self) -> &Url {
+        &self.lfs_url
+    }
+
+    /// Returns the non-secret credential username.
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Returns the local token used to select the exact credential.
+    #[must_use]
+    pub fn token(&self) -> &LfsSessionToken {
+        &self.token
+    }
+
+    /// Erases the credential through `git credential reject`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git cannot be started, stdin cannot be
+    /// written, or the credential helper exits unsuccessfully.
+    pub fn reject(&self) -> CliResult<()> {
+        self.reject_in_dir(Path::new("."))
+    }
+
+    /// Erases the credential in an explicit repository context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git cannot be started, stdin cannot be
+    /// written, or the credential helper exits unsuccessfully.
+    pub fn reject_in_dir(&self, repository_dir: impl AsRef<Path>) -> CliResult<()> {
+        self.reject_with_git_program_in_dir(Path::new("git"), repository_dir)
+    }
+
+    /// Erases the credential with a caller-selected Git executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when the process cannot complete successfully.
+    pub fn reject_with_git_program(&self, git_program: impl AsRef<Path>) -> CliResult<()> {
+        self.reject_with_git_program_in_dir(git_program, Path::new("."))
+    }
+
+    /// Erases the credential in an explicit repository context with a
+    /// caller-selected Git executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when the process cannot be started, stdin cannot be
+    /// written, or the credential helper exits unsuccessfully.
+    pub fn reject_with_git_program_in_dir(
+        &self,
+        git_program: impl AsRef<Path>,
+        repository_dir: impl AsRef<Path>,
+    ) -> CliResult<()> {
+        let command_name = "git credential reject";
+        let mut command = git_command(git_program.as_ref());
+        let mut child = command
+            .args(["credential", "reject"])
+            .current_dir(repository_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| CliError::Io {
+                context: format!("failed to start {command_name}"),
+                source,
+            })?;
+
+        {
+            let mut stdin = child.stdin.take().ok_or_else(|| CliError::Io {
+                context: format!("failed to open stdin for {command_name}"),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "child stdin unavailable",
+                ),
+            })?;
+            stdin
+                .write_all(self.credential_input().as_bytes())
+                .map_err(|source| CliError::Io {
+                    context: format!("failed to write credential to {command_name}"),
+                    source,
+                })?;
+        }
+
+        let (status, stderr) = wait_for_git_command(&mut child, command_name, self.token.as_str())?;
+        if status.success() {
+            return Ok(());
+        }
+
+        Err(CliError::ExternalCommand {
+            command: command_name.to_owned(),
+            status: command_status_text(status),
+            stderr: sanitize_command_stderr(&stderr, self.token.as_str()),
+        })
+    }
+
+    fn credential_input(&self) -> String {
+        format!(
+            "url={}\nusername={}\npassword={}\n\n",
+            self.lfs_url.as_str(),
+            self.username,
+            self.token.as_str()
+        )
+    }
+}
+
+impl fmt::Debug for GitCredentialRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitCredentialRejection")
+            .field("lfs_url", &self.lfs_url.as_str())
+            .field("username", &self.username)
+            .field("token", &"<redacted>")
+            .finish()
     }
 }
 
@@ -1317,11 +1532,11 @@ mod tests {
 
     use super::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, GitCredentialLookup,
-        MAX_COMMAND_STDERR_LEN, MAX_CREDENTIAL_FIELD_LEN, MAX_CREDENTIAL_OUTPUT_LEN,
-        MAX_RETAINED_COMMAND_STDERR_LEN, git_command, git_config_output_has_helper,
-        git_credential_helper_fallback_instructions, parse_git_credential_fill_output,
-        retain_stderr_data, retain_stdout_data, sanitize_command_stderr,
-        wait_for_git_command_timeout,
+        GitCredentialRejection, MAX_COMMAND_STDERR_LEN, MAX_CREDENTIAL_FIELD_LEN,
+        MAX_CREDENTIAL_OUTPUT_LEN, MAX_RETAINED_COMMAND_STDERR_LEN, git_command,
+        git_config_output_has_helper, git_credential_helper_fallback_instructions,
+        parse_git_credential_fill_output, retain_stderr_data, retain_stdout_data,
+        sanitize_command_stderr, wait_for_git_command_timeout,
     };
     use crate::{CliError, LfsSessionToken};
 
@@ -1344,6 +1559,67 @@ mod tests {
             "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\npassword=local-lfs-token\n\n"
         );
         assert!(!format!("{approval:?}").contains("local-lfs-token"));
+    }
+
+    #[test]
+    fn rejection_payload_uses_git_credential_protocol_without_debug_leaks() {
+        let rejection = GitCredentialRejection::new(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            token(),
+        )
+        .expect("rejection should parse");
+
+        assert_eq!(rejection.lfs_url().host_str(), Some("lfs.example.com"));
+        assert_eq!(rejection.username(), DEFAULT_GIT_CREDENTIAL_USERNAME);
+        assert_eq!(
+            rejection.credential_input(),
+            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\npassword=local-lfs-token\n\n"
+        );
+        assert!(!format!("{rejection:?}").contains("local-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rejection_invokes_git_credential_reject_in_repository_context() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let repository = temp.path().join("repo");
+        let stdin_path = temp.path().join("stdin.txt");
+        let cwd_path = temp.path().join("cwd.txt");
+        fs::create_dir(&repository).expect("repository directory should be created");
+        let fake_git = write_fake_git(
+            temp.path(),
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" != "credential" ] || [ "$2" != "reject" ]; then
+  echo "unexpected args: $*" >&2
+  exit 64
+fi
+pwd > '{}'
+cat > '{}'
+"#,
+                cwd_path.display(),
+                stdin_path.display()
+            ),
+        );
+        let rejection = GitCredentialRejection::new(
+            "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
+            token(),
+        )
+        .expect("rejection should parse");
+
+        rejection
+            .reject_with_git_program_in_dir(&fake_git, &repository)
+            .expect("fake git rejection should succeed");
+
+        assert_eq!(
+            fs::read_to_string(stdin_path).expect("stdin capture should be readable"),
+            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\npassword=local-lfs-token\n\n"
+        );
+        let recorded_cwd = fs::read_to_string(cwd_path).expect("cwd capture should be readable");
+        assert_eq!(
+            dunce::canonicalize(recorded_cwd.trim()).expect("captured cwd should canonicalize"),
+            dunce::canonicalize(repository).expect("repository should canonicalize")
+        );
     }
 
     #[test]

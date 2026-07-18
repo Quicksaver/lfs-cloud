@@ -24,7 +24,7 @@ pub mod sessions;
 pub use cli::run_from_env;
 pub use credentials::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredential, GitCredentialApproval, GitCredentialLookup,
-    git_credential_helper_fallback_instructions,
+    GitCredentialRejection, git_credential_helper_fallback_instructions,
 };
 pub use error::{
     CliError, CliResult, ErrorCategory, LfsCloudError, LfsCloudResult, MigrationError,
@@ -90,9 +90,9 @@ pub use providers::{
 #[doc(hidden)]
 pub use server::lfs_server_router_with_provider_adapters;
 pub use server::{
-    AdvertisedServerUrls, LfsRouteEndpoint, LfsRouteResolver, ResolvedLfsRoute, ServeOptions,
-    advertised_server_urls, lfs_server_router, lfs_server_router_with_sessions,
-    render_server_startup_message, serve,
+    AdvertisedServerUrls, LFS_SESSION_REVOKE_PATH, LfsRouteEndpoint, LfsRouteResolver,
+    ResolvedLfsRoute, ServeOptions, advertised_server_urls, lfs_server_router,
+    lfs_server_router_with_sessions, render_server_startup_message, serve,
 };
 pub use server_config::{
     DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,

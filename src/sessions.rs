@@ -1305,6 +1305,35 @@ mod tests {
     }
 
     #[test]
+    fn durable_session_revocation_survives_database_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let database_path = directory.path().join("metadata.sqlite3");
+        let encryption_secret = b"stable-server-side-session-encryption-secret";
+        let issued = {
+            let database =
+                Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should open"));
+            let store = LocalLfsSessionStore::open_durable(database, encryption_secret)
+                .expect("durable session store should open");
+            let issued = store
+                .issue_session(&user(), ["read:user"])
+                .expect("durable session should be issued");
+            assert!(
+                store
+                    .revoke(&issued.token)
+                    .expect("durable revocation should succeed")
+            );
+            issued
+        };
+
+        let database =
+            Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should reopen"));
+        let reopened = LocalLfsSessionStore::open_durable(database, encryption_secret)
+            .expect("durable session store should reopen");
+
+        assert_eq!(reopened.verify(&issued.token), None);
+    }
+
+    #[test]
     fn durable_session_store_restores_protected_session_after_reopen() {
         let directory = tempfile::tempdir().expect("tempdir should be created");
         let database_path = directory.path().join("metadata.sqlite3");

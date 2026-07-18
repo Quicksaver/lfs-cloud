@@ -22,16 +22,17 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use reqwest::{Client, StatusCode as HttpStatusCode, redirect::Policy};
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
-    GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitLfsConfigChange,
-    GitLfsConfigTarget, GitLfsHistoryPointers, GitLfsMigrationDiscovery,
+    GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitCredentialRejection,
+    GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers, GitLfsMigrationDiscovery,
     GitLfsSourceEndpointSource, GitRepository, GoogleDriveCredentialLoader,
-    GoogleDriveStorageConfig, LfsInitRoute, LfsObject, LfsObjectSize, LfsOid, LfsPointer,
-    LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
+    GoogleDriveStorageConfig, LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsObjectSize,
+    LfsOid, LfsPointer, LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
     LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
     LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
     LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
@@ -42,6 +43,7 @@ use crate::{
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const SESSION_REVOCATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
 const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
@@ -69,6 +71,8 @@ enum Command {
     Serve(ServeCommand),
     /// Start GitHub OAuth login and store the local LFS token for this repo.
     Login(LoginCommand),
+    /// Revoke the local LFS session and erase its Git credential.
+    Logout(LogoutCommand),
     /// Resolve the Git LFS URL for the current repository.
     Init(InitCommand),
     /// Check repository, server, auth, storage, and local cache readiness.
@@ -113,6 +117,17 @@ struct LoginCommand {
     /// Print the login URL without trying to open a browser.
     #[arg(long)]
     no_open: bool,
+}
+
+#[derive(Debug, Args)]
+struct LogoutCommand {
+    /// Base URL of the running LFS Cloud server.
+    #[arg(long, value_name = "URL")]
+    server: String,
+
+    /// Allow plaintext HTTP to a non-loopback server on a trusted network.
+    #[arg(long)]
+    allow_insecure_http: bool,
 }
 
 #[derive(Debug, Args)]
@@ -234,6 +249,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         crate::serve,
         run_init_to_stdout,
         run_login_to_stdio,
+        run_logout_to_stdout,
         run_status_to_stdout,
         run_pull_to_stdout,
         run_hydrate_to_stdout,
@@ -248,11 +264,12 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     clippy::too_many_arguments,
     reason = "command dispatch keeps per-subcommand side effects injectable for focused tests"
 )]
-async fn dispatch<F, Fut, I, L, S, P, H, D, G, M>(
+async fn dispatch<F, Fut, I, L, O, S, P, H, D, G, M>(
     cli: Cli,
     serve: F,
     init: I,
     login: L,
+    logout: O,
     status: S,
     pull: P,
     hydrate: H,
@@ -265,6 +282,7 @@ where
     Fut: Future<Output = crate::ServerResult<()>>,
     I: FnOnce(InitCommand) -> anyhow::Result<()>,
     L: FnOnce(LoginCommand) -> anyhow::Result<()>,
+    O: FnOnce(LogoutCommand) -> anyhow::Result<()>,
     S: FnOnce(StatusCommand, Option<PathBuf>) -> anyhow::Result<()>,
     P: FnOnce(PullCommand) -> anyhow::Result<()>,
     H: FnOnce(HydrateCommand) -> anyhow::Result<()>,
@@ -280,6 +298,7 @@ where
             .await
             .context("failed to run lfs-cloud server"),
         Command::Login(command) => login(command).context("failed to complete lfs-cloud login"),
+        Command::Logout(command) => logout(command).context("failed to complete lfs-cloud logout"),
         Command::Init(command) => init(command).context("failed to resolve lfs-cloud init route"),
         Command::Status(command) => {
             status(command, cli.config).context("failed to check lfs-cloud status")
@@ -327,6 +346,25 @@ fn run_login_to_stdio(command: LoginCommand) -> anyhow::Result<()> {
     let mut stdout = io::stdout().lock();
 
     run_login(command, &mut input, &mut stdout)
+}
+
+fn run_logout_to_stdout(command: LogoutCommand) -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+    let mut stdout = io::stdout().lock();
+
+    run_logout_from_dir(
+        command,
+        &current_dir,
+        &mut stdout,
+        |lfs_url| {
+            GitCredentialLookup::new_with_insecure_http(lfs_url, true)?
+                .lookup_in_dir(&current_dir)
+                .map(|credential| credential.token().clone())
+        },
+        request_lfs_session_revocation,
+        |rejection| rejection.reject_in_dir(&current_dir),
+    )
+    .map_err(anyhow::Error::from)
 }
 
 fn run_status_to_stdout(
@@ -494,6 +532,112 @@ where
     writeln!(output, "  username: {approval_username}").map_err(output_error)?;
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionRevocationStatus {
+    Revoked,
+    AlreadyInactive,
+}
+
+fn run_logout_from_dir<W, L, R, E>(
+    command: LogoutCommand,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+    mut lookup_credential: L,
+    mut revoke_session: R,
+    mut erase_credential: E,
+) -> CliResult<()>
+where
+    W: Write,
+    L: FnMut(&str) -> CliResult<LfsSessionToken>,
+    R: FnMut(&str, &LfsSessionToken) -> CliResult<SessionRevocationStatus>,
+    E: FnMut(GitCredentialRejection) -> CliResult<()>,
+{
+    let repository = GitRepository::discover(start_dir.as_ref()).map_err(login_discovery_error)?;
+    let route = LfsInitRoute::resolve_with_insecure_http(
+        &command.server,
+        &repository.remote,
+        command.allow_insecure_http,
+    )?;
+    let token = lookup_credential(&route.lfs_url)?;
+    let revoke_url = session_revocation_url_for_server(&route.server_url)?;
+    let revocation = revoke_session(&revoke_url, &token)?;
+    let rejection = GitCredentialRejection::new_with_insecure_http(
+        &route.lfs_url,
+        token,
+        command.allow_insecure_http,
+    )?;
+    erase_credential(rejection)?;
+
+    match revocation {
+        SessionRevocationStatus::Revoked => {
+            writeln!(output, "revoked local LFS session").map_err(output_error)?;
+        }
+        SessionRevocationStatus::AlreadyInactive => {
+            writeln!(output, "local LFS session was already inactive").map_err(output_error)?;
+        }
+    }
+    writeln!(output, "erased local LFS credential").map_err(output_error)?;
+    writeln!(
+        output,
+        "  lfs.url: {}",
+        redacted_url_for_display(&route.lfs_url)
+    )
+    .map_err(output_error)?;
+
+    Ok(())
+}
+
+fn session_revocation_url_for_server(server_url: &str) -> CliResult<String> {
+    let mut url = crate::init::validate_server_url(server_url, true)?;
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|()| CliError::InvalidArguments {
+            message: "server URL cannot be used as a route base".to_owned(),
+        })?;
+    segments.extend(LFS_SESSION_REVOKE_PATH.trim_start_matches('/').split('/'));
+    drop(segments);
+
+    Ok(url.to_string())
+}
+
+fn request_lfs_session_revocation(
+    revoke_url: &str,
+    token: &LfsSessionToken,
+) -> CliResult<SessionRevocationStatus> {
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .map_err(|source| CliError::Io {
+            context: "failed to create LFS session revocation client".to_owned(),
+            source: io::Error::other(source),
+        })?;
+    let response = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            client
+                .delete(revoke_url)
+                .bearer_auth(token.as_str())
+                .timeout(SESSION_REVOCATION_TIMEOUT)
+                .send(),
+        )
+    })
+    .map_err(|source| CliError::Io {
+        context: "failed to request LFS session revocation".to_owned(),
+        source: io::Error::other(source),
+    })?;
+
+    match response.status() {
+        HttpStatusCode::NO_CONTENT => Ok(SessionRevocationStatus::Revoked),
+        HttpStatusCode::UNAUTHORIZED => Ok(SessionRevocationStatus::AlreadyInactive),
+        status => Err(CliError::ExternalCommandOutput {
+            command: "LFS session revocation request".to_owned(),
+            message: SanitizedMessage::new(format!(
+                "server returned unexpected HTTP status {}",
+                status.as_u16()
+            )),
+        }),
+    }
 }
 
 fn login_discovery_error(error: CliError) -> CliError {
@@ -2384,19 +2528,20 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand,
-        MigrateCommand, PullCommand, StatusCommand, current_checkout_lfs_pointer_files,
-        current_checkout_lfs_pointer_scan, dispatch, is_git_worktree_discovery_error,
-        login_url_for_server, probe_server_reachable, run_dehydrate_from_dir, run_gc_from_dir,
-        run_hydrate_from_dir, run_init_from_dir, run_login_from_dir, run_migrate_from_dir,
-        run_pull_from_dir, run_status_from_dir, sanitize_browser_stderr, tracing_config,
-        validate_status_storage, write_init_change,
+        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, LogoutCommand,
+        MigrateCommand, PullCommand, SessionRevocationStatus, StatusCommand,
+        current_checkout_lfs_pointer_files, current_checkout_lfs_pointer_scan, dispatch,
+        is_git_worktree_discovery_error, login_url_for_server, probe_server_reachable,
+        run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
+        run_login_from_dir, run_logout_from_dir, run_migrate_from_dir, run_pull_from_dir,
+        run_status_from_dir, sanitize_browser_stderr, tracing_config, validate_status_storage,
+        write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
-        GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
-        LfsOid, LfsPointer, LocalCacheError, LocalCacheLayout, SanitizedMessage, ServeOptions,
-        StorageProviderConfig,
+        GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig,
+        LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken, LocalCacheError,
+        LocalCacheLayout, SanitizedMessage, ServeOptions, StorageProviderConfig,
     };
 
     #[test]
@@ -2485,6 +2630,25 @@ mod tests {
         assert_eq!(command.server, "http://127.0.0.1:8080");
         assert!(command.allow_insecure_http);
         assert!(command.no_open);
+    }
+
+    #[test]
+    fn logout_command_accepts_server_url_and_insecure_http_option() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "logout",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--allow-insecure-http",
+        ])
+        .expect("logout command should parse");
+
+        let super::Command::Logout(command) = cli.command else {
+            panic!("logout subcommand should parse");
+        };
+
+        assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert!(command.allow_insecure_http);
     }
 
     #[test]
@@ -2772,6 +2936,7 @@ mod tests {
             },
             |_| unreachable!("init runner must not be called for serve command"),
             |_| unreachable!("login runner must not be called for serve command"),
+            |_| unreachable!("logout runner must not be called for serve command"),
             |_, _| unreachable!("status runner must not be called for serve command"),
             |_| unreachable!("pull runner must not be called for serve command"),
             |_| unreachable!("hydrate runner must not be called for serve command"),
@@ -2809,6 +2974,7 @@ mod tests {
                 Ok(())
             },
             |_| unreachable!("login runner must not be called for init command"),
+            |_| unreachable!("logout runner must not be called for init command"),
             |_, _| unreachable!("status runner must not be called for init command"),
             |_| unreachable!("pull runner must not be called for init command"),
             |_| unreachable!("hydrate runner must not be called for init command"),
@@ -2842,6 +3008,7 @@ mod tests {
                     .expect("capture mutex should lock") = Some(command.server);
                 Ok(())
             },
+            |_| unreachable!("logout runner must not be called for login command"),
             |_, _| unreachable!("status runner must not be called for login command"),
             |_| unreachable!("pull runner must not be called for login command"),
             |_| unreachable!("hydrate runner must not be called for login command"),
@@ -2851,6 +3018,40 @@ mod tests {
         )
         .await
         .expect("login dispatch should succeed");
+
+        assert_eq!(
+            *captured.lock().expect("capture mutex should lock"),
+            Some("http://127.0.0.1:8080".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_logout_with_server_url() {
+        let cli = Cli::try_parse_from(["lfs-cloud", "logout", "--server", "http://127.0.0.1:8080"])
+            .expect("logout command should parse");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_runner = Arc::clone(&captured);
+
+        dispatch(
+            cli,
+            |_| async { unreachable!("serve runner must not be called for logout command") },
+            |_| unreachable!("init runner must not be called for logout command"),
+            |_| unreachable!("login runner must not be called for logout command"),
+            move |command| {
+                *captured_for_runner
+                    .lock()
+                    .expect("capture mutex should lock") = Some(command.server);
+                Ok(())
+            },
+            |_, _| unreachable!("status runner must not be called for logout command"),
+            |_| unreachable!("pull runner must not be called for logout command"),
+            |_| unreachable!("hydrate runner must not be called for logout command"),
+            |_| unreachable!("dehydrate runner must not be called for logout command"),
+            |_| unreachable!("gc runner must not be called for logout command"),
+            |_, _| unreachable!("migrate runner must not be called for logout command"),
+        )
+        .await
+        .expect("logout dispatch should succeed");
 
         assert_eq!(
             *captured.lock().expect("capture mutex should lock"),
@@ -2877,6 +3078,7 @@ mod tests {
             |_| async { unreachable!("serve runner must not be called for status command") },
             |_| unreachable!("init runner must not be called for status command"),
             |_| unreachable!("login runner must not be called for status command"),
+            |_| unreachable!("logout runner must not be called for status command"),
             move |command, config_path| {
                 *captured_for_runner
                     .lock()
@@ -2914,6 +3116,7 @@ mod tests {
             |_| async { unreachable!("serve runner must not be called for pull command") },
             |_| unreachable!("init runner must not be called for pull command"),
             |_| unreachable!("login runner must not be called for pull command"),
+            |_| unreachable!("logout runner must not be called for pull command"),
             |_, _| unreachable!("status runner must not be called for pull command"),
             move |command| {
                 *captured_for_runner
@@ -2947,6 +3150,7 @@ mod tests {
             |_| async { unreachable!("serve runner must not be called for hydrate command") },
             |_| unreachable!("init runner must not be called for hydrate command"),
             |_| unreachable!("login runner must not be called for hydrate command"),
+            |_| unreachable!("logout runner must not be called for hydrate command"),
             |_, _| unreachable!("status runner must not be called for hydrate command"),
             |_| unreachable!("pull runner must not be called for hydrate command"),
             move |command| {
@@ -2980,6 +3184,7 @@ mod tests {
             |_| async { unreachable!("serve runner must not be called for dehydrate command") },
             |_| unreachable!("init runner must not be called for dehydrate command"),
             |_| unreachable!("login runner must not be called for dehydrate command"),
+            |_| unreachable!("logout runner must not be called for dehydrate command"),
             |_, _| unreachable!("status runner must not be called for dehydrate command"),
             |_| unreachable!("pull runner must not be called for dehydrate command"),
             |_| unreachable!("hydrate runner must not be called for dehydrate command"),
@@ -3013,6 +3218,7 @@ mod tests {
             |_| async { unreachable!("serve runner must not be called for gc command") },
             |_| unreachable!("init runner must not be called for gc command"),
             |_| unreachable!("login runner must not be called for gc command"),
+            |_| unreachable!("logout runner must not be called for gc command"),
             |_, _| unreachable!("status runner must not be called for gc command"),
             |_| unreachable!("pull runner must not be called for gc command"),
             |_| unreachable!("hydrate runner must not be called for gc command"),
@@ -3054,6 +3260,7 @@ mod tests {
             |_| async { unreachable!("serve runner must not be called for migrate command") },
             |_| unreachable!("init runner must not be called for migrate command"),
             |_| unreachable!("login runner must not be called for migrate command"),
+            |_| unreachable!("logout runner must not be called for migrate command"),
             |_, _| unreachable!("status runner must not be called for migrate command"),
             |_| unreachable!("pull runner must not be called for migrate command"),
             |_| unreachable!("hydrate runner must not be called for migrate command"),
@@ -4795,6 +5002,122 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("browser open skipped"));
+    }
+
+    #[test]
+    fn logout_revokes_remote_session_before_erasing_local_credential() {
+        if !git_is_available() {
+            return;
+        }
+
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), &["init"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let lookup_events = Arc::clone(&events);
+        let revoke_events = Arc::clone(&events);
+        let erase_events = Arc::clone(&events);
+        let mut output = Vec::new();
+
+        run_logout_from_dir(
+            LogoutCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
+            },
+            repo.path(),
+            &mut output,
+            move |lfs_url| {
+                lookup_events
+                    .lock()
+                    .expect("events mutex should lock")
+                    .push(format!("lookup:{lfs_url}"));
+                crate::LfsSessionToken::from_secret("local-lfs-token").map_err(|error| {
+                    CliError::InvalidArguments {
+                        message: error.to_string(),
+                    }
+                })
+            },
+            move |logout_url, token| {
+                revoke_events
+                    .lock()
+                    .expect("events mutex should lock")
+                    .push(format!("revoke:{logout_url}:{}", token.as_str()));
+                Ok(SessionRevocationStatus::Revoked)
+            },
+            move |rejection: GitCredentialRejection| {
+                erase_events
+                    .lock()
+                    .expect("events mutex should lock")
+                    .push(format!(
+                        "erase:{}:{}",
+                        rejection.lfs_url(),
+                        rejection.token().as_str()
+                    ));
+                Ok(())
+            },
+        )
+        .expect("logout should complete");
+
+        assert_eq!(
+            *events.lock().expect("events mutex should lock"),
+            vec![
+                "lookup:http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs",
+                "revoke:http://127.0.0.1:8080/auth/session:local-lfs-token",
+                "erase:http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs:local-lfs-token",
+            ]
+        );
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("revoked local LFS session"));
+        assert!(rendered.contains("erased local LFS credential"));
+        assert!(!rendered.contains("local-lfs-token"));
+    }
+
+    #[test]
+    fn logout_erases_stale_local_credential_when_session_is_already_inactive() {
+        if !git_is_available() {
+            return;
+        }
+
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), &["init"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let erased = Arc::new(Mutex::new(false));
+        let erased_for_runner = Arc::clone(&erased);
+        let mut output = Vec::new();
+
+        run_logout_from_dir(
+            LogoutCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
+            },
+            repo.path(),
+            &mut output,
+            |_| {
+                LfsSessionToken::from_secret("stale-lfs-token").map_err(|error| {
+                    CliError::InvalidArguments {
+                        message: error.to_string(),
+                    }
+                })
+            },
+            |_, _| Ok(SessionRevocationStatus::AlreadyInactive),
+            move |_| {
+                *erased_for_runner.lock().expect("erasure mutex should lock") = true;
+                Ok(())
+            },
+        )
+        .expect("already inactive logout should complete local cleanup");
+
+        assert!(*erased.lock().expect("erasure mutex should lock"));
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("already inactive"));
+        assert!(rendered.contains("erased local LFS credential"));
+        assert!(!rendered.contains("stale-lfs-token"));
     }
 
     #[test]

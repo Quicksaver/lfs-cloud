@@ -16,6 +16,8 @@ The initial goal is to keep normal Git version control on GitHub, while routing 
 > `lfs-cloud login --server` can open the server's GitHub OAuth login URL for
 > the current repository, accept the returned local `lfs-cloud` token, and store
 > that local token in Git's credential helper for the repository-scoped LFS URL.
+> `lfs-cloud logout --server` revokes that server-side session and erases the
+> matching repository-scoped Git credential.
 > `lfs-cloud status` can inspect the current repository against server config,
 > check TCP reachability for the configured server URL, verify that a local LFS
 > credential is available, validate the configured Drive credential reference,
@@ -196,6 +198,21 @@ Session issuance is bounded to 16 active credentials per stable provider user,
 eight successful issuances per minute per user, and 1,024 active credentials
 per server process. An overloaded callback returns HTTP 429 with `Retry-After`;
 it never evicts another active credential to admit the new login.
+
+### Revoke A Repository Session
+
+```bash
+lfs-cloud logout --server http://127.0.0.1:8080
+```
+
+Logout loads the repository-scoped local LFS credential, authenticates a
+server-side session revocation request with it, and then erases the credential
+through `git credential reject`. If the server reports that the session is
+already expired or revoked, the local credential is still erased. A failed or
+unexpected server response leaves the local credential in place so logout can
+be retried. When GitHub definitively rejects the private OAuth token retained
+by an active session, the server revokes the corresponding local LFS session
+automatically.
 
 ### Check Repository Status
 

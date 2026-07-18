@@ -301,11 +301,37 @@ independently validated or adjudicated.
     assessed here and no invalid finding attributable separately, this was
     high-quality, security-relevant feedback.
 
-13. **Medium — Session revocation has no user-facing route or CLI flow.** The
-    `revoke` operation is only exercised by unit tests, so a stolen token remains
-    usable until expiry or restart (`src/sessions.rs:342-355`). Expose
-    authenticated logout/revocation, erase the Git credential entry, and revoke
-    local sessions when upstream authentication is definitively invalid.
+13. **[DONE] Session revocation had no user-facing route or CLI flow** (Medium,
+    `src/server.rs`, `src/sessions.rs`, `src/credentials.rs`, and `src/cli.rs`):
+    **Valid and actionable.** The session store already supported in-memory and
+    durable token revocation, but production exposed no authenticated endpoint
+    or CLI command that could invoke it, and a definitively invalid private
+    GitHub token left its local bearer session active. The full server now
+    mounts authenticated `DELETE /auth/session`, consumes the presented local
+    token, and removes both its in-process record and durable SQLite row.
+    `lfs-cloud logout --server` resolves the current repository route, performs
+    a non-redirecting authenticated revocation request, and only then erases the
+    exact path-scoped credential through `git credential reject`; an already
+    expired or revoked server token still permits local cleanup, while an
+    unexpected server failure preserves the credential for retry. LFS batch,
+    upload, and download authorization now carry the authenticated local token
+    through the request boundary and revoke it when GitHub definitively returns
+    `AuthenticationRequired`. Coverage proves endpoint replay denial, automatic
+    upstream-invalid revocation, durable deletion across database reopen,
+    repository-context credential rejection, CLI ordering, stale-credential
+    cleanup, redacted output, and command dispatch. README, implementation
+    guidance, the repository learning, and
+    `scripts/manual/verify-logout-command.sh` document and exercise the new
+    contract. Verification passed with `cargo fmt --check`, `yarn lint:fix`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, `cargo test --doc`,
+    `scripts/manual/verify-logout-command.sh`, and `git diff --check`. The
+    reviewer's core finding and all three remediation requirements were precise
+    and security-relevant. Its suggestion that restart ended exposure was stale
+    because production sessions now survive restarts, but that makes explicit
+    durable revocation more important rather than invalidating the finding;
+    with one valid finding and no invalid finding attributable separately, this
+    was high-quality feedback with one minor outdated detail.
 
 14. **Low — Authentication performs a serialized O(n) session scan and clones
     OAuth-bearing records.** Every request locks the map and prunes all sessions
