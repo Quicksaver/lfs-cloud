@@ -757,6 +757,20 @@ impl LocalCacheLayout {
     where
         F: FnOnce(),
     {
+        self.dehydrate_file_with_read_observer(object, worktree_path, before_pointer_publish, || {})
+    }
+
+    fn dehydrate_file_with_read_observer<F, R>(
+        &self,
+        object: &LfsObject,
+        worktree_path: impl AsRef<Path>,
+        before_pointer_publish: F,
+        mut before_full_worktree_read: R,
+    ) -> LocalCacheResult<LocalCacheDehydration>
+    where
+        F: FnOnce(),
+        R: FnMut(),
+    {
         // Hold a shared operation lock through pointer publication. GC takes
         // the exclusive side, so it can never observe the cache object after
         // publication but before the worktree reference becomes visible.
@@ -776,32 +790,41 @@ impl LocalCacheLayout {
                 status: LocalCacheDehydrationStatus::AlreadyDehydrated,
             });
         }
-        let verified_worktree = match verify_worktree_file_object(worktree_path, object) {
-            Ok(verified) => verified,
-            Err(error) => {
-                if let Some(pointer) = existing_pointer {
-                    return Err(LocalCacheError::PointerObjectMismatch {
-                        path: worktree_path.to_path_buf(),
-                        expected_oid: object.oid.clone(),
-                        expected_size: object.size,
-                        actual_oid: pointer.object.oid,
-                        actual_size: pointer.object.size,
-                    });
-                }
-
-                return Err(error);
+        if let Some(pointer) = existing_pointer {
+            // A valid pointer can also be the literal contents of another LFS
+            // object. This bounded read distinguishes that case while keeping
+            // ordinary large hydrated files on the staged-copy fast path.
+            before_full_worktree_read();
+            if verify_worktree_file_object(worktree_path, object).is_err() {
+                return Err(LocalCacheError::PointerObjectMismatch {
+                    path: worktree_path.to_path_buf(),
+                    expected_oid: object.oid.clone(),
+                    expected_size: object.size,
+                    actual_oid: pointer.object.oid,
+                    actual_size: pointer.object.size,
+                });
             }
-        };
+        }
         let status = if cache_object_path_exists(&cache_path)? {
             self.verify_object(object)?;
             sync_verified_cache_object(&cache_path)?;
             LocalCacheDehydrationStatus::ReplacedWithPointer
         } else {
-            copy_verified_worktree_object_to_cache(&verified_worktree.path, &cache_path, object)?;
+            // Hash the source while staging its cache copy. Atomic exchange
+            // later retains and verifies the exact displaced bytes, so a
+            // separate pre-copy and pre-exchange hash would add I/O without
+            // strengthening the concurrent-edit guarantee.
+            before_full_worktree_read();
+            copy_verified_worktree_object_to_cache(worktree_path, &cache_path, object)?;
             LocalCacheDehydrationStatus::CachedAndReplacedWithPointer
         };
 
-        publish_pointer_file(worktree_path, object, before_pointer_publish)?;
+        publish_pointer_file(
+            worktree_path,
+            object,
+            before_pointer_publish,
+            &mut before_full_worktree_read,
+        )?;
 
         Ok(LocalCacheDehydration {
             object: object.clone(),
@@ -1771,13 +1794,15 @@ fn read_existing_lfs_pointer_file(path: &Path) -> LocalCacheResult<Option<LfsPoi
     Ok(LfsPointer::parse(contents).ok())
 }
 
-fn publish_pointer_file<F>(
+fn publish_pointer_file<F, R>(
     path: &Path,
     object: &LfsObject,
     before_publish: F,
+    before_displaced_verification: R,
 ) -> LocalCacheResult<()>
 where
     F: FnOnce(),
+    R: FnOnce(),
 {
     let parent = path.parent().ok_or_else(|| LocalCacheError::Io {
         context: "failed to resolve dehydration target parent",
@@ -1809,9 +1834,9 @@ where
     })?;
     set_temporary_file_mode(temp.path(), path, mode)?;
 
-    verify_worktree_file_object(path, object)?;
     before_publish();
     replace_retaining_displaced(temp, path, |displaced_path| {
+        before_displaced_verification();
         remap_integrity_path(verify_worktree_file_object(displaced_path, object), path).map(|_| ())
     })?;
 
@@ -3436,6 +3461,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dehydrate_file_reads_uncached_large_worktree_bytes_only_twice() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = vec![b'x'; (MAX_LFS_POINTER_FILE_SIZE + 1) as usize];
+        let object = object_for_bytes(&bytes);
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(&worktree_path, &bytes);
+        let mut full_read_count = 0;
+
+        layout
+            .dehydrate_file_with_read_observer(
+                &object,
+                &worktree_path,
+                || {},
+                || full_read_count += 1,
+            )
+            .expect("clean worktree object should dehydrate");
+
+        assert_eq!(full_read_count, 2);
+    }
+
+    #[test]
+    fn dehydrate_file_reads_cached_large_worktree_bytes_only_once() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = vec![b'x'; (MAX_LFS_POINTER_FILE_SIZE + 1) as usize];
+        let object = object_for_bytes(&bytes);
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), &bytes);
+        write_file(&worktree_path, &bytes);
+        let mut full_read_count = 0;
+
+        layout
+            .dehydrate_file_with_read_observer(
+                &object,
+                &worktree_path,
+                || {},
+                || full_read_count += 1,
+            )
+            .expect("clean cached worktree object should dehydrate");
+
+        assert_eq!(full_read_count, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn dehydrate_file_rejects_symlink_without_replacing_it() {
@@ -3478,7 +3548,7 @@ mod tests {
 
     #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
     #[test]
-    fn dehydrate_file_preserves_edit_after_final_object_check() {
+    fn dehydrate_file_preserves_edit_before_pointer_exchange() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
         let bytes = b"worktree bytes to dehydrate";
@@ -3487,25 +3557,25 @@ mod tests {
         let worktree_path = temp.path().join("repo/assets/model.bin");
         write_file(&worktree_path, bytes);
 
-        let object_checked = Arc::new(Barrier::new(2));
+        let pointer_staged = Arc::new(Barrier::new(2));
         let allow_publish = Arc::new(Barrier::new(2));
         let dehydration_layout = layout.clone();
         let dehydration_object = object.clone();
         let dehydration_path = worktree_path.clone();
-        let dehydration_object_checked = Arc::clone(&object_checked);
+        let dehydration_pointer_staged = Arc::clone(&pointer_staged);
         let dehydration_allow_publish = Arc::clone(&allow_publish);
         let dehydration = thread::spawn(move || {
             dehydration_layout.dehydrate_file_with_before_pointer_publish(
                 &dehydration_object,
                 &dehydration_path,
                 || {
-                    dehydration_object_checked.wait();
+                    dehydration_pointer_staged.wait();
                     dehydration_allow_publish.wait();
                 },
             )
         });
 
-        object_checked.wait();
+        pointer_staged.wait();
         write_file(&worktree_path, edited_bytes);
         allow_publish.wait();
 

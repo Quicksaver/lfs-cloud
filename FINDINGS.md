@@ -1372,13 +1372,39 @@ independently validated or adjudicated.
    defenses; with one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, relevant feedback.
 
-7. **Medium — Dehydration performs three to four full reads of large files.**
-   CLI hashing, library verification, cache copying, and the final race check
-   each traverse the data (`src/cli.rs:1700-1772`,
-   `src/local_cache.rs:671-701`, `src/local_cache.rs:1461`,
-   `src/local_cache.rs:2032-2050`). Derive identity during a single staged copy,
-   validate source metadata around it, and minimize final checks under the
-   operation lock. Add read-count instrumentation or benchmarks.
+7. **[DONE] Dehydration performs three to four full reads of large files**
+   (Medium, `src/local_cache.rs`, `README.md`, and `IMPLEMENTATION.md`):
+   **Valid and actionable, with one stale citation.** The CLI no longer hashes
+   worktree content to derive identity because an earlier fix now reads the
+   expected object from the Git index, but the library still traversed a large
+   worktree file four times when populating cache: initial verification,
+   hash-while-copying, pre-publication verification, and displaced-byte
+   verification. Dehydration now hashes uncached source bytes only while
+   staging the cache copy, removes the redundant initial and pre-exchange
+   traversals, and retains the stronger decisive safety check: atomic exchange
+   preserves the exact displaced bytes, hashes them, and rolls the edit back
+   into place on mismatch. Platforms without exchange rename keep their final
+   verification immediately before atomic replacement. Read-observer
+   regressions prove that an uncached large worktree file is traversed exactly
+   twice and a cached one exactly once; the existing concurrent-edit test still
+   proves that an edit before exchange is restored rather than discarded.
+   README, implementation guidance, and the repository learning now describe
+   the combined staging hash and post-exchange verification boundary.
+   Verification passed with `cargo fmt --all`, `yarn lint:fix`, focused
+   dehydration tests, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   the serial all-target suite excluding the unrelated upload-stall test,
+   `cargo test --doc`, `scripts/manual/verify-local-cache-cli.sh`, and
+   `git diff --check`. The unfiltered all-target run passed 587 tests before the
+   upload-stall test failed because only 2.7 GiB of temporary disk space was
+   available for its 5 GiB preflight; the same environment therefore returned
+   insufficient-space before reaching the asserted timeout, so that single
+   test was excluded from the successful serial rerun. The focused reviewer
+   found a genuine medium-severity large-file performance issue and requested
+   useful read-count coverage. The CLI citation had become stale and
+   metadata-only validation would be weaker than hashing the atomically
+   displaced bytes, but the core diagnosis and optimization direction were
+   accurate; with one valid finding and no invalid finding attributable
+   separately, this was high-quality, relevant feedback.
 
 8. **Medium — New materialized files bypass a restrictive process umask.** The
    implementation explicitly sets mode `0644`, potentially exposing private

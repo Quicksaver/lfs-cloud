@@ -795,10 +795,14 @@ check after atomic publication so a raced symlink is restored rather than
 followed or discarded.
 On macOS and Linux, destructive publication atomically exchanges the proposed
 file with the current path, verifies the displaced bytes, and exchanges them
-back if an edit landed after the final precondition check. A failed rollback
-retains the displaced bytes at a reported recovery path rather than deleting
-them. Platforms without exchange-rename support retain the path lock and final
-identity check before atomic replacement.
+back if an edit landed during publication. Dehydration hashes uncached
+worktree bytes while staging the cache copy, then relies on the displaced-byte
+verification as its decisive final identity check. This bounds large
+worktree-file traversal to two reads when populating the cache and one when a
+verified cache object already exists, without weakening concurrent-edit
+rollback. A failed rollback retains the displaced bytes at a reported recovery
+path rather than deleting them. Platforms without exchange-rename support
+retain the path lock and final identity check before atomic replacement.
 
 There are two likely implementation strategies:
 

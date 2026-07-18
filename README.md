@@ -273,9 +273,11 @@ dehydrated. A cache-wide operation lock prevents concurrent garbage collection
 from deleting newly preserved bytes before the pointer becomes visible.
 Same-path cache operations are serialized. On macOS and Linux, pointer
 publication atomically retains and verifies the displaced file, restoring it
-if a concurrent edit landed after the final check. Dehydration rejects symbolic
-links without reading their targets or replacing the links. Use `--cache-root`
-to target a non-default local cache root.
+if a concurrent edit landed during publication. When the shared cache is
+missing the object, dehydration verifies it while staging the cache copy rather
+than hashing it in a separate pass. Dehydration rejects symbolic links without
+reading their targets or replacing the links. Use `--cache-root` to target a
+non-default local cache root.
 
 ### Garbage-Collect The Local Cache
 
