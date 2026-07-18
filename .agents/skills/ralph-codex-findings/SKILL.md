@@ -15,11 +15,11 @@ Spawn a subagent with `fork_turns: "none"`. It is to work in this branch to foll
 - Write all notes, conclusions, and reporting into the @FINDINGS.md file, and finish by marking the item as `done`.
 - If task is not completed successfully or requires user interaction, report back to the user with the status and any necessary information or questions and stop.
 
-After each subagent finishes, terminate it explicitly, reload this $ralph-codex-findings skill, and repeat the orchestration loop with a new subagent.
-
 **Keep subagent instructions to a minimum!** Only instruct the subagent to read the files, use the skills, and write to the findings file. Any additional instructions such as this orchestration context, which step we might be in, or your own instructions and status is unnecessary and polluting to the subagent.
 
-**Wait patiently and silently for a subagent to finish, then explicitly close it when it finishes**. Then reload this $ralph-codex-findings skill and continue the orchestration loop with a new subagent.
+**Wait patiently and silently for a subagent to finish.** If it fails or requires user interaction, keep it as an inactive subagent so it can be resumed afterwards.
+
+**Explicitly close the subagent when it completes its work successfully**, then reload this $ralph-codex-findings skill and continue the orchestration loop with a new subagent.
 
 Iterate until all tasks in the implementation plan are marked as complete, or until user interaction is required for any reason.
 
