@@ -15,6 +15,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Query, State},
+    middleware,
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
@@ -320,7 +321,27 @@ impl fmt::Debug for GitHubOAuthCallbackRouteResponse {
 pub fn github_oauth_callback_router(state: GitHubOAuthCallbackRouteState) -> Router {
     Router::new()
         .route(GITHUB_OAUTH_CALLBACK_PATH, get(github_oauth_callback_route))
+        .layer(middleware::map_response(
+            protect_github_oauth_callback_response,
+        ))
         .with_state(state)
+}
+
+async fn protect_github_oauth_callback_response(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    headers.insert(
+        axum::http::header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        axum::http::header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 /// Creates an Axum router for the GitHub OAuth login redirect endpoint.
@@ -2281,7 +2302,9 @@ mod tests {
         extract::{Path, State},
         http::{
             HeaderMap, HeaderValue, Request, StatusCode,
-            header::{AUTHORIZATION, CONTENT_TYPE, LOCATION},
+            header::{
+                AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, LOCATION, PRAGMA, REFERRER_POLICY,
+            },
         },
         response::IntoResponse,
         routing::{get, post},
@@ -3590,6 +3613,7 @@ mod tests {
             .expect("callback request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_oauth_callback_response_is_protected(response.headers());
         let body = response.text().await.expect("response body should read");
         assert!(!body.contains("gho_token"));
         assert!(!body.contains("oauth-code"));
@@ -3797,6 +3821,7 @@ mod tests {
             .expect("callback request should complete");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_oauth_callback_response_is_protected(response.headers());
         let body = response.text().await.expect("response body should read");
         assert!(!body.contains("oauth-code"));
         assert!(!body.contains("returned-state"));
@@ -4196,6 +4221,21 @@ mod tests {
             url: format!("http://{address}"),
             task,
         }
+    }
+
+    fn assert_oauth_callback_response_is_protected(headers: &HeaderMap) {
+        assert_eq!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, private"))
+        );
+        assert_eq!(
+            headers.get(PRAGMA),
+            Some(&HeaderValue::from_static("no-cache"))
+        );
+        assert_eq!(
+            headers.get(REFERRER_POLICY),
+            Some(&HeaderValue::from_static("no-referrer"))
+        );
     }
 
     async fn capture_token_request(

@@ -122,11 +122,23 @@ independently validated or adjudicated.
    invalid finding attributable separately, this was high-quality,
    security-relevant feedback.
 
-6. **Medium — OAuth callback responses containing credentials are cacheable.**
-   Successful GET responses return `lfs_token` without defensive cache or
-   referrer headers (`src/github_auth.rs:338-359`). Add `Cache-Control: no-store,
-private`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer` to success
-   and error responses, with header assertions.
+6. **[DONE] OAuth callback responses containing credentials were cacheable**
+   (Medium, `src/github_auth.rs`): **Valid and actionable.** Successful callback
+   GET responses return the local LFS bearer token, while the callback router
+   previously supplied no cache or referrer policy on either success or error
+   responses. The callback router now applies `Cache-Control: no-store, private`,
+   `Pragma: no-cache`, and `Referrer-Policy: no-referrer` through response
+   middleware. Applying the policy at the router layer also protects callback
+   errors produced before the handler returns, including future extractor
+   rejections. Regression assertions cover both the credential-bearing success
+   response and an unauthorized CSRF error response. Verification passed with
+   `cargo test callback_route_`, `cargo fmt`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, and `cargo test --doc`. The focused reviewer
+   identified a genuine medium-severity browser and intermediary cache exposure
+   and prescribed the correct defensive headers; with one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, security-relevant feedback.
 
 7. **Medium — Unauthenticated login flooding can evict legitimate CSRF
    states.** Each login GET registers state and the 1,025th pending entry evicts
