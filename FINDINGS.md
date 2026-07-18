@@ -688,10 +688,24 @@ independently validated or adjudicated.
     single-connection MVP. With one valid finding assessed here and no invalid
     finding attributable separately, this was high-quality, relevant feedback.
 
-11. **Low — Size-only integrity failures incorrectly report a SHA-256
-    mismatch.** A correct OID with the wrong size receives a misleading hash
-    error (`src/server.rs:1799-1806`, `src/server.rs:3474-3503`). Report OID and
-    size generically or classify them separately, and fix the assertion.
+11. **[DONE] Size-only integrity failures incorrectly report a SHA-256
+    mismatch** (Low, `src/server.rs`): **Valid and actionable.** Upload staging
+    correctly represented both OID and size failures with the existing
+    `StorageError::IntegrityMismatch`, but the shared HTTP mapping described
+    every mismatch as a bad SHA-256. The Git LFS error response now states that
+    the uploaded object did not match the requested OID or size, accurately
+    covering both integrity dimensions without adding redundant error variants.
+    The existing route-OID and batch-size endpoint regressions both assert the
+    corrected client-facing contract; the size case uses bytes whose SHA-256 is
+    exactly the route OID, proving that a size-only failure no longer receives a
+    hash-only diagnostic. Verification passed with `yarn lint:fix`, `cargo fmt`,
+    focused upload-integrity endpoint tests,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, and `cargo test --doc`. The focused reviewer
+    identified a genuine, narrowly scoped client-diagnostic defect and
+    suggested a proportionate generic response; with one valid finding assessed
+    here and no invalid finding attributable separately, this was high-quality,
+    relevant feedback.
 
 12. **Low — Transfer-attempt metadata is declared but never recorded.** The
     schema and documentation promise transfer state, but production inserts no

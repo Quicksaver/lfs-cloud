@@ -2718,7 +2718,7 @@ fn git_lfs_storage_error_response(error: ServerError) -> Response {
             source: StorageError::IntegrityMismatch { .. },
         } => (
             StatusCode::UNPROCESSABLE_ENTITY,
-            "uploaded Git LFS object did not match the requested SHA-256",
+            "uploaded Git LFS object did not match the requested OID or size",
         ),
         ServerError::Storage {
             source: StorageError::ObjectNotFound { .. },
@@ -5128,7 +5128,7 @@ repositories:
         assert_lfs_json_error(
             response,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "uploaded Git LFS object did not match the requested SHA-256",
+            "uploaded Git LFS object did not match the requested OID or size",
         )
         .await;
         assert!(transfer_store.uploads().is_empty());
@@ -5163,7 +5163,7 @@ repositories:
         assert_lfs_json_error(
             response,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "uploaded Git LFS object did not match the requested SHA-256",
+            "uploaded Git LFS object did not match the requested OID or size",
         )
         .await;
         assert!(transfer_store.uploads().is_empty());
