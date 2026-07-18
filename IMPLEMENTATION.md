@@ -1332,10 +1332,13 @@ Defer:
 > cannot delete the newly preserved object in between those steps.
 > The `hydrate` and `dehydrate` CLI commands now expose those local cache
 > operations for explicit path lists, including `--cache-root` overrides for
-> tests or non-default local cache locations. The `gc` CLI command now scans
-> registered worktrees for Git LFS pointer references and removes unreferenced
-> shared cache objects. An unavailable registered root conservatively protects
-> all objects it might reference; `--prune-unavailable-worktrees` is required
+> tests or non-default local cache locations. The `gc` CLI command now asks Git
+> for NUL-delimited tracked paths in registered worktrees and retains pointer
+> references only when the effective index attribute is `filter=lfs`; ignored,
+> untracked, generated, and tracked non-LFS files cannot pin shared objects. It
+> then removes unreferenced shared cache objects. An unavailable registered root
+> conservatively protects all objects it might reference;
+> `--prune-unavailable-worktrees` is required
 > to declare those roots permanently abandoned before collection proceeds.
 > `gc` also supports `--dry-run` for review before deletion. The `pull` CLI command now runs
 > `git lfs fetch`, ingests fetched current-checkout objects from Git LFS media

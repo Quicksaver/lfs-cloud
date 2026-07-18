@@ -8,11 +8,15 @@
 
 use std::{
     collections::BTreeSet,
-    ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
 };
+
+#[cfg(unix)]
+use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 use fs4::FileExt;
 use serde::{Deserialize, Serialize};
@@ -118,6 +122,34 @@ pub enum LocalCacheError {
         /// Underlying JSON failure.
         #[source]
         source: serde_json::Error,
+    },
+
+    /// Git could not enumerate or classify tracked paths for garbage collection.
+    #[error(
+        "{command} failed for registered worktree {} with status {status}",
+        worktree_root.display()
+    )]
+    GitCommandFailed {
+        /// Stable command description that does not include repository data.
+        command: &'static str,
+        /// Registered worktree whose tracked paths were being inspected.
+        worktree_root: PathBuf,
+        /// Platform process status reported by Git.
+        status: String,
+    },
+
+    /// Git returned malformed path or attribute output during garbage collection.
+    #[error(
+        "{command} returned malformed output for registered worktree {}: {message}",
+        worktree_root.display()
+    )]
+    GitCommandOutput {
+        /// Stable command description that does not include repository data.
+        command: &'static str,
+        /// Registered worktree whose tracked paths were being inspected.
+        worktree_root: PathBuf,
+        /// Fixed diagnostic describing the malformed output.
+        message: &'static str,
     },
 
     /// The local worktree registry uses an unsupported schema version.
@@ -902,10 +934,12 @@ impl LocalCacheLayout {
 
     /// Removes cached objects not referenced by any registered worktree.
     ///
-    /// Reachability is intentionally conservative and local: the collector
-    /// scans existing registered worktree roots for Git LFS pointer files and
-    /// keeps every cached OID that a pointer references. When any registered
-    /// root is unavailable, objects not referenced by the remaining roots are
+    /// Reachability is intentionally conservative and local: the collector asks
+    /// Git for NUL-delimited tracked paths in each registered worktree, filters
+    /// those paths by the effective `filter=lfs` index attribute, and keeps
+    /// every cached OID that a matching worktree pointer references. When any
+    /// registered root is unavailable, objects not referenced by the remaining
+    /// roots are
     /// protected unless `prune_unavailable_worktrees` is true. Explicit pruning
     /// treats unavailable roots as permanently abandoned. Cache paths that do
     /// not match the expected sharded SHA-256 layout are reported but never
@@ -1239,55 +1273,193 @@ fn referenced_worktree_oids(
     let mut referenced = BTreeSet::new();
 
     for registration in registrations {
-        collect_pointer_oids_from_directory(&registration.worktree_root, &mut referenced)?;
+        collect_tracked_lfs_pointer_oids(registration, &mut referenced)?;
     }
 
     Ok(referenced)
 }
 
-fn collect_pointer_oids_from_directory(
-    directory: &Path,
+fn collect_tracked_lfs_pointer_oids(
+    registration: &LocalCacheWorktreeRegistration,
     referenced: &mut BTreeSet<LfsOid>,
 ) -> LocalCacheResult<()> {
-    let entries = fs::read_dir(directory).map_err(|source| LocalCacheError::Io {
-        context: "failed to read registered worktree directory",
-        path: directory.to_path_buf(),
-        source,
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|source| LocalCacheError::Io {
-            context: "failed to read registered worktree directory entry",
-            path: directory.to_path_buf(),
+    const LS_FILES: &str = "git ls-files -z";
+    let tracked_paths = registered_git_command(registration)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to start git ls-files -z for local cache garbage collection",
+            path: registration.worktree_root.clone(),
             source,
         })?;
-        let path = entry.path();
-        if entry.file_name() == OsStr::new(".git") {
-            continue;
-        }
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(LocalCacheError::Io {
-                    context: "failed to inspect registered worktree entry type",
-                    path,
-                    source,
-                });
-            }
-        };
+    if !tracked_paths.status.success() {
+        return Err(git_command_failed(
+            LS_FILES,
+            registration,
+            tracked_paths.status,
+        ));
+    }
+    if tracked_paths.stdout.is_empty() {
+        return Ok(());
+    }
 
-        if file_type.is_symlink() {
+    let attributes = check_tracked_path_filter_attributes(registration, tracked_paths.stdout)?;
+    let mut fields = attributes.split(|byte| *byte == b'\0').collect::<Vec<_>>();
+    if fields.last() == Some(&&[][..]) {
+        fields.pop();
+    }
+    let chunks = fields.chunks_exact(3);
+    if !chunks.remainder().is_empty() {
+        return Err(git_command_output(
+            "git check-attr --cached -z --stdin filter",
+            registration,
+            "expected path, attribute, and value triples",
+        ));
+    }
+
+    for chunk in chunks {
+        let [relative_path, attribute, value] = chunk else {
+            unreachable!("chunks_exact yielded a non-triple chunk");
+        };
+        if *attribute != b"filter" || *value != b"lfs" {
             continue;
         }
-        if file_type.is_dir() {
-            collect_pointer_oids_from_directory(&path, referenced)?;
-        } else if file_type.is_file() {
-            collect_pointer_oid_from_file(&path, referenced)?;
-        }
+
+        let relative_path = git_relative_path(relative_path, registration)?;
+        collect_pointer_oid_from_file(&registration.worktree_root.join(relative_path), referenced)?;
     }
 
     Ok(())
+}
+
+fn registered_git_command(registration: &LocalCacheWorktreeRegistration) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(&registration.git_dir)
+        .arg("--work-tree")
+        .arg(&registration.worktree_root)
+        .current_dir(&registration.worktree_root);
+    command
+}
+
+fn check_tracked_path_filter_attributes(
+    registration: &LocalCacheWorktreeRegistration,
+    tracked_paths: Vec<u8>,
+) -> LocalCacheResult<Vec<u8>> {
+    const CHECK_ATTR: &str = "git check-attr --cached -z --stdin filter";
+    let mut child = registered_git_command(registration)
+        .args(["check-attr", "--cached", "-z", "--stdin", "filter"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to start git check-attr for local cache garbage collection",
+            path: registration.worktree_root.clone(),
+            source,
+        })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("Git attribute stdin should be piped");
+    let writer = thread::spawn(move || {
+        let result = stdin.write_all(&tracked_paths);
+        drop(stdin);
+        result
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to wait for git check-attr during local cache garbage collection",
+            path: registration.worktree_root.clone(),
+            source,
+        })?;
+    let write_result = writer.join().map_err(|_| LocalCacheError::Io {
+        context: "git check-attr input writer panicked during local cache garbage collection",
+        path: registration.worktree_root.clone(),
+        source: io::Error::other("git check-attr input writer panicked"),
+    })?;
+
+    if !output.status.success() {
+        return Err(git_command_failed(CHECK_ATTR, registration, output.status));
+    }
+    write_result.map_err(|source| LocalCacheError::Io {
+        context: "failed to write tracked paths to git check-attr",
+        path: registration.worktree_root.clone(),
+        source,
+    })?;
+
+    Ok(output.stdout)
+}
+
+fn git_command_failed(
+    command: &'static str,
+    registration: &LocalCacheWorktreeRegistration,
+    status: std::process::ExitStatus,
+) -> LocalCacheError {
+    LocalCacheError::GitCommandFailed {
+        command,
+        worktree_root: registration.worktree_root.clone(),
+        status: status.to_string(),
+    }
+}
+
+fn git_command_output(
+    command: &'static str,
+    registration: &LocalCacheWorktreeRegistration,
+    message: &'static str,
+) -> LocalCacheError {
+    LocalCacheError::GitCommandOutput {
+        command,
+        worktree_root: registration.worktree_root.clone(),
+        message,
+    }
+}
+
+fn git_relative_path(
+    relative_path: &[u8],
+    registration: &LocalCacheWorktreeRegistration,
+) -> LocalCacheResult<PathBuf> {
+    let path = git_path_bytes_to_path_buf(relative_path, registration)?;
+    let contained = !path.is_absolute()
+        && path.components().next().is_some()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if !contained {
+        return Err(git_command_output(
+            "git check-attr --cached -z --stdin filter",
+            registration,
+            "returned a path outside the registered worktree",
+        ));
+    }
+
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn git_path_bytes_to_path_buf(
+    relative_path: &[u8],
+    _registration: &LocalCacheWorktreeRegistration,
+) -> LocalCacheResult<PathBuf> {
+    Ok(PathBuf::from(OsString::from_vec(relative_path.to_owned())))
+}
+
+#[cfg(not(unix))]
+fn git_path_bytes_to_path_buf(
+    relative_path: &[u8],
+    registration: &LocalCacheWorktreeRegistration,
+) -> LocalCacheResult<PathBuf> {
+    String::from_utf8(relative_path.to_owned())
+        .map(PathBuf::from)
+        .map_err(|_| {
+            git_command_output(
+                "git check-attr --cached -z --stdin filter",
+                registration,
+                "returned a non-UTF-8 path",
+            )
+        })
 }
 
 fn collect_pointer_oid_from_file(
@@ -2493,6 +2665,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        process::Command,
         str::FromStr,
         sync::{Arc, Barrier, mpsc},
         thread,
@@ -2518,6 +2691,35 @@ mod tests {
             fs::create_dir_all(parent).expect("test parent directory should be created");
         }
         fs::write(path, bytes).expect("test file should be written");
+    }
+
+    fn initialize_git_worktree(path: &Path) {
+        fs::create_dir_all(path).expect("test worktree should be created");
+        let output = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(path)
+            .output()
+            .expect("git init should start");
+        assert!(
+            output.status.success(),
+            "git init should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_add(path: &Path, relative_paths: &[&Path]) {
+        let output = Command::new("git")
+            .arg("add")
+            .arg("--")
+            .args(relative_paths)
+            .current_dir(path)
+            .output()
+            .expect("git add should start");
+        assert!(
+            output.status.success(),
+            "git add should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -3143,6 +3345,16 @@ mod tests {
         let worktree_path = repo.join("assets/model.bin");
         let bytes = b"only copy must survive concurrent garbage collection";
         let object = object_for_bytes(bytes);
+        initialize_git_worktree(&repo);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(
+            &worktree_path,
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        git_add(
+            &repo,
+            &[Path::new(".gitattributes"), Path::new("assets/model.bin")],
+        );
         write_file(&worktree_path, bytes);
         layout
             .register_worktree(
@@ -3638,7 +3850,8 @@ mod tests {
         )
         .expect("missing registration should validate");
 
-        fs::create_dir_all(repo.join("asset")).expect("worktree should be created");
+        initialize_git_worktree(&repo);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(&layout.object_path(&referenced), referenced_bytes);
         write_file(&layout.object_path(&unreferenced), unreferenced_bytes);
         write_file(
@@ -3646,6 +3859,10 @@ mod tests {
             LfsPointer::new(referenced.clone())
                 .to_pointer_file()
                 .as_bytes(),
+        );
+        git_add(
+            &repo,
+            &[Path::new(".gitattributes"), Path::new("asset/model.bin")],
         );
         layout
             .register_worktree(active_registration.clone())
@@ -3679,6 +3896,110 @@ mod tests {
                 .worktrees(),
             &[active_registration, missing_registration]
         );
+    }
+
+    #[test]
+    fn garbage_collect_uses_only_tracked_lfs_paths_for_reachability() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let repo = temp.path().join("repo");
+        let tracked_lfs = object_for_bytes(b"tracked LFS object");
+        let tracked_non_lfs = object_for_bytes(b"tracked non-LFS object");
+        let ignored = object_for_bytes(b"ignored generated object");
+        initialize_git_worktree(&repo);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(&repo.join(".gitignore"), b"generated/\n");
+        write_file(
+            &repo.join("asset/keep.bin"),
+            LfsPointer::new(tracked_lfs.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        write_file(
+            &repo.join("docs/pointer.txt"),
+            LfsPointer::new(tracked_non_lfs.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        write_file(
+            &repo.join("generated/pointer.bin"),
+            LfsPointer::new(ignored.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        git_add(
+            &repo,
+            &[
+                Path::new(".gitattributes"),
+                Path::new(".gitignore"),
+                Path::new("asset/keep.bin"),
+                Path::new("docs/pointer.txt"),
+            ],
+        );
+        write_file(&layout.object_path(&tracked_lfs), b"tracked LFS object");
+        write_file(
+            &layout.object_path(&tracked_non_lfs),
+            b"tracked non-LFS object",
+        );
+        write_file(&layout.object_path(&ignored), b"ignored generated object");
+        let registration =
+            LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
+                .expect("registration should validate");
+        layout
+            .register_worktree(registration)
+            .expect("worktree should register");
+
+        let report = layout
+            .garbage_collect(false, false)
+            .expect("garbage collection should finish");
+
+        assert_eq!(
+            report
+                .retained_objects
+                .iter()
+                .map(|object| object.oid.clone())
+                .collect::<Vec<_>>(),
+            vec![tracked_lfs.oid.clone()]
+        );
+        assert_eq!(report.deleted_objects.len(), 2);
+        assert!(layout.object_path(&tracked_lfs).exists());
+        assert!(!layout.object_path(&tracked_non_lfs).exists());
+        assert!(!layout.object_path(&ignored).exists());
+    }
+
+    #[test]
+    fn garbage_collect_handles_nul_delimited_tracked_lfs_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let repo = temp.path().join("repo");
+        let object = object_for_bytes(b"newline path object");
+        let relative_path = Path::new("asset/line\nbreak.bin");
+        initialize_git_worktree(&repo);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(
+            &repo.join(relative_path),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        git_add(&repo, &[Path::new(".gitattributes"), relative_path]);
+        write_file(&layout.object_path(&object), b"newline path object");
+        layout
+            .register_worktree(
+                LocalCacheWorktreeRegistration::new(
+                    "github-main:owner/repo",
+                    &repo,
+                    repo.join(".git"),
+                )
+                .expect("registration should validate"),
+            )
+            .expect("worktree should register");
+
+        let report = layout
+            .garbage_collect(false, false)
+            .expect("garbage collection should finish");
+
+        assert_eq!(report.retained_objects.len(), 1);
+        assert_eq!(report.retained_objects[0].oid, object.oid);
+        assert!(layout.object_path(&object).exists());
     }
 
     #[test]
@@ -3720,7 +4041,7 @@ mod tests {
     }
 
     #[test]
-    fn garbage_collect_ignores_git_file_when_collecting_pointers() {
+    fn garbage_collect_ignores_untracked_pointer_in_git_metadata() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
         let repo = temp.path().join("repo");
@@ -3730,10 +4051,10 @@ mod tests {
             LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
                 .expect("active registration should validate");
 
-        fs::create_dir_all(&repo).expect("worktree should be created");
+        initialize_git_worktree(&repo);
         write_file(&layout.object_path(&object), bytes);
         write_file(
-            &repo.join(".git"),
+            &repo.join(".git/lfs-cloud-pointer"),
             LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
         layout
@@ -3763,7 +4084,7 @@ mod tests {
             LocalCacheWorktreeRegistration::new("github-main:owner/repo", &repo, repo.join(".git"))
                 .expect("active registration should validate");
 
-        fs::create_dir_all(&repo).expect("worktree should be created");
+        initialize_git_worktree(&repo);
         fs::create_dir_all(&outside).expect("outside directory should be created");
         std::os::unix::fs::symlink(&outside, repo.join("linked"))
             .expect("directory symlink should be created");

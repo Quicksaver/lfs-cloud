@@ -5593,12 +5593,7 @@ mod tests {
         let layout = LocalCacheLayout::new(&cache_root);
         write_file(&layout.object_path(&keep_object), keep_bytes);
         write_file(&layout.object_path(&remove_object), remove_bytes);
-        write_file(
-            &repo.join("asset/model.bin"),
-            LfsPointer::new(keep_object.clone())
-                .to_pointer_file()
-                .as_bytes(),
-        );
+        stage_lfs_pointer(&repo, "asset/model.bin", &keep_object);
         let mut output = Vec::new();
 
         run_gc_from_dir(

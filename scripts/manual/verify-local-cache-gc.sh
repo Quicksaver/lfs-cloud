@@ -91,6 +91,8 @@ PY
 
 git -C "$repo_dir" init >/dev/null
 git -C "$repo_dir" remote add origin git@github.com:owner/repo.git
+printf '*.bin filter=lfs\n' >"$repo_dir/.gitattributes"
+git -C "$repo_dir" add -- .gitattributes asset/model.bin
 
 keep_oid="$(cat "$keep_oid_file")"
 remove_oid="$(cat "$remove_oid_file")"

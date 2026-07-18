@@ -1309,12 +1309,40 @@ independently validated or adjudicated.
    attributable separately, this was high-quality, integrity-relevant
    feedback.
 
-5. **Medium — GC scans the raw filesystem instead of Git LFS tracked paths.** It
-   recursively reads small files in ignored, generated, vendor, or dependency
-   trees, and untracked pointer-shaped text can pin objects indefinitely
-   (`src/local_cache.rs:1054-1155`). Enumerate NUL-safe tracked paths and evaluate
-   `filter=lfs`; track any intentionally local-only dehydrated references
-   explicitly.
+5. **[DONE] GC scans the raw filesystem instead of Git LFS tracked paths**
+   (Medium, `src/local_cache.rs`, `src/cli.rs`, cache documentation, and the
+   manual GC verifier): **Valid and actionable.** Reachability previously
+   recursively inspected every small regular file below each registered root,
+   so ignored, generated, vendor, dependency, untracked, and tracked non-LFS
+   pointer-shaped text could retain shared objects indefinitely. Garbage
+   collection now invokes Git against each registration's explicit worktree and
+   Git directory, enumerates tracked paths with `git ls-files -z`, and uses
+   `git check-attr --cached` with NUL-delimited stdin to evaluate the filter.
+   Only worktree files whose effective index attribute is exactly `filter=lfs`
+   are considered pointer references. Raw byte path handling
+   preserves non-UTF-8 Unix paths, containment validation rejects malformed Git
+   output, and concurrent stdin writing prevents large path sets from
+   deadlocking with attribute output. Git stderr is suppressed at this boundary
+   and failures use fixed command descriptions rather than reflecting
+   repository output. No separate local-only reference registry was added:
+   supported CLI dehydration already requires a contained, tracked
+   `filter=lfs` path whose index blob is a pointer, so the project currently has
+   no intentional local-only dehydration contract to preserve. Real-Git
+   regressions prove a tracked LFS pointer retains its object while an ignored
+   pointer and a tracked non-LFS pointer do not, and a newline-bearing tracked
+   path proves the protocol is NUL-safe. Existing GC concurrency and unavailable
+   worktree tests now use real tracked LFS fixtures, while the CLI and manual GC
+   fixtures stage their retained pointers. README, implementation guidance, and
+   the repository learning document the narrower reachability source.
+   Verification passed with `yarn lint:fix`, `cargo fmt --all`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`,
+   `scripts/manual/verify-local-cache-gc.sh`, and `git diff --check`. The
+   focused reviewer identified a genuine medium-severity retention and
+   scalability flaw, correctly required Git-owned tracked-path and attribute
+   classification, and called out the need to preserve any intentional
+   local-only references. With one valid finding assessed here and no invalid
+   finding attributable separately, this was high-quality, relevant feedback.
 
 6. **Medium — Worktree symlinks are followed and then replaced.** Dehydration
    can hash an outside-repository symlink target and replace the symlink with a
