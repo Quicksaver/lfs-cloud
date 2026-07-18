@@ -28,6 +28,7 @@ const MAX_CREDENTIAL_FIELD_LEN: usize = 2048;
 const MAX_CREDENTIAL_OUTPUT_LEN: usize = 8192;
 const MAX_COMMAND_STDERR_LEN: usize = 4096;
 const MAX_RETAINED_COMMAND_STDERR_LEN: usize = MAX_COMMAND_STDERR_LEN + MAX_CREDENTIAL_FIELD_LEN;
+const CREDENTIAL_LOOKUP_STDERR_SUPPRESSED: &str = "credential helper stderr suppressed";
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const STDERR_DRAIN_AFTER_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 const STDERR_DRAIN_AFTER_KILL_TIMEOUT: Duration = Duration::from_millis(100);
@@ -183,7 +184,9 @@ impl GitCredentialLookup {
             .args(["credential", "fill"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // A failing helper can echo the stored password before stdout is
+            // parsed, so there is no secret value available for redaction.
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|source| CliError::Io {
                 context: format!("failed to start {command_name}"),
@@ -206,15 +209,15 @@ impl GitCredentialLookup {
                 })?;
         }
 
-        let (status, stdout, stderr) =
-            wait_for_git_command_output(&mut child, command_name, "", GIT_COMMAND_TIMEOUT)?;
+        let (status, stdout, _) =
+            wait_for_git_command_output(&mut child, command_name, "", GIT_COMMAND_TIMEOUT)
+                .map_err(suppress_credential_lookup_stderr)?;
 
         if !status.success() {
-            return Err(CliError::ExternalCommand {
-                command: command_name.to_owned(),
-                status: command_status_text(status),
-                stderr: sanitize_command_stderr(&stderr, ""),
-            });
+            return Err(credential_lookup_command_error(
+                command_name.to_owned(),
+                command_status_text(status),
+            ));
         }
 
         parse_git_credential_fill_output(&self.lfs_url, &self.username, &stdout)
@@ -798,6 +801,23 @@ fn invalid_credential_output(message: impl Into<String>) -> CliError {
     CliError::ExternalCommandOutput {
         command: "git credential fill".to_owned(),
         message: SanitizedMessage::new(message.into()),
+    }
+}
+
+fn credential_lookup_command_error(command: String, status: String) -> CliError {
+    CliError::ExternalCommand {
+        command,
+        status,
+        stderr: SanitizedMessage::new(CREDENTIAL_LOOKUP_STDERR_SUPPRESSED),
+    }
+}
+
+fn suppress_credential_lookup_stderr(error: CliError) -> CliError {
+    match error {
+        CliError::ExternalCommand {
+            command, status, ..
+        } => credential_lookup_command_error(command, status),
+        other => other,
     }
 }
 
@@ -1590,13 +1610,13 @@ printf '%s\n' \
 
     #[test]
     #[cfg(unix)]
-    fn lookup_failure_reports_helper_errors() {
+    fn lookup_failure_suppresses_helper_stderr() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let fake_git = write_fake_git(
             temp.path(),
             r#"#!/bin/sh
 cat >/dev/null
-echo "credential helper did not return a token" >&2
+echo "credential helper rejected stored-lfs-token" >&2
 exit 1
 "#,
         );
@@ -1611,7 +1631,9 @@ exit 1
 
         assert!(matches!(error, CliError::ExternalCommand { .. }));
         assert!(display.contains("git credential fill failed"));
-        assert!(display.contains("credential helper did not return a token"));
+        assert!(display.contains("credential helper stderr suppressed"));
+        assert!(!display.contains("credential helper rejected"));
+        assert!(!display.contains("stored-lfs-token"));
     }
 
     #[test]

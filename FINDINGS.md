@@ -223,11 +223,31 @@ independently validated or adjudicated.
    here and no invalid finding attributable separately, this was high-quality,
    security-relevant feedback.
 
-10. **Medium — Failed credential lookup can disclose a stored token.** A failing
-    helper's raw stderr is surfaced before the code knows the password to redact
-    (`src/credentials.rs:195-203`, `src/credentials.rs:723-745`). Suppress raw
-    helper stderr or redact credential/password-shaped content, and test a
-    helper that echoes the token before failing.
+10. **[DONE] Failed credential lookup could disclose a stored token** (Medium,
+    `src/credentials.rs` and
+    `scripts/manual/verify-secret-redaction.sh`): **Valid and actionable.** A
+    failing `git credential fill` process previously surfaced raw helper stderr
+    while the stored password was available only in the helper's stdout. On a
+    failure or timeout, lookup therefore had no reliable secret value to pass
+    to exact-token redaction, and an arbitrary helper diagnostic could expose
+    the credential. Credential lookup now sends helper stderr directly to the
+    null stream and rewrites command failure and timeout diagnostics to a fixed
+    safe message. Other credential approval and Git configuration commands
+    retain their more informative exact-token redaction because those paths
+    already know the submitted token. A fake-helper regression writes a
+    sentinel stored token to stderr before failing and proves neither the token
+    nor surrounding helper text reaches the returned error; the regression is
+    also required by the manual secret-redaction gate. The repository learning
+    records why lookup diagnostics require suppression rather than ordinary
+    redaction. Verification passed with `cargo fmt`, `yarn lint:fix`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, `cargo test --doc`,
+    `scripts/manual/verify-secret-redaction.sh`, and `git diff --check`. The
+    focused reviewer identified a genuine medium-severity credential disclosure
+    boundary and recommended both the safe suppression option and the decisive
+    failing-helper regression; with one valid finding assessed here and no
+    invalid finding attributable separately, this was high-quality,
+    security-relevant feedback.
 
 11. **Medium — Credential lookup is not non-interactive.** A cache miss can
     invoke terminal prompting, askpass, or credential-manager UI

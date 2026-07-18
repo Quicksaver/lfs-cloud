@@ -9,6 +9,7 @@ redaction_tests=(
   "cli::tests::status_reports_failures_without_leaking_credential_secrets"
   "credentials::tests::approve_failure_redacts_token_from_command_error"
   "credentials::tests::command_stderr_redacts_token_before_truncating"
+  "credentials::tests::lookup_failure_suppresses_helper_stderr"
   "credentials::tests::lookup_rejects_invalid_local_lfs_tokens_without_leaking_them"
   "credentials::tests::lookup_rejects_non_utf8_stdout_without_leaking_output"
   "git::tests::debug_redacts_credentialed_url_defensively"
