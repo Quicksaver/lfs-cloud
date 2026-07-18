@@ -2262,12 +2262,34 @@ independently validated or adjudicated.
    With one valid finding and no invalid finding attributable separately, this
    was high-quality, highly relevant feedback.
 
-2. **High — Tests bypass the production server composition path.** The tested
-   router omits production configuration loading, SQLite synchronization, OAuth
-   routes, Drive store construction, listener binding, and shutdown
-   (`src/server.rs:93`, `src/server.rs:198`, `tests/local_end_to_end.rs:79`).
-   Refactor assembly into an injectable server builder and exercise the complete
-   production composition.
+2. **[DONE] Tests bypass the production server composition path** (High,
+   `src/server.rs`): **Valid and actionable.** The existing real Git LFS test
+   crossed a TCP listener, but it still constructed the provider-adapter router
+   directly and started Axum itself. It therefore could not detect broken
+   configuration loading, metadata synchronization, durable session setup,
+   OAuth route wiring, Drive client construction/readiness, production provider
+   dispatch, listener binding, or graceful shutdown. Production `serve` now
+   delegates those exact steps to `ServerBuilder`; production clients remain the
+   default, while focused tests can inject only loopback upstream clients and a
+   deterministic shutdown signal without replacing the boot sequence. A new
+   composition regression loads YAML from disk with a config-relative SQLite
+   path, synchronizes and later verifies the active repository mapping, refreshes
+   a Drive credential and validates its writable root before readiness, binds the
+   configured TCP listener, completes the mounted PKCE OAuth login/callback flow,
+   uses the resulting durable local token for a production GitHub-authorized LFS
+   upload batch and production Drive existence lookup, and exits through bounded
+   graceful shutdown. The real Git LFS adapter test remains complementary
+   protocol coverage rather than being misrepresented as production startup
+   coverage. The repository learning now records the composition boundary.
+   Verification passed with the focused composition regression,
+   `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo build`, `cargo test --all-targets -- --test-threads=1`,
+   `cargo test --doc`, `yarn lint:fix`, and `git diff --check`. The reviewer
+   found a genuine high-severity integration blind spot, precisely
+   distinguished protocol routing from process composition, and prescribed the
+   correct injectable-builder and full-boot regression. With one valid finding
+   and no invalid finding attributable separately, this was high-quality,
+   highly relevant feedback.
 
 3. **High — Live-provider tests stop before object transfer.** GitHub coverage
    checks identity and permission, while Drive coverage checks only root-folder

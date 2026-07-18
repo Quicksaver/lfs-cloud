@@ -11,6 +11,7 @@ use std::{
     io::{self, ErrorKind},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Weak},
     time::{Duration, Instant},
 };
@@ -113,58 +114,145 @@ impl ServeOptions {
 /// Returns [`ServerError`] when configuration loading, metadata initialization,
 /// storage readiness validation, listener binding, or Axum serving fails.
 pub async fn serve(options: ServeOptions) -> ServerResult<()> {
-    let config_path = options
-        .config_path
-        .unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
-    let mut config = ServerConfig::load_from_path(config_path)?;
-    let bind = ServerBind::from_config_and_overrides(
-        &config.server.host,
-        config.server.port,
-        options.host,
-        options.port,
-    )?;
-    bind.validate_transport(&config)?;
+    ServerBuilder::new(options).serve().await
+}
 
-    let metadata_database = Arc::new(MetadataDatabase::open(config.server.metadata_path.clone())?);
-    metadata_database.sync_config(&config)?;
-    config.server.host = bind.host.clone();
-    config.server.port = bind.port;
+type ServerShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-    let session_store = production_session_store(&config, metadata_database.clone())?;
-    let transfer_store = Arc::new(GoogleDriveTransferStore::new(
-        config.clone(),
-        metadata_database.clone(),
-    )?);
-    transfer_store.validate_storage_providers().await?;
-    let router = server_router_with_sessions_and_transfer_store(
-        config,
-        session_store,
-        transfer_store,
-        metadata_database,
-    )?;
-    let listener = tokio::net::TcpListener::bind((bind.host.as_str(), bind.port))
+struct ServerCompositionClients {
+    drive_credential_source: Arc<dyn GoogleDriveCredentialSource>,
+    drive_token_refresher: GoogleDriveTokenRefresher,
+    drive_root_validator: GoogleDriveRootValidator,
+    github_token_exchanger: crate::GitHubOAuthTokenExchanger,
+    github_user_client: crate::GitHubUserClient,
+}
+
+impl ServerCompositionClients {
+    fn production() -> ServerResult<Self> {
+        Ok(Self {
+            drive_credential_source: Arc::new(GoogleDriveCredentialLoader::new()),
+            drive_token_refresher: GoogleDriveTokenRefresher::new()?,
+            drive_root_validator: GoogleDriveRootValidator::new()?,
+            github_token_exchanger: crate::GitHubOAuthTokenExchanger::new()?,
+            github_user_client: crate::GitHubUserClient::new()?,
+        })
+    }
+}
+
+struct ServerBuilder {
+    options: ServeOptions,
+    clients: Option<ServerCompositionClients>,
+    shutdown_signal: Option<ServerShutdownSignal>,
+    #[cfg(test)]
+    drive_object_api_base_url: Option<String>,
+}
+
+impl ServerBuilder {
+    fn new(options: ServeOptions) -> Self {
+        Self {
+            options,
+            clients: None,
+            shutdown_signal: None,
+            #[cfg(test)]
+            drive_object_api_base_url: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_clients(mut self, clients: ServerCompositionClients) -> Self {
+        self.clients = Some(clients);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_shutdown_signal(
+        mut self,
+        shutdown_signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        self.shutdown_signal = Some(Box::pin(shutdown_signal));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_drive_object_api_base_url(mut self, api_base_url: impl Into<String>) -> Self {
+        self.drive_object_api_base_url = Some(api_base_url.into());
+        self
+    }
+
+    async fn serve(self) -> ServerResult<()> {
+        let config_path = self
+            .options
+            .config_path
+            .unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
+        let mut config = ServerConfig::load_from_path(config_path)?;
+        let bind = ServerBind::from_config_and_overrides(
+            &config.server.host,
+            config.server.port,
+            self.options.host,
+            self.options.port,
+        )?;
+        bind.validate_transport(&config)?;
+
+        let metadata_database =
+            Arc::new(MetadataDatabase::open(config.server.metadata_path.clone())?);
+        metadata_database.sync_config(&config)?;
+        config.server.host = bind.host.clone();
+        config.server.port = bind.port;
+
+        let clients = match self.clients {
+            Some(clients) => clients,
+            None => ServerCompositionClients::production()?,
+        };
+        let session_store = production_session_store(&config, metadata_database.clone())?;
+        let transfer_store = GoogleDriveTransferStore::with_dependencies(
+            config.clone(),
+            metadata_database.clone(),
+            clients.drive_credential_source,
+            clients.drive_token_refresher,
+            clients.drive_root_validator,
+        );
+        #[cfg(test)]
+        let transfer_store = match self.drive_object_api_base_url {
+            Some(api_base_url) => transfer_store.with_object_api_base_url(api_base_url),
+            None => transfer_store,
+        };
+        let transfer_store = Arc::new(transfer_store);
+        transfer_store.validate_storage_providers().await?;
+        let router = server_router_with_sessions_and_transfer_store(
+            config,
+            session_store,
+            transfer_store,
+            metadata_database,
+            clients.github_token_exchanger,
+            clients.github_user_client,
+        )?;
+        let listener = tokio::net::TcpListener::bind((bind.host.as_str(), bind.port))
+            .await
+            .map_err(|source| ServerError::Bind {
+                host: bind.host.clone(),
+                port: bind.port,
+                source,
+            })?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|source| ServerError::LocalAddress { source })?;
+        let urls = advertised_server_urls(&bind.host, local_addr.port());
+
+        println!("{}", render_server_startup_message(&urls));
+
+        let shutdown_signal = self
+            .shutdown_signal
+            .unwrap_or_else(|| Box::pin(shutdown_signal()));
+        serve_with_graceful_shutdown(
+            listener,
+            router,
+            shutdown_signal,
+            SERVER_SHUTDOWN_DRAIN_TIMEOUT,
+        )
         .await
-        .map_err(|source| ServerError::Bind {
-            host: bind.host.clone(),
-            port: bind.port,
-            source,
-        })?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|source| ServerError::LocalAddress { source })?;
-    let urls = advertised_server_urls(&bind.host, local_addr.port());
-
-    println!("{}", render_server_startup_message(&urls));
-
-    serve_with_graceful_shutdown(
-        listener,
-        router,
-        shutdown_signal(),
-        SERVER_SHUTDOWN_DRAIN_TIMEOUT,
-    )
-    .await
-    .map(|_| ())
-    .map_err(|source| ServerError::Serve { source })
+        .map(|_| ())
+        .map_err(|source| ServerError::Serve { source })
+    }
 }
 
 async fn serve_with_graceful_shutdown<F>(
@@ -310,6 +398,8 @@ fn server_router_with_sessions_and_transfer_store(
     session_store: LocalLfsSessionStore,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
     metadata_database: Arc<MetadataDatabase>,
+    github_token_exchanger: crate::GitHubOAuthTokenExchanger,
+    github_user_client: crate::GitHubUserClient,
 ) -> ServerResult<Router> {
     let max_concurrent_requests = config.server.max_concurrent_requests;
     let lfs_router = build_lfs_server_router(
@@ -321,7 +411,13 @@ fn server_router_with_sessions_and_transfer_store(
         Some(metadata_database),
     );
     let session_router = lfs_session_revoke_router(session_store.clone());
-    let Some(auth_router) = github_oauth_router(config, session_store)? else {
+    let Some(auth_router) = github_oauth_router_with_clients(
+        config,
+        session_store,
+        github_token_exchanger,
+        github_user_client,
+    )?
+    else {
         return Ok(with_http_request_limit(
             session_router.merge(lfs_router),
             max_concurrent_requests,
@@ -558,6 +654,20 @@ fn github_oauth_router(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
 ) -> ServerResult<Option<Router>> {
+    github_oauth_router_with_clients(
+        config,
+        session_store,
+        crate::GitHubOAuthTokenExchanger::new()?,
+        crate::GitHubUserClient::new()?,
+    )
+}
+
+fn github_oauth_router_with_clients(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+    token_exchanger: crate::GitHubOAuthTokenExchanger,
+    user_client: crate::GitHubUserClient,
+) -> ServerResult<Option<Router>> {
     let github_providers = config
         .repository_providers
         .values()
@@ -584,8 +694,8 @@ fn github_oauth_router(
         (*provider).clone(),
         GitHubOAuthStateRegistry::new(),
         redirect_url,
-        crate::GitHubOAuthTokenExchanger::new()?,
-        crate::GitHubUserClient::new()?,
+        token_exchanger,
+        user_client,
         session_store,
     )?;
 
@@ -995,20 +1105,6 @@ impl GoogleDriveCredentialSource for GoogleDriveCredentialLoader {
 }
 
 impl GoogleDriveTransferStore {
-    fn new(config: ServerConfig, metadata_database: Arc<MetadataDatabase>) -> ServerResult<Self> {
-        Ok(Self {
-            storage_providers: config.storage_providers,
-            metadata_database,
-            credential_source: Arc::new(GoogleDriveCredentialLoader::new()),
-            token_refresher: GoogleDriveTokenRefresher::new()?,
-            token_cache: GoogleDriveAccessTokenCache::default(),
-            root_validator: GoogleDriveRootValidator::new()?,
-            #[cfg(test)]
-            object_api_base_url: None,
-        })
-    }
-
-    #[cfg(test)]
     fn with_dependencies(
         config: ServerConfig,
         metadata_database: Arc<MetadataDatabase>,
@@ -1023,6 +1119,7 @@ impl GoogleDriveTransferStore {
             token_refresher,
             token_cache: GoogleDriveAccessTokenCache::default(),
             root_validator,
+            #[cfg(test)]
             object_api_base_url: None,
         }
     }
@@ -3614,7 +3711,9 @@ fn detect_lan_ipv4() -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::{self, ErrorKind},
+        net::TcpListener as StdTcpListener,
         path::Path as FsPath,
         sync::{Arc, Mutex},
         time::Duration,
@@ -3631,7 +3730,7 @@ mod tests {
             },
         },
         response::{IntoResponse, Response},
-        routing::get,
+        routing::{get, post},
     };
     use tokio::sync::{Barrier, Notify};
     use tower::ServiceExt;
@@ -3640,10 +3739,11 @@ mod tests {
         BASE64_STANDARD, BatchBodyGuardrails, GoogleDriveAccessTokenCache,
         GoogleDriveCredentialSource, GoogleDriveTransferStore, LFS_AUTH_CHALLENGE,
         LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore,
-        LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind,
-        ServerShutdownOutcome, UploadStagingCoordinator, UploadStagingGuardrails,
-        advertised_server_urls, authenticate_lfs_session,
-        ensure_temp_space_for_upload_with_available_space, lfs_server_router_with_sessions,
+        LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES,
+        ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients, ServerShutdownOutcome,
+        UploadStagingCoordinator, UploadStagingGuardrails, advertised_server_urls,
+        authenticate_lfs_session, ensure_temp_space_for_upload_with_available_space,
+        lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
         lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails,
         production_session_store, render_server_startup_message, serve_with_graceful_shutdown,
@@ -3656,12 +3756,13 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use crate::{
-        DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, GoogleDriveCredential,
-        GoogleDriveRootValidator, GoogleDriveStorageConfig, GoogleDriveTokenRefresher,
-        LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken,
-        LocalLfsSessionStore, MetadataDatabase, ProviderFuture, RepositoryMapping,
-        RepositoryPermission, RepositoryProviderError, RepositoryUser, ServerConfig, ServerError,
-        ServerResult, StorageError, StorageResult, StoredObject,
+        DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, GitHubOAuthTokenExchanger,
+        GitHubUserClient, GoogleDriveCredential, GoogleDriveRootValidator,
+        GoogleDriveStorageConfig, GoogleDriveTokenRefresher, LfsBatchOperation, LfsBatchResponse,
+        LfsObject, LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase,
+        ProviderFuture, RepositoryMapping, RepositoryPermission, RepositoryProviderError,
+        RepositoryUser, ServerConfig, ServerError, ServerResult, StorageError, StorageResult,
+        StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -3751,6 +3852,293 @@ repositories:
         ) -> StorageResult<GoogleDriveCredential> {
             Ok(self.credential.clone())
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_server_builder_exercises_complete_composition() {
+        let upstream = Router::new()
+            .route(
+                "/github-token",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "access_token": "gho_composition_test",
+                        "token_type": "bearer",
+                        "scope": "read:user,repo"
+                    }))
+                }),
+            )
+            .route(
+                "/drive-token",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "access_token": "drive-composition-test",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "scope": "https://www.googleapis.com/auth/drive.file"
+                    }))
+                }),
+            )
+            .route(
+                "/user",
+                get(|| async { Json(serde_json::json!({ "login": "octocat", "id": 42 })) }),
+            )
+            .route(
+                "/repos/{owner}/{repo}",
+                get(|| async { Json(serde_json::json!({ "id": 8675309_u64 })) }),
+            )
+            .route(
+                "/repos/{owner}/{repo}/collaborators/{username}/permission",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "permission": "write",
+                        "user": { "login": "octocat", "id": 42 }
+                    }))
+                }),
+            )
+            .route(
+                "/drive/v3/files/root",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "id": "root",
+                        "name": "Composition Test Root",
+                        "mimeType": "application/vnd.google-apps.folder",
+                        "trashed": false,
+                        "capabilities": { "canAddChildren": true }
+                    }))
+                }),
+            )
+            .route(
+                "/drive/v3/files",
+                get(|| async { Json(serde_json::json!({ "files": [] })) }),
+            );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("composition upstream listener should bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("composition upstream address should resolve");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream)
+                .await
+                .expect("composition upstream should run");
+        });
+        let upstream_url = format!("http://{upstream_address}");
+
+        let server_port = unused_tcp_port();
+        let server_url = format!("http://127.0.0.1:{server_port}");
+        let directory = tempfile::tempdir().expect("composition tempdir should be created");
+        let config_path = directory.path().join("lfs-cloud.yml");
+        let metadata_path = directory.path().join("state/metadata.sqlite3");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+server:
+  host: 127.0.0.1
+  port: {server_port}
+  public_url: {server_url}
+  metadata_path: state/metadata.sqlite3
+repository_providers:
+  github-main:
+    type: github
+    api_url: {upstream_url}
+    oauth_client_id: composition-client
+    oauth_client_secret: composition-secret
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials_ref: composition-drive
+    root_folder_id: root
+repositories:
+  - id: github-main:owner/repo
+    repo_provider: github-main
+    host: github.com
+    owner: owner
+    name: repo
+    provider_repository_id: "8675309"
+    storage_provider: drive-user-a
+"#,
+            ),
+        )
+        .expect("composition config should be written");
+        let drive_credential = GoogleDriveCredential::from_json(
+            "drive-user-a",
+            "composition-drive",
+            &serde_json::json!({
+                "client_id": "drive-client",
+                "client_secret": "drive-secret",
+                "refresh_token": "drive-refresh",
+                "token_uri": format!("{upstream_url}/drive-token")
+            })
+            .to_string(),
+        )
+        .expect("composition Drive credential should parse");
+        let clients = ServerCompositionClients {
+            drive_credential_source: Arc::new(StaticGoogleDriveCredentialSource {
+                credential: drive_credential,
+            }),
+            drive_token_refresher: GoogleDriveTokenRefresher::with_client(reqwest::Client::new()),
+            drive_root_validator: GoogleDriveRootValidator::with_client_and_api_base_url(
+                reqwest::Client::new(),
+                &upstream_url,
+            )
+            .expect("composition Drive root validator should build"),
+            github_token_exchanger: GitHubOAuthTokenExchanger::with_token_url(format!(
+                "{upstream_url}/github-token"
+            ))
+            .expect("composition GitHub token exchanger should build"),
+            github_user_client: GitHubUserClient::new()
+                .expect("composition GitHub user client should build"),
+        };
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(
+            ServerBuilder::new(ServeOptions::new(Some(config_path), None, None))
+                .with_clients(clients)
+                .with_drive_object_api_base_url(&upstream_url)
+                .with_shutdown_signal(async move {
+                    let _ = shutdown_receiver.await;
+                })
+                .serve(),
+        );
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("composition HTTP client should build");
+        let login_response =
+            wait_for_server_response(&client, format!("{server_url}/auth/github/login")).await;
+        assert_eq!(
+            login_response.status(),
+            reqwest::StatusCode::TEMPORARY_REDIRECT
+        );
+        let authorization_url = login_response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| url::Url::parse(value).ok())
+            .expect("login should redirect to a valid GitHub authorization URL");
+        let state = authorization_url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+            .expect("authorization URL should include state");
+        assert!(
+            authorization_url
+                .query_pairs()
+                .any(|(key, value)| { key == "code_challenge_method" && value == "S256" })
+        );
+
+        let mut callback_url = url::Url::parse(&format!("{server_url}/auth/github/callback"))
+            .expect("callback URL should parse");
+        callback_url
+            .query_pairs_mut()
+            .append_pair("code", "composition-code")
+            .append_pair("state", &state);
+        let callback_response = client
+            .get(callback_url)
+            .send()
+            .await
+            .expect("composition OAuth callback should respond");
+        assert_eq!(callback_response.status(), reqwest::StatusCode::OK);
+        let callback_body: serde_json::Value = callback_response
+            .json()
+            .await
+            .expect("composition OAuth callback should return JSON");
+        let lfs_token = callback_body["lfs_token"]
+            .as_str()
+            .expect("composition callback should issue an LFS token");
+        assert_ne!(lfs_token, "gho_composition_test");
+
+        let object_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let basic_auth =
+            BASE64_STANDARD.encode(format!("{DEFAULT_GIT_CREDENTIAL_USERNAME}:{lfs_token}"));
+        let batch_response = client
+            .post(format!(
+                "{server_url}/github.com/owner/repo.git/info/lfs/objects/batch"
+            ))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Basic {basic_auth}"),
+            )
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/vnd.git-lfs+json",
+            )
+            .json(&serde_json::json!({
+                "operation": "upload",
+                "transfers": ["basic"],
+                "objects": [{ "oid": object_oid, "size": 42 }]
+            }))
+            .send()
+            .await
+            .expect("composition LFS batch should respond");
+        assert_eq!(batch_response.status(), reqwest::StatusCode::OK);
+        let batch_body: serde_json::Value = batch_response
+            .json()
+            .await
+            .expect("composition LFS batch should return JSON");
+        assert!(
+            batch_body["objects"][0]["actions"]["upload"]["href"]
+                .as_str()
+                .is_some_and(|href| href.contains(object_oid))
+        );
+
+        shutdown_sender
+            .send(())
+            .expect("composition shutdown receiver should remain active");
+        server
+            .await
+            .expect("composition server task should join")
+            .expect("composition server should shut down cleanly");
+
+        let metadata = rusqlite::Connection::open(&metadata_path)
+            .expect("composition metadata database should reopen");
+        let active_mappings: i64 = metadata
+            .query_row(
+                "SELECT COUNT(*) FROM repository_mappings WHERE is_active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("composition metadata mapping should be queryable");
+        assert_eq!(active_mappings, 1);
+        let durable_sessions: i64 = metadata
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("composition durable session should be queryable");
+        assert_eq!(durable_sessions, 1);
+        drop(metadata);
+        let metadata_bytes = fs::read(&metadata_path)
+            .expect("composition metadata database bytes should be readable");
+        assert!(
+            !metadata_bytes
+                .windows(lfs_token.len())
+                .any(|window| window == lfs_token.as_bytes())
+        );
+        assert!(
+            !metadata_bytes
+                .windows(b"gho_composition_test".len())
+                .any(|window| window == b"gho_composition_test")
+        );
+
+        upstream_task.abort();
+        let _ = upstream_task.await;
+    }
+
+    fn unused_tcp_port() -> u16 {
+        StdTcpListener::bind("127.0.0.1:0")
+            .expect("ephemeral port probe should bind")
+            .local_addr()
+            .expect("ephemeral port should resolve")
+            .port()
+    }
+
+    async fn wait_for_server_response(client: &reqwest::Client, url: String) -> reqwest::Response {
+        for _ in 0..100 {
+            match client.get(&url).send().await {
+                Ok(response) => return response,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+
+        panic!("composition server did not bind {url}");
     }
 
     #[tokio::test]
