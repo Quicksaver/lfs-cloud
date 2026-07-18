@@ -29,15 +29,15 @@ use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display
 use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitCredentialRejection,
     GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers, GitLfsMigrationDiscovery,
-    GitLfsSourceEndpointSource, GitRepository, GoogleDriveCredentialLoader,
+    GitLfsSourceEndpointSource, GitRemote, GitRepository, GoogleDriveCredentialLoader,
     GoogleDriveStorageConfig, LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsPointer,
     LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
     LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
     LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
     LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
     LocalMigrationObjectAvailability, ServeOptions, ServerConfig, StorageProviderConfig,
-    TracingConfig, check_local_migration_objects, discover_git_lfs_migration,
-    enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
+    TracingConfig, check_local_migration_objects, discover_git_lfs_migration_from_remote,
+    enumerate_current_checkout_lfs_pointers, enumerate_fetched_ref_lfs_pointers_for_remote,
     enumerate_selected_ref_lfs_pointers, init_tracing,
 };
 
@@ -222,11 +222,19 @@ struct MigrateCommand {
     #[arg(long, value_name = "PATH")]
     cache_root: Option<PathBuf>,
 
+    /// Git remote that owns the source repository and source LFS objects.
+    #[arg(long, value_name = "REMOTE", default_value = "origin")]
+    source_remote: String,
+
+    /// Confirm migration between different source and target repositories.
+    #[arg(long)]
+    allow_cross_remote: bool,
+
     /// Scan one selected branch, tag, or ref. Can be repeated.
     #[arg(long = "ref", value_name = "REF", conflicts_with = "all_refs")]
     refs: Vec<String>,
 
-    /// Scan every fetched local branch, remote-tracking branch, and tag.
+    /// Scan local branches, tags, and the source remote's fetched refs.
     #[arg(long, conflicts_with = "refs")]
     all_refs: bool,
 
@@ -1143,13 +1151,27 @@ where
 
     let start_dir = start_dir.as_ref();
     let repository = GitRepository::discover(start_dir)?;
+    let source_repository = GitRepository::discover_with_remote(start_dir, &command.source_remote)?;
+    if !same_repository_identity(&source_repository.remote, &repository.remote)
+        && !command.allow_cross_remote
+    {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "source remote {} identifies {}, but target remote {} identifies {}; rerun with --allow-cross-remote only after confirming this cross-repository migration",
+                source_repository.remote.remote_name,
+                source_repository.remote.repository_label(),
+                repository.remote.remote_name,
+                repository.remote.repository_label(),
+            ),
+        });
+    }
     let route = LfsInitRoute::resolve_with_insecure_http(
         &command.server,
         &repository.remote,
         command.allow_insecure_http,
     )?;
-    let discovery = discover_git_lfs_migration(start_dir)?;
-    let scan = migration_pointer_scan(start_dir, &command)?;
+    let discovery = discover_git_lfs_migration_from_remote(start_dir, &command.source_remote)?;
+    let scan = migration_pointer_scan(start_dir, &command, &command.source_remote)?;
     let cache_layout = Some(local_cache_layout(command.cache_root.clone())?);
     let availability =
         check_local_migration_objects(start_dir, scan.objects.iter(), cache_layout.as_ref())?;
@@ -1169,6 +1191,8 @@ where
     let source_purge = migration_source_purge_report(&discovery, command.purge_source_lfs);
     let report = MigrationDryRunReport {
         discovery,
+        source_remote: source_repository.remote,
+        target_remote: repository.remote.clone(),
         scan,
         availability,
         route,
@@ -1209,6 +1233,8 @@ impl MigrationScanMode {
 #[derive(Debug)]
 struct MigrationDryRunReport {
     discovery: GitLfsMigrationDiscovery,
+    source_remote: GitRemote,
+    target_remote: GitRemote,
     scan: MigrationPointerScan,
     availability: LocalMigrationObjectAvailability,
     route: LfsInitRoute,
@@ -1241,9 +1267,10 @@ enum MigrationSourcePurgeReport {
 fn migration_pointer_scan(
     start_dir: &Path,
     command: &MigrateCommand,
+    source_remote: &str,
 ) -> CliResult<MigrationPointerScan> {
     if command.all_refs {
-        let history = enumerate_all_fetched_ref_lfs_pointers(start_dir)?;
+        let history = enumerate_fetched_ref_lfs_pointers_for_remote(start_dir, source_remote)?;
         return Ok(history_pointer_scan(
             MigrationScanMode::AllFetchedRefs,
             history,
@@ -1267,6 +1294,12 @@ fn migration_pointer_scan(
         pointer_file_count: checkout.pointers.len(),
         objects,
     })
+}
+
+fn same_repository_identity(left: &GitRemote, right: &GitRemote) -> bool {
+    left.host.eq_ignore_ascii_case(&right.host)
+        && left.owner.eq_ignore_ascii_case(&right.owner)
+        && left.name.eq_ignore_ascii_case(&right.name)
 }
 
 fn history_pointer_scan(
@@ -1512,6 +1545,18 @@ where
         report.discovery.worktree_root.display()
     )?;
     writeln!(output, "  mode: {}", report.scan.mode.label())?;
+    writeln!(
+        output,
+        "  source remote: {} ({})",
+        report.source_remote.remote_name,
+        report.source_remote.repository_label()
+    )?;
+    writeln!(
+        output,
+        "  target remote: {} ({})",
+        report.target_remote.remote_name,
+        report.target_remote.repository_label()
+    )?;
     writeln!(
         output,
         "  source: {}",
@@ -3410,6 +3455,9 @@ mod tests {
             "/tmp/lfs-cloud-cache",
             "--purge-source-lfs",
             "--allow-insecure-http",
+            "--source-remote",
+            "upstream",
+            "--allow-cross-remote",
         ])
         .expect("migrate command should parse");
 
@@ -3420,11 +3468,32 @@ mod tests {
         assert_eq!(cli.config, Some("lfs-cloud.test.yml".into()));
         assert_eq!(command.server, "http://127.0.0.1:8080");
         assert!(command.allow_insecure_http);
+        assert_eq!(command.source_remote, "upstream");
+        assert!(command.allow_cross_remote);
         assert!(command.dry_run);
         assert!(command.all_refs);
         assert!(command.purge_source_lfs);
         assert!(command.refs.is_empty());
         assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+    }
+
+    #[test]
+    fn migrate_command_defaults_source_remote_to_origin() {
+        let cli = Cli::try_parse_from([
+            "lfs-cloud",
+            "migrate",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--dry-run",
+        ])
+        .expect("migrate command should use the safe source remote default");
+
+        let super::Command::Migrate(command) = cli.command else {
+            panic!("migrate subcommand should parse");
+        };
+
+        assert_eq!(command.source_remote, "origin");
+        assert!(!command.allow_cross_remote);
     }
 
     #[test]
@@ -4328,6 +4397,8 @@ mod tests {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
                 refs: Vec::new(),
                 all_refs: false,
                 dry_run: true,
@@ -4375,6 +4446,84 @@ mod tests {
     }
 
     #[test]
+    fn migrate_requires_acknowledgement_for_cross_remote_identity() {
+        if !git_is_available() {
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        run_git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:target/repo.git",
+            ],
+        );
+        run_git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:source/repo.git",
+            ],
+        );
+        let command = |allow_cross_remote| MigrateCommand {
+            server: "http://127.0.0.1:8080".to_owned(),
+            allow_insecure_http: false,
+            cache_root: Some(temp.path().join("cache")),
+            source_remote: "upstream".to_owned(),
+            allow_cross_remote,
+            refs: Vec::new(),
+            all_refs: false,
+            dry_run: true,
+            purge_source_lfs: false,
+        };
+        let mut denied_output = Vec::new();
+
+        let error = run_migrate_from_dir(
+            command(false),
+            Some(temp.path().join("missing-config.yml")),
+            &repo,
+            &mut denied_output,
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect_err("cross-repository migration should require explicit acknowledgement");
+
+        assert!(matches!(error, CliError::InvalidArguments { message }
+            if message.contains("github.com/source/repo")
+                && message.contains("github.com/target/repo")
+                && message.contains("--allow-cross-remote")));
+        assert!(denied_output.is_empty());
+
+        let mut allowed_output = Vec::new();
+        run_migrate_from_dir(
+            command(true),
+            Some(temp.path().join("missing-config.yml")),
+            &repo,
+            &mut allowed_output,
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("acknowledged cross-repository dry run should report the plan");
+
+        let rendered = String::from_utf8(allowed_output).expect("output should be UTF-8");
+        assert!(rendered.contains("source remote: upstream (github.com/source/repo)"));
+        assert!(rendered.contains("target remote: origin (github.com/target/repo)"));
+        assert!(rendered.contains("source: https://github.com/source/repo.git/info/lfs"));
+        assert!(
+            rendered.contains("target: http://127.0.0.1:8080/github.com/target/repo.git/info/lfs")
+        );
+    }
+
+    #[test]
     fn migrate_dry_run_reports_missing_objects_as_would_fetch_without_fetching() {
         if !git_is_available() {
             return;
@@ -4401,6 +4550,8 @@ mod tests {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
                 refs: Vec::new(),
                 all_refs: false,
                 dry_run: true,
@@ -4456,6 +4607,8 @@ mod tests {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
                 refs: Vec::new(),
                 all_refs: false,
                 dry_run: true,
@@ -4526,6 +4679,8 @@ mod tests {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root),
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
                 refs: Vec::new(),
                 all_refs: false,
                 dry_run: true,
@@ -4579,6 +4734,8 @@ mod tests {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root),
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
                 refs: Vec::new(),
                 all_refs: false,
                 dry_run: true,
@@ -4629,6 +4786,8 @@ mod tests {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root),
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
                 refs: Vec::new(),
                 all_refs: false,
                 dry_run: true,
@@ -4668,6 +4827,8 @@ mod tests {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
                 cache_root: Some(temp.path().join("cache")),
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
                 refs: Vec::new(),
                 all_refs: false,
                 dry_run: false,

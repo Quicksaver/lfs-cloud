@@ -591,6 +591,15 @@ lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 - configured storage-provider access verification result
 - warnings for missing objects, unsupported purge, quota risks, or permission gaps
 
+Migration uses one explicit source Git remote, defaulting to `origin`, for
+remote-scoped LFS endpoint discovery, source fetches, and remote-tracking refs
+included by all-ref scans. The target repository identity comes from `origin`.
+The plan must show both remote names and provider repository identities. If the
+identities differ, require `--allow-cross-remote` before planning or executing
+the cross-repository copy. All-ref scans may include repository-owned local
+branches and tags, but must not admit remote-tracking refs from an unselected
+remote.
+
 Git commands used for dry-run discovery must disable partial-clone lazy
 fetching. A pointer blob that is not stored locally must produce an explicit
 availability error rather than silently transferring data from a promisor
@@ -631,8 +640,9 @@ selected refs
   migrate objects reachable from specific branches/tags
 
 all refs
-  migrate every LFS object reachable from local refs, including objects not
-  currently checked out in the working tree
+  migrate every LFS object reachable from local branches, tags, and the
+  explicit source remote's fetched refs, including objects not currently
+  checked out in the working tree
 ```
 
 The safest default should be to migrate the current checkout and warn if other refs still reference objects that have not been copied. For a full provider move, the user should choose an explicit all-refs mode. In all-refs mode, the command should fetch refs first, enumerate LFS pointers across those refs, fetch missing object bytes from the source LFS provider, and upload every discovered object to `lfs-cloud`.

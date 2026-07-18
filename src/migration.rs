@@ -47,6 +47,8 @@ const MIGRATION_SOURCE_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(25)
 pub struct GitLfsMigrationDiscovery {
     /// Git worktree root that was inspected.
     pub worktree_root: PathBuf,
+    /// Explicit Git remote whose repository and LFS endpoint are the source.
+    pub source_remote: String,
     /// Whether the `git lfs` command is available and its version output.
     pub installation: GitLfsInstallation,
     /// Git filter configuration currently visible to `git config`.
@@ -236,6 +238,8 @@ impl MigrationFetchMode {
 pub struct MigrationSourceFetch {
     /// Git worktree root where the source fetch ran.
     pub worktree_root: PathBuf,
+    /// Explicit Git remote used for source-provider fetches.
+    pub source_remote: String,
     /// Ref scope used for the source fetch.
     pub mode: MigrationFetchMode,
     /// Safe display form of the `git lfs fetch` command that ran.
@@ -367,15 +371,40 @@ pub enum GitLfsSourceEndpointSource {
 pub fn discover_git_lfs_migration(
     start_dir: impl AsRef<Path>,
 ) -> MigrationResult<GitLfsMigrationDiscovery> {
+    discover_git_lfs_migration_from_remote(start_dir, DEFAULT_REMOTE_NAME)
+}
+
+/// Discovers existing Git LFS migration inputs for an explicit source remote.
+///
+/// The named remote controls remote-scoped LFS configuration and the fallback
+/// endpoint derived from the Git remote URL. Repository-wide `lfs.url` and
+/// worktree `.lfsconfig` settings retain their normal higher precedence.
+///
+/// This function is intentionally read-only. It runs Git commands that inspect
+/// repository state and reads `.gitattributes` files, but it never fetches LFS
+/// objects, writes Git config, or mutates the local cache.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree,
+/// `source_remote` is invalid or unavailable, Git cannot be started for
+/// required discovery commands, or discovered metadata is too large or
+/// non-UTF-8.
+pub fn discover_git_lfs_migration_from_remote(
+    start_dir: impl AsRef<Path>,
+    source_remote: impl AsRef<str>,
+) -> MigrationResult<GitLfsMigrationDiscovery> {
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
+    let source_remote = validate_source_remote_name(source_remote.as_ref())?;
 
     Ok(GitLfsMigrationDiscovery {
         installation: detect_git_lfs_installation(&worktree_root),
         filters: discover_lfs_filters(&worktree_root)?,
         tracked_patterns: discover_lfs_tracked_patterns(&worktree_root)?,
-        source_endpoint: discover_source_endpoint(&worktree_root)?,
+        source_endpoint: discover_source_endpoint(&worktree_root, &source_remote)?,
         worktree_root,
+        source_remote,
     })
 }
 
@@ -473,12 +502,13 @@ where
     })
 }
 
-/// Enumerates Git LFS pointer files reachable from all fetched repository refs.
+/// Enumerates Git LFS pointer files reachable from local branches, tags, and
+/// fetched `origin` remote-tracking refs.
 ///
-/// The scan includes local branches, remote-tracking branches, and tags under
-/// `refs/heads`, `refs/remotes`, and `refs/tags`. Symbolic refs are skipped so
-/// aliases such as `refs/remotes/origin/HEAD` do not duplicate another ref's
-/// history.
+/// Symbolic refs are skipped so aliases such as `refs/remotes/origin/HEAD` do
+/// not duplicate another ref's history. Use
+/// [`enumerate_fetched_ref_lfs_pointers_for_remote`] to select another explicit
+/// source remote.
 ///
 /// # Errors
 ///
@@ -487,9 +517,30 @@ where
 pub fn enumerate_all_fetched_ref_lfs_pointers(
     start_dir: impl AsRef<Path>,
 ) -> MigrationResult<GitLfsHistoryPointers> {
+    enumerate_fetched_ref_lfs_pointers_for_remote(start_dir, DEFAULT_REMOTE_NAME)
+}
+
+/// Enumerates Git LFS pointers reachable from local branches, tags, and one
+/// explicit source remote's fetched remote-tracking refs.
+///
+/// Scoping remote-tracking refs prevents an all-ref migration from silently
+/// mixing histories fetched from unrelated repository remotes. Local branches
+/// and tags remain included because they are repository-owned refs rather than
+/// remote-tracking namespaces.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when `start_dir` is not inside a Git worktree,
+/// `source_remote` is invalid, Git cannot list refs, or a discovered ref cannot
+/// be scanned.
+pub fn enumerate_fetched_ref_lfs_pointers_for_remote(
+    start_dir: impl AsRef<Path>,
+    source_remote: impl AsRef<str>,
+) -> MigrationResult<GitLfsHistoryPointers> {
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
-    let refs = all_fetched_ref_names(&worktree_root)?;
+    let source_remote = validate_source_remote_name(source_remote.as_ref())?;
+    let refs = all_fetched_ref_names(&worktree_root, &source_remote)?;
     let mut scanned_refs = Vec::new();
     let mut pointers = Vec::new();
     let mut seen = BTreeSet::new();
@@ -607,10 +658,43 @@ where
     I: IntoIterator<Item = O>,
     O: Borrow<LfsObject>,
 {
+    fetch_missing_migration_objects_from_remote(
+        start_dir,
+        objects,
+        shared_cache,
+        DEFAULT_REMOTE_NAME,
+        mode,
+    )
+}
+
+/// Fetches missing source Git LFS objects from an explicit Git remote.
+///
+/// This is the remote-selecting variant of [`fetch_missing_migration_objects`].
+/// The selected remote is included in every fetch scope so later execution
+/// cannot silently follow the current branch's configured remote.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when the source remote is invalid, the start
+/// directory is not a Git worktree, selected refs use invalid revision syntax,
+/// `git lfs fetch` cannot be started, or the source fetch exits unsuccessfully.
+pub fn fetch_missing_migration_objects_from_remote<I, O>(
+    start_dir: impl AsRef<Path>,
+    objects: I,
+    shared_cache: Option<&LocalCacheLayout>,
+    source_remote: impl AsRef<str>,
+    mode: MigrationFetchMode,
+) -> MigrationResult<MigrationSourceFetch>
+where
+    I: IntoIterator<Item = O>,
+    O: Borrow<LfsObject>,
+{
+    let source_remote = validate_source_remote_name(source_remote.as_ref())?;
     fetch_missing_migration_objects_with_runner(
         start_dir,
         objects,
         shared_cache,
+        &source_remote,
         mode,
         run_git_lfs_fetch_command,
     )
@@ -762,6 +846,7 @@ fn fetch_missing_migration_objects_with_runner<I, O, F>(
     start_dir: impl AsRef<Path>,
     objects: I,
     shared_cache: Option<&LocalCacheLayout>,
+    source_remote: &str,
     mode: MigrationFetchMode,
     mut runner: F,
 ) -> MigrationResult<MigrationSourceFetch>
@@ -779,6 +864,7 @@ where
         let after = before.clone();
         return Ok(MigrationSourceFetch {
             worktree_root,
+            source_remote: source_remote.to_owned(),
             mode,
             command,
             fetched_objects: Vec::new(),
@@ -788,7 +874,7 @@ where
         });
     }
 
-    let fetch_command = migration_source_fetch_command(&worktree_root, &mode)?;
+    let fetch_command = migration_source_fetch_command(source_remote, &mode)?;
     runner(&worktree_root, &fetch_command)?;
     command = Some(fetch_command.display.clone());
 
@@ -802,6 +888,7 @@ where
 
     Ok(MigrationSourceFetch {
         worktree_root,
+        source_remote: source_remote.to_owned(),
         mode,
         command,
         before,
@@ -818,15 +905,17 @@ struct MigrationSourceFetchCommand {
 }
 
 fn migration_source_fetch_command(
-    worktree_root: &Path,
+    source_remote: &str,
     mode: &MigrationFetchMode,
 ) -> MigrationResult<MigrationSourceFetchCommand> {
+    let source_remote = validate_source_remote_name(source_remote)?;
     let mut args = vec![OsString::from("lfs"), OsString::from("fetch")];
 
     match mode {
         MigrationFetchMode::CurrentCheckout => {
             args.push(OsString::from("--include="));
             args.push(OsString::from("--exclude="));
+            args.push(OsString::from(&source_remote));
         }
         MigrationFetchMode::SelectedRefs { refs } => {
             if refs.is_empty() {
@@ -843,7 +932,7 @@ fn migration_source_fetch_command(
 
             args.push(OsString::from("--include="));
             args.push(OsString::from("--exclude="));
-            args.push(OsString::from(source_remote_name(worktree_root)?));
+            args.push(OsString::from(&source_remote));
             args.extend(
                 refs.iter()
                     .map(|ref_name| OsString::from(ref_name.as_str())),
@@ -851,6 +940,7 @@ fn migration_source_fetch_command(
         }
         MigrationFetchMode::AllFetchedRefs => {
             args.push(OsString::from("--all"));
+            args.push(OsString::from(&source_remote));
         }
     }
 
@@ -1311,7 +1401,10 @@ fn discover_lfs_filters(worktree_root: &Path) -> MigrationResult<GitLfsFilterCon
     })
 }
 
-fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitLfsSourceEndpoint>> {
+fn discover_source_endpoint(
+    worktree_root: &Path,
+    source_remote: &str,
+) -> MigrationResult<Option<GitLfsSourceEndpoint>> {
     if let Some(url) = git_config_get(worktree_root, ["config", "--local", "--get", "lfs.url"])? {
         return Ok(Some(GitLfsSourceEndpoint {
             url,
@@ -1319,8 +1412,7 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
         }));
     }
 
-    let remote_name = source_remote_name(worktree_root)?;
-    let remote_lfsurl_key = format!("remote.{remote_name}.lfsurl");
+    let remote_lfsurl_key = format!("remote.{source_remote}.lfsurl");
     if let Some(url) = git_config_get_os(
         worktree_root,
         [
@@ -1329,7 +1421,7 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
             OsStr::new("--get"),
             OsStr::new(&remote_lfsurl_key),
         ],
-        &format!("git config --local --get remote.{remote_name}.lfsurl"),
+        &format!("git config --local --get remote.{source_remote}.lfsurl"),
     )? {
         return Ok(Some(GitLfsSourceEndpoint {
             url,
@@ -1358,7 +1450,7 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
         }));
     }
 
-    let remote_url_key = format!("remote.{remote_name}.url");
+    let remote_url_key = format!("remote.{source_remote}.url");
     let Some(remote_url) = git_config_get_os(
         worktree_root,
         [
@@ -1367,7 +1459,7 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
             OsStr::new("--get"),
             OsStr::new(&remote_url_key),
         ],
-        &format!("git config --local --get remote.{remote_name}.url"),
+        &format!("git config --local --get remote.{source_remote}.url"),
     )?
     else {
         return Ok(None);
@@ -1381,27 +1473,20 @@ fn discover_source_endpoint(worktree_root: &Path) -> MigrationResult<Option<GitL
     )
 }
 
-fn source_remote_name(worktree_root: &Path) -> MigrationResult<String> {
-    let Some(branch_name) = git_config_get(
-        worktree_root,
-        ["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )?
-    else {
-        return Ok(DEFAULT_REMOTE_NAME.to_owned());
-    };
+fn validate_source_remote_name(source_remote: &str) -> MigrationResult<String> {
+    if source_remote.trim().is_empty()
+        || source_remote.trim().len() != source_remote.len()
+        || source_remote.chars().any(char::is_control)
+        || source_remote.chars().any(char::is_whitespace)
+    {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new(
+                "source remote name must not be blank, padded, or contain whitespace or control characters",
+            ),
+        });
+    }
 
-    let remote_key = format!("branch.{branch_name}.remote");
-    Ok(git_config_get_os(
-        worktree_root,
-        [
-            OsStr::new("config"),
-            OsStr::new("--local"),
-            OsStr::new("--get"),
-            OsStr::new(&remote_key),
-        ],
-        &format!("git config --local --get branch.{branch_name}.remote"),
-    )?
-    .unwrap_or_else(|| DEFAULT_REMOTE_NAME.to_owned()))
+    Ok(source_remote.to_owned())
 }
 
 fn default_lfs_endpoint_for_remote_url(remote_url: &str) -> Option<String> {
@@ -1942,18 +2027,22 @@ fn resolve_ref_commit(worktree_root: &Path, ref_name: &str) -> MigrationResult<S
     }
 }
 
-fn all_fetched_ref_names(worktree_root: &Path) -> MigrationResult<Vec<String>> {
-    let command_name =
-        "git for-each-ref --format=%(refname)%00%(symref) refs/heads refs/remotes refs/tags";
-    let output = run_git(
+fn all_fetched_ref_names(
+    worktree_root: &Path,
+    source_remote: &str,
+) -> MigrationResult<Vec<String>> {
+    let command_name = "git for-each-ref --format=%(refname)%00%(symref) refs/heads refs/remotes/<source> refs/tags";
+    let remote_refs = format!("refs/remotes/{source_remote}");
+    let output = run_git_os_vec(
         worktree_root,
-        [
-            "for-each-ref",
-            "--format=%(refname)%00%(symref)",
-            "refs/heads",
-            "refs/remotes",
-            "refs/tags",
+        vec![
+            OsString::from("for-each-ref"),
+            OsString::from("--format=%(refname)%00%(symref)"),
+            OsString::from("refs/heads"),
+            OsString::from(remote_refs),
+            OsString::from("refs/tags"),
         ],
+        command_name,
     )?;
     let stdout =
         required_success_stdout_with_limit(output, command_name, MAX_HISTORY_REF_LIST_BYTES)?;
@@ -2645,8 +2734,9 @@ mod tests {
         LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus,
         MAX_GIT_ATTRIBUTES_BYTES, MAX_MIGRATION_GIT_OUTPUT_BYTES, MigrationError,
         MigrationFetchMode, check_local_migration_objects, default_lfs_endpoint_for_remote_url,
-        discover_git_lfs_migration, display_git_command, enumerate_all_fetched_ref_lfs_pointers,
-        enumerate_current_checkout_lfs_pointers, enumerate_selected_ref_lfs_pointers,
+        discover_git_lfs_migration, discover_git_lfs_migration_from_remote, display_git_command,
+        enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
+        enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
         fetch_missing_migration_objects, fetch_missing_migration_objects_with_runner,
         git_lfs_object_path, hash_migration_object_file, migration_source_fetch_command,
         parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
@@ -2961,7 +3051,7 @@ mod tests {
     }
 
     #[test]
-    fn source_endpoint_uses_current_branch_remote_before_origin() {
+    fn source_endpoint_defaults_to_origin_instead_of_current_branch_remote() {
         let repo = TempRepo::new();
         repo.git([
             "remote",
@@ -2982,12 +3072,42 @@ mod tests {
             discover_git_lfs_migration(repo.path()).expect("migration discovery should succeed");
         let endpoint = discovery
             .source_endpoint
-            .expect("branch remote URL should provide a default LFS endpoint");
+            .expect("origin remote URL should provide a default LFS endpoint");
 
+        assert_eq!(endpoint.url, "https://github.com/origin/repo.git/info/lfs");
+        assert_eq!(discovery.source_remote, "origin");
         assert_eq!(
-            endpoint.url,
-            "https://github.com/upstream/repo.git/info/lfs"
+            endpoint.source,
+            GitLfsSourceEndpointSource::RemoteUrlDefault
         );
+    }
+
+    #[test]
+    fn source_endpoint_uses_the_explicit_source_remote() {
+        let repo = TempRepo::new();
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/target/repo.git",
+        ]);
+        repo.git([
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/source/repo.git",
+        ]);
+        repo.git(["checkout", "-b", "feature"]);
+        repo.git(["config", "--local", "branch.feature.remote", "origin"]);
+
+        let discovery = discover_git_lfs_migration_from_remote(repo.path(), "upstream")
+            .expect("migration discovery should use the selected source remote");
+        let endpoint = discovery
+            .source_endpoint
+            .expect("explicit source remote should provide a default LFS endpoint");
+
+        assert_eq!(discovery.source_remote, "upstream");
+        assert_eq!(endpoint.url, "https://github.com/source/repo.git/info/lfs");
         assert_eq!(
             endpoint.source,
             GitLfsSourceEndpointSource::RemoteUrlDefault
@@ -3486,6 +3606,44 @@ mod tests {
     }
 
     #[test]
+    fn all_fetched_ref_pointer_scan_excludes_other_remote_tracking_refs() {
+        let repo = TempRepo::new();
+        let origin_object = test_lfs_object('5', 555);
+        let upstream_object = test_lfs_object('6', 666);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/origin.bin",
+            &LfsPointer::new(origin_object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add origin pointer");
+        repo.git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        repo.git(["checkout", "-b", "upstream-history"]);
+        repo.write_file(
+            "asset/upstream.bin",
+            &LfsPointer::new(upstream_object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add upstream pointer");
+        repo.git(["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        repo.git(["checkout", "main"]);
+        repo.git(["branch", "-D", "upstream-history"]);
+
+        let scan = enumerate_fetched_ref_lfs_pointers_for_remote(repo.path(), "origin")
+            .expect("source-scoped all-ref scan should succeed");
+        let ref_names = scan
+            .refs
+            .iter()
+            .map(|scanned_ref| scanned_ref.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let objects = history_scan_objects(&scan.pointers);
+
+        assert!(ref_names.contains("refs/remotes/origin/main"));
+        assert!(!ref_names.contains("refs/remotes/upstream/main"));
+        assert!(objects.contains(&origin_object));
+        assert!(!objects.contains(&upstream_object));
+    }
+
+    #[test]
     fn selected_ref_pointer_scan_skips_lfs_matching_gitlinks() {
         let repo = TempRepo::new();
         let object = test_lfs_object('9', 555);
@@ -3747,6 +3905,7 @@ mod tests {
             repo.path(),
             [&object],
             None,
+            "origin",
             MigrationFetchMode::CurrentCheckout,
             |_, _| {
                 fetch_attempted = true;
@@ -3781,6 +3940,7 @@ mod tests {
             repo.path(),
             [&object],
             None,
+            "origin",
             MigrationFetchMode::selected_refs(["main"]),
             |worktree_root, command| {
                 observed_command = Some(command.clone());
@@ -3825,6 +3985,7 @@ mod tests {
             repo.path(),
             [&object],
             None,
+            "origin",
             MigrationFetchMode::AllFetchedRefs,
             |worktree_root, command| {
                 observed_command = Some(command.clone());
@@ -3845,9 +4006,13 @@ mod tests {
                 OsString::from("lfs"),
                 OsString::from("fetch"),
                 OsString::from("--all"),
+                OsString::from("origin"),
             ]
         );
-        assert_eq!(report.command.as_deref(), Some("git lfs fetch --all"));
+        assert_eq!(
+            report.command.as_deref(),
+            Some("git lfs fetch --all origin")
+        );
         assert_eq!(report.fetched_objects, vec![object]);
         assert!(report.unavailable_objects.is_empty());
     }
@@ -3998,6 +4163,7 @@ mod tests {
             repo.path(),
             [&object],
             None,
+            "origin",
             MigrationFetchMode::CurrentCheckout,
             |_, _| Ok(()),
         )
@@ -4005,7 +4171,7 @@ mod tests {
 
         assert_eq!(
             report.command.as_deref(),
-            Some("git lfs fetch --include= --exclude=")
+            Some("git lfs fetch --include= --exclude= origin")
         );
         assert!(report.fetched_objects.is_empty());
         assert_eq!(report.unavailable_objects, vec![object]);
@@ -4013,28 +4179,28 @@ mod tests {
 
     #[test]
     fn source_fetch_commands_match_migration_scope() {
-        let repo = TempRepo::new();
-        repo.git(["remote", "add", "origin", "git@github.com:owner/repo.git"]);
-
         let current =
-            migration_source_fetch_command(&repo.path(), &MigrationFetchMode::CurrentCheckout)
+            migration_source_fetch_command("upstream", &MigrationFetchMode::CurrentCheckout)
                 .expect("current checkout fetch command should be built");
-        assert_eq!(current.display, "git lfs fetch --include= --exclude=");
+        assert_eq!(
+            current.display,
+            "git lfs fetch --include= --exclude= upstream"
+        );
 
         let selected = migration_source_fetch_command(
-            &repo.path(),
+            "upstream",
             &MigrationFetchMode::selected_refs(["main", "refs/tags/v1"]),
         )
         .expect("selected-ref fetch command should be built");
         assert_eq!(
             selected.display,
-            "git lfs fetch --include= --exclude= origin main refs/tags/v1"
+            "git lfs fetch --include= --exclude= upstream main refs/tags/v1"
         );
 
         let all_refs =
-            migration_source_fetch_command(&repo.path(), &MigrationFetchMode::AllFetchedRefs)
+            migration_source_fetch_command("upstream", &MigrationFetchMode::AllFetchedRefs)
                 .expect("all-ref fetch command should be built");
-        assert_eq!(all_refs.display, "git lfs fetch --all");
+        assert_eq!(all_refs.display, "git lfs fetch --all upstream");
     }
 
     #[test]
@@ -4054,7 +4220,6 @@ mod tests {
 
     #[test]
     fn source_fetch_rejects_empty_or_unsafe_selected_refs() {
-        let repo = TempRepo::new();
         let mode = MigrationFetchMode::selected_refs(["main", "refs/tags/v1"]);
         assert_eq!(
             mode.selected_ref_names(),
@@ -4063,14 +4228,14 @@ mod tests {
 
         assert!(matches!(
             migration_source_fetch_command(
-                &repo.path(),
+                "origin",
                 &MigrationFetchMode::SelectedRefs { refs: Vec::new() }
             ),
             Err(MigrationError::InvalidInput { .. })
         ));
         assert!(matches!(
             migration_source_fetch_command(
-                &repo.path(),
+                "origin",
                 &MigrationFetchMode::selected_refs(["main..feature"])
             ),
             Err(MigrationError::InvalidInput { .. })

@@ -333,6 +333,13 @@ results. It does not fetch, upload, write Git config, create cache state, open
 metadata storage, or touch the configured storage provider. Git discovery also
 disables partial-clone lazy fetching; if a required Git object exists only on a
 promisor remote, fetch that object explicitly before rerunning the plan.
+The source repository remote is explicit and defaults to `origin`; use
+`--source-remote <name>` to select another remote. The target repository
+identity always comes from `origin`, and the plan reports both identities.
+When they differ, migration stops unless `--allow-cross-remote` explicitly
+acknowledges the cross-repository copy. `--all-refs` includes local branches,
+tags, and remote-tracking refs only for the selected source remote, rather than
+silently mixing histories from every configured remote.
 Use `--purge-source-lfs` with `--dry-run` to include GitHub Support cleanup
 instructions and object IDs/sizes for a post-migration source LFS purge
 request.
@@ -349,6 +356,12 @@ For GitHub LFS cleanup assistance:
 
 ```bash
 lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run --purge-source-lfs
+```
+
+For an intentional fork-to-target migration:
+
+```bash
+lfs-cloud migrate --server http://127.0.0.1:8080 --source-remote upstream --all-refs --dry-run --allow-cross-remote
 ```
 
 For GitHub, automatic purge is not expected to be possible through a normal API. The command should instead produce a report and helper text for GitHub Support.

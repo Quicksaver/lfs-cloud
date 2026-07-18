@@ -79,9 +79,11 @@ pub use migration::{
     LocalMigrationObject, LocalMigrationObjectAvailability, LocalMigrationObjectLocation,
     LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus, MigrationFetchMode,
     MigrationSourceFetch, MigrationStorageUpload, check_local_migration_objects,
-    discover_git_lfs_migration, enumerate_all_fetched_ref_lfs_pointers,
-    enumerate_current_checkout_lfs_pointers, enumerate_selected_ref_lfs_pointers,
-    fetch_missing_migration_objects, upload_migration_objects_to_storage,
+    discover_git_lfs_migration, discover_git_lfs_migration_from_remote,
+    enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
+    enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
+    fetch_missing_migration_objects, fetch_missing_migration_objects_from_remote,
+    upload_migration_objects_to_storage,
 };
 pub use providers::{
     ProviderFuture, RepositoryAuthorization, RepositoryHandle, RepositoryIdentity,

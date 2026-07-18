@@ -1519,13 +1519,37 @@ independently validated or adjudicated.
    outcome; with one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, relevant feedback.
 
-3. **High — Source and target repository identities can silently diverge.** The
-   target comes from `origin`, current-checkout source selection can follow the
-   current branch remote, and all-ref scans include every remote
-   (`src/cli.rs:805-824`, `src/migration.rs:1323-1405`,
-   `src/migration.rs:1921-1953`). Define an explicit source-remote contract,
-   display it in the plan, and require confirmation or a flag for cross-remote
-   migration.
+3. **[DONE] Source and target repository identities can silently diverge**
+   (High, `src/cli.rs`, `src/migration.rs`, migration documentation, and
+   `AGENTS.md`): **Valid and actionable.** Migration planning previously fixed
+   its LFS Cloud target to `origin`, while source endpoint discovery followed
+   the current branch's remote and all-ref enumeration admitted remote-tracking
+   refs from every configured remote. The CLI now defines one explicit
+   `--source-remote`, defaulting to `origin`, and uses it consistently for
+   remote-scoped LFS endpoint discovery, source fetch command construction, and
+   remote-tracking refs included by all-ref scans. Local branches and tags stay
+   in all-ref scope as repository-owned refs, but another remote's tracking
+   namespace is excluded. Dry-run reports show both the named source repository
+   identity and target `origin` identity. When their host/owner/name identities
+   differ, planning fails before producing a report unless the user supplies
+   `--allow-cross-remote`; the error names both repositories and the required
+   acknowledgement. Existing public migration helpers retain safe `origin`
+   defaults, with explicit-remote variants for callers that intentionally
+   select another source. Regression coverage proves branch configuration no
+   longer changes the default source, explicit source endpoint and fetch
+   selection use the named remote, unrelated remote-tracking history is
+   excluded, cross-repository planning fails closed, and an acknowledged plan
+   displays both identities and endpoints. README, implementation guidance,
+   and the repository learning document the contract. Verification passed with
+   `cargo fmt --all -- --check`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine high-severity
+   data-scope and repository-identity flaw, connected three independently
+   selected remote boundaries, and prescribed the correct explicit contract,
+   visible plan evidence, and acknowledgement gate. With one valid finding
+   assessed here and no invalid finding attributable separately, this was
+   high-quality, safety-relevant feedback.
 
 4. **High — Shallow clones are treated as complete migration inventories.** The
    history scan does not reject or prominently qualify truncated history
