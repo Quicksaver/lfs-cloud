@@ -2488,12 +2488,25 @@ independently validated or adjudicated.
    property tests. With one valid finding and no invalid finding attributable
    separately, this was high-quality, directly actionable feedback.
 
-10. **Low — Test-only unsafe environment mutation has an invalid safety
-    rationale.** The logging tests mutate process-global environment state under
-    assumptions that are not enforced across the entire test process
-    (`src/logging.rs:212`, `src/logging.rs:222`, `src/logging.rs:237`). Move
-    environment-sensitive cases to subprocess tests or globally serialize them
-    with an enforceable mechanism.
+10. **[DONE] Test-only unsafe environment mutation had an invalid safety
+    rationale** (Low, `src/logging.rs`): **Valid and actionable.** The logging
+    tests' module-local mutex serialized only their own `set_var` and
+    `remove_var` calls; it could not prevent unrelated test or dependency
+    threads from reading the process environment, so the Rust 2024 `unsafe`
+    precondition was not established. The environment-sensitive override,
+    empty-value, and Unix non-Unicode cases now launch one exact ignored test in
+    a child process and inject their environment through `Command::env`. The
+    parent test process no longer mutates environment variables, and the unsafe
+    blocks, restoration guard, and incomplete mutex rationale were removed.
+    The repository learning now records the child-process boundary for future
+    environment-sensitive tests. Verification passed with focused logging
+    tests, `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+    `cargo build`, `cargo test --all-targets`, and `cargo test --doc`. The
+    focused reviewer found a genuine low-severity test-safety flaw, correctly
+    rejected a synchronization argument that did not cover the whole process,
+    and recommended the appropriate isolation mechanism; with one valid
+    finding and no invalid finding attributable separately, this was
+    high-quality, directly actionable feedback.
 
 ## Release readiness
 

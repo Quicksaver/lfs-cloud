@@ -197,56 +197,36 @@ fn configured_filter_value(config: &TracingConfig) -> Result<String, TracingInit
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        ffi::OsString,
-        io::IsTerminal,
-        sync::{Mutex, MutexGuard},
-    };
+    use std::{env, ffi::OsString, io::IsTerminal, process::Command};
 
     use super::{
         DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, TracingConfig, TracingInitError,
         configured_filter_value, tracing_filter,
     };
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const ENV_FILTER_CASE_ENV: &str = "LFS_CLOUD_LOGGING_TEST_CASE";
+    const ENV_FILTER_HELPER_TEST: &str = "logging::tests::configured_filter_environment_subprocess";
+    const TEST_LOG_ENV_VAR: &str = "LFS_CLOUD_TEST_LOG";
 
-    struct EnvVarGuard {
-        name: String,
-        original: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
-    }
+    fn assert_env_filter_subprocess(case: &str, value: OsString) {
+        let output = Command::new(env::current_exe().expect("test executable should resolve"))
+            .args([
+                "--ignored",
+                "--exact",
+                ENV_FILTER_HELPER_TEST,
+                "--nocapture",
+            ])
+            .env(ENV_FILTER_CASE_ENV, case)
+            .env(TEST_LOG_ENV_VAR, value)
+            .output()
+            .expect("environment-sensitive logging test subprocess should start");
 
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: Tests that mutate environment variables serialize through
-            // ENV_LOCK, and the guard restores the original value before unlock.
-            unsafe {
-                match &self.original {
-                    Some(value) => env::set_var(&self.name, value),
-                    None => env::remove_var(&self.name),
-                }
-            }
-        }
-    }
-
-    fn set_env_var(name: &str, value: Option<OsString>) -> EnvVarGuard {
-        let lock = ENV_LOCK.lock().expect("environment lock should not poison");
-        let original = env::var_os(name);
-
-        // SAFETY: ENV_LOCK serializes environment mutation in these tests.
-        unsafe {
-            match value {
-                Some(value) => env::set_var(name, value),
-                None => env::remove_var(name),
-            }
-        }
-
-        EnvVarGuard {
-            name: name.to_owned(),
-            original,
-            _lock: lock,
-        }
+        assert!(
+            output.status.success(),
+            "environment-sensitive logging test subprocess failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -271,25 +251,12 @@ mod tests {
 
     #[test]
     fn configured_filter_env_override_wins_over_default() {
-        let _guard = set_env_var("LFS_CLOUD_TEST_LOG", Some("lfs_cloud=trace".into()));
-        let config = TracingConfig::new("warn").with_env_filter_var("LFS_CLOUD_TEST_LOG");
-
-        assert_eq!(
-            configured_filter_value(&config).expect("filter value should resolve"),
-            "lfs_cloud=trace"
-        );
+        assert_env_filter_subprocess("override", "lfs_cloud=trace".into());
     }
 
     #[test]
     fn configured_filter_ignores_empty_env_override() {
-        let _guard = set_env_var("LFS_CLOUD_TEST_LOG", Some(" \t\n".into()));
-        let config =
-            TracingConfig::new("warn,lfs_cloud=info").with_env_filter_var("LFS_CLOUD_TEST_LOG");
-
-        assert_eq!(
-            configured_filter_value(&config).expect("filter value should resolve"),
-            "warn,lfs_cloud=info"
-        );
+        assert_env_filter_subprocess("empty", " \t\n".into());
     }
 
     #[cfg(unix)]
@@ -297,21 +264,50 @@ mod tests {
     fn configured_filter_reports_non_unicode_env_override() {
         use std::os::unix::ffi::OsStringExt;
 
-        let _guard = set_env_var(
-            "LFS_CLOUD_TEST_LOG",
-            Some(OsString::from_vec(vec![0xff, b'w', b'a', b'r', b'n'])),
+        assert_env_filter_subprocess(
+            "non-unicode",
+            OsString::from_vec(vec![0xff, b'w', b'a', b'r', b'n']),
         );
-        let config = TracingConfig::new("warn").with_env_filter_var("LFS_CLOUD_TEST_LOG");
-        let error = configured_filter_value(&config).expect_err("non-Unicode value should fail");
+    }
 
-        match error {
-            TracingInitError::InvalidEnvironmentFilter { var_name, .. } => {
-                assert_eq!(var_name, "LFS_CLOUD_TEST_LOG");
+    #[test]
+    #[ignore = "invoked as an isolated environment-sensitive test helper"]
+    fn configured_filter_environment_subprocess() {
+        let Some(case) = env::var_os(ENV_FILTER_CASE_ENV) else {
+            return;
+        };
+        let config = match case.to_str() {
+            Some("override") => TracingConfig::new("warn").with_env_filter_var(TEST_LOG_ENV_VAR),
+            Some("empty") => {
+                TracingConfig::new("warn,lfs_cloud=info").with_env_filter_var(TEST_LOG_ENV_VAR)
             }
-            TracingInitError::InvalidFilter { .. } | TracingInitError::Install { .. } => {
-                panic!("non-Unicode env value should be reported before parsing")
+            Some("non-unicode") => {
+                let config = TracingConfig::new("warn").with_env_filter_var(TEST_LOG_ENV_VAR);
+                let error = configured_filter_value(&config)
+                    .expect_err("non-Unicode environment value should fail");
+
+                match error {
+                    TracingInitError::InvalidEnvironmentFilter { var_name, .. } => {
+                        assert_eq!(var_name, TEST_LOG_ENV_VAR);
+                    }
+                    TracingInitError::InvalidFilter { .. } | TracingInitError::Install { .. } => {
+                        panic!("non-Unicode env value should be reported before parsing")
+                    }
+                }
+                return;
             }
-        }
+            _ => panic!("environment-sensitive logging test case should be recognized"),
+        };
+
+        let expected = match case.to_str() {
+            Some("override") => "lfs_cloud=trace",
+            Some("empty") => "warn,lfs_cloud=info",
+            _ => unreachable!("recognized string cases were handled above"),
+        };
+        assert_eq!(
+            configured_filter_value(&config).expect("filter value should resolve"),
+            expected
+        );
     }
 
     #[test]
