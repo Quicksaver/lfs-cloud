@@ -2434,11 +2434,32 @@ independently validated or adjudicated.
    finding attributable separately, this was high-quality, directly
    actionable feedback.
 
-8. **Low — A project-shape test enforces a redundant dependency roster.** It
-   requires every originally planned dependency even if unused
-   (`tests/project_shape.rs:96`). Replace it with actionable policy checks such
-   as forbidden TLS backends, unwanted default features, advisory scanning, and
-   unused dependency detection.
+8. **[DONE] A project-shape test enforced a redundant dependency roster** (Low,
+   `tests/project_shape.rs`): **Valid and actionable.** The architecture test
+   required every crate from the original scaffold even when removing one
+   would leave the build and behavior intact, turning a planning snapshot into
+   a permanent dependency floor. The roster assertion has been removed and the
+   test module now describes dependency policy instead of a dependency
+   baseline. The remaining manifest test enforces only current architectural
+   constraints: selected YAML support, disabled default HTTP and configuration
+   features, Rustls transport, bundled SQLite, required runtime features, and
+   the intentionally absent OAuth HTTP stack. Dependency-advisory enforcement
+   remains the separate release-readiness finding below; a pinned
+   unused-dependency CI tool can also be considered independently without
+   coupling ordinary architecture tests to a historical crate list.
+   Verification passed with `cargo test --test project_shape` (2 passed),
+   `cargo fmt --all`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (623 unit tests passed with
+   five helper/manual tests ignored; all integration targets passed with the
+   expected three credential-gated tests ignored), `cargo test --doc` (39
+   passed), `yarn lint:check`, and `git diff --check`. The reviewer identified a
+   genuine low-severity maintenance constraint and correctly distinguished
+   behavioral dependency policy from a historical dependency inventory; the
+   broader tooling examples were relevant follow-on recommendations rather
+   than necessary parts of this focused fix. With one valid finding and no
+   invalid finding attributable separately, this was high-quality, directly
+   actionable feedback.
 
 9. **Low — Hostile-input parsers lack generative robustness coverage.** Batch
    rejection and other parsers rely on finite example tables

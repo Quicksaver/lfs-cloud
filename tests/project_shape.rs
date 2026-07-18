@@ -1,4 +1,4 @@
-//! Architecture tests for the MVP package shape and dependency baseline.
+//! Architecture tests for the MVP package shape and dependency policy.
 
 use std::{path::Path, sync::OnceLock};
 
@@ -91,31 +91,6 @@ fn mvp_uses_single_root_package_with_library_and_binary_targets() {
     );
     assert!(manifest_dir().join("src/lib.rs").is_file());
     assert!(manifest_dir().join("src/main.rs").is_file());
-}
-
-#[test]
-fn manifest_declares_planned_baseline_dependencies() {
-    let manifest = cargo_manifest();
-
-    for dependency_name in [
-        "anyhow",
-        "axum",
-        "clap",
-        "config",
-        "oauth2",
-        "reqwest",
-        "rusqlite",
-        "serde",
-        "tempfile",
-        "thiserror",
-        "tokio",
-        "tracing",
-        "tracing-subscriber",
-    ] {
-        dependency(manifest, "dependencies", dependency_name);
-    }
-
-    dependency(manifest, "dev-dependencies", "toml");
 }
 
 #[test]
