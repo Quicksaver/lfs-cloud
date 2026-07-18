@@ -23,6 +23,8 @@ Spawn a subagent with `fork_turns: "none"`. It is to work in this branch to foll
 
 Iterate until all tasks in the implementation plan are marked as complete, or until user interaction is required for any reason.
 
+**PERIODIC CLEANUP**: Every 10 iterations, run `cargo clean` yourself, then proceed to the next iteration.
+
 **SOLO DEVELOPMENT**: Each of your single active subagent is acting alone in the codebase, no other agents or humans will make changes while this orchestration is ongoing.
 
 **NO VALIDATION**: You do not validate the work yourself, that is the responsibility of subagents. You only identify when a task fails or requires user interaction, and report that back to the user.
