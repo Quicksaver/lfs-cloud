@@ -1572,8 +1572,8 @@ async fn handle_authenticated_lfs_request(
             handle_lfs_object_request(route.repository, oid, session, method, request, state).await
         }
         LfsRouteEndpoint::Info => git_lfs_json_error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "Git LFS endpoint routing is configured; transfer handling is not implemented yet",
+            StatusCode::NOT_FOUND,
+            "Git LFS base path is not an operation endpoint; use /objects/batch",
         ),
     }
 }
@@ -3220,7 +3220,8 @@ pub struct ResolvedLfsRoute {
 /// Git LFS endpoint beneath a configured repository route.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LfsRouteEndpoint {
-    /// The repository's base `/info/lfs` path.
+    /// The repository's base `/info/lfs` path, which identifies the repository
+    /// but is not itself a Git LFS operation endpoint.
     Info,
     /// The Git LFS batch API at `/objects/batch`.
     Batch,
@@ -4684,8 +4685,8 @@ repositories:
         .await;
         assert_lfs_json_error(
             authenticated,
-            StatusCode::NOT_IMPLEMENTED,
-            "Git LFS endpoint routing is configured; transfer handling is not implemented yet",
+            StatusCode::NOT_FOUND,
+            "Git LFS base path is not an operation endpoint; use /objects/batch",
         )
         .await;
     }

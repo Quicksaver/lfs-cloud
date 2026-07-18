@@ -736,11 +736,26 @@ independently validated or adjudicated.
     the severity. With one valid finding assessed here and no invalid finding
     attributable separately, this was high-quality, relevant feedback.
 
-13. **Low — Public server documentation and the base-route error are stale.**
-    They still claim transfer handling is for later work even though batch and
-    transfer endpoints exist (`src/server.rs:3-8`, `src/server.rs:82-87`,
-    `src/server.rs:951-954`). Update the docs and return a base-endpoint-specific
-    response.
+13. **[DONE] Public server documentation and the base-route error are stale**
+    (Low, `src/server.rs`): **Partly stale, with one valid and actionable
+    behavior defect.** The module and `serve` API documentation already state
+    that the server proxies authenticated batch and object transfers, so that
+    portion of the review had been addressed by earlier work and required no
+    additional documentation change. The authenticated repository base path
+    still returned HTTP 501 with the obsolete claim that transfer handling was
+    not implemented. It now returns a Git LFS JSON HTTP 404 explaining that the
+    base path is not an operation endpoint and directing clients to
+    `/objects/batch`; the public `LfsRouteEndpoint::Info` documentation now
+    makes the same distinction. A test-first regression failed against the old
+    501 response and passes with the endpoint-specific status and message.
+    Verification passed with `yarn lint:fix`, `cargo fmt --all`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+    `git diff --check`. The reviewer found a genuine low-severity stale-response
+    defect, but its public documentation claim was stale against the current
+    tree. With one valid behavior issue and one already-addressed documentation
+    assertion, this was useful and relevant but only moderately precise
+    feedback.
 
 ## Google Drive storage
 
