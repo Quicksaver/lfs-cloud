@@ -1427,10 +1427,13 @@ Defer:
 > pointer hashes and sizes before upload and provider-returned identities
 > validated after upload. The `migrate --dry-run` CLI command can now build a
 > read-only migration plan for the current checkout, selected refs, or all
-> fetched refs, reporting scanned refs, planned config writes, discovered
-> objects, source fetch/upload counts, and explicitly local readiness status without
-> fetching, uploading, writing Git config, creating cache state, opening
-> metadata, or touching storage. The default current-checkout report labels its
+> fetched refs, reporting tracked LFS patterns, scanned refs, planned config
+> writes, discovered objects, source fetch/upload counts, byte totals, separate
+> Git LFS/filter readiness, and explicit warnings for missing local sources,
+> unprobed permissions, storage quota/capacity, and unsupported purge behavior.
+> These remain explicitly local readiness results and require no fetching,
+> uploading, Git config writes, cache creation, metadata access, or storage
+> contact. The default current-checkout report labels its
 > index-only scope prominently and warns that unscanned refs may reference
 > additional LFS objects. `migrate --dry-run --purge-source-lfs` now
 > includes GitHub source LFS cleanup helper text and the GitHub Support flow,

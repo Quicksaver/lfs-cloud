@@ -1810,10 +1810,37 @@ independently validated or adjudicated.
     and no invalid finding attributable separately, this was high-quality,
     relevant feedback.
 
-13. **Medium — Required dry-run report fields are missing.** Reports omit
-    tracked LFS patterns, Git LFS/filter readiness, quota or missing-object
-    warnings, and byte totals (`src/cli.rs:1155-1247`). Add the fields defined by
-    the implementation plan and make unknown values explicit.
+13. **[DONE] Required dry-run report fields are missing** (Medium,
+    `src/cli.rs`, `README.md`, `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid
+    and actionable.** Migration discovery already collected tracked
+    `.gitattributes` patterns, Git LFS installation details, visible filter
+    settings, and exact object sizes, but the dry-run renderer discarded the
+    patterns and filter state and reduced object planning to counts. Permission
+    and quota uncertainty appeared only indirectly inside readiness prose, and
+    objects without verified local bytes had no explicit warning. The report
+    now lists each tracked LFS pattern with its source and attributes, reports
+    `git-lfs` and the clean/smudge/process/required filter settings as separate
+    local readiness checks, and includes overflow-safe byte totals for all
+    discovered, already-local, would-fetch, and target-unknown objects. A
+    dedicated warning section identifies missing or invalid local sources,
+    unprobed source/target repository permissions, unprobed destination quota
+    and free capacity, absent tracked patterns, and unsupported requested purge
+    behavior. These additions consume only existing local discovery and
+    availability data, preserving the dry-run prohibition on provider, storage,
+    cache, metadata, and config writes or remote provider access. Regression
+    coverage proves the tracked-pattern/filter output, exact byte aggregates,
+    missing-source warning, and permission/quota warnings. README,
+    implementation status, and the repository learning now document the
+    complete report contract. Verification passed with `yarn lint:fix`,
+    `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+    `git diff --check`. The focused reviewer identified a genuine
+    medium-severity planning and operator-safety gap, named the exact data
+    already required by the implementation plan, and correctly asked that
+    unknown remote state remain explicit; with one valid finding assessed here
+    and no invalid finding attributable separately, this was high-quality,
+    relevant feedback.
 
 14. **Medium — The manual migration-upload script exercises only fake stores.**
     It does not validate the live Drive upload path

@@ -1365,6 +1365,8 @@ where
     S: FnMut(&StorageProviderConfig) -> CliResult<()>,
 {
     let mut checks = Vec::new();
+    checks.push(migration_git_lfs_readiness_check(discovery));
+    checks.push(migration_filter_readiness_check(discovery));
     checks.push(migration_source_readiness_check(discovery));
     checks.push(migration_target_readiness_check(
         target.server_url,
@@ -1403,6 +1405,64 @@ where
     checks
 }
 
+fn migration_git_lfs_readiness_check(
+    discovery: &GitLfsMigrationDiscovery,
+) -> MigrationReadinessCheck {
+    if discovery.installation.installed {
+        return MigrationReadinessCheck {
+            name: "git-lfs",
+            level: StatusLevel::Ok,
+            message: discovery
+                .installation
+                .version
+                .clone()
+                .unwrap_or_else(|| "git lfs is available locally".to_owned()),
+        };
+    }
+
+    MigrationReadinessCheck {
+        name: "git-lfs",
+        level: StatusLevel::Warning,
+        message: discovery.installation.diagnostic.as_ref().map_or_else(
+            || "git lfs is not available locally".to_owned(),
+            ToString::to_string,
+        ),
+    }
+}
+
+fn migration_filter_readiness_check(
+    discovery: &GitLfsMigrationDiscovery,
+) -> MigrationReadinessCheck {
+    let filters = &discovery.filters;
+    let missing = [
+        ("filter.lfs.clean", filters.clean.is_none()),
+        ("filter.lfs.smudge", filters.smudge.is_none()),
+        ("filter.lfs.process", filters.process.is_none()),
+        ("filter.lfs.required", filters.required.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(name, is_missing)| is_missing.then_some(name))
+    .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        MigrationReadinessCheck {
+            name: "lfs-filters",
+            level: StatusLevel::Ok,
+            message: "clean, smudge, process, and required filters are configured locally"
+                .to_owned(),
+        }
+    } else {
+        MigrationReadinessCheck {
+            name: "lfs-filters",
+            level: StatusLevel::Warning,
+            message: format!(
+                "missing local Git LFS filter settings: {}",
+                missing.join(", ")
+            ),
+        }
+    }
+}
+
 fn migration_target_readiness_check<P>(
     server_url: &str,
     probe_server: &mut P,
@@ -1432,8 +1492,8 @@ where
 fn migration_source_readiness_check(
     discovery: &GitLfsMigrationDiscovery,
 ) -> MigrationReadinessCheck {
-    match (&discovery.source_endpoint, discovery.installation.installed) {
-        (Some(endpoint), true) => MigrationReadinessCheck {
+    match &discovery.source_endpoint {
+        Some(endpoint) => MigrationReadinessCheck {
             name: "source-config",
             level: StatusLevel::Ok,
             message: format!(
@@ -1442,15 +1502,7 @@ fn migration_source_readiness_check(
                 source_endpoint_source_label(endpoint.source)
             ),
         },
-        (Some(endpoint), false) => MigrationReadinessCheck {
-            name: "source-config",
-            level: StatusLevel::Warning,
-            message: format!(
-                "{} configured, but git lfs is not available for source fetches; source repository access not probed",
-                redacted_url_for_display(&endpoint.url)
-            ),
-        },
-        (None, _) => MigrationReadinessCheck {
+        None => MigrationReadinessCheck {
             name: "source-config",
             level: StatusLevel::Warning,
             message:
@@ -1567,8 +1619,15 @@ fn write_migration_dry_run_report<W>(
 where
     W: Write,
 {
-    let available_count = report.availability.available_objects().len();
-    let fetch_count = report.availability.unavailable_objects().len();
+    let available_objects = report.availability.available_objects();
+    let unavailable_objects = report.availability.unavailable_objects();
+    let available_count = available_objects.len();
+    let fetch_count = unavailable_objects.len();
+    let total_bytes = migration_objects_total_bytes(report.scan.objects.iter());
+    let available_bytes =
+        migration_objects_total_bytes(available_objects.iter().map(|local| &local.object));
+    let fetch_bytes =
+        migration_objects_total_bytes(unavailable_objects.iter().map(|local| &local.object));
 
     writeln!(output, "lfs-cloud migrate dry-run")?;
     writeln!(
@@ -1603,6 +1662,20 @@ where
         "  target: {}",
         redacted_url_for_display(&report.route.lfs_url)
     )?;
+    writeln!(
+        output,
+        "  tracked LFS patterns: {}",
+        report.discovery.tracked_patterns.len()
+    )?;
+    for tracked in &report.discovery.tracked_patterns {
+        writeln!(
+            output,
+            "    {} ({}; {})",
+            tracked.pattern,
+            tracked.source.display(),
+            tracked.attributes.join(" ")
+        )?;
+    }
     writeln!(output, "  config: {}", report.config_path.display())?;
     writeln!(output, "  refs scanned: {}", report.scan.refs_scanned.len())?;
     for ref_name in &report.scan.refs_scanned {
@@ -1623,8 +1696,9 @@ where
     )?;
     writeln!(
         output,
-        "  objects discovered: {}",
-        report.scan.objects.len()
+        "  objects discovered: {} ({} bytes total)",
+        report.scan.objects.len(),
+        total_bytes
     )?;
     for object in report
         .scan
@@ -1652,12 +1726,17 @@ where
     )?;
     writeln!(
         output,
-        "  source objects: {available_count} local, {fetch_count} missing locally"
+        "    {fetch_bytes} bytes would fetch, {available_bytes} bytes already local"
     )?;
     writeln!(
         output,
-        "  target objects: 0 confirmed new, 0 confirmed existing, {} unknown",
-        report.scan.objects.len()
+        "  source objects: {available_count} local, {fetch_count} missing locally ({available_bytes} local bytes, {fetch_bytes} missing bytes)"
+    )?;
+    writeln!(
+        output,
+        "  target objects: 0 confirmed new, 0 confirmed existing, {} unknown ({} bytes unknown)",
+        report.scan.objects.len(),
+        total_bytes
     )?;
     writeln!(
         output,
@@ -1676,8 +1755,67 @@ where
             check.message
         )?;
     }
+    write_migration_dry_run_warnings(output, report, fetch_count, fetch_bytes)?;
     if let Some(source_purge) = &report.source_purge {
         write_migration_source_purge_report(output, source_purge, report)?;
+    }
+
+    Ok(())
+}
+
+fn migration_objects_total_bytes<'a>(objects: impl IntoIterator<Item = &'a LfsObject>) -> u128 {
+    objects
+        .into_iter()
+        .map(|object| u128::from(object.size.bytes()))
+        .sum()
+}
+
+fn write_migration_dry_run_warnings<W>(
+    output: &mut W,
+    report: &MigrationDryRunReport,
+    fetch_count: usize,
+    fetch_bytes: u128,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    writeln!(output, "  warnings:")?;
+    if report.discovery.tracked_patterns.is_empty() {
+        writeln!(
+            output,
+            "    warning: no tracked LFS patterns were discovered"
+        )?;
+    }
+    if fetch_count > 0 {
+        let noun = if fetch_count == 1 {
+            "object"
+        } else {
+            "objects"
+        };
+        let verb = if fetch_count == 1 { "has" } else { "have" };
+        writeln!(
+            output,
+            "    warning: {fetch_count} {noun} ({fetch_bytes} bytes) {verb} no verified local source; source fetch and remote availability must succeed during execution"
+        )?;
+    }
+    writeln!(
+        output,
+        "    warning: source and target repository permissions were not probed"
+    )?;
+    writeln!(
+        output,
+        "    warning: target storage quota and free capacity were not probed"
+    )?;
+    if let Some(MigrationSourcePurgeReport::NotConfigured) = &report.source_purge {
+        writeln!(
+            output,
+            "    warning: source purge availability is unknown without a configured source endpoint"
+        )?;
+    } else if let Some(MigrationSourcePurgeReport::Unsupported { host }) = &report.source_purge {
+        writeln!(
+            output,
+            "    warning: automatic source purge is unsupported for {host}"
+        )?;
     }
 
     Ok(())
@@ -1691,12 +1829,7 @@ fn write_migration_source_purge_report<W>(
 where
     W: Write,
 {
-    let total_bytes = report
-        .scan
-        .objects
-        .iter()
-        .map(|object| u128::from(object.size.bytes()))
-        .sum::<u128>();
+    let total_bytes = migration_objects_total_bytes(report.scan.objects.iter());
 
     writeln!(output, "  source purge:")?;
     writeln!(
@@ -4423,6 +4556,19 @@ mod tests {
                 "git@github.com:Owner/Repo.git",
             ],
         );
+        run_git(
+            &repo,
+            &["config", "filter.lfs.clean", "git-lfs clean -- %f"],
+        );
+        run_git(
+            &repo,
+            &["config", "filter.lfs.smudge", "git-lfs smudge -- %f"],
+        );
+        run_git(
+            &repo,
+            &["config", "filter.lfs.process", "git-lfs filter-process"],
+        );
+        run_git(&repo, &["config", "filter.lfs.required", "true"]);
         let object = object_for_bytes(b"migration object already local");
         write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(
@@ -4483,9 +4629,18 @@ mod tests {
         assert!(rendered.contains("current checkout"));
         assert!(rendered.contains("files touched: 1 would update"));
         assert!(rendered.contains(".lfsconfig"));
+        assert!(rendered.contains("tracked LFS patterns: 1"));
+        assert!(rendered.contains("*.bin (.gitattributes; filter=lfs)"));
         assert!(rendered.contains("pointer files: 1"));
-        assert!(rendered.contains("objects discovered: 1"));
+        assert!(rendered.contains(&format!(
+            "objects discovered: 1 ({} bytes total)",
+            object.size.bytes()
+        )));
         assert!(rendered.contains("objects fetched: 0 would fetch, 1 already local"));
+        assert!(rendered.contains(&format!(
+            "0 bytes would fetch, {} bytes already local",
+            object.size.bytes()
+        )));
         assert!(rendered.contains("source objects: 1 local, 0 missing locally"));
         assert!(
             rendered.contains("target objects: 0 confirmed new, 0 confirmed existing, 1 unknown")
@@ -4493,6 +4648,8 @@ mod tests {
         assert!(rendered.contains("target storage not probed during dry-run"));
         assert!(!rendered.contains("objects uploaded:"));
         assert!(rendered.contains("local readiness checks (no remote access probes):"));
+        assert!(rendered.contains("git-lfs"));
+        assert!(rendered.contains("lfs-filters ok"));
         assert!(rendered.contains("source-config"));
         assert!(rendered.contains("server-tcp"));
         assert!(rendered.contains("lfs-credential"));
@@ -4500,6 +4657,9 @@ mod tests {
         assert!(rendered.contains("source repository access not probed"));
         assert!(rendered.contains("server authentication and repository access not probed"));
         assert!(rendered.contains("Drive root access not probed"));
+        assert!(rendered.contains("warnings:"));
+        assert!(rendered.contains("repository permissions were not probed"));
+        assert!(rendered.contains("storage quota and free capacity were not probed"));
         assert!(rendered.contains(object.oid.as_hex()));
     }
 
@@ -4595,7 +4755,7 @@ mod tests {
         write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(
             &repo.join("asset/model.bin"),
-            LfsPointer::new(object).to_pointer_file().as_bytes(),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
         let config_path = temp.path().join("lfs-cloud.yml");
@@ -4634,6 +4794,10 @@ mod tests {
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("objects fetched: 1 would fetch, 0 already local"));
+        assert!(rendered.contains(&format!(
+            "{} bytes would fetch, 0 bytes already local",
+            object.size.bytes()
+        )));
         assert!(rendered.contains("source objects: 0 local, 1 missing locally"));
         assert!(
             rendered.contains("target objects: 0 confirmed new, 0 confirmed existing, 1 unknown")
@@ -4641,6 +4805,10 @@ mod tests {
         assert!(rendered.contains("target storage not probed during dry-run"));
         assert!(!rendered.contains("objects uploaded:"));
         assert!(rendered.contains("server-tcp warning"));
+        assert!(rendered.contains(&format!(
+            "1 object ({} bytes) has no verified local source",
+            object.size.bytes()
+        )));
     }
 
     #[test]

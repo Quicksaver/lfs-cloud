@@ -328,18 +328,21 @@ lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 ```
 
 The current migration command supports read-only planning with `--dry-run`. The
-dry-run reports scanned refs, planned local config writes, discovered
-objects, objects that would be fetched from the source Git LFS provider,
-local source-object availability, explicitly unknown target-object existence,
-and local readiness results. A dry-run does not claim that locally available
-objects will be uploaded: execution checks the destination first and skips
-objects already present there. The readiness checks cover source endpoint
-configuration and Git LFS availability, target TCP reachability, local LFS
-credential presence, server config mapping, and local storage-credential
-loading. They do not verify source repository access, target server
-authentication or repository permission, Drive root access, or target-object
-existence. The dry-run does not fetch, upload, write Git config, create cache
-state, open metadata storage, or contact the configured storage provider.
+dry-run reports tracked LFS patterns, scanned refs, planned local config writes,
+discovered objects, objects that would be fetched from the source Git LFS
+provider, local source-object availability, explicitly unknown target-object
+existence, and object byte totals for each of those groups. The local readiness
+section reports the `git lfs` installation and visible filter settings
+separately from source endpoint, target TCP, local credential, server mapping,
+and storage-credential checks. A dedicated warning section calls out objects
+without a verified local source, unprobed repository permissions, storage
+quota/capacity risk, and unsupported requested purge behavior. A dry run does
+not claim that locally available objects will be uploaded: execution checks the
+destination first and skips objects already present there. The readiness checks
+do not verify source repository access, target server authentication or
+repository permission, Drive root access, or target-object existence. The
+dry-run does not fetch, upload, write Git config, create cache state, open
+metadata storage, or contact the configured storage provider.
 Git discovery also disables partial-clone lazy fetching; if a required Git
 object exists only on a promisor remote, fetch that object explicitly before
 rerunning the plan.
