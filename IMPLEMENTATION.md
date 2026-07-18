@@ -1405,10 +1405,12 @@ Defer:
 > checkout migration scanning can now ask Git for index paths with `filter=lfs`
 > and parse the corresponding index blobs into object identities. This keeps
 > hydrated files and paths omitted by sparse checkout in scope while excluding
-> non-LFS pointer-shaped fixtures. Selected-ref and all-fetched-ref migration scans can now
-> walk Git history, evaluate `filter=lfs` attributes against each historical
-> tree, and parse pointer blobs without checking out refs or mutating local
-> state. Read-only migration Git subprocesses disable lazy fetching, and a
+> non-LFS pointer-shaped fixtures. Selected-ref and all-fetched-ref migration
+> scans can now walk Git history through one persistent batch-object process,
+> reuse unchanged tree and blob summaries across commits, cache historical
+> `filter=lfs` decisions by attribute state and candidate paths, and parse
+> pointer blobs without checking out refs or mutating local state. Read-only
+> migration Git subprocesses disable lazy fetching, and a
 > pointer blob that exists only on a promisor remote produces an explicit local
 > availability error. Migration transfer planning can now check discovered object identities
 > against both repository Git LFS media storage and an optional shared

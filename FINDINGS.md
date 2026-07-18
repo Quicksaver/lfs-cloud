@@ -1669,10 +1669,36 @@ independently validated or adjudicated.
    remediation; with one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, relevant feedback.
 
-8. **High — History discovery is O(commits × full tree) and launches many Git
-   subprocesses.** Large repositories can make all-ref migration impractical
-   (`src/migration.rs:1956-2267`). Batch object and attribute queries, stream
-   results, cache across commits, and add representative scale benchmarks.
+8. **[DONE] History discovery was O(commits × full tree) and launched many Git
+   subprocesses** (High, `src/migration.rs`, `README.md`, `IMPLEMENTATION.md`,
+   and `AGENTS.md`): **Valid and actionable.** Selected-ref and all-ref scans
+   previously ran a recursive `git ls-tree` plus one or more historical
+   attribute queries for every reachable commit, then launched separate
+   `cat-file` size and content processes for each uncached candidate blob. A
+   repository with mostly unchanged files therefore repeated full-tree output
+   and process startup for every commit. Historical discovery now uses one
+   persistent `git cat-file --batch-command` process, parses one bounded tree or
+   pointer blob at a time, and caches subtree summaries and pointer decisions by
+   Git object ID across commits and refs. Only pointer-shaped candidate paths
+   reach `git check-attr --source=<commit>`, and equivalent queries are reused
+   when the exact historical `.gitattributes` blobs and candidate paths are
+   unchanged. Commit occurrence and cross-ref deduplication behavior remains
+   intact, including historical attribute changes, branch-only history,
+   gitlinks, shallow rejection, and missing promisor objects. A representative
+   scale regression creates 128 stable files and 17 commits, proves all 17
+   pointer occurrences remain visible, and asserts one batch-object process,
+   one attribute process, and bounded tree/blob inspection rather than full-tree
+   work per commit. README, implementation status, and repository learnings now
+   record the cached tree-DAG boundary. Verification passed with
+   `yarn lint:fix`, `cargo fmt --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a
+   genuine high-severity scalability flaw, accurately traced both repeated tree
+   enumeration and subprocess amplification, and requested the decisive batch,
+   caching, streaming, and scale coverage; with one valid finding assessed here
+   and no invalid finding attributable separately, this was high-quality,
+   performance-relevant feedback.
 
 9. **High — Git command output limits are applied only after unbounded
    allocation.** Helpers use `Command::output` and truncate after capture,

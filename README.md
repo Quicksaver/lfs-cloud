@@ -355,6 +355,11 @@ cannot provide a complete inventory for those history scopes. Run
 `git fetch --unshallow` before using either mode. Current-checkout planning is
 still available in a shallow clone because it inventories only the current
 index.
+Historical scans reuse unchanged Git tree and blob objects across commits and
+cache equivalent historical attribute queries. This keeps large selected-ref
+and all-ref plans proportional to changed tree state plus reported pointer
+occurrences instead of recursively listing the full repository tree for every
+commit.
 Use `--purge-source-lfs` with `--dry-run` to include GitHub Support cleanup
 guidance. The dry-run labels discovered objects as planned candidates and does
 not emit a purge manifest. Planned OIDs and sizes are not proof that the

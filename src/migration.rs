@@ -13,9 +13,9 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Child, Command, ExitStatus, Output, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -468,14 +468,21 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    enumerate_selected_ref_lfs_pointers_with_metrics(start_dir, refs).map(|(pointers, _)| pointers)
+}
+
+fn enumerate_selected_ref_lfs_pointers_with_metrics<I, S>(
+    start_dir: impl AsRef<Path>,
+    refs: I,
+) -> MigrationResult<(GitLfsHistoryPointers, HistoryScanMetrics)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
     require_complete_history(&worktree_root)?;
     let mut scanned_refs = Vec::new();
-    let mut pointers = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut commit_cache = BTreeMap::new();
-    let mut blob_pointer_cache = BTreeMap::new();
 
     for ref_name in refs {
         let ref_name = ref_name.as_ref();
@@ -485,22 +492,9 @@ where
             name: ref_name.to_owned(),
             commit: commit.clone(),
         });
-        enumerate_ref_history_lfs_pointers(
-            &worktree_root,
-            ref_name,
-            &commit,
-            &mut pointers,
-            &mut seen,
-            &mut commit_cache,
-            &mut blob_pointer_cache,
-        )?;
     }
 
-    Ok(GitLfsHistoryPointers {
-        worktree_root,
-        refs: scanned_refs,
-        pointers,
-    })
+    scan_resolved_history_refs(worktree_root, scanned_refs)
 }
 
 /// Enumerates Git LFS pointer files reachable from local branches, tags, and
@@ -544,10 +538,6 @@ pub fn enumerate_fetched_ref_lfs_pointers_for_remote(
     let source_remote = validate_source_remote_name(source_remote.as_ref())?;
     let refs = all_fetched_ref_names(&worktree_root, &source_remote)?;
     let mut scanned_refs = Vec::new();
-    let mut pointers = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut commit_cache = BTreeMap::new();
-    let mut blob_pointer_cache = BTreeMap::new();
 
     for ref_name in refs {
         let commit = resolve_ref_commit(&worktree_root, &ref_name)?;
@@ -555,22 +545,9 @@ pub fn enumerate_fetched_ref_lfs_pointers_for_remote(
             name: ref_name.clone(),
             commit: commit.clone(),
         });
-        enumerate_ref_history_lfs_pointers(
-            &worktree_root,
-            &ref_name,
-            &commit,
-            &mut pointers,
-            &mut seen,
-            &mut commit_cache,
-            &mut blob_pointer_cache,
-        )?;
     }
 
-    Ok(GitLfsHistoryPointers {
-        worktree_root,
-        refs: scanned_refs,
-        pointers,
-    })
+    scan_resolved_history_refs(worktree_root, scanned_refs).map(|(pointers, _)| pointers)
 }
 
 /// Checks whether discovered migration objects already have verified local bytes.
@@ -1993,6 +1970,327 @@ struct GitLfsHistoryPointerOccurrence {
     object: LfsObject,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct HistoryScanMetrics {
+    cat_file_processes: usize,
+    attribute_processes: usize,
+    tree_entries_inspected: usize,
+    blobs_inspected: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitHistoryCommit {
+    object_id: String,
+    tree_id: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct HistoryTreeSummary {
+    pointer_blobs: Vec<GitTreeBlob>,
+    attribute_blobs: Vec<(PathBuf, String)>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HistoryAttributeQueryKey {
+    attribute_blobs: Vec<(PathBuf, String)>,
+    pointer_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawGitTreeEntry {
+    mode: Vec<u8>,
+    object_id: String,
+    name: Vec<u8>,
+}
+
+struct HistoryScanner<'a> {
+    worktree_root: &'a Path,
+    object_reader: Option<GitBatchObjectReader>,
+    tree_cache: BTreeMap<String, HistoryTreeSummary>,
+    blob_pointer_cache: BTreeMap<String, Option<LfsPointer>>,
+    attribute_cache: BTreeMap<HistoryAttributeQueryKey, BTreeSet<PathBuf>>,
+    commit_cache: BTreeMap<String, Vec<GitLfsHistoryPointerOccurrence>>,
+    pointers: Vec<GitLfsHistoryPointer>,
+    seen: BTreeSet<(String, PathBuf, LfsObject)>,
+    metrics: HistoryScanMetrics,
+}
+
+impl<'a> HistoryScanner<'a> {
+    fn new(worktree_root: &'a Path) -> MigrationResult<Self> {
+        Ok(Self {
+            worktree_root,
+            object_reader: Some(GitBatchObjectReader::start(worktree_root)?),
+            tree_cache: BTreeMap::new(),
+            blob_pointer_cache: BTreeMap::new(),
+            attribute_cache: BTreeMap::new(),
+            commit_cache: BTreeMap::new(),
+            pointers: Vec::new(),
+            seen: BTreeSet::new(),
+            metrics: HistoryScanMetrics {
+                cat_file_processes: 1,
+                ..HistoryScanMetrics::default()
+            },
+        })
+    }
+
+    fn scan_ref(&mut self, scanned_ref: &GitLfsScannedRef) -> MigrationResult<()> {
+        for commit in rev_list_commits(self.worktree_root, &scanned_ref.commit)? {
+            if !self.commit_cache.contains_key(&commit.object_id) {
+                let occurrences = self.scan_commit(&commit)?;
+                self.commit_cache
+                    .insert(commit.object_id.clone(), occurrences);
+            }
+
+            for occurrence in self
+                .commit_cache
+                .get(&commit.object_id)
+                .expect("history commit cache should contain scanned commit")
+            {
+                let key = (
+                    occurrence.commit.clone(),
+                    occurrence.relative_path.clone(),
+                    occurrence.object.clone(),
+                );
+                if self.seen.insert(key) {
+                    self.pointers.push(GitLfsHistoryPointer {
+                        ref_name: scanned_ref.name.clone(),
+                        commit: occurrence.commit.clone(),
+                        relative_path: occurrence.relative_path.clone(),
+                        object: occurrence.object.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn scan_commit(
+        &mut self,
+        commit: &GitHistoryCommit,
+    ) -> MigrationResult<Vec<GitLfsHistoryPointerOccurrence>> {
+        let summary = self.tree_summary(&commit.tree_id)?;
+        if summary.pointer_blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_key = HistoryAttributeQueryKey {
+            attribute_blobs: summary.attribute_blobs.clone(),
+            pointer_paths: summary
+                .pointer_blobs
+                .iter()
+                .map(|blob| blob.relative_path.clone())
+                .collect(),
+        };
+        let lfs_paths = if let Some(paths) = self.attribute_cache.get(&query_key) {
+            paths.clone()
+        } else {
+            let (paths, process_count) = git_check_attr_lfs_paths_for_tree_blobs(
+                self.worktree_root,
+                &summary.pointer_blobs,
+                &commit.object_id,
+            )?;
+            self.metrics.attribute_processes += process_count;
+            self.attribute_cache.insert(query_key, paths.clone());
+            paths
+        };
+
+        let mut occurrences = Vec::new();
+        for blob in summary
+            .pointer_blobs
+            .into_iter()
+            .filter(|blob| lfs_paths.contains(&blob.relative_path))
+        {
+            let pointer = self
+                .blob_pointer_cache
+                .get(&blob.object_id)
+                .and_then(Clone::clone)
+                .expect("tree summaries contain only parsed pointer blobs");
+            occurrences.push(GitLfsHistoryPointerOccurrence {
+                commit: commit.object_id.clone(),
+                relative_path: blob.relative_path,
+                object: pointer.object,
+            });
+        }
+
+        Ok(occurrences)
+    }
+
+    fn tree_summary(&mut self, tree_id: &str) -> MigrationResult<HistoryTreeSummary> {
+        if let Some(summary) = self.tree_cache.get(tree_id) {
+            return Ok(summary.clone());
+        }
+
+        let command_name = format!("git cat-file --batch-command tree {tree_id}");
+        let contents = self
+            .object_reader
+            .as_mut()
+            .expect("history scanner object reader should be available")
+            .contents(
+                tree_id,
+                "tree",
+                MAX_HISTORY_TREE_OUTPUT_BYTES,
+                &command_name,
+            )?;
+        let entries = parse_raw_git_tree(&contents, tree_id, &command_name)?;
+        self.metrics.tree_entries_inspected += entries.len();
+        let mut summary = HistoryTreeSummary::default();
+
+        for entry in entries {
+            let relative_path = safe_git_relative_path(&entry.name, &command_name)?;
+            if entry.mode == b"40000" {
+                let child = self.tree_summary(&entry.object_id)?;
+                append_prefixed_tree_summary(&mut summary, &relative_path, &entry.name, child);
+                continue;
+            }
+            if entry.mode == b"160000" {
+                continue;
+            }
+            if !matches!(entry.mode.as_slice(), b"100644" | b"100755" | b"120000") {
+                return Err(MigrationError::ExternalCommandOutput {
+                    command: command_name,
+                    message: SanitizedMessage::new("git returned an unsupported tree mode"),
+                });
+            }
+
+            if entry.name == b".gitattributes" {
+                summary
+                    .attribute_blobs
+                    .push((relative_path.clone(), entry.object_id.clone()));
+            }
+
+            if !self.blob_pointer_cache.contains_key(&entry.object_id) {
+                self.metrics.blobs_inspected += 1;
+                let pointer = self.read_pointer_blob_candidate(&entry.object_id)?;
+                self.blob_pointer_cache
+                    .insert(entry.object_id.clone(), pointer);
+            }
+            if self
+                .blob_pointer_cache
+                .get(&entry.object_id)
+                .is_some_and(Option::is_some)
+            {
+                summary.pointer_blobs.push(GitTreeBlob {
+                    object_id: entry.object_id,
+                    relative_path,
+                    relative_path_bytes: entry.name,
+                });
+            }
+        }
+
+        summary
+            .pointer_blobs
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        summary.attribute_blobs.sort();
+        self.tree_cache.insert(tree_id.to_owned(), summary.clone());
+        Ok(summary)
+    }
+
+    fn read_pointer_blob_candidate(
+        &mut self,
+        object_id: &str,
+    ) -> MigrationResult<Option<LfsPointer>> {
+        let command_name = format!("git cat-file --batch-command info {object_id}");
+        let info = self
+            .object_reader
+            .as_mut()
+            .expect("history scanner object reader should be available")
+            .info(object_id, &command_name)?;
+        if info.object_type != "blob" {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name,
+                message: SanitizedMessage::new("git tree entry did not resolve to a blob"),
+            });
+        }
+        if info.size > MAX_HISTORY_POINTER_BYTES {
+            return Ok(None);
+        }
+
+        let blob_command = format!("git cat-file --batch-command contents {object_id}");
+        let contents = self
+            .object_reader
+            .as_mut()
+            .expect("history scanner object reader should be available")
+            .contents(
+                object_id,
+                "blob",
+                MAX_HISTORY_POINTER_BYTES as usize,
+                &blob_command,
+            )?;
+        let Ok(contents) = std::str::from_utf8(&contents) else {
+            return Ok(None);
+        };
+
+        Ok(LfsPointer::parse(contents).ok())
+    }
+
+    fn finish(mut self) -> MigrationResult<(Vec<GitLfsHistoryPointer>, HistoryScanMetrics)> {
+        self.object_reader
+            .take()
+            .expect("history scanner object reader should be available")
+            .finish()?;
+        Ok((std::mem::take(&mut self.pointers), self.metrics.clone()))
+    }
+}
+
+fn scan_resolved_history_refs(
+    worktree_root: PathBuf,
+    scanned_refs: Vec<GitLfsScannedRef>,
+) -> MigrationResult<(GitLfsHistoryPointers, HistoryScanMetrics)> {
+    if scanned_refs.is_empty() {
+        return Ok((
+            GitLfsHistoryPointers {
+                worktree_root,
+                refs: scanned_refs,
+                pointers: Vec::new(),
+            },
+            HistoryScanMetrics::default(),
+        ));
+    }
+
+    let mut scanner = HistoryScanner::new(&worktree_root)?;
+    for scanned_ref in &scanned_refs {
+        scanner.scan_ref(scanned_ref)?;
+    }
+    let (pointers, metrics) = scanner.finish()?;
+    Ok((
+        GitLfsHistoryPointers {
+            worktree_root,
+            refs: scanned_refs,
+            pointers,
+        },
+        metrics,
+    ))
+}
+
+fn append_prefixed_tree_summary(
+    target: &mut HistoryTreeSummary,
+    prefix: &Path,
+    prefix_bytes: &[u8],
+    child: HistoryTreeSummary,
+) {
+    target
+        .pointer_blobs
+        .extend(child.pointer_blobs.into_iter().map(|blob| {
+            let mut relative_path_bytes =
+                Vec::with_capacity(prefix_bytes.len() + 1 + blob.relative_path_bytes.len());
+            relative_path_bytes.extend_from_slice(prefix_bytes);
+            relative_path_bytes.push(b'/');
+            relative_path_bytes.extend_from_slice(&blob.relative_path_bytes);
+            GitTreeBlob {
+                object_id: blob.object_id,
+                relative_path: prefix.join(blob.relative_path),
+                relative_path_bytes,
+            }
+        }));
+    target.attribute_blobs.extend(
+        child
+            .attribute_blobs
+            .into_iter()
+            .map(|(path, object_id)| (prefix.join(path), object_id)),
+    );
+}
+
 fn validate_history_ref_name(ref_name: &str) -> MigrationResult<()> {
     let has_invalid_byte = ref_name.bytes().any(|byte| {
         byte.is_ascii_control()
@@ -2085,87 +2383,19 @@ fn all_fetched_ref_names(
     Ok(refs)
 }
 
-fn enumerate_ref_history_lfs_pointers(
+fn rev_list_commits(
     worktree_root: &Path,
-    ref_name: &str,
     root_commit: &str,
-    pointers: &mut Vec<GitLfsHistoryPointer>,
-    seen: &mut BTreeSet<(String, PathBuf, LfsObject)>,
-    commit_cache: &mut BTreeMap<String, Vec<GitLfsHistoryPointerOccurrence>>,
-    blob_pointer_cache: &mut BTreeMap<String, Option<LfsPointer>>,
-) -> MigrationResult<()> {
-    for commit in rev_list_commits(worktree_root, root_commit)? {
-        if !commit_cache.contains_key(&commit) {
-            let occurrences =
-                scan_history_commit_lfs_pointers(worktree_root, &commit, blob_pointer_cache)?;
-            commit_cache.insert(commit.clone(), occurrences);
-        }
-
-        for occurrence in commit_cache
-            .get(&commit)
-            .expect("history commit cache should contain scanned commit")
-        {
-            let key = (
-                occurrence.commit.clone(),
-                occurrence.relative_path.clone(),
-                occurrence.object.clone(),
-            );
-            if seen.insert(key) {
-                pointers.push(GitLfsHistoryPointer {
-                    ref_name: ref_name.to_owned(),
-                    commit: occurrence.commit.clone(),
-                    relative_path: occurrence.relative_path.clone(),
-                    object: occurrence.object.clone(),
-                });
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn scan_history_commit_lfs_pointers(
-    worktree_root: &Path,
-    commit: &str,
-    blob_pointer_cache: &mut BTreeMap<String, Option<LfsPointer>>,
-) -> MigrationResult<Vec<GitLfsHistoryPointerOccurrence>> {
-    let blobs = tree_blobs_at_commit(worktree_root, commit)?;
-    if blobs.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let lfs_paths = git_check_attr_lfs_paths_for_tree_blobs(worktree_root, &blobs, commit)?;
-    let mut occurrences = Vec::new();
-    for blob in blobs
-        .into_iter()
-        .filter(|blob| lfs_paths.contains(&blob.relative_path))
-    {
-        let Some(pointer) = read_history_pointer_blob_candidate_cached(
-            worktree_root,
-            &blob.object_id,
-            blob_pointer_cache,
-        )?
-        else {
-            continue;
-        };
-
-        occurrences.push(GitLfsHistoryPointerOccurrence {
-            commit: commit.to_owned(),
-            relative_path: blob.relative_path,
-            object: pointer.object,
-        });
-    }
-
-    Ok(occurrences)
-}
-
-fn rev_list_commits(worktree_root: &Path, root_commit: &str) -> MigrationResult<Vec<String>> {
-    let command_name = format!("git rev-list --topo-order {root_commit}");
+) -> MigrationResult<Vec<GitHistoryCommit>> {
+    let command_name =
+        format!("git rev-list --topo-order --format=%H%x20%T --no-commit-header {root_commit}");
     let output = run_git_os_vec(
         worktree_root,
         vec![
             OsString::from("rev-list"),
             OsString::from("--topo-order"),
+            OsString::from("--format=%H %T"),
+            OsString::from("--no-commit-header"),
             OsString::from(root_commit),
         ],
         &command_name,
@@ -2175,45 +2405,336 @@ fn rev_list_commits(worktree_root: &Path, root_commit: &str) -> MigrationResult<
     let mut commits = Vec::new();
 
     for line in stdout.lines().filter(|line| !line.is_empty()) {
-        if !is_git_object_id(line) {
+        let Some((object_id, tree_id)) = line.split_once(' ') else {
             return Err(MigrationError::ExternalCommandOutput {
-                command: command_name,
-                message: SanitizedMessage::new("git returned an invalid commit object ID"),
+                command: command_name.clone(),
+                message: SanitizedMessage::new("git returned malformed commit and tree output"),
+            });
+        };
+        if !is_git_object_id(object_id) || !is_git_object_id(tree_id) {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.clone(),
+                message: SanitizedMessage::new("git returned an invalid commit or tree object ID"),
             });
         }
-        commits.push(line.to_owned());
+        commits.push(GitHistoryCommit {
+            object_id: object_id.to_owned(),
+            tree_id: tree_id.to_owned(),
+        });
     }
 
     Ok(commits)
 }
 
-fn tree_blobs_at_commit(worktree_root: &Path, commit: &str) -> MigrationResult<Vec<GitTreeBlob>> {
-    let command_name =
-        format!("git ls-tree -r -z --format=%(objecttype)%x00%(objectname)%x00%(path) {commit}");
-    let output = run_git_os_vec(
-        worktree_root,
-        vec![
-            OsString::from("ls-tree"),
-            OsString::from("-r"),
-            OsString::from("-z"),
-            OsString::from("--format=%(objecttype)%x00%(objectname)%x00%(path)"),
-            OsString::from(commit),
-        ],
-        &command_name,
-    )?;
-    if !output.status.success() {
-        return Err(command_error(&command_name, output.status, &output.stderr));
-    }
-    if output.stdout.len() > MAX_HISTORY_TREE_OUTPUT_BYTES {
+fn parse_raw_git_tree(
+    contents: &[u8],
+    tree_id: &str,
+    command_name: &str,
+) -> MigrationResult<Vec<RawGitTreeEntry>> {
+    let object_id_bytes = tree_id.len() / 2;
+    if !matches!(object_id_bytes, 20 | 32) {
         return Err(MigrationError::ExternalCommandOutput {
-            command: command_name,
-            message: SanitizedMessage::new("git returned too much tree output"),
+            command: command_name.to_owned(),
+            message: SanitizedMessage::new("git returned an invalid tree object ID"),
         });
     }
 
-    parse_ls_tree_blob_output(&output.stdout, &command_name)
+    let mut entries = Vec::new();
+    let mut cursor = 0;
+    while cursor < contents.len() {
+        let Some(mode_end_offset) = contents[cursor..].iter().position(|byte| *byte == b' ') else {
+            return Err(raw_git_tree_parse_error(command_name));
+        };
+        let mode_end = cursor + mode_end_offset;
+        let mode = contents[cursor..mode_end].to_vec();
+        cursor = mode_end + 1;
+
+        let Some(name_end_offset) = contents[cursor..].iter().position(|byte| *byte == b'\0')
+        else {
+            return Err(raw_git_tree_parse_error(command_name));
+        };
+        let name_end = cursor + name_end_offset;
+        let name = contents[cursor..name_end].to_vec();
+        cursor = name_end + 1;
+
+        let object_end = cursor
+            .checked_add(object_id_bytes)
+            .ok_or_else(|| raw_git_tree_parse_error(command_name))?;
+        let object_bytes = contents
+            .get(cursor..object_end)
+            .ok_or_else(|| raw_git_tree_parse_error(command_name))?;
+        cursor = object_end;
+
+        if mode.is_empty() || name.is_empty() {
+            return Err(raw_git_tree_parse_error(command_name));
+        }
+        let object_id = object_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        entries.push(RawGitTreeEntry {
+            mode,
+            object_id,
+            name,
+        });
+    }
+
+    Ok(entries)
 }
 
+fn raw_git_tree_parse_error(command_name: &str) -> MigrationError {
+    MigrationError::ExternalCommandOutput {
+        command: command_name.to_owned(),
+        message: SanitizedMessage::new("git returned malformed tree object data"),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitBatchObjectInfo {
+    object_type: String,
+    size: u64,
+}
+
+struct GitBatchObjectReader {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    stderr_reader: Option<thread::JoinHandle<io::Result<PipeReadResult>>>,
+    finished: bool,
+}
+
+impl GitBatchObjectReader {
+    fn start(worktree_root: &Path) -> MigrationResult<Self> {
+        const COMMAND: &str = "git cat-file --batch-command";
+        let mut child = read_only_git_command()
+            .args(["cat-file", "--batch-command"])
+            .current_dir(worktree_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| MigrationError::Io {
+                context: format!("failed to start {COMMAND}"),
+                source,
+            })?;
+        let stdin = child.stdin.take().ok_or_else(|| MigrationError::Io {
+            context: format!("{COMMAND} stdin was not piped"),
+            source: io::Error::other("git cat-file stdin was not piped"),
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| MigrationError::Io {
+            context: format!("{COMMAND} stdout was not piped"),
+            source: io::Error::other("git cat-file stdout was not piped"),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| MigrationError::Io {
+            context: format!("{COMMAND} stderr was not piped"),
+            source: io::Error::other("git cat-file stderr was not piped"),
+        })?;
+        let stderr_reader =
+            thread::spawn(move || read_pipe_with_limit(stderr, MAX_MIGRATION_GIT_OUTPUT_BYTES + 1));
+
+        Ok(Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+            stderr_reader: Some(stderr_reader),
+            finished: false,
+        })
+    }
+
+    fn info(&mut self, object_id: &str, command_name: &str) -> MigrationResult<GitBatchObjectInfo> {
+        self.write_request("info", object_id, command_name)?;
+        self.read_header(object_id, command_name)
+    }
+
+    fn contents(
+        &mut self,
+        object_id: &str,
+        expected_type: &str,
+        max_size: usize,
+        command_name: &str,
+    ) -> MigrationResult<Vec<u8>> {
+        self.write_request("contents", object_id, command_name)?;
+        let info = self.read_header(object_id, command_name)?;
+        if info.object_type != expected_type {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned an unexpected object type"),
+            });
+        }
+        let size =
+            usize::try_from(info.size).map_err(|_| MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned an oversized object"),
+            })?;
+        if size > max_size {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned too much object data"),
+            });
+        }
+
+        let mut contents = vec![0; size];
+        self.stdout
+            .read_exact(&mut contents)
+            .map_err(|source| MigrationError::Io {
+                context: format!("failed to read {command_name} object data"),
+                source,
+            })?;
+        let mut delimiter = [0];
+        self.stdout
+            .read_exact(&mut delimiter)
+            .map_err(|source| MigrationError::Io {
+                context: format!("failed to read {command_name} object delimiter"),
+                source,
+            })?;
+        if delimiter != [b'\n'] {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned malformed batch object data"),
+            });
+        }
+
+        Ok(contents)
+    }
+
+    fn write_request(
+        &mut self,
+        operation: &str,
+        object_id: &str,
+        command_name: &str,
+    ) -> MigrationResult<()> {
+        if !is_git_object_id(object_id) {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git object request contained an invalid ID"),
+            });
+        }
+        let stdin = self
+            .stdin
+            .as_mut()
+            .expect("unfinished git cat-file reader should retain stdin");
+        writeln!(stdin, "{operation} {object_id}")
+            .and_then(|()| stdin.flush())
+            .map_err(|source| MigrationError::Io {
+                context: format!("failed to write {command_name} request"),
+                source,
+            })
+    }
+
+    fn read_header(
+        &mut self,
+        requested_object_id: &str,
+        command_name: &str,
+    ) -> MigrationResult<GitBatchObjectInfo> {
+        let mut header = Vec::new();
+        let bytes_read = self
+            .stdout
+            .read_until(b'\n', &mut header)
+            .map_err(|source| MigrationError::Io {
+                context: format!("failed to read {command_name} response"),
+                source,
+            })?;
+        if bytes_read == 0 || !header.ends_with(b"\n") {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned a truncated batch object header"),
+            });
+        }
+        header.pop();
+        if header.ends_with(b" missing") {
+            return Err(MigrationError::GitObjectUnavailable {
+                object_id: requested_object_id.to_owned(),
+            });
+        }
+        let header =
+            std::str::from_utf8(&header).map_err(|_| MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned non-UTF-8 batch object metadata"),
+            })?;
+        let fields = header.split(' ').collect::<Vec<_>>();
+        let [object_id, object_type, size] = fields.as_slice() else {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned malformed batch object metadata"),
+            });
+        };
+        if *object_id != requested_object_id || !is_git_object_id(object_id) {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned a mismatched batch object ID"),
+            });
+        }
+        let size = size
+            .parse::<u64>()
+            .map_err(|_| MigrationError::ExternalCommandOutput {
+                command: command_name.to_owned(),
+                message: SanitizedMessage::new("git returned an invalid batch object size"),
+            })?;
+        Ok(GitBatchObjectInfo {
+            object_type: (*object_type).to_owned(),
+            size,
+        })
+    }
+
+    fn finish(mut self) -> MigrationResult<()> {
+        const COMMAND: &str = "git cat-file --batch-command";
+        self.stdin.take();
+        let status = self
+            .child
+            .as_mut()
+            .expect("unfinished git cat-file reader should retain its child")
+            .wait()
+            .map_err(|source| MigrationError::Io {
+                context: format!("failed to wait for {COMMAND}"),
+                source,
+            })?;
+        let stderr = self.join_stderr_reader(COMMAND)?;
+        self.finished = true;
+        if !status.success() {
+            return Err(command_error(COMMAND, status, &stderr.bytes));
+        }
+        if stderr.exceeded_limit {
+            return Err(MigrationError::ExternalCommandOutput {
+                command: COMMAND.to_owned(),
+                message: SanitizedMessage::new("git returned too much batch diagnostic output"),
+            });
+        }
+        Ok(())
+    }
+
+    fn join_stderr_reader(&mut self, command_name: &str) -> MigrationResult<PipeReadResult> {
+        self.stderr_reader
+            .take()
+            .expect("unfinished git cat-file reader should retain stderr reader")
+            .join()
+            .map_err(|_| MigrationError::Io {
+                context: format!("{command_name} stderr reader panicked"),
+                source: io::Error::other("git cat-file stderr reader panicked"),
+            })?
+            .map_err(|source| MigrationError::Io {
+                context: format!("failed to read {command_name} stderr"),
+                source,
+            })
+    }
+}
+
+impl Drop for GitBatchObjectReader {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.stdin.take();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(stderr_reader) = self.stderr_reader.take() {
+            let _ = stderr_reader.join();
+        }
+    }
+}
+
+#[cfg(test)]
 fn parse_ls_tree_blob_output(
     stdout: &[u8],
     command_name: &str,
@@ -2281,19 +2802,18 @@ fn git_check_attr_lfs_paths_for_tree_blobs(
     worktree_root: &Path,
     blobs: &[GitTreeBlob],
     commit: &str,
-) -> MigrationResult<BTreeSet<PathBuf>> {
+) -> MigrationResult<(BTreeSet<PathBuf>, usize)> {
     let mut lfs_paths = BTreeSet::new();
     let mut path_input = Vec::new();
+    let mut process_count = 0;
 
     for blob in blobs {
         let path_entry_len = blob.relative_path_bytes.len() + 1;
         if path_entry_len > MAX_HISTORY_CHECK_ATTR_INPUT_BYTES {
             return Err(MigrationError::ExternalCommandOutput {
-                command: format!(
-                    "git ls-tree -r -z --format=%(objecttype)%x00%(objectname)%x00%(path) {commit}"
-                ),
+                command: git_check_attr_filter_command_name(Some(commit)),
                 message: SanitizedMessage::new(
-                    "git returned an oversized path for attribute lookup",
+                    "historical pointer path is too large for attribute lookup",
                 ),
             });
         }
@@ -2302,6 +2822,7 @@ fn git_check_attr_lfs_paths_for_tree_blobs(
             && path_input.len() + path_entry_len > MAX_HISTORY_CHECK_ATTR_INPUT_BYTES
         {
             append_git_check_attr_lfs_paths(worktree_root, commit, path_input, &mut lfs_paths)?;
+            process_count += 1;
             path_input = Vec::new();
         }
 
@@ -2311,9 +2832,10 @@ fn git_check_attr_lfs_paths_for_tree_blobs(
 
     if !path_input.is_empty() {
         append_git_check_attr_lfs_paths(worktree_root, commit, path_input, &mut lfs_paths)?;
+        process_count += 1;
     }
 
-    Ok(lfs_paths)
+    Ok((lfs_paths, process_count))
 }
 
 fn append_git_check_attr_lfs_paths(
@@ -2330,20 +2852,6 @@ fn append_git_check_attr_lfs_paths(
     )?);
 
     Ok(())
-}
-
-fn read_history_pointer_blob_candidate_cached(
-    worktree_root: &Path,
-    object_id: &str,
-    blob_pointer_cache: &mut BTreeMap<String, Option<LfsPointer>>,
-) -> MigrationResult<Option<LfsPointer>> {
-    if let Some(pointer) = blob_pointer_cache.get(object_id) {
-        return Ok(pointer.clone());
-    }
-
-    let pointer = read_history_pointer_blob_candidate(worktree_root, object_id)?;
-    blob_pointer_cache.insert(object_id.to_owned(), pointer.clone());
-    Ok(pointer)
 }
 
 fn read_history_pointer_blob_candidate(
@@ -2756,8 +3264,9 @@ mod tests {
         discover_git_lfs_migration, discover_git_lfs_migration_from_remote, display_git_command,
         enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
         enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
-        fetch_missing_migration_objects, fetch_missing_migration_objects_with_runner,
-        git_lfs_object_path, hash_migration_object_file, migration_source_fetch_command,
+        enumerate_selected_ref_lfs_pointers_with_metrics, fetch_missing_migration_objects,
+        fetch_missing_migration_objects_with_runner, git_lfs_object_path,
+        hash_migration_object_file, migration_source_fetch_command,
         parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
         parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
         upload_migration_objects_to_storage, validate_history_ref_name,
@@ -3496,6 +4005,75 @@ mod tests {
                 .iter()
                 .all(|pointer| pointer.ref_name == "main")
         );
+    }
+
+    #[test]
+    fn selected_ref_pointer_scan_reuses_unchanged_history_work() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('4', 444);
+
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(object.clone()).to_pointer_file(),
+        );
+        for index in 0..128 {
+            repo.write_file(
+                format!("stable/file-{index:03}.txt"),
+                &format!("stable fixture {index}\n"),
+            );
+        }
+        repo.write_file("changing/revision.txt", "revision 0\n");
+        repo.commit_all("add representative history fixture");
+
+        for revision in 1..=16 {
+            repo.write_file("changing/revision.txt", &format!("revision {revision}\n"));
+            repo.commit_all(&format!("update revision {revision}"));
+        }
+
+        let (scan, metrics) =
+            enumerate_selected_ref_lfs_pointers_with_metrics(repo.path(), ["main"])
+                .expect("representative selected-ref scan should succeed");
+
+        assert_eq!(scan.pointers.len(), 17);
+        assert!(scan.pointers.iter().all(|pointer| pointer.object == object));
+        assert_eq!(metrics.cat_file_processes, 1);
+        assert_eq!(metrics.attribute_processes, 1);
+        assert!(
+            metrics.tree_entries_inspected < 256,
+            "unchanged subtrees should be decoded once, got {metrics:?}"
+        );
+        assert!(
+            metrics.blobs_inspected < 160,
+            "unchanged blobs should be inspected once, got {metrics:?}"
+        );
+    }
+
+    #[test]
+    fn selected_ref_pointer_scan_rechecks_changed_historical_attributes() {
+        let repo = TempRepo::new();
+        let object = test_lfs_object('5', 555);
+
+        repo.write_file(".gitattributes", "asset/*.bin -filter\n");
+        repo.write_file(
+            "asset/model.bin",
+            &LfsPointer::new(object.clone()).to_pointer_file(),
+        );
+        repo.commit_all("add pointer-shaped non-lfs blob");
+        repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
+        repo.commit_all("track asset with lfs");
+        let lfs_commit = repo.git_stdout(["rev-parse", "HEAD"]);
+        repo.write_file(".gitattributes", "asset/*.bin -filter\n");
+        repo.commit_all("stop tracking asset with lfs");
+
+        let (scan, metrics) =
+            enumerate_selected_ref_lfs_pointers_with_metrics(repo.path(), ["main"])
+                .expect("historical attribute changes should be evaluated independently");
+
+        assert_eq!(scan.pointers.len(), 1);
+        assert_eq!(scan.pointers[0].commit, lfs_commit);
+        assert_eq!(scan.pointers[0].object, object);
+        assert_eq!(metrics.attribute_processes, 2);
     }
 
     #[test]
