@@ -1247,12 +1247,35 @@ independently validated or adjudicated.
    attributable separately, this was high-quality, security- and
    integrity-relevant feedback.
 
-3. **Medium — Hydration and dehydration can overwrite a concurrent edit after
-   their final check.** Each checks a path and then performs an unconditional
-   replacing rename (`src/local_cache.rs:1457-1466`,
-   `src/local_cache.rs:1723-1742`). Add per-path coordination and use conditional
-   or exchange rename semantics where supported, retaining displaced data until
-   its identity is verified. Add synchronized race tests.
+3. **[DONE] Hydration and dehydration can overwrite a concurrent edit after
+   their final check** (Medium, `src/local_cache.rs`, local cache documentation,
+   and `Cargo.toml`): **Valid and actionable.** Both destructive paths performed
+   a final pointer or object identity check and then used an unconditional
+   replacing rename, so an edit landing in that last TOCTOU window could be
+   discarded. Hydration and dehydration now acquire a deterministic
+   worktree-path lock in addition to the cache-operation lock, serializing
+   same-path cache operations across processes. On macOS and Linux, publication
+   uses Rustix exchange rename: the proposed file and current worktree path are
+   swapped atomically, the displaced bytes remain at the private temporary path
+   for identity verification, and a mismatch swaps them back before returning
+   an error. If rollback itself fails, temporary-file cleanup is disabled and a
+   dedicated error reports the recovery path, so displaced user content is not
+   silently deleted. Platforms without exchange-rename support retain the
+   path lock, final identity check, and atomic replacement. Test-first,
+   barrier-synchronized regressions inject edits after the final pointer and
+   hydrated-object checks and prove the edits are restored; another regression
+   proves a second same-path hydration waits for active publication. README and
+   implementation guidance document the platform behavior, and the repository
+   learning records the displaced-file recovery boundary. Verification passed
+   with `yarn lint:fix`, `cargo fmt --all`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets` (598 passed, 3 ignored across targets),
+   `cargo test --doc` (38 passed), and `git diff --check`. The focused reviewer
+   identified a genuine medium-severity local data-loss race, pinpointed both
+   unconditional replacement windows, and recommended the exact coordination,
+   displaced-data retention, and synchronized coverage needed. With one valid
+   finding assessed here and no invalid finding attributable separately, this
+   was high-quality, integrity-relevant feedback.
 
 4. **Medium — Temporarily unavailable worktrees are immediately pruned and
    their cache objects deleted.** `NotFound` is treated as permanent removal, so

@@ -786,6 +786,14 @@ lfs-cloud gc
   remove local cached objects not referenced by any registered repo/worktree
 ```
 
+Hydration and dehydration serialize operations for the same worktree path.
+On macOS and Linux, destructive publication atomically exchanges the proposed
+file with the current path, verifies the displaced bytes, and exchanges them
+back if an edit landed after the final precondition check. A failed rollback
+retains the displaced bytes at a reported recovery path rather than deleting
+them. Platforms without exchange-rename support retain the path lock and final
+identity check before atomic replacement.
+
 There are two likely implementation strategies:
 
 ```text
@@ -948,6 +956,7 @@ areas:
 | SQLite metadata             | `rusqlite`                      | Local MVP object/session metadata             |
 | OAuth and provider HTTP     | `oauth2`, `reqwest`             | OAuth request construction and HTTP calls     |
 | Session encryption          | `ring`                          | Protect durable upstream-token state at rest  |
+| Atomic worktree replacement | `rustix`                        | Exchange files without discarding raced edits |
 | Temporary files             | `tempfile`                      | Upload staging before hash/size verification  |
 | Manifest architecture tests | `toml`                          | Parse `Cargo.toml` in project-shape tests     |
 

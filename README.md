@@ -250,8 +250,11 @@ lfs-cloud hydrate path/to/file.bin
 
 This replaces matching Git LFS pointer files with verified object bytes from
 the shared local cache. It refuses non-pointer worktree content and fails if the
-referenced object is missing or corrupt in the cache. Use `--cache-root` to
-target a non-default local cache root.
+referenced object is missing or corrupt in the cache. Same-path cache
+operations are serialized. On macOS and Linux, publication atomically retains
+and verifies the displaced pointer, restoring it if a concurrent edit landed
+after the final check. Use `--cache-root` to target a non-default local cache
+root.
 
 ### Dehydrate Files To Pointers
 
@@ -266,8 +269,11 @@ local cache and the repository's Git LFS media store, and then replaces the
 worktree file with the canonical pointer. Dirty, untracked, non-LFS, and outside
 paths are rejected. Existing matching pointer files are treated as already
 dehydrated. A cache-wide operation lock prevents concurrent garbage collection
-from deleting newly preserved bytes before the pointer becomes visible. Use
-`--cache-root` to target a non-default local cache root.
+from deleting newly preserved bytes before the pointer becomes visible.
+Same-path cache operations are serialized. On macOS and Linux, pointer
+publication atomically retains and verifies the displaced file, restoring it
+if a concurrent edit landed after the final check. Use `--cache-root` to target
+a non-default local cache root.
 
 ### Garbage-Collect The Local Cache
 

@@ -31,6 +31,7 @@ const OBJECT_SHARD_WIDTH: usize = 2;
 const OBJECT_SHARD_LEVELS: usize = 2;
 const OBJECT_SHARD_PREFIX_LENGTH: usize = OBJECT_SHARD_WIDTH * OBJECT_SHARD_LEVELS;
 const CACHE_OPERATION_LOCK_FILE: &str = "objects.lock";
+const WORKTREE_PATH_LOCKS_DIR: &str = "worktree-path-locks";
 const WORKTREE_REGISTRY_LOCK_FILE: &str = "worktrees.json.lock";
 const WORKTREE_REGISTRY_VERSION: u32 = 1;
 const MAX_LFS_POINTER_FILE_SIZE: u64 = 64 * 1024;
@@ -198,6 +199,22 @@ pub enum LocalCacheError {
         actual_oid: LfsOid,
         /// Actual pointer object size.
         actual_size: LfsObjectSize,
+    },
+
+    /// A failed rollback left displaced worktree content at a recovery path.
+    #[error(
+        "failed to restore worktree content at {}; displaced bytes remain at {}: {source}",
+        path.display(),
+        recovery_path.display()
+    )]
+    WorktreeReplacementRollback {
+        /// Worktree path whose replacement could not be rolled back.
+        path: PathBuf,
+        /// Temporary path retaining the displaced worktree bytes.
+        recovery_path: PathBuf,
+        /// Underlying atomic-exchange failure.
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -611,9 +628,15 @@ impl LocalCacheLayout {
     ) -> LocalCacheResult<LocalCacheMaterialization> {
         let _operation_lock = self.lock_cache_operation_shared()?;
         let destination_path = destination_path.as_ref();
+        let _path_lock = self.lock_worktree_path(destination_path)?;
         let verified = self.verify_object(object)?;
 
-        materialize_verified_object(&verified, destination_path, MaterializationMode::NoReplace)
+        materialize_verified_object(
+            &verified,
+            destination_path,
+            MaterializationMode::NoReplace,
+            || {},
+        )
     }
 
     /// Replaces a Git LFS pointer file with verified cache object bytes.
@@ -632,8 +655,20 @@ impl LocalCacheLayout {
         &self,
         pointer_path: impl AsRef<Path>,
     ) -> LocalCacheResult<LocalCacheMaterialization> {
+        self.hydrate_pointer_file_with_before_publish(pointer_path, || {})
+    }
+
+    fn hydrate_pointer_file_with_before_publish<F>(
+        &self,
+        pointer_path: impl AsRef<Path>,
+        before_publish: F,
+    ) -> LocalCacheResult<LocalCacheMaterialization>
+    where
+        F: FnOnce(),
+    {
         let _operation_lock = self.lock_cache_operation_shared()?;
         let pointer_path = pointer_path.as_ref();
+        let _path_lock = self.lock_worktree_path(pointer_path)?;
         let pointer = read_lfs_pointer_file(pointer_path)?;
         let verified = self.verify_object(&pointer.object)?;
 
@@ -641,6 +676,7 @@ impl LocalCacheLayout {
             &verified,
             pointer_path,
             MaterializationMode::ReplaceMatchingPointer,
+            before_publish,
         )
     }
 
@@ -679,6 +715,7 @@ impl LocalCacheLayout {
         // publication but before the worktree reference becomes visible.
         let _operation_lock = self.lock_cache_operation_shared()?;
         let worktree_path = worktree_path.as_ref();
+        let _path_lock = self.lock_worktree_path(worktree_path)?;
         let cache_path = self.object_path(object);
 
         let existing_pointer = read_existing_lfs_pointer_file(worktree_path)?;
@@ -717,8 +754,7 @@ impl LocalCacheLayout {
             LocalCacheDehydrationStatus::CachedAndReplacedWithPointer
         };
 
-        before_pointer_publish();
-        publish_pointer_file(worktree_path, object)?;
+        publish_pointer_file(worktree_path, object, before_pointer_publish)?;
 
         Ok(LocalCacheDehydration {
             object: object.clone(),
@@ -945,6 +981,51 @@ impl LocalCacheLayout {
 
     fn cache_operation_lock_path(&self) -> PathBuf {
         self.root.join(CACHE_OPERATION_LOCK_FILE)
+    }
+
+    fn worktree_path_lock_path(&self, worktree_path: &Path) -> PathBuf {
+        let normalized = normalized_path_key(worktree_path);
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(normalized.as_os_str().to_string_lossy().as_bytes())
+        );
+
+        // Fixed stripes bound persistent coordination state. A collision only
+        // serializes unrelated paths; every operation for one path still uses
+        // the same cross-process lock.
+        self.root
+            .join(WORKTREE_PATH_LOCKS_DIR)
+            .join(format!("{}.lock", &digest[..2]))
+    }
+
+    fn lock_worktree_path(&self, worktree_path: &Path) -> LocalCacheResult<File> {
+        let path = self.worktree_path_lock_path(worktree_path);
+        let parent = path
+            .parent()
+            .expect("worktree lock path should have a parent");
+        fs::create_dir_all(parent).map_err(|source| LocalCacheError::Io {
+            context: "failed to create local cache worktree lock directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| LocalCacheError::Io {
+                context: "failed to open local cache worktree path lock",
+                path: path.clone(),
+                source,
+            })?;
+        FileExt::lock(&lock).map_err(|source| LocalCacheError::Io {
+            context: "failed to lock local cache worktree path",
+            path,
+            source,
+        })?;
+
+        Ok(lock)
     }
 
     fn open_cache_operation_lock(&self) -> LocalCacheResult<(File, PathBuf)> {
@@ -1497,7 +1578,14 @@ fn read_existing_lfs_pointer_file(path: &Path) -> LocalCacheResult<Option<LfsPoi
     Ok(LfsPointer::parse(contents).ok())
 }
 
-fn publish_pointer_file(path: &Path, object: &LfsObject) -> LocalCacheResult<()> {
+fn publish_pointer_file<F>(
+    path: &Path,
+    object: &LfsObject,
+    before_publish: F,
+) -> LocalCacheResult<()>
+where
+    F: FnOnce(),
+{
     let parent = path.parent().ok_or_else(|| LocalCacheError::Io {
         context: "failed to resolve dehydration target parent",
         path: path.to_path_buf(),
@@ -1528,15 +1616,10 @@ fn publish_pointer_file(path: &Path, object: &LfsObject) -> LocalCacheResult<()>
     })?;
     set_temporary_file_mode(temp.path(), path, mode)?;
 
-    // This best-effort local race check sits immediately before the atomic
-    // replacement, so a local edit that lands during cache publication is not
-    // dehydrated. Uncoordinated writers can still change the path after this
-    // point.
     verify_file_object(path, object)?;
-    temp.persist(path).map_err(|error| LocalCacheError::Io {
-        context: "failed to publish Git LFS pointer",
-        path: path.to_path_buf(),
-        source: error.error,
+    before_publish();
+    replace_retaining_displaced(temp, path, |displaced_path| {
+        remap_integrity_path(verify_file_object(displaced_path, object), path).map(|_| ())
     })?;
 
     let pointer = read_lfs_pointer_file(path)?;
@@ -1556,6 +1639,7 @@ fn materialize_verified_object(
     verified: &VerifiedLocalCacheObject,
     destination_path: &Path,
     mode: MaterializationMode,
+    before_publish: impl FnOnce(),
 ) -> LocalCacheResult<LocalCacheMaterialization> {
     match existing_destination_status(destination_path, &verified.object)? {
         ExistingDestinationStatus::Missing => {}
@@ -1607,7 +1691,13 @@ fn materialize_verified_object(
     let (temp, status) =
         materialize_to_temporary_file(&verified.path, destination_parent, &verified.object)?;
 
-    publish_materialized_file(temp, destination_path, mode, &verified.object)?;
+    publish_materialized_file(
+        temp,
+        destination_path,
+        mode,
+        &verified.object,
+        before_publish,
+    )?;
     // The final verification proves the path currently contains the expected
     // object. If an uncoordinated writer races this local worktree path, the
     // caller may still receive an integrity error after publication.
@@ -1764,9 +1854,11 @@ fn publish_materialized_file(
     destination_path: &Path,
     mode: MaterializationMode,
     object: &LfsObject,
+    before_publish: impl FnOnce(),
 ) -> LocalCacheResult<()> {
     match mode {
         MaterializationMode::NoReplace => {
+            before_publish();
             set_temporary_file_mode(
                 temp.path(),
                 destination_path,
@@ -1795,9 +1887,6 @@ fn publish_materialized_file(
             }
         }
         MaterializationMode::ReplaceMatchingPointer => {
-            // This second read is a best-effort local race check before the
-            // atomic replacement. Uncoordinated worktree writers can still
-            // change the destination after this point.
             let pointer = read_lfs_pointer_file(destination_path)?;
             if pointer.object != *object {
                 return Err(LocalCacheError::MaterializationTargetExists {
@@ -1808,15 +1897,108 @@ fn publish_materialized_file(
             }
             let replacement_mode = existing_file_mode(destination_path)?;
             set_temporary_file_mode(temp.path(), destination_path, replacement_mode)?;
-            temp.persist(destination_path)
-                .map_err(|error| LocalCacheError::Io {
-                    context: "failed to publish materialized object",
-                    path: destination_path.to_path_buf(),
-                    source: error.error,
+            before_publish();
+            replace_retaining_displaced(temp, destination_path, |displaced_path| {
+                let pointer = read_lfs_pointer_file(displaced_path).map_err(|_| {
+                    LocalCacheError::MaterializationTargetExists {
+                        oid: object.oid.clone(),
+                        size: object.size,
+                        path: destination_path.to_path_buf(),
+                    }
                 })?;
-            Ok(())
+                if pointer.object != *object {
+                    return Err(LocalCacheError::MaterializationTargetExists {
+                        oid: object.oid.clone(),
+                        size: object.size,
+                        path: destination_path.to_path_buf(),
+                    });
+                }
+
+                Ok(())
+            })
         }
     }
+}
+
+fn remap_integrity_path<T>(result: LocalCacheResult<T>, public_path: &Path) -> LocalCacheResult<T> {
+    result.map_err(|error| match error {
+        LocalCacheError::IntegrityMismatch {
+            expected_oid,
+            expected_size,
+            actual_oid,
+            actual_size,
+            ..
+        } => LocalCacheError::IntegrityMismatch {
+            path: public_path.to_path_buf(),
+            expected_oid,
+            expected_size,
+            actual_oid,
+            actual_size,
+        },
+        error => error,
+    })
+}
+
+fn replace_retaining_displaced<F>(
+    mut temp: tempfile::NamedTempFile,
+    destination_path: &Path,
+    verify_displaced: F,
+) -> LocalCacheResult<()>
+where
+    F: FnOnce(&Path) -> LocalCacheResult<()>,
+{
+    #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
+    {
+        exchange_paths(temp.path(), destination_path).map_err(|source| LocalCacheError::Io {
+            context: "failed to atomically exchange worktree content",
+            path: destination_path.to_path_buf(),
+            source,
+        })?;
+
+        match verify_displaced(temp.path()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Err(source) = exchange_paths(temp.path(), destination_path) {
+                    let recovery_path = temp.path().to_path_buf();
+                    temp.disable_cleanup(true);
+                    return Err(LocalCacheError::WorktreeReplacementRollback {
+                        path: destination_path.to_path_buf(),
+                        recovery_path,
+                        source,
+                    });
+                }
+
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "linux", target_vendor = "apple")))]
+    {
+        // Platforms without exchange rename retain the final identity check and
+        // path lock. The replacement remains atomic, but cannot preserve a
+        // displaced file for post-rename verification.
+        verify_displaced(destination_path)?;
+        temp.persist(destination_path)
+            .map(|_| ())
+            .map_err(|error| LocalCacheError::Io {
+                context: "failed to publish worktree content",
+                path: destination_path.to_path_buf(),
+                source: error.error,
+            })
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
+fn exchange_paths(left: &Path, right: &Path) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        left,
+        rustix::fs::CWD,
+        right,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(io::Error::from)
 }
 
 #[cfg(unix)]
@@ -2636,6 +2818,120 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn hydrate_pointer_file_preserves_edit_after_final_pointer_check() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"hydrated bytes from shared cache";
+        let edited_bytes = b"concurrent worktree edit";
+        let object = object_for_bytes(bytes);
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(
+            &destination,
+            LfsPointer::new(object).to_pointer_file().as_bytes(),
+        );
+
+        let pointer_checked = Arc::new(Barrier::new(2));
+        let allow_publish = Arc::new(Barrier::new(2));
+        let hydration_layout = layout.clone();
+        let hydration_destination = destination.clone();
+        let hydration_pointer_checked = Arc::clone(&pointer_checked);
+        let hydration_allow_publish = Arc::clone(&allow_publish);
+        let hydration = thread::spawn(move || {
+            hydration_layout.hydrate_pointer_file_with_before_publish(
+                &hydration_destination,
+                || {
+                    hydration_pointer_checked.wait();
+                    hydration_allow_publish.wait();
+                },
+            )
+        });
+
+        pointer_checked.wait();
+        write_file(&destination, edited_bytes);
+        allow_publish.wait();
+
+        let error = hydration
+            .join()
+            .expect("hydration thread should not panic")
+            .expect_err("a concurrent edit should abort hydration");
+        assert!(matches!(
+            error,
+            LocalCacheError::MaterializationTargetExists { path, .. } if path == destination
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("concurrent edit should remain readable"),
+            edited_bytes
+        );
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn hydrate_pointer_file_serializes_same_path_operations() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"hydrated bytes from shared cache";
+        let object = object_for_bytes(bytes);
+        let destination = temp.path().join("repo/assets/model.bin");
+        write_file(&layout.object_path(&object), bytes);
+        write_file(
+            &destination,
+            LfsPointer::new(object).to_pointer_file().as_bytes(),
+        );
+
+        let pointer_checked = Arc::new(Barrier::new(2));
+        let allow_publish = Arc::new(Barrier::new(2));
+        let first_layout = layout.clone();
+        let first_destination = destination.clone();
+        let first_pointer_checked = Arc::clone(&pointer_checked);
+        let first_allow_publish = Arc::clone(&allow_publish);
+        let first = thread::spawn(move || {
+            first_layout.hydrate_pointer_file_with_before_publish(&first_destination, || {
+                first_pointer_checked.wait();
+                first_allow_publish.wait();
+            })
+        });
+
+        pointer_checked.wait();
+        let second_layout = layout.clone();
+        let second_destination = destination.clone();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second = thread::spawn(move || {
+            second_done_tx
+                .send(second_layout.hydrate_pointer_file(&second_destination))
+                .expect("test should receive second hydration result");
+        });
+
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(250))
+                .is_err(),
+            "a same-path hydration should wait for the active publication"
+        );
+        allow_publish.wait();
+
+        first
+            .join()
+            .expect("first hydration thread should not panic")
+            .expect("first hydration should succeed");
+        let second_error = second_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second hydration should finish after publication")
+            .expect_err("the completed hydration should no longer be a pointer");
+        second.join().expect("second hydration should not panic");
+
+        assert!(matches!(
+            second_error,
+            LocalCacheError::PointerParse { path, .. } if path == destination
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("hydrated destination should be readable"),
+            bytes
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn hydrate_pointer_file_preserves_existing_worktree_file_mode() {
@@ -2760,6 +3056,54 @@ mod tests {
         );
         assert_eq!(
             fs::read(layout.object_path(&object)).expect("cache object should be readable"),
+            bytes
+        );
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn dehydrate_file_preserves_edit_after_final_object_check() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let bytes = b"worktree bytes to dehydrate";
+        let edited_bytes = b"concurrent worktree edit";
+        let object = object_for_bytes(bytes);
+        let worktree_path = temp.path().join("repo/assets/model.bin");
+        write_file(&worktree_path, bytes);
+
+        let object_checked = Arc::new(Barrier::new(2));
+        let allow_publish = Arc::new(Barrier::new(2));
+        let dehydration_layout = layout.clone();
+        let dehydration_object = object.clone();
+        let dehydration_path = worktree_path.clone();
+        let dehydration_object_checked = Arc::clone(&object_checked);
+        let dehydration_allow_publish = Arc::clone(&allow_publish);
+        let dehydration = thread::spawn(move || {
+            dehydration_layout.dehydrate_file_with_before_pointer_publish(
+                &dehydration_object,
+                &dehydration_path,
+                || {
+                    dehydration_object_checked.wait();
+                    dehydration_allow_publish.wait();
+                },
+            )
+        });
+
+        object_checked.wait();
+        write_file(&worktree_path, edited_bytes);
+        allow_publish.wait();
+
+        let error = dehydration
+            .join()
+            .expect("dehydration thread should not panic")
+            .expect_err("a concurrent edit should abort dehydration");
+        assert!(matches!(error, LocalCacheError::IntegrityMismatch { .. }));
+        assert_eq!(
+            fs::read(&worktree_path).expect("concurrent edit should remain readable"),
+            edited_bytes
+        );
+        assert_eq!(
+            fs::read(layout.object_path(&object)).expect("verified cache object should remain"),
             bytes
         );
     }
