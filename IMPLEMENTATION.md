@@ -155,6 +155,7 @@ server:
   public_url: https://lfs.example.com
   max_batch_objects: 100
   max_provider_calls: 16
+  max_concurrent_requests: 64
 
 repository_providers:
   github-main:
@@ -238,6 +239,11 @@ Permission decisions may be cached only briefly and scoped to the exact local
 session, repository, and read/write operation. Google access-token refreshes
 are single-flight and reuse the token only until shortly before its reported
 expiry.
+
+The server also admits at most the configured number of active HTTP requests
+across all routes, rejecting overload instead of queueing it. Authenticated
+batch bodies have separate 15-second idle and 60-second total read deadlines,
+so continuing to drip bytes cannot evade the overall bound.
 
 Each mapping also persists the repository provider's stable repository ID.
 Authorization resolves the current repository at the configured owner/name and
@@ -1187,6 +1193,8 @@ Defer:
 > error payloads with matching HTTP statuses. Upload staging now rejects object
 > sizes over the configured server cap, checks local temp-directory capacity
 > before writing, and times out idle client body reads.
+> Authenticated batch bodies now have idle and total read deadlines, while a
+> process-wide request admission limit rejects overload without queueing.
 > The binary now uses a testable `clap` root command with shared `--config`
 > and `--log-level` flags, initializes tracing from CLI or `RUST_LOG`, and
 > dispatches `serve` through the server runtime. CLI support code can now

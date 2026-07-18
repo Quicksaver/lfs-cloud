@@ -27,6 +27,7 @@ const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const DEFAULT_BIND_PORT: u16 = 8080;
 const DEFAULT_MAX_BATCH_OBJECTS: usize = 100;
 const DEFAULT_MAX_PROVIDER_CALLS: usize = 16;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
 
 /// Loaded and validated server configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,6 +273,11 @@ pub struct ServerSettings {
     /// The limit is shared across all repositories handled by this server
     /// process so one client cannot monopolize upstream provider capacity.
     pub max_provider_calls: usize,
+    /// Maximum number of requests actively handled by this server process.
+    ///
+    /// Admission is process-wide and rejects excess requests immediately,
+    /// preventing slow request bodies from creating an unbounded waiter queue.
+    pub max_concurrent_requests: usize,
     /// Local SQLite database file path for server-owned metadata.
     ///
     /// Relative configuration values are resolved against the server config
@@ -306,6 +312,12 @@ impl ServerSettings {
         if raw.max_provider_calls == 0 {
             return invalid_config("server.max_provider_calls", "must be greater than zero");
         }
+        if raw.max_concurrent_requests == 0 {
+            return invalid_config(
+                "server.max_concurrent_requests",
+                "must be greater than zero",
+            );
+        }
 
         Ok(Self {
             host,
@@ -314,6 +326,7 @@ impl ServerSettings {
             allow_insecure_http: raw.allow_insecure_http,
             max_batch_objects: raw.max_batch_objects,
             max_provider_calls: raw.max_provider_calls,
+            max_concurrent_requests: raw.max_concurrent_requests,
             metadata_path,
         })
     }
@@ -607,6 +620,8 @@ struct RawServerSettings {
     max_batch_objects: usize,
     #[serde(default = "default_max_provider_calls")]
     max_provider_calls: usize,
+    #[serde(default = "default_max_concurrent_requests")]
+    max_concurrent_requests: usize,
     #[serde(default)]
     metadata_path: Option<String>,
 }
@@ -620,6 +635,7 @@ impl Default for RawServerSettings {
             allow_insecure_http: false,
             max_batch_objects: default_max_batch_objects(),
             max_provider_calls: default_max_provider_calls(),
+            max_concurrent_requests: default_max_concurrent_requests(),
             metadata_path: None,
         }
     }
@@ -696,6 +712,10 @@ const fn default_max_batch_objects() -> usize {
 
 const fn default_max_provider_calls() -> usize {
     DEFAULT_MAX_PROVIDER_CALLS
+}
+
+const fn default_max_concurrent_requests() -> usize {
+    DEFAULT_MAX_CONCURRENT_REQUESTS
 }
 
 fn resolve_required(
@@ -1016,6 +1036,7 @@ repositories:
         assert!(!config.server.allow_insecure_http);
         assert_eq!(config.server.max_batch_objects, 100);
         assert_eq!(config.server.max_provider_calls, 16);
+        assert_eq!(config.server.max_concurrent_requests, 64);
         assert_eq!(
             config.server.metadata_path,
             PathBuf::from(DEFAULT_METADATA_DIR).join(DEFAULT_METADATA_DB_FILE)
@@ -1053,11 +1074,12 @@ repositories:
     fn parses_server_provider_work_limits() {
         let config = load_with_test_env(&valid_yaml().replace(
             "  public_url: http://127.0.0.1:8081",
-            "  public_url: http://127.0.0.1:8081\n  max_batch_objects: 25\n  max_provider_calls: 4",
+            "  public_url: http://127.0.0.1:8081\n  max_batch_objects: 25\n  max_provider_calls: 4\n  max_concurrent_requests: 8",
         ));
 
         assert_eq!(config.server.max_batch_objects, 25);
         assert_eq!(config.server.max_provider_calls, 4);
+        assert_eq!(config.server.max_concurrent_requests, 8);
     }
 
     #[test]
@@ -1070,6 +1092,10 @@ repositories:
             (
                 "max_provider_calls",
                 "server.max_provider_calls must be greater than zero",
+            ),
+            (
+                "max_concurrent_requests",
+                "server.max_concurrent_requests must be greater than zero",
             ),
         ] {
             let contents = valid_yaml().replace(

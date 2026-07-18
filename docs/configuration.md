@@ -21,6 +21,7 @@ server:
   public_url: http://127.0.0.1:8080
   max_batch_objects: 100
   max_provider_calls: 16
+  max_concurrent_requests: 64
   metadata_path: ./.lfs-cloud/metadata.sqlite3
 
 repository_providers:
@@ -84,7 +85,7 @@ LFS credentials, and object bytes to the network, so it requires the explicit
 termination. Client commands using this LAN URL also require
 `--allow-insecure-http`.
 
-## Provider Work Limits
+## Provider And Request Work Limits
 
 `server.max_batch_objects` bounds the number of object entries accepted in one
 Git LFS batch request. The default is `100`. Duplicate entries still count
@@ -98,6 +99,13 @@ session, repository, and operation for 15 seconds, which lets a batch action
 complete without an immediate duplicate GitHub check. Google Drive access
 tokens are cached until shortly before their reported expiry, with concurrent
 refreshes collapsed into one token request.
+
+`server.max_concurrent_requests` bounds active HTTP request handling across all
+server routes. The default is `64`. Excess requests receive HTTP 503 with a
+one-second `Retry-After` value instead of joining an unbounded queue. An
+authenticated Git LFS batch body also has a 15-second idle timeout and a
+60-second total read deadline, so a slow-dripping client cannot retain a
+request slot indefinitely.
 
 ## Google Drive Credentials
 
@@ -173,8 +181,8 @@ config file.
   credentials, query strings, or fragments. They must use HTTPS unless the
   host is an exact IPv4/IPv6 loopback address. Non-loopback HTTP requires the
   explicit development-only `server.allow_insecure_http: true` setting.
-- `server.max_batch_objects` and `server.max_provider_calls` must be greater
-  than zero when configured.
+- `server.max_batch_objects`, `server.max_provider_calls`, and
+  `server.max_concurrent_requests` must be greater than zero when configured.
 - Google credential JSON `token_uri` values, and custom Google Drive API base
   URLs used by embedded runtimes or tests, follow the same URL rules and must
   use HTTPS except for loopback HTTP endpoints.

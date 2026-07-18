@@ -19,11 +19,14 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{FromRequest, OriginalUri, Request, State},
+    extract::{OriginalUri, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
+        header::{
+            ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE,
+        },
     },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::delete,
 };
@@ -57,6 +60,9 @@ const GIT_LFS_JSON_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 const MAX_UPLOAD_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MIN_UPLOAD_STAGING_FREE_BYTES: u64 = 64 * 1024 * 1024;
 const UPLOAD_STAGING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BATCH_BODY_BYTES: usize = 2 * 1024 * 1024;
+const BATCH_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const BATCH_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const BATCH_STORAGE_LOOKUP_CONCURRENCY: usize = 16;
 const AUTHORIZATION_CACHE_TTL: Duration = Duration::from_secs(15);
 const GOOGLE_ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
@@ -182,13 +188,26 @@ pub fn server_router_with_sessions(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
 ) -> ServerResult<Router> {
-    let lfs_router = lfs_server_router_with_sessions(config.clone(), session_store.clone());
+    let max_concurrent_requests = config.server.max_concurrent_requests;
+    let lfs_router = build_lfs_server_router(
+        config.clone(),
+        session_store.clone(),
+        Arc::new(GitHubBatchAuthorizer::new(&config)),
+        Arc::new(PendingLfsObjectTransferStore),
+        BatchBodyGuardrails::default(),
+    );
     let session_router = lfs_session_revoke_router(session_store.clone());
     let Some(auth_router) = github_oauth_router(config, session_store)? else {
-        return Ok(session_router.merge(lfs_router));
+        return Ok(with_http_request_limit(
+            session_router.merge(lfs_router),
+            max_concurrent_requests,
+        ));
     };
 
-    Ok(auth_router.merge(session_router).merge(lfs_router))
+    Ok(with_http_request_limit(
+        auth_router.merge(session_router).merge(lfs_router),
+        max_concurrent_requests,
+    ))
 }
 
 fn server_router_with_sessions_and_transfer_store(
@@ -196,18 +215,26 @@ fn server_router_with_sessions_and_transfer_store(
     session_store: LocalLfsSessionStore,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
 ) -> ServerResult<Router> {
-    let lfs_router = lfs_server_router_with_sessions_authorizer_and_transfer_store(
+    let max_concurrent_requests = config.server.max_concurrent_requests;
+    let lfs_router = build_lfs_server_router(
         config.clone(),
         session_store.clone(),
         Arc::new(GitHubBatchAuthorizer::new(&config)),
         transfer_store,
+        BatchBodyGuardrails::default(),
     );
     let session_router = lfs_session_revoke_router(session_store.clone());
     let Some(auth_router) = github_oauth_router(config, session_store)? else {
-        return Ok(session_router.merge(lfs_router));
+        return Ok(with_http_request_limit(
+            session_router.merge(lfs_router),
+            max_concurrent_requests,
+        ));
     };
 
-    Ok(auth_router.merge(session_router).merge(lfs_router))
+    Ok(with_http_request_limit(
+        auth_router.merge(session_router).merge(lfs_router),
+        max_concurrent_requests,
+    ))
 }
 
 fn lfs_session_revoke_router(session_store: LocalLfsSessionStore) -> Router {
@@ -346,14 +373,85 @@ fn lfs_server_router_with_sessions_authorizer_and_transfer_store(
     authorizer: Arc<dyn LfsBatchAuthorizer>,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
 ) -> Router {
+    lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails(
+        config,
+        session_store,
+        authorizer,
+        transfer_store,
+        BatchBodyGuardrails::default(),
+    )
+}
+
+fn lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+    authorizer: Arc<dyn LfsBatchAuthorizer>,
+    transfer_store: Arc<dyn LfsObjectTransferStore>,
+    batch_body_guardrails: BatchBodyGuardrails,
+) -> Router {
+    let max_concurrent_requests = config.server.max_concurrent_requests;
+    with_http_request_limit(
+        build_lfs_server_router(
+            config,
+            session_store,
+            authorizer,
+            transfer_store,
+            batch_body_guardrails,
+        ),
+        max_concurrent_requests,
+    )
+}
+
+fn build_lfs_server_router(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+    authorizer: Arc<dyn LfsBatchAuthorizer>,
+    transfer_store: Arc<dyn LfsObjectTransferStore>,
+    batch_body_guardrails: BatchBodyGuardrails,
+) -> Router {
     let state = Arc::new(LfsServerState::new(
         config,
         session_store,
         authorizer,
         transfer_store,
+        batch_body_guardrails,
     ));
 
     Router::new().fallback(handle_lfs_request).with_state(state)
+}
+
+#[derive(Clone)]
+struct HttpRequestLimiter {
+    permits: Arc<Semaphore>,
+}
+
+fn with_http_request_limit(router: Router, max_concurrent_requests: usize) -> Router {
+    let limiter = HttpRequestLimiter {
+        permits: Arc::new(Semaphore::new(max_concurrent_requests)),
+    };
+    router.layer(middleware::from_fn_with_state(
+        limiter,
+        enforce_http_request_limit,
+    ))
+}
+
+async fn enforce_http_request_limit(
+    State(limiter): State<HttpRequestLimiter>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(_permit) = limiter.permits.clone().try_acquire_owned() else {
+        let mut response = git_lfs_json_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LFS Cloud server has reached its concurrent request limit",
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    };
+
+    next.run(request).await
 }
 
 fn github_oauth_router(
@@ -976,6 +1074,7 @@ struct LfsServerState {
     session_store: LocalLfsSessionStore,
     public_url: String,
     max_batch_objects: usize,
+    batch_body_guardrails: BatchBodyGuardrails,
     authorizer: Arc<dyn LfsBatchAuthorizer>,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
     provider_calls: Arc<Semaphore>,
@@ -997,6 +1096,7 @@ impl LfsServerState {
         session_store: LocalLfsSessionStore,
         authorizer: Arc<dyn LfsBatchAuthorizer>,
         transfer_store: Arc<dyn LfsObjectTransferStore>,
+        batch_body_guardrails: BatchBodyGuardrails,
     ) -> Self {
         let max_batch_objects = config.server.max_batch_objects;
         let max_provider_calls = config.server.max_provider_calls;
@@ -1005,6 +1105,7 @@ impl LfsServerState {
             session_store,
             public_url: config.server.public_url,
             max_batch_objects,
+            batch_body_guardrails,
             authorizer,
             transfer_store,
             provider_calls: Arc::new(Semaphore::new(max_provider_calls)),
@@ -1268,6 +1369,74 @@ async fn handle_authenticated_lfs_request(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BatchBodyGuardrails {
+    max_bytes: usize,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+}
+
+impl Default for BatchBodyGuardrails {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_BATCH_BODY_BYTES,
+            idle_timeout: BATCH_BODY_IDLE_TIMEOUT,
+            total_timeout: BATCH_BODY_TOTAL_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BatchBodyReadError {
+    PayloadTooLarge,
+    TimedOut,
+    Unreadable(axum::Error),
+}
+
+async fn read_batch_request_body(
+    request: Request,
+    guardrails: BatchBodyGuardrails,
+) -> Result<Bytes, BatchBodyReadError> {
+    if request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > guardrails.max_bytes as u64)
+    {
+        return Err(BatchBodyReadError::PayloadTooLarge);
+    }
+
+    let total_deadline = tokio::time::Instant::now() + guardrails.total_timeout;
+    let mut stream = request.into_body().into_data_stream();
+    let mut body = Vec::new();
+
+    loop {
+        let next = tokio::select! {
+            _ = tokio::time::sleep_until(total_deadline) => {
+                return Err(BatchBodyReadError::TimedOut);
+            }
+            next = tokio::time::timeout(guardrails.idle_timeout, stream.next()) => {
+                next.map_err(|_| BatchBodyReadError::TimedOut)?
+            }
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        let chunk = chunk.map_err(BatchBodyReadError::Unreadable)?;
+        let next_length = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(BatchBodyReadError::PayloadTooLarge)?;
+        if next_length > guardrails.max_bytes {
+            return Err(BatchBodyReadError::PayloadTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(Bytes::from(body))
+}
+
 async fn handle_lfs_batch_request(
     repository: RepositoryMapping,
     session: AuthenticatedLfsSession,
@@ -1286,7 +1455,7 @@ async fn handle_lfs_batch_request(
         return response;
     }
 
-    match Bytes::from_request(request, &()).await {
+    match read_batch_request_body(request, state.batch_body_guardrails).await {
         Ok(body) => match parse_lfs_batch_request_json(&body) {
             Ok(batch_request) => {
                 tracing::debug!(
@@ -1306,13 +1475,24 @@ async fn handle_lfs_batch_request(
                 )
             }
         },
-        Err(error) => {
+        Err(BatchBodyReadError::PayloadTooLarge) => git_lfs_json_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Git LFS request body exceeds the configured limit",
+        ),
+        Err(BatchBodyReadError::TimedOut) => git_lfs_json_error_response(
+            StatusCode::REQUEST_TIMEOUT,
+            "Git LFS batch request timed out while reading the request body",
+        ),
+        Err(BatchBodyReadError::Unreadable(error)) => {
             tracing::debug!(
                 repo_id = repository.id.as_str(),
                 %error,
                 "failed to read Git LFS batch request body"
             );
-            git_lfs_body_error_response(error.into_response())
+            git_lfs_json_error_response(
+                StatusCode::BAD_REQUEST,
+                "Git LFS request body could not be read",
+            )
         }
     }
 }
@@ -2086,17 +2266,6 @@ fn git_lfs_json_error_response(status: StatusCode, message: impl Into<String>) -
         .into_response()
 }
 
-fn git_lfs_body_error_response(rejection_response: Response) -> Response {
-    let status = rejection_response.status();
-    let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
-        "Git LFS request body exceeds the configured limit"
-    } else {
-        "Git LFS request body could not be read"
-    };
-
-    git_lfs_json_error_response(status, message)
-}
-
 fn git_lfs_authorization_error_response(error: ServerError) -> Response {
     let (status, message) = match error {
         ServerError::RepositoryProvider {
@@ -2682,15 +2851,17 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, GoogleDriveAccessTokenCache, LFS_AUTH_CHALLENGE, LFS_SESSION_REVOKE_PATH,
-        LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore, LfsRouteEndpoint,
-        LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind,
+        BASE64_STANDARD, BatchBodyGuardrails, GoogleDriveAccessTokenCache, LFS_AUTH_CHALLENGE,
+        LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore,
+        LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ServerBind,
         UploadStagingGuardrails, advertised_server_urls, authenticate_lfs_session,
         ensure_temp_space_for_upload_with_available_space, lfs_server_router_with_sessions,
-        lfs_server_router_with_sessions_authorizer_and_transfer_store, production_session_store,
-        render_server_startup_message, server_router_with_sessions, stage_upload_request_body,
-        stage_upload_request_body_with_guardrails, stage_upload_request_body_with_limit,
-        upload_staging_file_io_error, upload_staging_preflight_size,
+        lfs_server_router_with_sessions_authorizer_and_transfer_store,
+        lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails,
+        production_session_store, render_server_startup_message, server_router_with_sessions,
+        stage_upload_request_body, stage_upload_request_body_with_guardrails,
+        stage_upload_request_body_with_limit, upload_staging_file_io_error,
+        upload_staging_preflight_size,
     };
     use base64::Engine as _;
     use futures_util::stream;
@@ -4957,6 +5128,125 @@ repositories:
             response,
             StatusCode::PAYLOAD_TOO_LARGE,
             "Git LFS request body exceeds the configured limit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_batch_route_times_out_an_idle_body() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails(
+            test_config(),
+            store,
+            Arc::new(RecordingBatchAuthorizer::allow()),
+            Arc::new(RecordingTransferStore::default()),
+            BatchBodyGuardrails {
+                idle_timeout: Duration::from_millis(10),
+                total_timeout: Duration::from_secs(1),
+                ..BatchBodyGuardrails::default()
+            },
+        );
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/github.com/owner/repo.git/info/lfs/objects/batch")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from_stream(stream::pending::<
+                Result<Bytes, std::io::Error>,
+            >()))
+            .expect("test request should build");
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("router should respond after the idle deadline");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::REQUEST_TIMEOUT,
+            "Git LFS batch request timed out while reading the request body",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_batch_route_enforces_a_total_body_deadline() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let router = lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails(
+            test_config(),
+            store,
+            Arc::new(RecordingBatchAuthorizer::allow()),
+            Arc::new(RecordingTransferStore::default()),
+            BatchBodyGuardrails {
+                idle_timeout: Duration::from_millis(20),
+                total_timeout: Duration::from_millis(45),
+                ..BatchBodyGuardrails::default()
+            },
+        );
+        let slow_drip = stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Some((Ok::<_, std::io::Error>(Bytes::from_static(b" ")), ()))
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/github.com/owner/repo.git/info/lfs/objects/batch")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from_stream(slow_drip))
+            .expect("test request should build");
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("router should respond after the total deadline");
+
+        assert_lfs_json_error(
+            response,
+            StatusCode::REQUEST_TIMEOUT,
+            "Git LFS batch request timed out while reading the request body",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn server_wide_request_limit_rejects_overload_without_queueing() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let mut config = test_config();
+        config.server.max_concurrent_requests = 1;
+        let router = lfs_server_router_with_sessions(config, store);
+        let body_polled = Arc::new(Notify::new());
+        let body_polled_in_stream = body_polled.clone();
+        let blocked_body = stream::once(async move {
+            body_polled_in_stream.notify_one();
+            std::future::pending::<Result<Bytes, std::io::Error>>().await
+        });
+        let blocked_request = Request::builder()
+            .method(Method::POST)
+            .uri("/github.com/owner/repo.git/info/lfs/objects/batch")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from_stream(blocked_body))
+            .expect("test request should build");
+        let blocked = tokio::spawn(router.clone().oneshot(blocked_request));
+        body_polled.notified().await;
+
+        let overloaded = router
+            .oneshot(lfs_request(
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                None,
+            ))
+            .await
+            .expect("overloaded router should respond immediately");
+        blocked.abort();
+
+        assert_eq!(
+            overloaded
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_lfs_json_error(
+            overloaded,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LFS Cloud server has reached its concurrent request limit",
         )
         .await;
     }

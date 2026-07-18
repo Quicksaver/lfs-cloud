@@ -448,11 +448,37 @@ independently validated or adjudicated.
    separately, this was high-quality, security- and availability-relevant
    feedback.
 
-2. **High — Authenticated batch bodies have no read timeout or global request
-   limit.** `Bytes::from_request` can wait indefinitely for a valid session
-   slowly dripping a body (`src/server.rs:958-1004`). Add batch-body idle and
-   total timeouts plus global connection/request limits, and exercise them
-   through the actual router.
+2. **[DONE] Authenticated batch bodies had no read timeout or global request
+   limit** (High, `src/server.rs`, `src/server_config.rs`, and server
+   configuration documentation): **Valid and actionable.** Authentication
+   correctly happened before body buffering, but the authenticated
+   `Bytes::from_request` future could wait forever while a valid client dripped
+   bytes, and every such body had an independent unbounded request slot. Batch
+   bodies now use an explicit bounded reader that preserves the existing 2 MiB
+   size limit while enforcing a 15-second inter-chunk idle timeout and a
+   60-second end-to-end deadline; timeout failures return protocol-compatible
+   Git LFS JSON with HTTP 408. A process-wide middleware semaphore admits at
+   most `server.max_concurrent_requests` active HTTP requests across OAuth,
+   session, batch, and transfer routes (64 by default), rejecting excess work
+   immediately with HTTP 503 and `Retry-After: 1` rather than creating an
+   unbounded waiter queue. Request admission is the decisive boundary for this
+   finding because a slow batch body is already an active HTTP request; a
+   separate pre-request TCP connection cap would not replace these body
+   deadlines and can remain a listener or trusted reverse-proxy control.
+   Router-level regressions prove an idle authenticated body times out, a
+   continuously dripping body cannot evade the total deadline, and a second
+   request is rejected while the sole configured slot is occupied. Config
+   parsing rejects a zero limit, and README, implementation, configuration,
+   and repository-learning documentation describe the operational contract.
+   Verification passed with `cargo fmt --all`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine high-severity
+   authenticated slow-body availability flaw, correctly required independent
+   idle and total bounds so byte dripping could not reset the only deadline,
+   and requested the decisive router-level admission tests. With one valid
+   finding assessed here and no invalid finding attributable separately, this
+   was high-quality, security- and availability-relevant feedback.
 
 3. **High — Upload free-space checks race and do not reserve aggregate
    capacity.** Concurrent uploads can all pass the same preflight and then fill
