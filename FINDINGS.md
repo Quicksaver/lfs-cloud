@@ -2086,10 +2086,32 @@ independently validated or adjudicated.
    fixtures. With one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, protocol-relevant feedback.
 
-6. **Low — Historical Git LFS version aliases are rejected without an explicit
-   compatibility decision.** The version parser accepts only the current URL
-   (`src/lfs.rs:335-342`). Verify intended client compatibility, then either
-   support documented historical aliases or document and test the rejection.
+6. **[DONE] Historical Git LFS version aliases were rejected** (Low,
+   `src/lfs.rs` and `AGENTS.md`): **Valid and actionable.** LFS Cloud accepted
+   only the current public v1 URL, while Git LFS's official
+   [`pointer.go`](https://github.com/git-lfs/git-lfs/blob/main/lfs/pointer.go)
+   allowlist also accepts the alpha `http://git-media.io/v/2` and pre-release
+   `https://hawser.github.com/spec/v1` URLs. The official
+   [pointer specification](https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md#the-pointer)
+   explicitly documents the pre-release alias and requires regenerated
+   pointers to use the current public URL. The installed Git LFS 3.7.1 client
+   independently accepted both historical fixtures. `LfsPointer::parse` now
+   uses the same exact three-value allowlist, retains the canonical public v1
+   URL in parsed metadata, and therefore rewrites either historical form to
+   canonical bytes through `to_pointer_file`; unknown URLs remain rejected.
+   A test-first regression failed on the alpha alias before the implementation
+   and now covers both aliases plus canonical rendering. The repository
+   learning records this read-compatible/write-canonical boundary.
+   Verification passed with the installed Git LFS compatibility checks,
+   `cargo fmt --all`, `yarn lint:fix`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine historical
+   interoperability gap and correctly requested an explicit compatibility
+   decision plus regression coverage. It understated that the reference
+   client recognizes two aliases rather than only the documented pre-release
+   example, but with one valid finding and no invalid finding attributable
+   separately, this was useful, relevant low-severity feedback.
 
 7. **High — Storage-provider abstractions and test fakes do not consistently
    enforce repository namespace.** The generic trait addresses objects only by

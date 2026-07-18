@@ -18,6 +18,11 @@ pub const LFS_POINTER_SIZE_CUTOFF: u64 = 1_024;
 /// Git LFS batch transfer adapter supported by the MVP server.
 pub const LFS_BASIC_TRANSFER: &str = "basic";
 
+const LFS_POINTER_VERSION_ALIASES: [&str; 3] = [
+    "http://git-media.io/v/2",
+    "https://hawser.github.com/spec/v1",
+    LFS_POINTER_VERSION,
+];
 const SHA256_PREFIX: &str = "sha256:";
 const SHA256_HEX_LENGTH: usize = 64;
 const EMPTY_SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -367,9 +372,10 @@ impl LfsPointer {
     /// Non-empty pointer files must be smaller than
     /// [`LFS_POINTER_SIZE_CUTOFF`] bytes. Object identifiers must use canonical
     /// lowercase hexadecimal. For interoperability with the reference Git LFS
-    /// decoder, non-canonical blank lines, CRLF endings, and a missing final
-    /// newline are accepted; [`Self::to_pointer_file`] always emits canonical
-    /// line endings and spacing.
+    /// decoder, historical alpha and pre-release version URLs, non-canonical
+    /// blank lines, CRLF endings, and a missing final newline are accepted;
+    /// [`Self::to_pointer_file`] always emits the current version URL with
+    /// canonical line endings and spacing.
     ///
     /// # Examples
     ///
@@ -410,13 +416,10 @@ impl LfsPointer {
             }
         })?;
 
-        match version {
-            LFS_POINTER_VERSION => {}
-            version => {
-                return Err(LfsObjectError::PointerInvalidVersion {
-                    version: version.to_owned(),
-                });
-            }
+        if !LFS_POINTER_VERSION_ALIASES.contains(&version) {
+            return Err(LfsObjectError::PointerInvalidVersion {
+                version: version.to_owned(),
+            });
         }
 
         let mut previous_key = None;
@@ -1104,9 +1107,9 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        LfsBatchDownloadObject, LfsBatchHashAlgorithm, LfsBatchObjectError, LfsBatchObjectResponse,
-        LfsBatchOperation, LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectError,
-        LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
+        LFS_POINTER_VERSION, LfsBatchDownloadObject, LfsBatchHashAlgorithm, LfsBatchObjectError,
+        LfsBatchObjectResponse, LfsBatchOperation, LfsBatchResponse, LfsBatchUploadObject,
+        LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer, parse_lfs_batch_request_json,
     };
 
     const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1391,6 +1394,31 @@ mod tests {
             LfsPointer::parse(invalid_size),
             Err(LfsObjectError::PointerInvalidSize { .. })
         ));
+    }
+
+    #[test]
+    fn pointer_accepts_historical_version_aliases_and_renders_canonically() {
+        for version in [
+            "http://git-media.io/v/2",
+            "https://hawser.github.com/spec/v1",
+        ] {
+            let contents = format!(
+                "version {version}\n\
+                 oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                 size 42\n"
+            );
+
+            let pointer = LfsPointer::parse(&contents)
+                .expect("Git LFS-compatible historical version should parse");
+
+            assert_eq!(pointer.version, LFS_POINTER_VERSION);
+            assert_eq!(
+                pointer.to_pointer_file(),
+                "version https://git-lfs.github.com/spec/v1\n\
+                 oid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                 size 42\n"
+            );
+        }
     }
 
     #[test]
