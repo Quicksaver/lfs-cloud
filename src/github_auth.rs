@@ -20,8 +20,8 @@ use axum::{
     routing::get,
 };
 use oauth2::{
-    AuthUrl, ClientId, CsrfToken, RedirectUrl, Scope, basic::BasicClient,
-    url::ParseError as UrlParseError,
+    AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+    basic::BasicClient, url::ParseError as UrlParseError,
 };
 use reqwest::{
     Client, StatusCode,
@@ -102,8 +102,7 @@ impl GitHubOAuthCallbackRouteState {
     ///
     /// ```
     /// use lfs_cloud::{
-    ///     GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubOAuthStateRegistry,
-    ///     GitHubProviderConfig,
+    ///     GitHubOAuthCallbackRouteState, GitHubOAuthStateRegistry, GitHubProviderConfig,
     /// };
     ///
     /// let provider = GitHubProviderConfig {
@@ -114,7 +113,6 @@ impl GitHubOAuthCallbackRouteState {
     ///     allow_insecure_http: false,
     /// };
     /// let csrf_states = GitHubOAuthStateRegistry::new();
-    /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?)?;
     ///
     /// let route_state = GitHubOAuthCallbackRouteState::new(
     ///     provider,
@@ -153,7 +151,7 @@ impl GitHubOAuthCallbackRouteState {
     ///
     /// ```
     /// use lfs_cloud::{
-    ///     GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubOAuthTokenExchanger,
+    ///     GitHubOAuthCallbackRouteState, GitHubOAuthTokenExchanger,
     ///     GitHubOAuthStateRegistry, GitHubProviderConfig, GitHubUserClient,
     /// };
     ///
@@ -165,7 +163,6 @@ impl GitHubOAuthCallbackRouteState {
     ///     allow_insecure_http: false,
     /// };
     /// let csrf_states = GitHubOAuthStateRegistry::new();
-    /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?)?;
     /// let token_exchanger = GitHubOAuthTokenExchanger::new()?;
     /// let user_client = GitHubUserClient::new()?;
     ///
@@ -349,8 +346,8 @@ async fn protect_github_oauth_callback_response(mut response: Response) -> Respo
 /// Creates an Axum router for the GitHub OAuth login redirect endpoint.
 ///
 /// The route is mounted at [`GITHUB_OAUTH_LOGIN_PATH`], generates a fresh
-/// browser authorization URL, registers the matching CSRF state in the shared
-/// registry, and redirects the browser to GitHub.
+/// browser authorization URL, registers the matching CSRF state and PKCE
+/// verifier in the shared registry, and redirects the browser to GitHub.
 pub fn github_oauth_login_router(state: GitHubOAuthCallbackRouteState) -> Router {
     Router::new()
         .route(GITHUB_OAUTH_LOGIN_PATH, get(github_oauth_login_route))
@@ -361,13 +358,9 @@ async fn github_oauth_login_route(
     State(state): State<GitHubOAuthCallbackRouteState>,
 ) -> Result<Redirect, GitHubOAuthCallbackRouteError> {
     let authorization = GitHubOAuthAuthorization::new(&state.provider, &state.redirect_url)?;
-    state
-        .csrf_states
-        .register(authorization.csrf_state.clone())?;
+    let authorization_url = state.csrf_states.register(authorization)?;
 
-    Ok(Redirect::temporary(
-        authorization.authorization_url.as_str(),
-    ))
+    Ok(Redirect::temporary(authorization_url.as_str()))
 }
 
 async fn github_oauth_callback_route(
@@ -992,6 +985,7 @@ impl GitHubOAuthTokenExchanger {
             .append_pair("client_secret", provider.oauth_client_secret.as_str())
             .append_pair("code", callback.code.as_str())
             .append_pair("redirect_uri", redirect_url.as_str())
+            .append_pair("code_verifier", callback.pkce_verifier.secret())
             .finish();
 
         let response = self
@@ -1058,13 +1052,13 @@ impl GitHubOAuthTokenExchanger {
     }
 }
 
-/// Browser URL plus CSRF state for a GitHub OAuth authorization attempt.
-#[derive(Clone, Eq, PartialEq)]
+/// Browser URL plus one-time CSRF and PKCE secrets for an OAuth attempt.
 pub struct GitHubOAuthAuthorization {
     /// URL the user should open in a browser to start GitHub OAuth login.
     pub authorization_url: Url,
     /// CSRF state that must match the callback's `state` query parameter.
     pub csrf_state: GitHubOAuthState,
+    pkce_verifier: PkceCodeVerifier,
 }
 
 impl GitHubOAuthAuthorization {
@@ -1149,7 +1143,10 @@ impl GitHubOAuthAuthorization {
         let client = BasicClient::new(ClientId::new(provider.oauth_client_id.clone()))
             .set_auth_uri(auth_url)
             .set_redirect_uri(redirect_url);
-        let mut request = client.authorize_url(state_fn);
+        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let mut request = client
+            .authorize_url(state_fn)
+            .set_pkce_challenge(pkce_challenge);
         for scope in scopes {
             let scope = scope.as_ref().trim();
             if scope.is_empty() {
@@ -1164,6 +1161,7 @@ impl GitHubOAuthAuthorization {
         Ok(Self {
             authorization_url,
             csrf_state: GitHubOAuthState::from(csrf_state),
+            pkce_verifier,
         })
     }
 }
@@ -1178,19 +1176,25 @@ impl fmt::Debug for GitHubOAuthAuthorization {
     }
 }
 
-/// Shared one-time registry for GitHub OAuth CSRF states.
+/// Shared one-time registry for GitHub OAuth authorization attempts.
 ///
-/// Register each generated [`GitHubOAuthAuthorization::csrf_state`] before
-/// returning the authorization URL. The callback route consumes the matching
-/// state before exchanging the code, which lets one mounted router handle many
-/// concurrent login attempts without accepting replayed callbacks. Abandoned
-/// states expire, while capacity exhaustion rejects unrelated attempts instead
-/// of evicting an active login. State digests provide direct bounded-time lookup
-/// without retaining the raw secret or scanning every pending attempt.
+/// Register each generated [`GitHubOAuthAuthorization`] before returning its
+/// URL. The callback route consumes the matching CSRF state and its PKCE
+/// verifier before exchanging the code, which lets one mounted router handle
+/// many concurrent login attempts without accepting replayed callbacks.
+/// Abandoned attempts expire, while capacity exhaustion rejects unrelated
+/// attempts instead of evicting an active login. State digests provide direct
+/// bounded-time lookup without retaining the raw state or scanning every
+/// pending attempt.
 #[derive(Clone)]
 pub struct GitHubOAuthStateRegistry {
-    states: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    states: Arc<Mutex<HashMap<[u8; 32], GitHubOAuthPendingAttempt>>>,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+struct GitHubOAuthPendingAttempt {
+    registered_at: Instant,
+    pkce_verifier: PkceCodeVerifier,
 }
 
 impl Default for GitHubOAuthStateRegistry {
@@ -1203,29 +1207,71 @@ impl Default for GitHubOAuthStateRegistry {
 }
 
 impl GitHubOAuthStateRegistry {
-    /// Creates an empty CSRF state registry.
+    /// Creates an empty pending-authorization registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a registry preloaded with one CSRF state.
-    #[must_use]
-    pub fn with_state(state: GitHubOAuthState) -> Self {
+    #[cfg(test)]
+    fn with_state(state: GitHubOAuthState) -> Self {
         let registry = Self::new();
         registry
-            .register(state)
+            .register_state(state)
             .expect("a new OAuth state registry must have capacity");
         registry
     }
 
-    /// Registers a generated CSRF state for one future callback.
+    /// Registers a generated authorization attempt for one future callback.
+    ///
+    /// The returned URL is safe to redirect to only after this method succeeds.
+    /// Consuming the authorization value ensures its PKCE verifier has exactly
+    /// one owner until the callback removes it from the registry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lfs_cloud::{
+    ///     GitHubOAuthAuthorization, GitHubOAuthStateRegistry, GitHubProviderConfig,
+    /// };
+    ///
+    /// let provider = GitHubProviderConfig {
+    ///     id: "github-main".to_owned(),
+    ///     api_url: "https://api.github.com".to_owned(),
+    ///     oauth_client_id: "client-id".to_owned(),
+    ///     oauth_client_secret: "client-secret".to_owned(),
+    ///     allow_insecure_http: false,
+    /// };
+    /// let authorization = GitHubOAuthAuthorization::new(
+    ///     &provider,
+    ///     "http://127.0.0.1:8080/auth/github/callback",
+    /// )?;
+    /// let registry = GitHubOAuthStateRegistry::new();
+    /// let authorization_url = registry.register(authorization)?;
+    ///
+    /// assert_eq!(authorization_url.host_str(), Some("github.com"));
+    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns [`ServerError::RateLimited`] when the pending-state capacity is
     /// exhausted. Existing attempts are never evicted to admit a new request.
-    pub fn register(&self, state: GitHubOAuthState) -> ServerResult<()> {
+    pub fn register(&self, authorization: GitHubOAuthAuthorization) -> ServerResult<Url> {
+        let GitHubOAuthAuthorization {
+            authorization_url,
+            csrf_state,
+            pkce_verifier,
+        } = authorization;
+        self.register_attempt(csrf_state, pkce_verifier)?;
+        Ok(authorization_url)
+    }
+
+    fn register_attempt(
+        &self,
+        state: GitHubOAuthState,
+        pkce_verifier: PkceCodeVerifier,
+    ) -> ServerResult<()> {
         let now = (self.clock)();
         let state_key = oauth_state_key(&state);
         let mut states = self
@@ -1238,18 +1284,26 @@ impl GitHubOAuthStateRegistry {
                 retry_after_seconds: GITHUB_OAUTH_STATE_TTL.as_secs(),
             });
         }
-        states.insert(state_key, now);
+        states.insert(
+            state_key,
+            GitHubOAuthPendingAttempt {
+                registered_at: now,
+                pkce_verifier,
+            },
+        );
         Ok(())
     }
 
-    fn consume(&self, state: &GitHubOAuthState) -> bool {
+    fn consume(&self, state: &GitHubOAuthState) -> Option<PkceCodeVerifier> {
         let now = (self.clock)();
         let mut states = self
             .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_oauth_states(&mut states, now);
-        states.remove(&oauth_state_key(state)).is_some()
+        states
+            .remove(&oauth_state_key(state))
+            .map(|attempt| attempt.pkce_verifier)
     }
 
     fn len(&self) -> usize {
@@ -1269,14 +1323,23 @@ impl GitHubOAuthStateRegistry {
             clock,
         }
     }
+
+    #[cfg(test)]
+    fn register_state(&self, state: GitHubOAuthState) -> ServerResult<()> {
+        let (_, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        self.register_attempt(state, pkce_verifier)
+    }
 }
 
 fn oauth_state_key(state: &GitHubOAuthState) -> [u8; 32] {
     Sha256::digest(state.as_str().as_bytes()).into()
 }
 
-fn prune_expired_oauth_states(states: &mut HashMap<[u8; 32], Instant>, now: Instant) {
-    states.retain(|_, registered_at| now.duration_since(*registered_at) < GITHUB_OAUTH_STATE_TTL);
+fn prune_expired_oauth_states(
+    states: &mut HashMap<[u8; 32], GitHubOAuthPendingAttempt>,
+    now: Instant,
+) {
+    states.retain(|_, attempt| now.duration_since(attempt.registered_at) < GITHUB_OAUTH_STATE_TTL);
 }
 
 impl fmt::Debug for GitHubOAuthStateRegistry {
@@ -1417,19 +1480,20 @@ impl fmt::Debug for GitHubOAuthCallbackQuery {
 }
 
 /// Validated GitHub OAuth callback ready for code-to-token exchange.
-#[derive(Clone, Eq, PartialEq)]
 pub struct GitHubOAuthCallback {
     /// Authorization code returned by GitHub.
     pub code: GitHubOAuthCode,
     /// CSRF state that matched the stored authorization attempt.
     pub state: GitHubOAuthState,
+    pkce_verifier: PkceCodeVerifier,
 }
 
 impl GitHubOAuthCallback {
-    /// Validates a GitHub OAuth callback query against the expected CSRF state.
+    /// Validates a callback against one generated OAuth authorization attempt.
     ///
-    /// The returned callback contains the authorization code only after the
-    /// state matches. Callers should then exchange the code for a GitHub token.
+    /// The returned callback contains the authorization code and one-time PKCE
+    /// verifier only after the state matches. Callers should then exchange the
+    /// code for a GitHub token.
     ///
     /// # Errors
     ///
@@ -1440,21 +1504,38 @@ impl GitHubOAuthCallback {
     ///
     /// ```
     /// use lfs_cloud::{
-    ///     GitHubOAuthCallback, GitHubOAuthCallbackQuery, GitHubOAuthState,
+    ///     GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery,
+    ///     GitHubProviderConfig,
     /// };
     ///
-    /// let expected_state = GitHubOAuthState::from_secret("csrf-state")?;
-    /// let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "csrf-state");
+    /// let provider = GitHubProviderConfig {
+    ///     id: "github-main".to_owned(),
+    ///     api_url: "https://api.github.com".to_owned(),
+    ///     oauth_client_id: "client-id".to_owned(),
+    ///     oauth_client_secret: "client-secret".to_owned(),
+    ///     allow_insecure_http: false,
+    /// };
+    /// let authorization = GitHubOAuthAuthorization::new(
+    ///     &provider,
+    ///     "http://127.0.0.1:8080/auth/github/callback",
+    /// )?;
+    /// let state = authorization.csrf_state.as_str().to_owned();
+    /// let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", state);
     ///
-    /// let callback = GitHubOAuthCallback::validate(query, &expected_state)?;
+    /// let callback = GitHubOAuthCallback::validate(query, authorization)?;
     ///
     /// assert_eq!(callback.code.as_str(), "oauth-code");
     /// # Ok::<(), lfs_cloud::ServerError>(())
     /// ```
     pub fn validate(
         query: GitHubOAuthCallbackQuery,
-        expected_state: &GitHubOAuthState,
+        authorization: GitHubOAuthAuthorization,
     ) -> ServerResult<Self> {
+        let GitHubOAuthAuthorization {
+            csrf_state: expected_state,
+            pkce_verifier,
+            ..
+        } = authorization;
         let state = required_callback_param(query.state, "state")?;
         if !constant_time_str_eq(&state, expected_state.as_str()) {
             return Err(ServerError::Unauthorized {
@@ -1482,7 +1563,25 @@ impl GitHubOAuthCallback {
         Ok(Self {
             code: GitHubOAuthCode(code),
             state: GitHubOAuthState(state),
+            pkce_verifier,
         })
+    }
+
+    #[cfg(test)]
+    fn validate_state(
+        query: GitHubOAuthCallbackQuery,
+        expected_state: &GitHubOAuthState,
+    ) -> ServerResult<Self> {
+        let (_, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        Self::validate(
+            query,
+            GitHubOAuthAuthorization {
+                authorization_url: Url::parse(GITHUB_OAUTH_AUTHORIZE_URL)
+                    .expect("built-in GitHub authorization URL must parse"),
+                csrf_state: expected_state.clone(),
+                pkce_verifier,
+            },
+        )
     }
 
     fn validate_registered(
@@ -1490,11 +1589,12 @@ impl GitHubOAuthCallback {
         csrf_states: &GitHubOAuthStateRegistry,
     ) -> ServerResult<Self> {
         let state = GitHubOAuthState(required_callback_param(query.state, "state")?);
-        if !csrf_states.consume(&state) {
-            return Err(ServerError::Unauthorized {
-                reason: "github oauth csrf state mismatch".to_owned(),
-            });
-        }
+        let pkce_verifier =
+            csrf_states
+                .consume(&state)
+                .ok_or_else(|| ServerError::Unauthorized {
+                    reason: "github oauth csrf state mismatch".to_owned(),
+                })?;
 
         // Consume the one-time state before honoring provider-denied callbacks so
         // denied OAuth redirects cannot be replayed with an authorization code.
@@ -1518,6 +1618,7 @@ impl GitHubOAuthCallback {
         Ok(Self {
             code: GitHubOAuthCode(code),
             state,
+            pkce_verifier,
         })
     }
 }
@@ -2043,6 +2144,7 @@ fn redact_token_exchange_secrets(
     let mut secrets = [
         provider.oauth_client_secret.as_str(),
         callback.code.as_str(),
+        callback.pkce_verifier.secret(),
     ];
     secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
 
@@ -2454,7 +2556,7 @@ mod tests {
         response::IntoResponse,
         routing::{get, post},
     };
-    use oauth2::CsrfToken;
+    use oauth2::{CsrfToken, PkceCodeChallenge};
     use tokio::{sync::Mutex, task::JoinHandle};
     use tower::ServiceExt;
     use url::Url;
@@ -2527,6 +2629,17 @@ mod tests {
             Some("read:user repo")
         );
         assert_eq!(query.get("state").map(String::as_str), Some("csrf-state"));
+        assert_eq!(
+            query.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(query.get("code_challenge").map(String::len), Some(43));
+        let expected_challenge =
+            PkceCodeChallenge::from_code_verifier_sha256(&authorization.pkce_verifier);
+        assert_eq!(
+            query.get("code_challenge").map(String::as_str),
+            Some(expected_challenge.as_str())
+        );
         assert_eq!(authorization.csrf_state.as_str(), "csrf-state");
     }
 
@@ -2626,6 +2739,12 @@ mod tests {
             request.body.get("redirect_uri").map(String::as_str),
             Some(REDIRECT_URL)
         );
+        assert!(
+            request
+                .body
+                .get("code_verifier")
+                .is_some_and(|value| value.len() >= 43)
+        );
     }
 
     #[tokio::test]
@@ -2671,14 +2790,16 @@ mod tests {
 
     #[tokio::test]
     async fn token_exchange_redacts_secrets_reflected_in_json_error() {
-        let (token_url, _token_server) = token_server(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":"invalid_grant","error_description":"client-secret oauth-code"}"#,
-        )
-        .await;
+        let callback = validated_callback("oauth-code", "csrf-state");
+        let reflected_body = format!(
+            r#"{{"error":"invalid_grant","error_description":"client-secret oauth-code {}"}}"#,
+            callback.pkce_verifier.secret()
+        );
+        let (token_url, _token_server) =
+            token_server(StatusCode::BAD_REQUEST, reflected_body).await;
         let exchanger =
             GitHubOAuthTokenExchanger::with_token_url(token_url).expect("mock URL should parse");
-        let callback = validated_callback("oauth-code", "csrf-state");
+        let pkce_verifier = callback.pkce_verifier.secret().to_owned();
 
         let error = exchanger
             .exchange_code(&provider_config(), &callback, REDIRECT_URL)
@@ -2690,6 +2811,7 @@ mod tests {
         assert!(rendered.contains("invalid_grant"));
         assert!(!rendered.contains("client-secret"));
         assert!(!rendered.contains("oauth-code"));
+        assert!(!rendered.contains(&pkce_verifier));
     }
 
     #[tokio::test]
@@ -3759,11 +3881,13 @@ mod tests {
             || CsrfToken::new("csrf-state".to_owned()),
         )
         .expect("authorization URL should build");
+        let pkce_verifier = authorization.pkce_verifier.secret().to_owned();
 
         let rendered = format!("{authorization:?}");
 
         assert!(rendered.contains("GitHubOAuthAuthorization"));
         assert!(!rendered.contains("csrf-state"));
+        assert!(!rendered.contains(&pkce_verifier));
     }
 
     #[test]
@@ -3798,12 +3922,12 @@ mod tests {
         let active_state =
             GitHubOAuthState::from_secret("active-state").expect("state should parse");
         registry
-            .register(active_state.clone())
+            .register_state(active_state.clone())
             .expect("first state should register");
 
         for index in 1..MAX_PENDING_GITHUB_OAUTH_STATES {
             registry
-                .register(
+                .register_state(
                     GitHubOAuthState::from_secret(format!("csrf-state-{index}"))
                         .expect("state should parse"),
                 )
@@ -3812,14 +3936,14 @@ mod tests {
 
         assert_eq!(registry.len(), MAX_PENDING_GITHUB_OAUTH_STATES);
         let error = registry
-            .register(
+            .register_state(
                 GitHubOAuthState::from_secret("unrelated-overload-state")
                     .expect("state should parse"),
             )
             .expect_err("capacity must reject an unrelated login attempt");
         assert!(matches!(error, ServerError::RateLimited { .. }));
         assert_eq!(registry.len(), MAX_PENDING_GITHUB_OAUTH_STATES);
-        assert!(registry.consume(&active_state));
+        assert!(registry.consume(&active_state).is_some());
     }
 
     #[test]
@@ -3833,7 +3957,9 @@ mod tests {
         let registry = GitHubOAuthStateRegistry::with_clock(clock);
 
         registry
-            .register(GitHubOAuthState::from_secret("before-expiry").expect("state should parse"))
+            .register_state(
+                GitHubOAuthState::from_secret("before-expiry").expect("state should parse"),
+            )
             .expect("state should register");
         elapsed_seconds.store(GITHUB_OAUTH_STATE_TTL.as_secs() - 1, Ordering::SeqCst);
         assert_eq!(registry.len(), 1);
@@ -3845,7 +3971,9 @@ mod tests {
         assert_eq!(registry.len(), 0);
 
         registry
-            .register(GitHubOAuthState::from_secret("after-expiry").expect("state should parse"))
+            .register_state(
+                GitHubOAuthState::from_secret("after-expiry").expect("state should parse"),
+            )
             .expect("capacity should be reusable after expiry");
         assert_eq!(registry.len(), 1);
     }
@@ -3854,25 +3982,39 @@ mod tests {
     fn state_registry_consumes_only_exact_digest_key() {
         let registry = GitHubOAuthStateRegistry::new();
         registry
-            .register(
+            .register_state(
                 GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse"),
             )
             .expect("state should register");
         registry
-            .register(GitHubOAuthState::from_secret("csrf-state-beta").expect("state should parse"))
+            .register_state(
+                GitHubOAuthState::from_secret("csrf-state-beta").expect("state should parse"),
+            )
             .expect("state should register");
 
-        assert!(!registry.consume(
-            &GitHubOAuthState::from_secret("csrf-state-alphb").expect("state should parse")
-        ));
+        assert!(
+            registry
+                .consume(
+                    &GitHubOAuthState::from_secret("csrf-state-alphb").expect("state should parse")
+                )
+                .is_none()
+        );
         assert_eq!(registry.len(), 2);
-        assert!(registry.consume(
-            &GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse")
-        ));
+        assert!(
+            registry
+                .consume(
+                    &GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse")
+                )
+                .is_some()
+        );
         assert_eq!(registry.len(), 1);
-        assert!(!registry.consume(
-            &GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse")
-        ));
+        assert!(
+            registry
+                .consume(
+                    &GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse")
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -4040,11 +4182,11 @@ mod tests {
         let active_state =
             GitHubOAuthState::from_secret("active-state").expect("state should parse");
         csrf_states
-            .register(active_state.clone())
+            .register_state(active_state.clone())
             .expect("active state should register");
         for index in 1..MAX_PENDING_GITHUB_OAUTH_STATES {
             csrf_states
-                .register(
+                .register_state(
                     GitHubOAuthState::from_secret(format!("csrf-state-{index}"))
                         .expect("state should parse"),
                 )
@@ -4078,7 +4220,7 @@ mod tests {
                 .expect("overload response should include Retry-After"),
             GITHUB_OAUTH_STATE_TTL.as_secs().to_string().as_str()
         );
-        assert!(csrf_states.consume(&active_state));
+        assert!(csrf_states.consume(&active_state).is_some());
     }
 
     #[tokio::test]
@@ -4092,12 +4234,12 @@ mod tests {
             user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
         let csrf_states = GitHubOAuthStateRegistry::new();
         csrf_states
-            .register(
+            .register_state(
                 GitHubOAuthState::from_secret("first-state").expect("first state should parse"),
             )
             .expect("first state should register");
         csrf_states
-            .register(
+            .register_state(
                 GitHubOAuthState::from_secret("second-state").expect("second state should parse"),
             )
             .expect("second state should register");
@@ -4141,6 +4283,86 @@ mod tests {
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(token_server.requests.lock().await.len(), 2);
         assert_eq!(user_server.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn callback_route_binds_intercepted_codes_to_the_original_pkce_attempt() {
+        let first_authorization = GitHubOAuthAuthorization::with_state(
+            &provider_config(),
+            REDIRECT_URL,
+            DEFAULT_GITHUB_OAUTH_SCOPES.iter().copied(),
+            || CsrfToken::new("first-state".to_owned()),
+        )
+        .expect("first authorization should build");
+        let first_verifier = first_authorization.pkce_verifier.secret().to_owned();
+        let second_authorization = GitHubOAuthAuthorization::with_state(
+            &provider_config(),
+            REDIRECT_URL,
+            DEFAULT_GITHUB_OAUTH_SCOPES.iter().copied(),
+            || CsrfToken::new("second-state".to_owned()),
+        )
+        .expect("second authorization should build");
+        let second_verifier = second_authorization.pkce_verifier.secret().to_owned();
+        assert_ne!(first_verifier, second_verifier);
+
+        let expected_verifiers = BTreeMap::from([
+            ("first-code".to_owned(), first_verifier),
+            ("second-code".to_owned(), second_verifier),
+        ]);
+        let (token_url, token_server) = pkce_token_server(expected_verifiers).await;
+        let (api_url, user_server) =
+            user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
+        let csrf_states = GitHubOAuthStateRegistry::new();
+        csrf_states
+            .register(first_authorization)
+            .expect("first authorization should register");
+        csrf_states
+            .register(second_authorization)
+            .expect("second authorization should register");
+        let route_state = GitHubOAuthCallbackRouteState::with_clients(
+            provider_config_with_api_url(api_url),
+            csrf_states,
+            REDIRECT_URL,
+            GitHubOAuthTokenExchanger::with_token_url(token_url)
+                .expect("mock token URL should parse"),
+            GitHubUserClient::new().expect("user client should build"),
+        )
+        .expect("callback route state should build");
+        let callback_server = callback_server(route_state).await;
+        let client = reqwest::Client::new();
+
+        let intercepted = client
+            .get(format!(
+                "{}{GITHUB_OAUTH_CALLBACK_PATH}?code=first-code&state=second-state",
+                callback_server.url()
+            ))
+            .send()
+            .await
+            .expect("intercepted callback should complete");
+        assert_eq!(intercepted.status(), StatusCode::UNAUTHORIZED);
+        assert!(user_server.requests.lock().await.is_empty());
+
+        let original = client
+            .get(format!(
+                "{}{GITHUB_OAUTH_CALLBACK_PATH}?code=first-code&state=first-state",
+                callback_server.url()
+            ))
+            .send()
+            .await
+            .expect("original callback should complete");
+        assert_eq!(original.status(), StatusCode::OK);
+        assert_eq!(user_server.requests.lock().await.len(), 1);
+
+        let replay = client
+            .get(format!(
+                "{}{GITHUB_OAUTH_CALLBACK_PATH}?code=first-code&state=first-state",
+                callback_server.url()
+            ))
+            .send()
+            .await
+            .expect("replayed callback should complete");
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(token_server.requests.lock().await.len(), 2);
     }
 
     #[tokio::test]
@@ -4245,8 +4467,8 @@ mod tests {
             GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
         let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "csrf-state");
 
-        let callback =
-            GitHubOAuthCallback::validate(query, &expected_state).expect("callback should match");
+        let callback = GitHubOAuthCallback::validate_state(query, &expected_state)
+            .expect("callback should match");
 
         assert_eq!(callback.code.as_str(), "oauth-code");
         assert_eq!(callback.state.as_str(), "csrf-state");
@@ -4258,7 +4480,7 @@ mod tests {
             GitHubOAuthState::from_secret("expected-state").expect("state should be valid");
         let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "returned-state");
 
-        let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+        let error = GitHubOAuthCallback::validate_state(query, &expected_state).unwrap_err();
 
         assert!(matches!(error, ServerError::Unauthorized { .. }));
         let rendered = error.to_string();
@@ -4291,7 +4513,7 @@ mod tests {
             },
             GitHubOAuthCallbackQuery::authorization_code("oauth-code", "  "),
         ] {
-            let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+            let error = GitHubOAuthCallback::validate_state(query, &expected_state).unwrap_err();
             assert!(matches!(error, ServerError::InvalidRequest { .. }));
         }
     }
@@ -4306,7 +4528,7 @@ mod tests {
             GitHubOAuthCallbackQuery::authorization_code(oversized.clone(), "csrf-state"),
             GitHubOAuthCallbackQuery::authorization_code("oauth-code", oversized),
         ] {
-            let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+            let error = GitHubOAuthCallback::validate_state(query, &expected_state).unwrap_err();
             assert!(matches!(error, ServerError::InvalidRequest { .. }));
         }
     }
@@ -4323,7 +4545,7 @@ mod tests {
             error_uri: Some("https://docs.github.com".to_owned()),
         };
 
-        let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+        let error = GitHubOAuthCallback::validate_state(query, &expected_state).unwrap_err();
 
         assert!(matches!(error, ServerError::Unauthorized { .. }));
         let rendered = error.to_string();
@@ -4343,7 +4565,7 @@ mod tests {
             error_uri: None,
         };
 
-        let error = GitHubOAuthCallback::validate(query, &expected_state).unwrap_err();
+        let error = GitHubOAuthCallback::validate_state(query, &expected_state).unwrap_err();
 
         assert!(matches!(error, ServerError::Unauthorized { .. }));
         let rendered = error.to_string();
@@ -4364,7 +4586,7 @@ mod tests {
             error_description: None,
             error_uri: None,
         };
-        let missing_error = GitHubOAuthCallback::validate(missing_state, &expected_state)
+        let missing_error = GitHubOAuthCallback::validate_state(missing_state, &expected_state)
             .expect_err("missing state should fail before provider error handling");
         assert!(matches!(missing_error, ServerError::InvalidRequest { .. }));
         assert!(!missing_error.to_string().contains("access_denied"));
@@ -4376,7 +4598,7 @@ mod tests {
             error_description: None,
             error_uri: None,
         };
-        let mismatch_error = GitHubOAuthCallback::validate(mismatched_state, &expected_state)
+        let mismatch_error = GitHubOAuthCallback::validate_state(mismatched_state, &expected_state)
             .expect_err("mismatched state should fail before provider error handling");
         assert!(matches!(mismatch_error, ServerError::Unauthorized { .. }));
         let rendered = mismatch_error.to_string();
@@ -4391,8 +4613,9 @@ mod tests {
             GitHubOAuthState::from_secret("csrf-state").expect("state should be valid");
         let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "csrf-state");
 
-        let callback =
-            GitHubOAuthCallback::validate(query.clone(), &expected_state).expect("valid callback");
+        let callback = GitHubOAuthCallback::validate_state(query.clone(), &expected_state)
+            .expect("valid callback");
+        let pkce_verifier = callback.pkce_verifier.secret().to_owned();
 
         let query_debug = format!("{query:?}");
         let callback_debug = format!("{callback:?}");
@@ -4401,12 +4624,14 @@ mod tests {
         assert!(!query_debug.contains("csrf-state"));
         assert!(!callback_debug.contains("oauth-code"));
         assert!(!callback_debug.contains("csrf-state"));
+        assert!(!callback_debug.contains(&pkce_verifier));
     }
 
     #[derive(Debug, Default)]
     struct TokenServerState {
         status: StatusCode,
         body: String,
+        expected_pkce_verifiers: Option<BTreeMap<String, String>>,
         requests: Mutex<Vec<CapturedTokenRequest>>,
     }
 
@@ -4454,6 +4679,7 @@ mod tests {
         let state = Arc::new(TokenServerState {
             status,
             body: body.into(),
+            expected_pkce_verifiers: None,
             requests: Mutex::new(Vec::new()),
         });
         let app = Router::new()
@@ -4470,6 +4696,35 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("mock token server should run");
+        });
+
+        (format!("http://{address}/login/oauth/access_token"), state)
+    }
+
+    async fn pkce_token_server(
+        expected_pkce_verifiers: BTreeMap<String, String>,
+    ) -> (String, Arc<TokenServerState>) {
+        let state = Arc::new(TokenServerState {
+            status: StatusCode::OK,
+            body: r#"{"access_token":"gho_token","token_type":"bearer","scope":"read:user"}"#
+                .to_owned(),
+            expected_pkce_verifiers: Some(expected_pkce_verifiers),
+            requests: Mutex::new(Vec::new()),
+        });
+        let app = Router::new()
+            .route("/login/oauth/access_token", post(capture_token_request))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock PKCE token server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock PKCE token server address should be available");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock PKCE token server should run");
         });
 
         (format!("http://{address}/login/oauth/access_token"), state)
@@ -4606,21 +4861,37 @@ mod tests {
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
-        let body = url::form_urlencoded::parse(body.as_bytes())
+        let body: BTreeMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect();
 
+        let pkce_matches = state
+            .expected_pkce_verifiers
+            .as_ref()
+            .is_none_or(|expected| {
+                body.get("code")
+                    .and_then(|code| expected.get(code))
+                    .is_some_and(|verifier| body.get("code_verifier") == Some(verifier))
+            });
         state.requests.lock().await.push(CapturedTokenRequest {
             accept,
             content_type,
             body,
         });
 
-        (
-            state.status,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            state.body.clone(),
-        )
+        if pkce_matches {
+            (
+                state.status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                state.body.clone(),
+            )
+        } else {
+            (
+                StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"incorrect_client_credentials"}"#.to_owned(),
+            )
+        }
     }
 
     async fn capture_user_request(
@@ -4721,7 +4992,8 @@ mod tests {
         let expected_state = GitHubOAuthState::from_secret(state).expect("state should be valid");
         let query = GitHubOAuthCallbackQuery::authorization_code(code, state);
 
-        GitHubOAuthCallback::validate(query, &expected_state).expect("callback should validate")
+        GitHubOAuthCallback::validate_state(query, &expected_state)
+            .expect("callback should validate")
     }
 
     fn query_pairs(authorization: &GitHubOAuthAuthorization) -> BTreeMap<String, String> {

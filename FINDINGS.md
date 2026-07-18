@@ -272,11 +272,34 @@ independently validated or adjudicated.
     and no invalid finding attributable separately, this was high-quality,
     relevant feedback.
 
-12. **Medium — The OAuth authorization flow omits PKCE.** Authorization requests
-    send state and use a client secret but no code challenge or verifier
-    (`src/github_auth.rs:794-818`, `src/github_auth.rs:922-951`). Generate an S256
-    verifier per attempt, retain it with state, send the challenge, and require
-    the verifier during exchange. Add replay/interception tests.
+12. **[DONE] The OAuth authorization flow omitted PKCE** (Medium,
+    `src/github_auth.rs`, `README.md`, `IMPLEMENTATION.md`, and `AGENTS.md`):
+    **Valid and actionable.** The browser authorization previously bound the
+    callback only with CSRF state and redirect URI, while code exchange used the
+    client secret but no proof tied to the originating attempt. GitHub's
+    [OAuth App web-flow documentation](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps)
+    strongly recommends S256 PKCE and requires the original verifier at token
+    exchange when a challenge was sent. Each authorization now generates a
+    fresh 32-byte verifier through the `oauth2` crate, sends its 43-character
+    SHA-256 challenge and `S256` method, and transfers exclusive verifier
+    ownership into the digest-keyed pending-state registry before redirecting.
+    Callback admission removes the matching state and verifier together before
+    provider-error handling or code exchange, and the token request includes
+    `code_verifier`; reflected verifier values are redacted with the client
+    secret and authorization code. Regression coverage proves the challenge is
+    derived from the retained verifier, the verifier reaches token exchange,
+    an intercepted code paired with another attempt's state/verifier is denied,
+    the original attempt still succeeds, and its replay is rejected before a
+    second exchange. README and implementation guidance document the PKCE
+    contract, while the repository learning records one-owner attempt state.
+    Verification passed with `cargo fmt`, `yarn lint:fix`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
+    focused reviewer identified a genuine medium-severity authorization-code
+    interception defense gap and prescribed the correct state-bound S256 PKCE
+    lifecycle plus decisive interception/replay tests; with one valid finding
+    assessed here and no invalid finding attributable separately, this was
+    high-quality, security-relevant feedback.
 
 13. **Medium — Session revocation has no user-facing route or CLI flow.** The
     `revoke` operation is only exercised by unit tests, so a stolen token remains

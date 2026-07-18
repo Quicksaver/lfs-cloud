@@ -445,6 +445,12 @@ The local session retains that ID, and repository permission checks compare it
 with the collaborator response's nested user ID before granting access. The
 mutable login remains useful for the API path but is not sufficient identity.
 
+Every GitHub browser authorization uses S256 PKCE in addition to CSRF state.
+Retain the one-time verifier with the corresponding pending state, consume both
+at callback admission, and submit the verifier during code exchange so an
+intercepted authorization code cannot be redeemed without its original login
+attempt.
+
 Production sessions persist in SQLite until their short-lived expiry so a
 server restart does not invalidate credentials already stored by Git. Persist
 only a SHA-256 digest of the local bearer token. Authenticated-encrypt the
@@ -1312,7 +1318,7 @@ Defer:
 
 #### Epic 2.1: OAuth Login
 
-- [x] [T] Implement GitHub OAuth authorization URL generation with CSRF state.
+- [x] [T] Implement GitHub OAuth authorization URL generation with CSRF state and S256 PKCE.
 - [x] [T] Implement OAuth callback query parsing and CSRF state validation helper.
 - [x] [T] Implement OAuth callback route that uses the validated callback.
 - [x] [T] Implement GitHub OAuth code-to-token exchange.

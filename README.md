@@ -182,6 +182,8 @@ credential helper for the repository-scoped LFS URL. It does not store the
 GitHub OAuth access token in Git credentials. The server binds the local
 session to GitHub's immutable numeric user ID and rejects repository permission
 responses for a different account, even if the mutable login was reused.
+Each browser authorization uses S256 PKCE; the server retains the one-time code
+verifier with the matching CSRF state and consumes both before token exchange.
 Unexpired local sessions survive server restarts through the configured SQLite
 metadata database. SQLite stores only a SHA-256 digest of the local bearer
 token; the private GitHub token and authenticated session metadata are
