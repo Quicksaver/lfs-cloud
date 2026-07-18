@@ -32,6 +32,12 @@ cargo clippy --all-targets -- -D warnings
 yarn lint:check
 ```
 
+GitHub Actions runs the Rust formatting, lint, build, unit/integration, and
+documentation-test gates natively on Linux, macOS, and Windows. The test suite
+uses platform-native child processes for timeout and process-tree cleanup
+coverage, so Windows exercises the same recursive termination boundary as Unix
+rather than only compiling it.
+
 Run the CLI from the workspace:
 
 ```bash

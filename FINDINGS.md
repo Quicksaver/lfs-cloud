@@ -2402,11 +2402,37 @@ independently validated or adjudicated.
    finding attributable separately, this was high-quality, directly actionable
    feedback.
 
-7. **Medium — Platform-specific process handling is not tested across supported
-   operating systems.** Windows timeout cleanup uses `taskkill`, while relevant
-   helper and timeout tests are Unix-only (`src/credentials.rs:970`,
-   `src/migration.rs:1019`, `src/credentials.rs:1313`). Run CI on Linux, macOS,
-   and Windows with platform-native fake helpers and process-tree cases.
+7. **[DONE] Platform-specific process handling was not tested across supported
+   operating systems** (Medium, `.github/workflows/ci.yml`,
+   `src/credentials.rs`, `src/migration.rs`, `docs/install-release.md`, and
+   `AGENTS.md`): **Valid and actionable.** The repository had no CI workflow,
+   while the credential-helper and migration-fetch timeout regressions used
+   Unix shell fixtures and were excluded entirely on Windows even though the
+   production cleanup path calls recursive `taskkill /T`. CI now runs the
+   complete Rust format, Clippy, build, all-target, and documentation-test gates
+   natively on Linux, macOS, and Windows using the declared Rust 1.88 toolchain.
+   The two decisive timeout regressions now re-execute the platform's native
+   Rust test binary as a fake parent process, spawn a descendant that inherits
+   its captured pipes, and prove timeout cleanup prevents that descendant from
+   surviving. The same assertions therefore exercise Unix process-group or
+   descendant discovery and Windows recursive `taskkill` behavior without
+   assuming a Unix shell exists. Install guidance and the repository learning
+   document the native matrix and reusable fixture pattern. Local verification
+   passed with `yarn lint:fix`, `yarn lint:check`, `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1` (623 unit tests passed with
+   five helper/manual tests ignored; every integration target passed with the
+   expected three credential-gated tests ignored), `cargo test --doc` (39
+   passed), and `git diff --check`. Native Windows execution was not available
+   locally; an additional `x86_64-pc-windows-gnu` check stopped in dependency
+   build scripts because the host lacks `x86_64-w64-mingw32-gcc`, so the new
+   Windows CI job is intentionally the authoritative native gate rather than a
+   claimed local cross-platform pass. The reviewer identified a genuine
+   medium-severity platform reliability blind spot, cited the untested cleanup
+   boundary precisely, and prescribed both the OS matrix and platform-native
+   process-tree cases needed to close it. With one valid finding and no invalid
+   finding attributable separately, this was high-quality, directly
+   actionable feedback.
 
 8. **Low — A project-shape test enforces a redundant dependency roster.** It
    requires every originally planned dependency even if unused

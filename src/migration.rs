@@ -4259,6 +4259,10 @@ mod tests {
     };
 
     const TEST_REPOSITORY_NAMESPACE: &str = "github-main:owner/repo";
+    const PROCESS_TREE_HELPER_TEST: &str = "migration::tests::migration_process_tree_helper";
+    const PROCESS_TREE_DESCENDANT_TEST: &str =
+        "migration::tests::migration_process_tree_descendant";
+    const PROCESS_TREE_MARKER_ENV: &str = "LFS_CLOUD_MIGRATION_TEST_MARKER";
 
     #[cfg(unix)]
     #[test]
@@ -6290,12 +6294,14 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn source_fetch_timeout_stops_stderr_holding_descendants() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 60 & wait")
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let marker_path = temp.path().join("descendant-survived");
+        let test_executable = std::env::current_exe().expect("test executable should resolve");
+        let mut child = Command::new(test_executable)
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MARKER_ENV, &marker_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -6319,6 +6325,41 @@ mod tests {
             MigrationError::ExternalCommand { status, .. }
                 if status == "timed out after 0 seconds"
         ));
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            !marker_path.exists(),
+            "timeout cleanup left a descendant process alive"
+        );
+    }
+
+    #[test]
+    #[ignore = "invoked as a platform-native process-tree test helper"]
+    fn migration_process_tree_helper() {
+        let Some(marker_path) = std::env::var_os(PROCESS_TREE_MARKER_ENV) else {
+            return;
+        };
+        let test_executable = std::env::current_exe().expect("test executable should resolve");
+        let mut descendant = Command::new(test_executable)
+            .args(["--ignored", "--exact", PROCESS_TREE_DESCENDANT_TEST])
+            .env(PROCESS_TREE_MARKER_ENV, marker_path)
+            .spawn()
+            .expect("descendant helper should start");
+
+        descendant
+            .wait()
+            .expect("descendant helper should remain waitable");
+    }
+
+    #[test]
+    #[ignore = "invoked as a platform-native process-tree test descendant"]
+    fn migration_process_tree_descendant() {
+        let Some(marker_path) = std::env::var_os(PROCESS_TREE_MARKER_ENV) else {
+            return;
+        };
+
+        std::thread::sleep(Duration::from_millis(500));
+        fs::write(marker_path, b"descendant survived timeout cleanup")
+            .expect("descendant marker should be writable");
     }
 
     #[ignore = "manual verification requires git-lfs and a local source repository"]

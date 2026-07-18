@@ -1596,6 +1596,11 @@ mod tests {
     };
     use crate::{CliError, LfsSessionToken};
 
+    const PROCESS_TREE_HELPER_TEST: &str = "credentials::tests::credential_process_tree_helper";
+    const PROCESS_TREE_DESCENDANT_TEST: &str =
+        "credentials::tests::credential_process_tree_descendant";
+    const PROCESS_TREE_MARKER_ENV: &str = "LFS_CLOUD_CREDENTIAL_TEST_MARKER";
+
     fn token() -> LfsSessionToken {
         LfsSessionToken::from_secret("local-lfs-token").expect("test token should be valid")
     }
@@ -2498,25 +2503,14 @@ exit 0
     }
 
     #[test]
-    #[cfg(unix)]
     fn command_timeout_stops_descendant_helpers() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let marker_path = temp.path().join("descendant-survived");
-        let fake_git = write_fake_git(
-            temp.path(),
-            &format!(
-                r#"#!/bin/sh
-(
-  sleep 0.5
-  touch '{}'
-) &
-echo "waiting with local-lfs-token" >&2
-wait
-"#,
-                marker_path.display()
-            ),
-        );
-        let mut command = git_command(&fake_git);
+        let test_executable = std::env::current_exe().expect("test executable should resolve");
+        let mut command = git_command(&test_executable);
+        command
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MARKER_ENV, &marker_path);
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2534,6 +2528,36 @@ wait
         thread::sleep(Duration::from_millis(700));
 
         assert!(!marker_path.exists());
+    }
+
+    #[test]
+    #[ignore = "invoked as a platform-native process-tree test helper"]
+    fn credential_process_tree_helper() {
+        let Some(marker_path) = std::env::var_os(PROCESS_TREE_MARKER_ENV) else {
+            return;
+        };
+        let test_executable = std::env::current_exe().expect("test executable should resolve");
+        let mut descendant = Command::new(test_executable)
+            .args(["--ignored", "--exact", PROCESS_TREE_DESCENDANT_TEST])
+            .env(PROCESS_TREE_MARKER_ENV, marker_path)
+            .spawn()
+            .expect("descendant helper should start");
+
+        descendant
+            .wait()
+            .expect("descendant helper should remain waitable");
+    }
+
+    #[test]
+    #[ignore = "invoked as a platform-native process-tree test descendant"]
+    fn credential_process_tree_descendant() {
+        let Some(marker_path) = std::env::var_os(PROCESS_TREE_MARKER_ENV) else {
+            return;
+        };
+
+        thread::sleep(Duration::from_millis(500));
+        fs::write(marker_path, b"descendant survived timeout cleanup")
+            .expect("descendant marker should be writable");
     }
 
     #[test]
