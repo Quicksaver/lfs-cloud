@@ -1096,11 +1096,11 @@ fn wait_for_git_command_timeout(
             context: format!("failed to wait for {command_name}"),
             source,
         })? {
-            drain_stderr_until(
+            finish_stderr_reader_after_child_exit(
+                child,
                 &mut stderr_reader,
                 &mut stderr,
                 command_name,
-                STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
             )?;
             return Ok((status, stderr));
         }
@@ -1114,6 +1114,7 @@ fn wait_for_git_command_timeout(
                 command_name,
                 STDERR_DRAIN_AFTER_KILL_TIMEOUT,
             )?;
+            join_pipe_reader(&mut stderr_reader, command_name)?;
             return Err(CliError::ExternalCommand {
                 command: command_name.to_owned(),
                 status: format!("timed out after {} seconds", timeout.as_secs()),
@@ -1155,19 +1156,13 @@ fn wait_for_git_command_output(
             context: format!("failed to wait for {command_name}"),
             source,
         })? {
-            drain_pipe_until(
+            finish_output_readers_after_child_exit(
+                child,
                 &mut stdout_reader,
                 &mut stdout,
-                command_name,
-                retain_stdout_data,
-                STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
-            )?;
-            drain_pipe_until(
                 &mut stderr_reader,
                 &mut stderr,
                 command_name,
-                retain_stderr_data,
-                STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
             )?;
             return Ok((status, stdout, stderr));
         }
@@ -1189,6 +1184,8 @@ fn wait_for_git_command_output(
                 retain_stderr_data,
                 STDERR_DRAIN_AFTER_KILL_TIMEOUT,
             )?;
+            join_pipe_reader(&mut stdout_reader, command_name)?;
+            join_pipe_reader(&mut stderr_reader, command_name)?;
             return Err(CliError::ExternalCommand {
                 command: command_name.to_owned(),
                 status: format!("timed out after {} seconds", timeout.as_secs()),
@@ -1201,11 +1198,21 @@ fn wait_for_git_command_output(
 }
 
 fn git_command(git_program: &Path) -> Command {
-    Command::new(git_program)
+    let mut command = Command::new(git_program);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // Git may invoke credential helpers that fork. A dedicated process
+        // group gives the command boundary deterministic ownership of those
+        // descendants even after the direct Git child has exited.
+        command.process_group(0);
+    }
+    command
 }
 
 fn stop_timed_out_child(child: &mut Child, command_name: &str) -> CliResult<()> {
-    stop_timed_out_child_process_tree(child);
+    stop_child_process_tree(child);
 
     if child
         .try_wait()
@@ -1225,68 +1232,17 @@ fn stop_timed_out_child(child: &mut Child, command_name: &str) -> CliResult<()> 
 }
 
 #[cfg(unix)]
-fn stop_timed_out_child_process_tree(child: &Child) {
-    let descendants = collect_descendant_pids(child.id());
-    for pid in descendants.iter().rev() {
-        signal_process("TERM", *pid);
-    }
+fn stop_child_process_tree(child: &Child) {
+    signal_process_group("TERM", child.id());
     thread::sleep(Duration::from_millis(50));
-    for pid in descendants.iter().rev() {
-        signal_process("KILL", *pid);
-    }
+    signal_process_group("KILL", child.id());
 }
 
 #[cfg(unix)]
-fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
-    let mut descendants = Vec::new();
-    let mut pending = child_pids(root_pid);
-
-    while let Some(pid) = pending.pop() {
-        descendants.push(pid);
-        pending.extend(child_pids(pid));
-    }
-
-    descendants
-}
-
-#[cfg(target_os = "linux")]
-fn child_pids(parent_pid: u32) -> Vec<u32> {
-    let children_path = format!("/proc/{parent_pid}/task/{parent_pid}/children");
-    let Ok(children) = std::fs::read_to_string(children_path) else {
-        return Vec::new();
-    };
-
-    children
-        .split_whitespace()
-        .filter_map(|pid| pid.parse().ok())
-        .collect()
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn child_pids(parent_pid: u32) -> Vec<u32> {
-    let Ok(output) = Command::new("pgrep")
-        .args(["-P", &parent_pid.to_string()])
-        .stdin(Stdio::null())
-        .output()
-    else {
-        return Vec::new();
-    };
-
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
-}
-
-#[cfg(unix)]
-fn signal_process(signal: &str, pid: u32) {
+fn signal_process_group(signal: &str, process_group_id: u32) {
     let _ = Command::new("kill")
         .arg(format!("-{signal}"))
-        .arg(pid.to_string())
+        .arg(format!("-{process_group_id}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1294,7 +1250,7 @@ fn signal_process(signal: &str, pid: u32) {
 }
 
 #[cfg(windows)]
-fn stop_timed_out_child_process_tree(child: &Child) {
+fn stop_child_process_tree(child: &Child) {
     let _ = Command::new("taskkill")
         .args(["/T", "/F", "/PID", &child.id().to_string()])
         .stdin(Stdio::null())
@@ -1304,11 +1260,11 @@ fn stop_timed_out_child_process_tree(child: &Child) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn stop_timed_out_child_process_tree(_child: &Child) {}
+fn stop_child_process_tree(_child: &Child) {}
 
 struct PipeReader {
     receiver: Receiver<PipeEvent>,
-    _reader_thread: thread::JoinHandle<()>,
+    reader_thread: Option<thread::JoinHandle<()>>,
     closed: bool,
 }
 
@@ -1341,9 +1297,19 @@ impl PipeReader {
 
         Self {
             receiver,
-            _reader_thread: reader_thread,
+            reader_thread: Some(reader_thread),
             closed: false,
         }
+    }
+
+    fn join(&mut self, command_name: &str) -> CliResult<()> {
+        let Some(reader_thread) = self.reader_thread.take() else {
+            return Ok(());
+        };
+        reader_thread.join().map_err(|_| CliError::Io {
+            context: format!("pipe reader thread panicked for {command_name}"),
+            source: std::io::Error::other("pipe reader thread panicked"),
+        })
     }
 }
 
@@ -1351,6 +1317,96 @@ enum PipeEvent {
     Data(Vec<u8>),
     Error(std::io::Error),
     Closed,
+}
+
+fn finish_stderr_reader_after_child_exit(
+    child: &Child,
+    reader: &mut Option<PipeReader>,
+    stderr: &mut Vec<u8>,
+    command_name: &str,
+) -> CliResult<()> {
+    drain_stderr_until(
+        reader,
+        stderr,
+        command_name,
+        STDERR_DRAIN_AFTER_KILL_TIMEOUT,
+    )?;
+    if pipe_reader_is_open(reader) {
+        // A pipe that remains open after the direct child exits is owned by a
+        // descendant. Stop the command's remaining process tree before waiting
+        // for EOF so no blocked reader thread is detached on return.
+        stop_child_process_tree(child);
+    }
+    drain_stderr_until(
+        reader,
+        stderr,
+        command_name,
+        STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
+    )?;
+    join_pipe_reader(reader, command_name)
+}
+
+fn finish_output_readers_after_child_exit(
+    child: &Child,
+    stdout_reader: &mut Option<PipeReader>,
+    stdout: &mut Vec<u8>,
+    stderr_reader: &mut Option<PipeReader>,
+    stderr: &mut Vec<u8>,
+    command_name: &str,
+) -> CliResult<()> {
+    drain_pipe_until(
+        stdout_reader,
+        stdout,
+        command_name,
+        retain_stdout_data,
+        STDERR_DRAIN_AFTER_KILL_TIMEOUT,
+    )?;
+    drain_pipe_until(
+        stderr_reader,
+        stderr,
+        command_name,
+        retain_stderr_data,
+        STDERR_DRAIN_AFTER_KILL_TIMEOUT,
+    )?;
+    if pipe_reader_is_open(stdout_reader) || pipe_reader_is_open(stderr_reader) {
+        stop_child_process_tree(child);
+    }
+    drain_pipe_until(
+        stdout_reader,
+        stdout,
+        command_name,
+        retain_stdout_data,
+        STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
+    )?;
+    drain_pipe_until(
+        stderr_reader,
+        stderr,
+        command_name,
+        retain_stderr_data,
+        STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
+    )?;
+    join_pipe_reader(stdout_reader, command_name)?;
+    join_pipe_reader(stderr_reader, command_name)
+}
+
+fn pipe_reader_is_open(reader: &Option<PipeReader>) -> bool {
+    reader.as_ref().is_some_and(|reader| !reader.closed)
+}
+
+fn join_pipe_reader(reader: &mut Option<PipeReader>, command_name: &str) -> CliResult<()> {
+    let Some(reader) = reader else {
+        return Ok(());
+    };
+    if !reader.closed {
+        return Err(CliError::Io {
+            context: format!("timed out draining pipe output from {command_name}"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pipe remained open after process-tree cleanup",
+            ),
+        });
+    }
+    reader.join(command_name)
 }
 
 fn drain_available_stderr(
@@ -1536,7 +1592,7 @@ mod tests {
         MAX_CREDENTIAL_OUTPUT_LEN, MAX_RETAINED_COMMAND_STDERR_LEN, git_command,
         git_config_output_has_helper, git_credential_helper_fallback_instructions,
         parse_git_credential_fill_output, retain_stderr_data, retain_stdout_data,
-        sanitize_command_stderr, wait_for_git_command_timeout,
+        sanitize_command_stderr, wait_for_git_command_output, wait_for_git_command_timeout,
     };
     use crate::{CliError, LfsSessionToken};
 
@@ -2305,7 +2361,8 @@ echo "waiting with local-lfs-token" >&2
 sleep 5
 "#,
         );
-        let mut child = Command::new(&fake_git)
+        let mut command = git_command(&fake_git);
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -2340,7 +2397,8 @@ done
 exit 42
 "#,
         );
-        let mut child = Command::new(&fake_git)
+        let mut command = git_command(&fake_git);
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -2388,6 +2446,55 @@ wait
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(display.contains("fake git failed with status timed out"));
         assert!(!display.contains("local-lfs-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn successful_command_stops_pipe_holding_descendants() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let fake_git = write_fake_git(
+            temp.path(),
+            r#"#!/bin/sh
+sleep 10 &
+printf '%s\n' "$!" > "$1"
+printf 'configured-helper\n'
+exit 0
+"#,
+        );
+        let mut command = git_command(&fake_git);
+        let mut child = command
+            .arg(&descendant_pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fake git should start");
+
+        let (status, stdout, stderr) =
+            wait_for_git_command_output(&mut child, "fake git", "", Duration::from_secs(5))
+                .expect("successful direct child should complete");
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .expect("fake git should record its descendant")
+            .trim()
+            .to_owned();
+        let descendant_alive = Command::new("kill")
+            .args(["-0", &descendant_pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill probe should run")
+            .success();
+        if descendant_alive {
+            let _ = Command::new("kill")
+                .args(["-KILL", &descendant_pid])
+                .status();
+        }
+
+        assert!(status.success());
+        assert_eq!(stdout, b"configured-helper\n");
+        assert!(stderr.is_empty());
+        assert!(!descendant_alive, "pipe-holding descendant was left alive");
     }
 
     #[test]
@@ -2441,7 +2548,8 @@ while :; do
 done
 "#,
         );
-        let mut child = Command::new(&fake_git)
+        let mut command = git_command(&fake_git);
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

@@ -387,12 +387,30 @@ independently validated or adjudicated.
     assertion remediation; with one valid finding assessed here and no invalid
     finding attributable separately, this was high-quality, relevant feedback.
 
-16. **Low — Credential-helper descendants can leave blocked reader threads.** A
-    successful direct child can exit while a descendant retains stdout or
-    stderr, causing drain timeouts and detached blocked threads
-    (`src/credentials.rs:832-846`, `src/credentials.rs:983-1020`,
-    `src/credentials.rs:1117-1145`). Use cancellable/nonblocking reads or
-    deterministic process-group cleanup, and test a pipe-holding descendant.
+16. **[DONE] Credential-helper descendants could leave blocked pipe-reader
+    threads** (Low, `src/credentials.rs`): **Valid and actionable.** Timeout
+    handling already attempted descendant cleanup, but a successful direct Git
+    child could exit while a helper descendant retained stdout or stderr. The
+    bounded drain then returned while dropping the pipe readers' join handles,
+    leaving their threads detached and blocked until the descendant eventually
+    closed the inherited descriptors. Credential Git commands now enter a
+    dedicated Unix process group, and both successful-exit and timeout paths
+    terminate remaining process-tree members before finishing an open pipe.
+    Successful-exit handling drains buffered output, confirms EOF, and joins
+    every reader thread before returning; Windows continues to use recursive
+    `taskkill /T` cleanup. A Unix regression starts a successful fake Git child
+    whose sleeping descendant inherits both output pipes, verifies the direct
+    child's output is preserved, and proves the descendant is gone when the
+    wait returns. The new test failed against the previous implementation and
+    passed after the fix. Verification passed with `cargo fmt --check`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`,
+    `yarn lint:fix`, and `git diff --check`. The focused reviewer identified a
+    genuine low-severity process-lifecycle leak, distinguished direct-child
+    completion from inherited-pipe EOF correctly, and requested the decisive
+    pipe-holding-descendant regression. With one valid finding assessed here
+    and no invalid finding attributable separately, this was high-quality,
+    relevant feedback.
 
 ## Server and metadata
 
