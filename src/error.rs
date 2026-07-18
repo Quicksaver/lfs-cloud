@@ -347,6 +347,13 @@ pub enum ServerError {
         message: String,
     },
 
+    /// The server is temporarily refusing work to protect bounded resources.
+    #[error("request rate limit exceeded; retry after {retry_after_seconds} seconds")]
+    RateLimited {
+        /// Minimum delay clients should observe before retrying.
+        retry_after_seconds: u64,
+    },
+
     /// The server could not complete a request due to an internal invariant failure.
     #[error("internal server error: {message}")]
     Internal {

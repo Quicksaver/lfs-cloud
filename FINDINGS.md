@@ -140,14 +140,37 @@ independently validated or adjudicated.
    assessed here and no invalid finding attributable separately, this was
    high-quality, security-relevant feedback.
 
-7. **Medium — Unauthenticated login flooding can evict legitimate CSRF
-   states.** Each login GET registers state and the 1,025th pending entry evicts
-   the oldest; callback lookup also scans all states under a global mutex
-   (`src/github_auth.rs:327-335`, `src/github_auth.rs:992-1019`,
-   `src/server.rs:318-330`). Rate-limit the endpoints, return 429 on overload,
-   and use cookie-bound or signed state with keyed lookup. Inject a clock and
-   test before, at, and after expiry, eviction order, and that unrelated
-   requests cannot evict an active attempt.
+7. **[DONE] Unauthenticated login flooding could evict legitimate CSRF
+   states** (Medium, `src/github_auth.rs` and `src/error.rs`): **Valid and
+   actionable.** The pending-state registry previously admitted the 1,025th
+   login by silently deleting the oldest unrelated attempt, and every callback
+   scanned the full registry while holding its mutex. Registration now hashes
+   each opaque random state into a fixed digest key, consumes it through direct
+   `HashMap` lookup, and rejects new admission at the bounded capacity without
+   evicting any active attempt. Capacity exhaustion is a typed server
+   rate-limit error; the login endpoint returns HTTP 429 with `Retry-After`
+   instead of redirecting with a state that displaced another user. The
+   registry clock is injectable in tests, and deterministic coverage proves
+   validity immediately before expiry, expiry at the exact TTL, continued
+   expiry afterward, capacity reuse, exact one-time lookup, overload response
+   headers, and preservation of an unrelated active state. The implementation
+   intentionally retains server-side one-time random states rather than adding
+   a second cookie/signature mechanism: they already provide unguessable CSRF
+   binding and replay consumption, while digest-keyed lookup removes the linear
+   scan. It also avoids a naive global requests-per-second throttle, which an
+   unauthenticated caller could monopolize; per-client temporal throttling
+   remains an appropriate listener or trusted-proxy control once the server has
+   a trustworthy client-identity boundary. Verification passed with
+   `cargo fmt`, focused state-registry and 429 route tests,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, and `cargo test --doc`. The focused reviewer
+   identified a genuine medium-severity availability flaw, correctly connected
+   eviction and linear lookup to unauthenticated traffic, and requested the
+   decisive boundary and preservation tests. The cookie/signed-state and
+   endpoint-throttle suggestions were broader than necessary for this
+   server-side one-time-state design, but the core finding and remediation
+   direction were high-quality and security-relevant; with one valid finding
+   and no invalid finding attributable separately, this was strong feedback.
 
 8. **Medium — Successful logins can evict unrelated active sessions.** At the
    global 1,024-session cap, issuance silently removes the soonest-expiring

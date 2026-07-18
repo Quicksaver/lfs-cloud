@@ -6,7 +6,7 @@
 //! non-secret identity metadata.
 
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     fmt,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -29,6 +29,7 @@ use reqwest::{
     redirect::Policy,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
@@ -112,7 +113,7 @@ impl GitHubOAuthCallbackRouteState {
     ///     allow_insecure_http: false,
     /// };
     /// let csrf_states = GitHubOAuthStateRegistry::new();
-    /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?);
+    /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?)?;
     ///
     /// let route_state = GitHubOAuthCallbackRouteState::new(
     ///     provider,
@@ -163,7 +164,7 @@ impl GitHubOAuthCallbackRouteState {
     ///     allow_insecure_http: false,
     /// };
     /// let csrf_states = GitHubOAuthStateRegistry::new();
-    /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?);
+    /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?)?;
     /// let token_exchanger = GitHubOAuthTokenExchanger::new()?;
     /// let user_client = GitHubUserClient::new()?;
     ///
@@ -359,7 +360,9 @@ async fn github_oauth_login_route(
     State(state): State<GitHubOAuthCallbackRouteState>,
 ) -> Result<Redirect, GitHubOAuthCallbackRouteError> {
     let authorization = GitHubOAuthAuthorization::new(&state.provider, &state.redirect_url)?;
-    state.csrf_states.register(authorization.csrf_state.clone());
+    state
+        .csrf_states
+        .register(authorization.csrf_state.clone())?;
 
     Ok(Redirect::temporary(
         authorization.authorization_url.as_str(),
@@ -400,16 +403,26 @@ impl From<ServerError> for GitHubOAuthCallbackRouteError {
 
 impl IntoResponse for GitHubOAuthCallbackRouteError {
     fn into_response(self) -> Response {
-        let (status, error, message) = match &self.0 {
+        let (status, error, message, retry_after_seconds) = match &self.0 {
             ServerError::InvalidRequest { .. } => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "Invalid GitHub OAuth callback request.",
+                None,
+            ),
+            ServerError::RateLimited {
+                retry_after_seconds,
+            } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "GitHub OAuth login capacity is temporarily exhausted.",
+                Some(*retry_after_seconds),
             ),
             ServerError::Unauthorized { .. } => (
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "GitHub OAuth callback was not authorized.",
+                None,
             ),
             ServerError::RepositoryProvider {
                 source:
@@ -420,6 +433,7 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "GitHub OAuth callback was not authorized.",
+                None,
             ),
             ServerError::RepositoryProvider {
                 source: RepositoryProviderError::RepositoryNotFound { .. },
@@ -427,11 +441,13 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
                 StatusCode::NOT_FOUND,
                 "not_found",
                 "GitHub repository was not found.",
+                None,
             ),
             ServerError::RepositoryProvider { .. } | ServerError::Storage { .. } => (
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
                 "GitHub OAuth callback could not be completed.",
+                None,
             ),
             ServerError::ConfigRead { .. }
             | ServerError::ConfigParse { .. }
@@ -450,11 +466,20 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "GitHub OAuth callback could not be completed.",
+                None,
             ),
         };
         let body = GitHubOAuthCallbackRouteErrorBody { error, message };
+        let mut response = (status, Json(body)).into_response();
+        if let Some(retry_after_seconds) = retry_after_seconds {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_str(&retry_after_seconds.to_string())
+                    .expect("u64 retry delay must be a valid HTTP header value"),
+            );
+        }
 
-        (status, Json(body)).into_response()
+        response
     }
 }
 
@@ -1138,11 +1163,22 @@ impl fmt::Debug for GitHubOAuthAuthorization {
 /// returning the authorization URL. The callback route consumes the matching
 /// state before exchanging the code, which lets one mounted router handle many
 /// concurrent login attempts without accepting replayed callbacks. Abandoned
-/// states expire and the registry evicts old entries before accepting more than
-/// the maximum pending state count.
-#[derive(Clone, Default)]
+/// states expire, while capacity exhaustion rejects unrelated attempts instead
+/// of evicting an active login. State digests provide direct bounded-time lookup
+/// without retaining the raw secret or scanning every pending attempt.
+#[derive(Clone)]
 pub struct GitHubOAuthStateRegistry {
-    states: Arc<Mutex<BTreeMap<String, Instant>>>,
+    states: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl Default for GitHubOAuthStateRegistry {
+    fn default() -> Self {
+        Self {
+            states: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(Instant::now),
+        }
+    }
 }
 
 impl GitHubOAuthStateRegistry {
@@ -1156,42 +1192,47 @@ impl GitHubOAuthStateRegistry {
     #[must_use]
     pub fn with_state(state: GitHubOAuthState) -> Self {
         let registry = Self::new();
-        registry.register(state);
+        registry
+            .register(state)
+            .expect("a new OAuth state registry must have capacity");
         registry
     }
 
     /// Registers a generated CSRF state for one future callback.
-    pub fn register(&self, state: GitHubOAuthState) {
-        let now = Instant::now();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::RateLimited`] when the pending-state capacity is
+    /// exhausted. Existing attempts are never evicted to admit a new request.
+    pub fn register(&self, state: GitHubOAuthState) -> ServerResult<()> {
+        let now = (self.clock)();
+        let state_key = oauth_state_key(&state);
         let mut states = self
             .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_oauth_states(&mut states, now);
-        if !states.contains_key(state.as_str()) && states.len() >= MAX_PENDING_GITHUB_OAUTH_STATES {
-            evict_oldest_oauth_state(&mut states);
+        if !states.contains_key(&state_key) && states.len() >= MAX_PENDING_GITHUB_OAUTH_STATES {
+            return Err(ServerError::RateLimited {
+                retry_after_seconds: GITHUB_OAUTH_STATE_TTL.as_secs(),
+            });
         }
-        states.insert(state.0, now);
+        states.insert(state_key, now);
+        Ok(())
     }
 
     fn consume(&self, state: &GitHubOAuthState) -> bool {
-        let now = Instant::now();
+        let now = (self.clock)();
         let mut states = self
             .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_oauth_states(&mut states, now);
-        let mut consumed = false;
-        states.retain(|registered_state, _| {
-            let matches = constant_time_str_eq(state.as_str(), registered_state);
-            consumed |= matches;
-            !matches
-        });
-        consumed
+        states.remove(&oauth_state_key(state)).is_some()
     }
 
     fn len(&self) -> usize {
-        let now = Instant::now();
+        let now = (self.clock)();
         let mut states = self
             .states
             .lock()
@@ -1199,20 +1240,22 @@ impl GitHubOAuthStateRegistry {
         prune_expired_oauth_states(&mut states, now);
         states.len()
     }
-}
 
-fn prune_expired_oauth_states(states: &mut BTreeMap<String, Instant>, now: Instant) {
-    states.retain(|_, registered_at| now.duration_since(*registered_at) <= GITHUB_OAUTH_STATE_TTL);
-}
-
-fn evict_oldest_oauth_state(states: &mut BTreeMap<String, Instant>) {
-    if let Some(oldest_state) = states
-        .iter()
-        .min_by_key(|(_, registered_at)| **registered_at)
-        .map(|(state, _)| state.clone())
-    {
-        states.remove(&oldest_state);
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        Self {
+            states: Arc::new(Mutex::new(HashMap::new())),
+            clock,
+        }
     }
+}
+
+fn oauth_state_key(state: &GitHubOAuthState) -> [u8; 32] {
+    Sha256::digest(state.as_str().as_bytes()).into()
+}
+
+fn prune_expired_oauth_states(states: &mut HashMap<[u8; 32], Instant>, now: Instant) {
+    states.retain(|_, registered_at| now.duration_since(*registered_at) < GITHUB_OAUTH_STATE_TTL);
 }
 
 impl fmt::Debug for GitHubOAuthStateRegistry {
@@ -2292,8 +2335,9 @@ mod tests {
         collections::BTreeMap,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
+        time::{Duration, Instant},
     };
 
     use axum::{
@@ -2304,6 +2348,7 @@ mod tests {
             HeaderMap, HeaderValue, Request, StatusCode,
             header::{
                 AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, LOCATION, PRAGMA, REFERRER_POLICY,
+                RETRY_AFTER,
             },
         },
         response::IntoResponse,
@@ -2316,11 +2361,11 @@ mod tests {
 
     use super::{
         DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
-        GITHUB_OAUTH_LOGIN_PATH, GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken,
-        GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery,
-        GitHubOAuthCallbackRouteState, GitHubOAuthState, GitHubOAuthStateRegistry,
-        GitHubOAuthTokenExchanger, GitHubRepositoryPermissionClient, GitHubUserClient,
-        MAX_PENDING_GITHUB_OAUTH_STATES, exchange_github_oauth_code,
+        GITHUB_OAUTH_LOGIN_PATH, GITHUB_OAUTH_STATE_TTL, GITHUB_OAUTH_TOKEN_URL,
+        GitHubOAuthAccessToken, GitHubOAuthAuthorization, GitHubOAuthCallback,
+        GitHubOAuthCallbackQuery, GitHubOAuthCallbackRouteState, GitHubOAuthState,
+        GitHubOAuthStateRegistry, GitHubOAuthTokenExchanger, GitHubRepositoryPermissionClient,
+        GitHubUserClient, MAX_PENDING_GITHUB_OAUTH_STATES, exchange_github_oauth_code,
         fetch_authenticated_github_user, github_oauth_authorization_url,
         github_oauth_callback_router, github_oauth_login_router,
     };
@@ -3535,28 +3580,74 @@ mod tests {
     }
 
     #[test]
-    fn state_registry_limits_pending_states() {
+    fn state_registry_rejects_overload_without_evicting_active_states() {
         let registry = GitHubOAuthStateRegistry::new();
+        let active_state =
+            GitHubOAuthState::from_secret("active-state").expect("state should parse");
+        registry
+            .register(active_state.clone())
+            .expect("first state should register");
 
-        for index in 0..=MAX_PENDING_GITHUB_OAUTH_STATES {
-            registry.register(
-                GitHubOAuthState::from_secret(format!("csrf-state-{index}"))
-                    .expect("state should parse"),
-            );
+        for index in 1..MAX_PENDING_GITHUB_OAUTH_STATES {
+            registry
+                .register(
+                    GitHubOAuthState::from_secret(format!("csrf-state-{index}"))
+                        .expect("state should parse"),
+                )
+                .expect("state should register before capacity");
         }
 
         assert_eq!(registry.len(), MAX_PENDING_GITHUB_OAUTH_STATES);
+        let error = registry
+            .register(
+                GitHubOAuthState::from_secret("unrelated-overload-state")
+                    .expect("state should parse"),
+            )
+            .expect_err("capacity must reject an unrelated login attempt");
+        assert!(matches!(error, ServerError::RateLimited { .. }));
+        assert_eq!(registry.len(), MAX_PENDING_GITHUB_OAUTH_STATES);
+        assert!(registry.consume(&active_state));
     }
 
     #[test]
-    fn state_registry_consumes_only_exact_constant_time_match() {
+    fn state_registry_expires_states_at_the_exact_ttl_boundary() {
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let base = Instant::now();
+        let clock = {
+            let elapsed_seconds = Arc::clone(&elapsed_seconds);
+            Arc::new(move || base + Duration::from_secs(elapsed_seconds.load(Ordering::SeqCst)))
+        };
+        let registry = GitHubOAuthStateRegistry::with_clock(clock);
+
+        registry
+            .register(GitHubOAuthState::from_secret("before-expiry").expect("state should parse"))
+            .expect("state should register");
+        elapsed_seconds.store(GITHUB_OAUTH_STATE_TTL.as_secs() - 1, Ordering::SeqCst);
+        assert_eq!(registry.len(), 1);
+
+        elapsed_seconds.store(GITHUB_OAUTH_STATE_TTL.as_secs(), Ordering::SeqCst);
+        assert_eq!(registry.len(), 0);
+
+        elapsed_seconds.store(GITHUB_OAUTH_STATE_TTL.as_secs() + 1, Ordering::SeqCst);
+        assert_eq!(registry.len(), 0);
+
+        registry
+            .register(GitHubOAuthState::from_secret("after-expiry").expect("state should parse"))
+            .expect("capacity should be reusable after expiry");
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn state_registry_consumes_only_exact_digest_key() {
         let registry = GitHubOAuthStateRegistry::new();
-        registry.register(
-            GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse"),
-        );
-        registry.register(
-            GitHubOAuthState::from_secret("csrf-state-beta").expect("state should parse"),
-        );
+        registry
+            .register(
+                GitHubOAuthState::from_secret("csrf-state-alpha").expect("state should parse"),
+            )
+            .expect("state should register");
+        registry
+            .register(GitHubOAuthState::from_secret("csrf-state-beta").expect("state should parse"))
+            .expect("state should register");
 
         assert!(!registry.consume(
             &GitHubOAuthState::from_secret("csrf-state-alphb").expect("state should parse")
@@ -3731,6 +3822,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_route_returns_too_many_requests_without_evicting_active_state() {
+        let csrf_states = GitHubOAuthStateRegistry::new();
+        let active_state =
+            GitHubOAuthState::from_secret("active-state").expect("state should parse");
+        csrf_states
+            .register(active_state.clone())
+            .expect("active state should register");
+        for index in 1..MAX_PENDING_GITHUB_OAUTH_STATES {
+            csrf_states
+                .register(
+                    GitHubOAuthState::from_secret(format!("csrf-state-{index}"))
+                        .expect("state should parse"),
+                )
+                .expect("state should register before capacity");
+        }
+        let route_state = GitHubOAuthCallbackRouteState::with_clients(
+            provider_config(),
+            csrf_states.clone(),
+            REDIRECT_URL,
+            GitHubOAuthTokenExchanger::new().expect("token exchanger should build"),
+            GitHubUserClient::new().expect("user client should build"),
+        )
+        .expect("callback route state should build");
+        let app = github_oauth_login_router(route_state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(GITHUB_OAUTH_LOGIN_PATH)
+                    .body(Body::empty())
+                    .expect("login request should build"),
+            )
+            .await
+            .expect("login request should complete");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .expect("overload response should include Retry-After"),
+            GITHUB_OAUTH_STATE_TTL.as_secs().to_string().as_str()
+        );
+        assert!(csrf_states.consume(&active_state));
+    }
+
+    #[tokio::test]
     async fn callback_route_accepts_multiple_registered_states_once() {
         let (token_url, token_server) = token_server(
             StatusCode::OK,
@@ -3740,12 +3878,16 @@ mod tests {
         let (api_url, user_server) =
             user_server(StatusCode::OK, r#"{"login":"octocat","id":42}"#).await;
         let csrf_states = GitHubOAuthStateRegistry::new();
-        csrf_states.register(
-            GitHubOAuthState::from_secret("first-state").expect("first state should parse"),
-        );
-        csrf_states.register(
-            GitHubOAuthState::from_secret("second-state").expect("second state should parse"),
-        );
+        csrf_states
+            .register(
+                GitHubOAuthState::from_secret("first-state").expect("first state should parse"),
+            )
+            .expect("first state should register");
+        csrf_states
+            .register(
+                GitHubOAuthState::from_secret("second-state").expect("second state should parse"),
+            )
+            .expect("second state should register");
         let route_state = GitHubOAuthCallbackRouteState::with_clients(
             provider_config_with_api_url(api_url),
             csrf_states,
