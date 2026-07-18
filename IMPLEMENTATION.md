@@ -261,7 +261,11 @@ For example:
 lfs-cloud serve --config ./lfs-cloud.yml --port 8080
 ```
 
-By default, the CLI can bind to `127.0.0.1` for safer single-machine use. LAN exposure should be explicit or clearly reported, for example by binding to `0.0.0.0` or a selected interface:
+By default, the CLI can bind to `127.0.0.1` for safer single-machine use. LAN
+exposure should use HTTPS through trusted TLS termination. Plaintext LAN
+development must be explicitly enabled with `server.allow_insecure_http: true`
+and the matching client `--allow-insecure-http` flag before binding to `0.0.0.0`
+or a selected interface:
 
 ```bash
 lfs-cloud serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080
@@ -1021,7 +1025,8 @@ MVP deployment is local-network only:
 ```text
 default bind: 127.0.0.1
 LAN bind: explicit --host 0.0.0.0 or selected interface
-transport: HTTP allowed for MVP
+transport: HTTPS by default; literal loopback HTTP allowed for local development
+unsafe LAN HTTP: explicit server and client opt-in on a trusted network
 ```
 
 The CLI should print both localhost and LAN-accessible addresses when available. Production HTTPS and hosted transfer infrastructure are out of scope for the first MVP.

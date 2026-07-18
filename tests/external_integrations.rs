@@ -43,6 +43,7 @@ async fn github_disposable_repo_permission_check() {
         api_url: api_url.clone(),
         oauth_client_id: "external-integration".to_owned(),
         oauth_client_secret: "external-integration".to_owned(),
+        allow_insecure_http: false,
     };
     let oauth_token =
         GitHubOAuthAccessToken::from_secret(token.clone()).expect("GitHub token should validate");

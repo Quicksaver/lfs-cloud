@@ -132,6 +132,13 @@ For LAN exposure:
 lfs-cloud serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080
 ```
 
+Use HTTPS through trusted TLS termination for LAN or remote access. Plaintext
+HTTP is accepted automatically only for exact loopback IP addresses. A trusted
+development LAN requires `server.allow_insecure_http: true`, and CLI commands
+that accept `--server` require the matching `--allow-insecure-http` flag. This
+unsafe mode exposes OAuth codes, LFS credentials, and object bytes to anyone
+able to observe that network.
+
 The CLI prints addresses like:
 
 ```text
@@ -356,7 +363,7 @@ defined yet.
 For early use, prefer:
 
 - `localhost` for single-machine development
-- LAN exposure for trusted local-network machines
+- HTTPS LAN exposure for trusted local-network machines
 - self-hosted or VPS deployment when remote access is needed
 
 Avoid relying on tunnel services such as ngrok for normal large-file traffic. They are useful for demos or temporary testing, but their bandwidth/request limits are a poor fit for GB-scale LFS usage.

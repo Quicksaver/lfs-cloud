@@ -9,6 +9,7 @@ pub mod error;
 pub mod git;
 pub mod github_auth;
 pub mod google_drive;
+mod http_transport;
 pub mod init;
 pub mod lfs;
 pub mod local_cache;

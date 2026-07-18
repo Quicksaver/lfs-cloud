@@ -16,7 +16,10 @@ use std::{
 
 use url::Url;
 
-use crate::{CliError, CliResult, LfsSessionToken, SanitizedMessage};
+use crate::{
+    CliError, CliResult, LfsSessionToken, SanitizedMessage,
+    http_transport::uses_protected_http_transport,
+};
 
 /// Username stored alongside local LFS Cloud bearer tokens in Git credentials.
 pub const DEFAULT_GIT_CREDENTIAL_USERNAME: &str = "lfs-cloud";
@@ -111,6 +114,17 @@ impl GitCredentialLookup {
         Self::with_username(lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME)
     }
 
+    /// Creates a lookup after an explicit CLI plaintext-HTTP opt-in.
+    pub(crate) fn new_with_insecure_http(
+        lfs_url: impl AsRef<str>,
+        allow_insecure_http: bool,
+    ) -> CliResult<Self> {
+        Ok(Self {
+            lfs_url: validate_lfs_credential_url(lfs_url.as_ref(), allow_insecure_http)?,
+            username: DEFAULT_GIT_CREDENTIAL_USERNAME.to_owned(),
+        })
+    }
+
     /// Creates a credential lookup request with an explicit username.
     ///
     /// # Errors
@@ -119,7 +133,7 @@ impl GitCredentialLookup {
     /// padded, too long, or contains control characters.
     pub fn with_username(lfs_url: impl AsRef<str>, username: impl Into<String>) -> CliResult<Self> {
         Ok(Self {
-            lfs_url: validate_lfs_credential_url(lfs_url.as_ref())?,
+            lfs_url: validate_lfs_credential_url(lfs_url.as_ref(), false)?,
             username: validate_credential_field("git credential username", username.into())?,
         })
     }
@@ -248,6 +262,19 @@ impl GitCredentialApproval {
         Self::with_username(lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME, token)
     }
 
+    /// Creates an approval after an explicit CLI plaintext-HTTP opt-in.
+    pub(crate) fn new_with_insecure_http(
+        lfs_url: impl AsRef<str>,
+        token: LfsSessionToken,
+        allow_insecure_http: bool,
+    ) -> CliResult<Self> {
+        Ok(Self {
+            lfs_url: validate_lfs_credential_url(lfs_url.as_ref(), allow_insecure_http)?,
+            username: DEFAULT_GIT_CREDENTIAL_USERNAME.to_owned(),
+            token,
+        })
+    }
+
     /// Creates a credential approval payload with an explicit username.
     ///
     /// # Errors
@@ -260,7 +287,7 @@ impl GitCredentialApproval {
         token: LfsSessionToken,
     ) -> CliResult<Self> {
         Ok(Self {
-            lfs_url: validate_lfs_credential_url(lfs_url.as_ref())?,
+            lfs_url: validate_lfs_credential_url(lfs_url.as_ref(), false)?,
             username: validate_credential_field("git credential username", username.into())?,
             token,
         })
@@ -529,7 +556,7 @@ impl GitCredentialApproval {
 /// # Ok::<(), lfs_cloud::CliError>(())
 /// ```
 pub fn git_credential_helper_fallback_instructions(lfs_url: impl AsRef<str>) -> CliResult<String> {
-    let lfs_url = validate_lfs_credential_url(lfs_url.as_ref())?;
+    let lfs_url = validate_lfs_credential_url(lfs_url.as_ref(), false)?;
     Ok(credential_helper_fallback_instructions(
         &lfs_url,
         DEFAULT_GIT_CREDENTIAL_USERNAME,
@@ -600,7 +627,7 @@ impl fmt::Debug for GitCredentialApproval {
     }
 }
 
-fn validate_lfs_credential_url(value: &str) -> CliResult<Url> {
+fn validate_lfs_credential_url(value: &str, allow_insecure_http: bool) -> CliResult<Url> {
     let url = Url::parse(value).map_err(|source| CliError::InvalidArguments {
         message: format!("configured LFS URL is not valid: {source}"),
     })?;
@@ -626,6 +653,11 @@ fn validate_lfs_credential_url(value: &str) -> CliResult<Url> {
     if url.query().is_some() {
         return Err(CliError::InvalidArguments {
             message: "configured LFS URL must not include a query string".to_owned(),
+        });
+    }
+    if !allow_insecure_http && !uses_protected_http_transport(&url) {
+        return Err(CliError::InvalidArguments {
+            message: "configured LFS URL must use HTTPS unless it targets an exact loopback IP; pass --allow-insecure-http only on a trusted development network".to_owned(),
         });
     }
 
@@ -1297,6 +1329,29 @@ mod tests {
             let error = GitCredentialApproval::new(invalid, token()).unwrap_err();
             assert!(matches!(error, CliError::InvalidArguments { .. }));
         }
+    }
+
+    #[test]
+    fn credentials_require_protected_transport_without_explicit_opt_in() {
+        for rejected in [
+            "http://localhost:8080/repo.git/info/lfs",
+            "http://192.168.1.25:8080/repo.git/info/lfs",
+        ] {
+            let error = GitCredentialApproval::new(rejected, token())
+                .expect_err("non-loopback HTTP should be rejected");
+            assert!(error.to_string().contains("must use HTTPS"), "{rejected}");
+            let error = GitCredentialLookup::new(rejected)
+                .expect_err("non-loopback HTTP lookup should be rejected");
+            assert!(error.to_string().contains("must use HTTPS"), "{rejected}");
+        }
+
+        let approval = GitCredentialApproval::new_with_insecure_http(
+            "http://192.168.1.25:8080/repo.git/info/lfs",
+            token(),
+            true,
+        )
+        .expect("explicit CLI opt-in should allow the trusted LAN URL");
+        assert_eq!(approval.lfs_url().host_str(), Some("192.168.1.25"));
     }
 
     #[test]

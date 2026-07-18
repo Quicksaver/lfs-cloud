@@ -22,6 +22,7 @@ use reqwest::{
     header::{
         ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION,
     },
+    redirect::Policy,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -1501,6 +1502,7 @@ fn default_google_drive_http_client_from(
 
     let client = Client::builder()
         .timeout(timeout)
+        .redirect(Policy::none())
         .build()
         .map_err(|source| StorageError::Retryable {
             provider: "google_drive".to_owned(),
@@ -1540,6 +1542,7 @@ fn default_google_drive_object_upload_http_client() -> StorageResult<Client> {
     }
 
     let client = Client::builder()
+        .redirect(Policy::none())
         .build()
         .map_err(|source| StorageError::Retryable {
             provider: "google_drive".to_owned(),
@@ -1565,6 +1568,7 @@ fn default_google_drive_object_download_http_client() -> StorageResult<Client> {
         .no_brotli()
         .no_zstd()
         .no_deflate()
+        .redirect(Policy::none())
         .build()
         .map_err(|source| StorageError::Retryable {
             provider: "google_drive".to_owned(),

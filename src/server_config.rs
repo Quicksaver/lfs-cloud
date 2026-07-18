@@ -14,7 +14,7 @@ use config::{Config, File, FileFormat};
 use serde::Deserialize;
 use url::Url;
 
-use crate::{ServerError, ServerResult};
+use crate::{ServerError, ServerResult, http_transport::uses_protected_http_transport};
 
 /// Default server config path used when no explicit path is supplied.
 pub const DEFAULT_CONFIG_PATH: &str = "lfs-cloud.yml";
@@ -143,8 +143,13 @@ impl ServerConfig {
             .repository_providers
             .into_iter()
             .map(|(id, provider)| {
-                RepositoryProviderConfig::from_raw(id, provider, &mut env)
-                    .map(|provider| (provider.id().to_owned(), provider))
+                RepositoryProviderConfig::from_raw(
+                    id,
+                    provider,
+                    server.allow_insecure_http,
+                    &mut env,
+                )
+                .map(|provider| (provider.id().to_owned(), provider))
             })
             .collect::<ServerResult<BTreeMap<_, _>>>()?;
         let storage_providers = raw
@@ -247,6 +252,13 @@ pub struct ServerSettings {
     pub port: u16,
     /// Public base URL used when constructing Git LFS action URLs.
     pub public_url: String,
+    /// Whether non-loopback plaintext HTTP is explicitly allowed.
+    ///
+    /// This development-only escape hatch affects the public server URL and
+    /// repository-provider API URLs. It should never be enabled on an
+    /// untrusted network because those endpoints carry credentials and LFS
+    /// object content.
+    pub allow_insecure_http: bool,
     /// Local SQLite database file path for server-owned metadata.
     ///
     /// Relative configuration values are resolved against the server config
@@ -264,7 +276,12 @@ impl ServerSettings {
     ) -> ServerResult<Self> {
         let host = resolve_required(raw.host, "server.host", env)?;
         let public_url = resolve_required(raw.public_url, "server.public_url", env)?;
-        validate_http_url(&public_url, "server.public_url", false)?;
+        validate_http_url(
+            &public_url,
+            "server.public_url",
+            false,
+            raw.allow_insecure_http,
+        )?;
         let metadata_path = resolve_metadata_path(raw.metadata_path, metadata_base_dir, env)?;
 
         if raw.port == 0 {
@@ -275,6 +292,7 @@ impl ServerSettings {
             host,
             port: raw.port,
             public_url,
+            allow_insecure_http: raw.allow_insecure_http,
             metadata_path,
         })
     }
@@ -307,6 +325,7 @@ impl RepositoryProviderConfig {
     fn from_raw(
         id: String,
         raw: RawRepositoryProviderConfig,
+        allow_insecure_http: bool,
         env: &mut impl FnMut(&str) -> Option<String>,
     ) -> ServerResult<Self> {
         validate_key(&id, format!("repository_providers.{id}"))?;
@@ -316,7 +335,12 @@ impl RepositoryProviderConfig {
         match provider_type.as_str() {
             "github" => Ok(Self::GitHub(GitHubProviderConfig {
                 id,
-                api_url: resolve_http_url(raw.api_url, format!("{base_path}.api_url"), env)?,
+                api_url: resolve_http_url(
+                    raw.api_url,
+                    format!("{base_path}.api_url"),
+                    allow_insecure_http,
+                    env,
+                )?,
                 oauth_client_id: resolve_required(
                     raw.oauth_client_id,
                     format!("{base_path}.oauth_client_id"),
@@ -327,6 +351,7 @@ impl RepositoryProviderConfig {
                     format!("{base_path}.oauth_client_secret"),
                     env,
                 )?,
+                allow_insecure_http,
             })),
             unsupported => invalid_config(
                 format!("{base_path}.type"),
@@ -347,6 +372,8 @@ pub struct GitHubProviderConfig {
     pub oauth_client_id: String,
     /// OAuth client secret used for token exchange.
     pub oauth_client_secret: String,
+    /// Whether non-loopback plaintext HTTP was explicitly enabled.
+    pub allow_insecure_http: bool,
 }
 
 impl fmt::Debug for GitHubProviderConfig {
@@ -357,6 +384,7 @@ impl fmt::Debug for GitHubProviderConfig {
             .field("api_url", &self.api_url)
             .field("oauth_client_id", &self.oauth_client_id)
             .field("oauth_client_secret", &RedactedSecret)
+            .field("allow_insecure_http", &self.allow_insecure_http)
             .finish()
     }
 }
@@ -553,6 +581,8 @@ struct RawServerSettings {
     #[serde(default)]
     public_url: Option<String>,
     #[serde(default)]
+    allow_insecure_http: bool,
+    #[serde(default)]
     metadata_path: Option<String>,
 }
 
@@ -562,6 +592,7 @@ impl Default for RawServerSettings {
             host: default_bind_host(),
             port: default_bind_port(),
             public_url: None,
+            allow_insecure_http: false,
             metadata_path: None,
         }
     }
@@ -652,11 +683,12 @@ fn resolve_required(
 fn resolve_http_url(
     value: Option<String>,
     path: impl Into<String>,
+    allow_insecure_http: bool,
     env: &mut impl FnMut(&str) -> Option<String>,
 ) -> ServerResult<String> {
     let path = path.into();
     let value = resolve_required(value, &path, env)?;
-    validate_http_url(&value, &path, false)?;
+    validate_http_url(&value, &path, false, allow_insecure_http)?;
     Ok(value)
 }
 
@@ -832,6 +864,7 @@ fn validate_http_url(
     url: &str,
     path: impl Into<String>,
     allow_trailing_slash: bool,
+    allow_insecure_http: bool,
 ) -> ServerResult<()> {
     let path = path.into();
     validate_no_outer_whitespace(url, &path)?;
@@ -848,6 +881,12 @@ fn validate_http_url(
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return invalid_config(path, "must not include credentials");
+    }
+    if !allow_insecure_http && !uses_protected_http_transport(&parsed) {
+        return invalid_config(
+            path,
+            "must use HTTPS unless it targets an exact loopback IP; set server.allow_insecure_http to true only for a trusted development network",
+        );
     }
 
     Ok(())
@@ -939,6 +978,7 @@ repositories:
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8081);
         assert_eq!(config.server.public_url, "http://127.0.0.1:8081");
+        assert!(!config.server.allow_insecure_http);
         assert_eq!(
             config.server.metadata_path,
             PathBuf::from(DEFAULT_METADATA_DIR).join(DEFAULT_METADATA_DB_FILE)
@@ -1748,6 +1788,65 @@ repository_providers:
             &error,
             "repository_providers.github-main.api_url must be a valid http or https URL",
         );
+    }
+
+    #[test]
+    fn requires_https_for_non_loopback_server_and_github_urls() {
+        let public_url_error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://192.168.1.25:8080
+"#,
+            "<test>",
+            test_env,
+        )
+        .expect_err("LAN HTTP should require an explicit unsafe opt-in");
+        assert_error_contains(&public_url_error, "server.public_url must use HTTPS");
+
+        let api_url_error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: http://github.example.test/api/v3
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+"#,
+            "<test>",
+            test_env,
+        )
+        .expect_err("remote GitHub HTTP should require an explicit unsafe opt-in");
+        assert_error_contains(
+            &api_url_error,
+            "repository_providers.github-main.api_url must use HTTPS",
+        );
+    }
+
+    #[test]
+    fn explicit_unsafe_http_opt_in_allows_trusted_lan_development() {
+        let config = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://192.168.1.25:8080
+  allow_insecure_http: true
+repository_providers:
+  github-main:
+    type: github
+    api_url: http://192.168.1.30:8081/api/v3
+    oauth_client_id: client-id
+    oauth_client_secret: client-secret
+"#,
+            "<test>",
+            test_env,
+        )
+        .expect("explicit unsafe opt-in should allow trusted LAN development URLs");
+
+        assert!(config.server.allow_insecure_http);
+        let RepositoryProviderConfig::GitHub(provider) =
+            &config.repository_providers["github-main"];
+        assert!(provider.allow_insecure_http);
     }
 
     #[test]

@@ -106,6 +106,10 @@ struct LoginCommand {
     #[arg(long, value_name = "URL")]
     server: String,
 
+    /// Allow plaintext HTTP to a non-loopback server on a trusted network.
+    #[arg(long)]
+    allow_insecure_http: bool,
+
     /// Print the login URL without trying to open a browser.
     #[arg(long)]
     no_open: bool,
@@ -117,6 +121,10 @@ struct InitCommand {
     #[arg(long, value_name = "URL")]
     server: String,
 
+    /// Allow plaintext HTTP to a non-loopback server on a trusted network.
+    #[arg(long)]
+    allow_insecure_http: bool,
+
     /// Write lfs.url to local Git config instead of committed .lfsconfig.
     #[arg(long)]
     local: bool,
@@ -127,6 +135,10 @@ struct StatusCommand {
     /// Base URL of the running LFS Cloud server.
     #[arg(long, value_name = "URL")]
     server: Option<String>,
+
+    /// Allow plaintext HTTP to a non-loopback server on a trusted network.
+    #[arg(long)]
+    allow_insecure_http: bool,
 
     /// Local cache root to inspect instead of ~/.lfs-cloud.
     #[arg(long, value_name = "PATH")]
@@ -178,6 +190,10 @@ struct MigrateCommand {
     /// Base URL of the running LFS Cloud server.
     #[arg(long, value_name = "URL")]
     server: String,
+
+    /// Allow plaintext HTTP to a non-loopback server on a trusted network.
+    #[arg(long)]
+    allow_insecure_http: bool,
 
     /// Local cache root to inspect instead of ~/.lfs-cloud.
     #[arg(long, value_name = "PATH")]
@@ -333,7 +349,10 @@ fn run_status_to_stdout_blocking(
         &current_dir,
         &mut stdout,
         probe_server_reachable,
-        |lfs_url| GitCredentialLookup::new(lfs_url).and_then(|lookup| lookup.lookup().map(|_| ())),
+        |lfs_url| {
+            GitCredentialLookup::new_with_insecure_http(lfs_url, true)
+                .and_then(|lookup| lookup.lookup().map(|_| ()))
+        },
         validate_status_storage,
     )
     .map_err(anyhow::Error::from)
@@ -381,7 +400,10 @@ fn run_migrate_to_stdout(
         &current_dir,
         &mut stdout,
         probe_server_reachable,
-        |lfs_url| GitCredentialLookup::new(lfs_url).and_then(|lookup| lookup.lookup().map(|_| ())),
+        |lfs_url| {
+            GitCredentialLookup::new_with_insecure_http(lfs_url, true)
+                .and_then(|lookup| lookup.lookup().map(|_| ()))
+        },
         validate_status_storage,
     )
     .map_err(anyhow::Error::from)
@@ -420,7 +442,11 @@ where
     A: FnMut(GitCredentialApproval) -> CliResult<()>,
 {
     let repository = GitRepository::discover(start_dir.as_ref()).map_err(login_discovery_error)?;
-    let route = LfsInitRoute::resolve(&command.server, &repository.remote)?;
+    let route = LfsInitRoute::resolve_with_insecure_http(
+        &command.server,
+        &repository.remote,
+        command.allow_insecure_http,
+    )?;
     let login_url = login_url_for_server(&route.server_url)?;
 
     writeln!(output, "authorize LFS Cloud with GitHub:").map_err(output_error)?;
@@ -450,7 +476,11 @@ where
         LfsSessionToken::from_secret(token.trim()).map_err(|_| CliError::InvalidArguments {
             message: "lfs_token was invalid or blank".to_owned(),
         })?;
-    let approval = GitCredentialApproval::new(&route.lfs_url, token)?;
+    let approval = GitCredentialApproval::new_with_insecure_http(
+        &route.lfs_url,
+        token,
+        command.allow_insecure_http,
+    )?;
     let approval_username = approval.username().to_owned();
     approve_credential(approval)?;
 
@@ -487,8 +517,12 @@ where
 {
     let repository = GitRepository::discover(start_dir.as_ref())
         .context("failed to inspect current Git repository")?;
-    let route = LfsInitRoute::resolve(&command.server, &repository.remote)
-        .context("failed to build Git LFS URL")?;
+    let route = LfsInitRoute::resolve_with_insecure_http(
+        &command.server,
+        &repository.remote,
+        command.allow_insecure_http,
+    )
+    .context("failed to build Git LFS URL")?;
     let change = repository
         .write_lfs_url(command.target(), &route.lfs_url)
         .context("failed to write Git LFS config")?;
@@ -545,6 +579,11 @@ where
             .as_ref()
             .map(|config| config.server.public_url.clone())
     });
+    let allow_insecure_http = command.allow_insecure_http
+        || (command.server.is_none()
+            && config
+                .as_ref()
+                .is_some_and(|config| config.server.allow_insecure_http));
 
     if let Some(server_url) = server_url.as_deref() {
         let server_url_display = redacted_url_for_display(server_url);
@@ -564,7 +603,11 @@ where
 
     let route = match (server_url.as_deref(), repository.as_ref()) {
         (Some(server_url), Some(repository)) => {
-            match LfsInitRoute::resolve(server_url, &repository.remote) {
+            match LfsInitRoute::resolve_with_insecure_http(
+                server_url,
+                &repository.remote,
+                allow_insecure_http,
+            ) {
                 Ok(route) => {
                     report.ok("route", redacted_url_for_display(&route.lfs_url));
                     Some(route)
@@ -804,7 +847,11 @@ where
 
     let start_dir = start_dir.as_ref();
     let repository = GitRepository::discover(start_dir)?;
-    let route = LfsInitRoute::resolve(&command.server, &repository.remote)?;
+    let route = LfsInitRoute::resolve_with_insecure_http(
+        &command.server,
+        &repository.remote,
+        command.allow_insecure_http,
+    )?;
     let discovery = discover_git_lfs_migration(start_dir)?;
     let scan = migration_pointer_scan(start_dir, &command)?;
     let cache_layout = Some(local_cache_layout(command.cache_root.clone())?);
@@ -2047,7 +2094,9 @@ fn report_cache_status(report: &mut StatusReport, cache_root: Option<PathBuf>) {
 }
 
 fn probe_server_reachable(server_url: &str) -> CliResult<()> {
-    let url = crate::init::validate_server_url(server_url)?;
+    // Callers validate the transport policy while building the repository
+    // route; this helper performs only the lower-level TCP reachability probe.
+    let url = crate::init::validate_server_url(server_url, true)?;
     let host = url.host_str().ok_or_else(|| CliError::InvalidArguments {
         message: "server URL must include a host".to_owned(),
     })?;
@@ -2384,6 +2433,7 @@ mod tests {
             "init",
             "--server",
             "http://127.0.0.1:8080",
+            "--allow-insecure-http",
         ])
         .expect("init command should parse");
 
@@ -2393,6 +2443,7 @@ mod tests {
 
         assert_eq!(cli.config, Some("custom-lfs-cloud.yml".into()));
         assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert!(command.allow_insecure_http);
         assert!(!command.local);
     }
 
@@ -2423,6 +2474,7 @@ mod tests {
             "--server",
             "http://127.0.0.1:8080",
             "--no-open",
+            "--allow-insecure-http",
         ])
         .expect("login command should parse");
 
@@ -2431,6 +2483,7 @@ mod tests {
         };
 
         assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert!(command.allow_insecure_http);
         assert!(command.no_open);
     }
 
@@ -2443,6 +2496,7 @@ mod tests {
             "status",
             "--server",
             "http://127.0.0.1:8080",
+            "--allow-insecure-http",
             "--cache-root",
             "/tmp/lfs-cloud-cache",
         ])
@@ -2454,6 +2508,7 @@ mod tests {
 
         assert_eq!(cli.config, Some("lfs-cloud.test.yml".into()));
         assert_eq!(command.server, Some("http://127.0.0.1:8080".to_owned()));
+        assert!(command.allow_insecure_http);
         assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
     }
 
@@ -2548,6 +2603,7 @@ mod tests {
             "--cache-root",
             "/tmp/lfs-cloud-cache",
             "--purge-source-lfs",
+            "--allow-insecure-http",
         ])
         .expect("migrate command should parse");
 
@@ -2557,6 +2613,7 @@ mod tests {
 
         assert_eq!(cli.config, Some("lfs-cloud.test.yml".into()));
         assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert!(command.allow_insecure_http);
         assert!(command.dry_run);
         assert!(command.all_refs);
         assert!(command.purge_source_lfs);
@@ -3042,6 +3099,7 @@ mod tests {
         run_init_from_dir(
             InitCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 local: false,
             },
             &nested,
@@ -3092,6 +3150,7 @@ mod tests {
         run_init_from_dir(
             InitCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 local: false,
             },
             repo.path(),
@@ -3161,6 +3220,7 @@ mod tests {
         run_init_from_dir(
             InitCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 local: true,
             },
             repo.path(),
@@ -3214,6 +3274,7 @@ mod tests {
         run_status_from_dir(
             StatusCommand {
                 server: None,
+                allow_insecure_http: false,
                 cache_root: Some(cache_root),
             },
             Some(config_path),
@@ -3268,6 +3329,7 @@ mod tests {
         let error = run_status_from_dir(
             StatusCommand {
                 server: Some("http://127.0.0.1:8080".to_owned()),
+                allow_insecure_http: false,
                 cache_root: Some(temp.path().join("cache")),
             },
             Some(config_path),
@@ -3324,6 +3386,7 @@ mod tests {
         let error = run_status_from_dir(
             StatusCommand {
                 server: Some(unsafe_server_url.to_owned()),
+                allow_insecure_http: false,
                 cache_root: Some(temp.path().join("cache")),
             },
             Some(config_path),
@@ -3405,6 +3468,7 @@ mod tests {
         run_migrate_from_dir(
             MigrateCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
                 refs: Vec::new(),
                 all_refs: false,
@@ -3477,6 +3541,7 @@ mod tests {
         run_migrate_from_dir(
             MigrateCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
                 refs: Vec::new(),
                 all_refs: false,
@@ -3531,6 +3596,7 @@ mod tests {
         run_migrate_from_dir(
             MigrateCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
                 refs: Vec::new(),
                 all_refs: false,
@@ -3600,6 +3666,7 @@ mod tests {
         run_migrate_from_dir(
             MigrateCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 cache_root: Some(cache_root),
                 refs: Vec::new(),
                 all_refs: false,
@@ -3652,6 +3719,7 @@ mod tests {
         run_migrate_from_dir(
             MigrateCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 cache_root: Some(cache_root),
                 refs: Vec::new(),
                 all_refs: false,
@@ -3701,6 +3769,7 @@ mod tests {
         run_migrate_from_dir(
             MigrateCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 cache_root: Some(cache_root),
                 refs: Vec::new(),
                 all_refs: false,
@@ -3739,6 +3808,7 @@ mod tests {
         let error = run_migrate_from_dir(
             MigrateCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 cache_root: Some(temp.path().join("cache")),
                 refs: Vec::new(),
                 all_refs: false,
@@ -4637,6 +4707,7 @@ mod tests {
         run_login_from_dir(
             LoginCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 no_open: false,
             },
             repo.path(),
@@ -4702,6 +4773,7 @@ mod tests {
         run_login_from_dir(
             LoginCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 no_open: true,
             },
             repo.path(),
@@ -4739,6 +4811,7 @@ mod tests {
         let error = run_login_from_dir(
             LoginCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
                 no_open: true,
             },
             repo.path(),

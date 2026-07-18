@@ -25,6 +25,7 @@ use oauth2::{
 use reqwest::{
     Client, StatusCode,
     header::{ACCEPT, CONTENT_TYPE, HeaderValue},
+    redirect::Policy,
 };
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -32,7 +33,7 @@ use url::Url;
 use crate::{
     GitHubProviderConfig, IssuedLfsSession, LocalLfsSessionStore, RepositoryAuthorization,
     RepositoryIdentity, RepositoryPermission, RepositoryProviderError, RepositoryUser,
-    SanitizedMessage, ServerError, ServerResult,
+    SanitizedMessage, ServerError, ServerResult, http_transport::uses_protected_http_transport,
 };
 
 const MAX_OAUTH_SENSITIVE_VALUE_LEN: usize = 1024;
@@ -107,6 +108,7 @@ impl GitHubOAuthCallbackRouteState {
     ///     api_url: "https://api.github.com".to_owned(),
     ///     oauth_client_id: "client-id".to_owned(),
     ///     oauth_client_secret: "client-secret".to_owned(),
+    ///     allow_insecure_http: false,
     /// };
     /// let csrf_states = GitHubOAuthStateRegistry::new();
     /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?);
@@ -157,6 +159,7 @@ impl GitHubOAuthCallbackRouteState {
     ///     api_url: "https://api.github.com".to_owned(),
     ///     oauth_client_id: "client-id".to_owned(),
     ///     oauth_client_secret: "client-secret".to_owned(),
+    ///     allow_insecure_http: false,
     /// };
     /// let csrf_states = GitHubOAuthStateRegistry::new();
     /// csrf_states.register(GitHubOAuthState::from_secret("csrf-state")?);
@@ -213,6 +216,13 @@ impl GitHubOAuthCallbackRouteState {
         session_store: LocalLfsSessionStore,
     ) -> ServerResult<Self> {
         let redirect_url = redirect_url.into();
+        let parsed_redirect_url = Url::parse(&redirect_url)
+            .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
+        validate_github_transport_url(
+            &parsed_redirect_url,
+            "github oauth redirect_url",
+            provider.allow_insecure_http,
+        )?;
         RedirectUrl::new(redirect_url.clone())
             .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
 
@@ -915,7 +925,20 @@ impl GitHubOAuthTokenExchanger {
         callback: &GitHubOAuthCallback,
         redirect_url: impl AsRef<str>,
     ) -> ServerResult<GitHubOAuthToken> {
-        let redirect_url = RedirectUrl::new(redirect_url.as_ref().to_owned())
+        let raw_redirect_url = redirect_url.as_ref();
+        let parsed_redirect_url = Url::parse(raw_redirect_url)
+            .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
+        validate_github_transport_url(
+            &parsed_redirect_url,
+            "github oauth redirect_url",
+            provider.allow_insecure_http,
+        )?;
+        validate_github_transport_url(
+            &self.token_url,
+            "github oauth token endpoint",
+            provider.allow_insecure_http,
+        )?;
+        let redirect_url = RedirectUrl::new(raw_redirect_url.to_owned())
             .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
         let request_body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("client_id", provider.oauth_client_id.as_str())
@@ -994,6 +1017,7 @@ impl GitHubOAuthAuthorization {
     ///     api_url: "https://api.github.com".to_owned(),
     ///     oauth_client_id: "client-id".to_owned(),
     ///     oauth_client_secret: "client-secret".to_owned(),
+    ///     allow_insecure_http: false,
     /// };
     ///
     /// let authorization = GitHubOAuthAuthorization::new(
@@ -1043,7 +1067,15 @@ impl GitHubOAuthAuthorization {
     where
         S: AsRef<str>,
     {
-        let redirect_url = RedirectUrl::new(redirect_url.into())
+        let raw_redirect_url = redirect_url.into();
+        let parsed_redirect_url = Url::parse(&raw_redirect_url)
+            .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
+        validate_github_transport_url(
+            &parsed_redirect_url,
+            "github oauth redirect_url",
+            provider.allow_insecure_http,
+        )?;
+        let redirect_url = RedirectUrl::new(raw_redirect_url)
             .map_err(|source| invalid_oauth_url("github oauth redirect_url", source))?;
         let auth_url = AuthUrl::new(GITHUB_OAUTH_AUTHORIZE_URL.to_owned())
             .map_err(|source| invalid_oauth_url("github oauth authorization endpoint", source))?;
@@ -1434,6 +1466,7 @@ impl fmt::Debug for GitHubOAuthCallback {
 ///     api_url: "https://api.github.com".to_owned(),
 ///     oauth_client_id: "client-id".to_owned(),
 ///     oauth_client_secret: "client-secret".to_owned(),
+///     allow_insecure_http: false,
 /// };
 ///
 /// let authorization = github_oauth_authorization_url(
@@ -1877,9 +1910,26 @@ fn invalid_oauth_url(path: &str, source: UrlParseError) -> ServerError {
     }
 }
 
+fn validate_github_transport_url(
+    url: &Url,
+    path: &str,
+    allow_insecure_http: bool,
+) -> ServerResult<()> {
+    if allow_insecure_http || uses_protected_http_transport(url) {
+        return Ok(());
+    }
+
+    Err(ServerError::InvalidConfiguration {
+        message: format!(
+            "{path} must use HTTPS unless it targets an exact loopback IP; enable allow_insecure_http only for a trusted development network"
+        ),
+    })
+}
+
 fn github_user_endpoint(provider: &GitHubProviderConfig) -> ServerResult<Url> {
     let mut endpoint = Url::parse(&provider.api_url)
         .map_err(|source| invalid_oauth_url("github api_url", source))?;
+    validate_github_transport_url(&endpoint, "github api_url", provider.allow_insecure_http)?;
     let base_path = endpoint.path().trim_end_matches('/');
     endpoint.set_path(&format!("{base_path}/user"));
     endpoint.set_query(None);
@@ -1895,6 +1945,7 @@ fn github_repository_permission_endpoint(
 ) -> ServerResult<Url> {
     let mut endpoint = Url::parse(&provider.api_url)
         .map_err(|source| invalid_oauth_url("github api_url", source))?;
+    validate_github_transport_url(&endpoint, "github api_url", provider.allow_insecure_http)?;
     append_github_api_path(
         &mut endpoint,
         [
@@ -1918,6 +1969,7 @@ fn github_repository_identity_endpoint(
 ) -> ServerResult<Url> {
     let mut endpoint = Url::parse(&provider.api_url)
         .map_err(|source| invalid_oauth_url("github api_url", source))?;
+    validate_github_transport_url(&endpoint, "github api_url", provider.allow_insecure_http)?;
     append_github_api_path(
         &mut endpoint,
         ["repos", repository.owner.as_str(), repository.name.as_str()],
@@ -2036,11 +2088,15 @@ fn build_github_oauth_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
         .timeout(GITHUB_OAUTH_TOKEN_EXCHANGE_TIMEOUT)
         .user_agent(GITHUB_USER_AGENT)
+        .redirect(Policy::none())
         .build()
 }
 
 fn build_github_api_http_client() -> Result<Client, reqwest::Error> {
-    Client::builder().user_agent(GITHUB_USER_AGENT).build()
+    Client::builder()
+        .user_agent(GITHUB_USER_AGENT)
+        .redirect(Policy::none())
+        .build()
 }
 
 fn required_callback_param(value: Option<String>, name: &str) -> ServerResult<String> {
@@ -2211,7 +2267,13 @@ fn github_forbidden_body_indicates_auth(body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use axum::{
         Json, Router,
@@ -2219,7 +2281,7 @@ mod tests {
         extract::{Path, State},
         http::{
             HeaderMap, HeaderValue, Request, StatusCode,
-            header::{AUTHORIZATION, CONTENT_TYPE},
+            header::{AUTHORIZATION, CONTENT_TYPE, LOCATION},
         },
         response::IntoResponse,
         routing::{get, post},
@@ -2252,6 +2314,7 @@ mod tests {
             api_url: "https://api.github.com".to_owned(),
             oauth_client_id: "client-id".to_owned(),
             oauth_client_secret: "client-secret".to_owned(),
+            allow_insecure_http: false,
         }
     }
 
@@ -3266,6 +3329,134 @@ mod tests {
         let error = GitHubOAuthAuthorization::new(&provider_config(), "not a url").unwrap_err();
 
         assert!(error.to_string().contains("github oauth redirect_url"));
+    }
+
+    #[test]
+    fn oauth_redirect_requires_protected_transport_or_explicit_opt_in() {
+        let error = GitHubOAuthAuthorization::new(
+            &provider_config(),
+            "http://lfs.example.com/auth/github/callback",
+        )
+        .expect_err("remote plaintext callback should be rejected");
+        assert!(error.to_string().contains("must use HTTPS"));
+
+        let mut development_provider = provider_config();
+        development_provider.allow_insecure_http = true;
+        GitHubOAuthAuthorization::new(
+            &development_provider,
+            "http://192.168.1.25:8080/auth/github/callback",
+        )
+        .expect("explicit development opt-in should allow trusted LAN callback URL");
+    }
+
+    #[tokio::test]
+    async fn default_oauth_client_does_not_follow_token_endpoint_redirects() {
+        let redirected = Arc::new(AtomicBool::new(false));
+        let redirected_for_handler = Arc::clone(&redirected);
+        let app = Router::new()
+            .route(
+                "/token",
+                post(|| async { (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, "/sink")]) }),
+            )
+            .route(
+                "/sink",
+                post(move || {
+                    let redirected = Arc::clone(&redirected_for_handler);
+                    async move {
+                        redirected.store(true, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "access_token": "redirected-token",
+                            "token_type": "bearer"
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirect server should bind");
+        let address = listener
+            .local_addr()
+            .expect("redirect server address should be available");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("redirect server should run");
+        });
+
+        let exchanger =
+            GitHubOAuthTokenExchanger::with_token_url(format!("http://{address}/token"))
+                .expect("loopback token URL should be accepted");
+        let error = exchanger
+            .exchange_code(
+                &provider_config(),
+                &validated_callback("oauth-code", "csrf-state"),
+                REDIRECT_URL,
+            )
+            .await
+            .expect_err("redirect response must not be followed");
+
+        assert!(!redirected.load(Ordering::SeqCst));
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::Upstream {
+                    status: Some(307),
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_api_client_does_not_follow_token_bearing_redirects() {
+        let redirected = Arc::new(AtomicBool::new(false));
+        let redirected_for_handler = Arc::clone(&redirected);
+        let app = Router::new()
+            .route(
+                "/api/v3/user",
+                get(|| async { (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, "/sink")]) }),
+            )
+            .route(
+                "/sink",
+                get(move || {
+                    let redirected = Arc::clone(&redirected_for_handler);
+                    async move {
+                        redirected.store(true, Ordering::SeqCst);
+                        Json(serde_json::json!({ "login": "octocat", "id": 1 }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirect server should bind");
+        let address = listener
+            .local_addr()
+            .expect("redirect server address should be available");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("redirect server should run");
+        });
+
+        let provider = provider_config_with_api_url(format!("http://{address}/api/v3"));
+        let token = GitHubOAuthAccessToken::from_secret("oauth-token")
+            .expect("OAuth token fixture should be valid");
+        let error = GitHubUserClient::new()
+            .expect("default API client should build")
+            .fetch_authenticated_user(&provider, &token)
+            .await
+            .expect_err("token-bearing API redirect must not be followed");
+
+        assert!(!redirected.load(Ordering::SeqCst));
+        assert!(matches!(
+            error,
+            ServerError::RepositoryProvider {
+                source: RepositoryProviderError::Upstream {
+                    status: Some(307),
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

@@ -225,6 +225,7 @@ server:
   host: $host
   port: $port
   public_url: $public_url
+  allow_insecure_http: true
   metadata_path: $tmp_dir/metadata.sqlite3
 
 repository_providers:
@@ -246,6 +247,7 @@ repositories:
     host: $route_host
     owner: $route_owner
     name: $route_repo
+    provider_repository_id: "8675309"
     storage_provider: drive-user-a
 YAML
 elif [[ -n "${LFS_CLOUD_LAN_PUBLIC_URL:-}" ]]; then
@@ -338,7 +340,8 @@ Manual cross-machine checklist:
      LFS_CLOUD_LAN_PORT=$port \\
      scripts/manual/verify-lan-smoke-test.sh
    For a real disposable-repo transfer run, point LFS_CLOUD_LAN_CONFIG at the
-   real server config, make sure its server.public_url uses that same LAN URL,
+   real server config, make sure its server.public_url uses that same LAN URL
+   with server.allow_insecure_http: true,
    and set LFS_CLOUD_LAN_ROUTE_HOST, LFS_CLOUD_LAN_ROUTE_OWNER, and
    LFS_CLOUD_LAN_ROUTE_REPO to a mapped repository if it is not github.com/owner/repo.
 2. Confirm the server output includes both:
@@ -349,8 +352,8 @@ Manual cross-machine checklist:
    Expected: HTTP 401, Git LFS JSON content, and a Basic or Bearer auth challenge.
 4. With a disposable GitHub repo mapped in the real server config, run from the
    client worktree:
-   lfs-cloud init --server http://<server-lan-ip>:$port
-   lfs-cloud login --server http://<server-lan-ip>:$port
+   lfs-cloud init --server http://<server-lan-ip>:$port --allow-insecure-http
+   lfs-cloud login --server http://<server-lan-ip>:$port --allow-insecure-http
    git lfs env
    Expected: the Git LFS endpoint points at the LAN URL for the disposable repo.
 5. Track and push one small Git LFS file from the client, then clone or pull

@@ -65,18 +65,33 @@ independently validated or adjudicated.
    regression; with one valid finding assessed here and no invalid finding
    attributable separately, this was high-quality, security-relevant feedback.
 
-4. **High — Non-loopback plaintext HTTP can expose authentication secrets and
-   LFS object content.** Configuration permits plaintext callback, server, and
-   GitHub API URLs that can expose OAuth codes, local LFS tokens, Basic/Bearer
-   credentials, GitHub access tokens, and transferred objects
-   (`src/server.rs:117-132`, `src/server.rs:313-317`,
-   `src/server_config.rs:244`, `src/server_config.rs:302-315`,
-   `src/server_config.rs:626-635`, `src/server_config.rs:805-827`,
-   `src/github_auth.rs:207-217`, `src/github_auth.rs:537-550`,
-   `src/github_auth.rs:634-650`, `src/credentials.rs:570-600`). Require HTTPS or
-   trusted TLS termination except for exact loopback development endpoints,
-   reject HTTPS-to-HTTP redirects, and gate any LAN exception behind an explicit
-   unsafe opt-in.
+4. **[DONE] Non-loopback plaintext HTTP can expose authentication secrets and
+   LFS object content** (High, `src/http_transport.rs`, `src/server_config.rs`,
+   `src/server.rs`, `src/init.rs`, `src/cli.rs`, `src/credentials.rs`,
+   `src/github_auth.rs`, and `src/google_drive.rs`): **Valid and actionable.**
+   The shared transport policy now requires HTTPS or an exact literal IPv4/IPv6
+   loopback address for URLs carrying OAuth, local LFS credentials, provider
+   tokens, or object bytes. Server configuration rejects unsafe public and
+   GitHub API URLs by default, and startup rejects a plaintext non-loopback bind
+   even when the configured public URL is loopback. Trusted-LAN development is
+   still possible only through the explicit `server.allow_insecure_http: true`
+   setting and matching `--allow-insecure-http` flags on client commands. Git
+   credential approval and lookup independently enforce the same boundary so a
+   caller cannot persist or retrieve a local LFS token for an unapproved
+   plaintext endpoint. Default GitHub OAuth/API and Google provider clients no
+   longer follow redirects, preventing token-bearing requests from being
+   redirected to a downgraded or unrelated endpoint. Configuration, CLI,
+   operator documentation, the repository learning, and the LAN smoke verifier
+   describe and exercise the new contract. Verification passed with
+   `yarn lint:fix`, `cargo fmt --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets`, `cargo test --doc`, and
+   `scripts/manual/verify-lan-smoke-test.sh`. The focused reviewer found a
+   genuine high-severity transport flaw, identified every important secret and
+   data path affected, and proposed the correct safe default plus explicit
+   development escape hatch; with one valid finding assessed here and no
+   invalid finding attributable separately, this was high-quality,
+   security-relevant feedback.
 
 5. **High — Server restarts invalidate every issued LFS credential despite the
    SQLite session contract.** Production always creates a fresh in-memory

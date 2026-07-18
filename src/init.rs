@@ -6,7 +6,7 @@
 
 use url::Url;
 
-use crate::{CliError, CliResult, GitRemote};
+use crate::{CliError, CliResult, GitRemote, http_transport::uses_protected_http_transport};
 
 /// Resolved Git LFS endpoint for an `lfs-cloud init --server` invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,7 +41,19 @@ impl LfsInitRoute {
     /// # Ok::<(), lfs_cloud::CliError>(())
     /// ```
     pub fn resolve(server_url: impl AsRef<str>, remote: &GitRemote) -> CliResult<Self> {
-        let mut lfs_url = validate_server_url(server_url.as_ref())?;
+        Self::resolve_with_insecure_http(server_url, remote, false)
+    }
+
+    /// Resolves a Git LFS endpoint with an explicit plaintext-HTTP policy.
+    ///
+    /// This is kept crate-private so only CLI commands that expose the named
+    /// unsafe opt-in can bypass the default transport protection.
+    pub(crate) fn resolve_with_insecure_http(
+        server_url: impl AsRef<str>,
+        remote: &GitRemote,
+        allow_insecure_http: bool,
+    ) -> CliResult<Self> {
+        let mut lfs_url = validate_server_url(server_url.as_ref(), allow_insecure_http)?;
         let server_url = normalized_server_url(&lfs_url);
         append_lfs_route_segments(&mut lfs_url, remote)?;
 
@@ -53,7 +65,7 @@ impl LfsInitRoute {
     }
 }
 
-pub(crate) fn validate_server_url(value: &str) -> CliResult<Url> {
+pub(crate) fn validate_server_url(value: &str, allow_insecure_http: bool) -> CliResult<Url> {
     if value.is_empty() {
         return invalid_server_url("server URL must not be blank");
     }
@@ -83,6 +95,11 @@ pub(crate) fn validate_server_url(value: &str) -> CliResult<Url> {
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return invalid_server_url("server URL must not include a query string or fragment");
+    }
+    if !allow_insecure_http && !uses_protected_http_transport(&parsed) {
+        return invalid_server_url(
+            "server URL must use HTTPS unless it targets an exact loopback IP; pass --allow-insecure-http only on a trusted development network",
+        );
     }
 
     Ok(parsed)
@@ -177,13 +194,34 @@ mod tests {
         let remote = GitRemote::parse("origin", "https://github.com/owner/repo.git")
             .expect("remote should parse");
         let route =
-            LfsInitRoute::resolve("HTTP://LOCALHOST:8080", &remote).expect("route should resolve");
+            LfsInitRoute::resolve("HTTPS://LOCALHOST:8080", &remote).expect("route should resolve");
 
-        assert_eq!(route.server_url, "http://localhost:8080");
+        assert_eq!(route.server_url, "https://localhost:8080");
         assert_eq!(
             route.lfs_url,
-            "http://localhost:8080/github.com/owner/repo.git/info/lfs"
+            "https://localhost:8080/github.com/owner/repo.git/info/lfs"
         );
+    }
+
+    #[test]
+    fn requires_https_except_for_exact_loopback_or_explicit_opt_in() {
+        let remote = GitRemote::parse("origin", "https://github.com/owner/repo.git")
+            .expect("remote should parse");
+
+        for rejected in [
+            "http://localhost:8080",
+            "http://192.168.1.25:8080",
+            "http://lfs.example.com",
+        ] {
+            let error = LfsInitRoute::resolve(rejected, &remote)
+                .expect_err("non-loopback HTTP should require explicit opt-in");
+            assert!(error.to_string().contains("must use HTTPS"), "{rejected}");
+        }
+
+        let route =
+            LfsInitRoute::resolve_with_insecure_http("http://192.168.1.25:8080", &remote, true)
+                .expect("explicit unsafe opt-in should permit a trusted LAN endpoint");
+        assert_eq!(route.server_url, "http://192.168.1.25:8080");
     }
 
     #[test]

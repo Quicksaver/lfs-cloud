@@ -66,6 +66,7 @@ server:
   host: 0.0.0.0
   port: 8080
   public_url: http://192.168.1.25:8080
+  allow_insecure_http: true
 ```
 
 The `serve` command can also override the bind address and port:
@@ -75,7 +76,11 @@ lfs-cloud serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080
 ```
 
 `public_url` is the URL embedded in Git LFS batch action responses. Set it to
-the address clients can actually reach.
+the address clients can actually reach. Plaintext LAN mode exposes OAuth codes,
+LFS credentials, and object bytes to the network, so it requires the explicit
+`allow_insecure_http: true` development opt-in. Prefer HTTPS through trusted TLS
+termination. Client commands using this LAN URL also require
+`--allow-insecure-http`.
 
 ## Google Drive Credentials
 
@@ -134,7 +139,9 @@ config file.
 ## Validation Rules
 
 - `server.public_url` and GitHub `api_url` must be HTTP(S) URLs without
-  credentials, query strings, or fragments.
+  credentials, query strings, or fragments. They must use HTTPS unless the
+  host is an exact IPv4/IPv6 loopback address. Non-loopback HTTP requires the
+  explicit development-only `server.allow_insecure_http: true` setting.
 - Google credential JSON `token_uri` values, and custom Google Drive API base
   URLs used by embedded runtimes or tests, follow the same URL rules and must
   use HTTPS except for loopback HTTP endpoints.

@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::io::ReaderStream;
-use url::form_urlencoded;
+use url::{Url, form_urlencoded};
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, GITHUB_OAUTH_CALLBACK_PATH, GitHubOAuthCallbackRouteState,
@@ -101,6 +101,7 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
         options.host,
         options.port,
     )?;
+    bind.validate_transport(&config)?;
 
     let metadata_database = Arc::new(MetadataDatabase::open(config.server.metadata_path.clone())?);
     metadata_database.sync_config(&config)?;
@@ -2037,6 +2038,30 @@ impl ServerBind {
 
         Ok(Self { host, port })
     }
+
+    fn validate_transport(&self, config: &ServerConfig) -> ServerResult<()> {
+        if config.server.allow_insecure_http {
+            return Ok(());
+        }
+
+        let public_url = Url::parse(&config.server.public_url).map_err(|source| {
+            ServerError::InvalidConfiguration {
+                message: format!("server.public_url must be a valid absolute URL: {source}"),
+            }
+        })?;
+        if public_url.scheme() == "https"
+            || self
+                .host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+        {
+            return Ok(());
+        }
+
+        Err(ServerError::InvalidConfiguration {
+            message: "server.host must be an exact loopback IP when server.public_url uses HTTP; set server.allow_insecure_http to true only for a trusted development network or use HTTPS through trusted TLS termination".to_owned(),
+        })
+    }
 }
 
 /// Repository route and endpoint resolved from an incoming request path.
@@ -2857,6 +2882,27 @@ repositories:
             .expect_err("host with spaces should fail config validation");
 
         assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn plaintext_listener_requires_loopback_or_explicit_unsafe_opt_in() {
+        let bind = ServerBind::from_config_and_overrides("0.0.0.0", 8080, None, None)
+            .expect("unspecified bind should be structurally valid");
+        let config = test_config();
+        let error = bind
+            .validate_transport(&config)
+            .expect_err("plaintext public listener should require explicit opt-in");
+        assert!(error.to_string().contains("exact loopback IP"));
+
+        let mut secure_public_config = config.clone();
+        secure_public_config.server.public_url = "https://lfs.example.com".to_owned();
+        bind.validate_transport(&secure_public_config)
+            .expect("HTTPS through trusted TLS termination should allow a private bind");
+
+        let mut development_config = config;
+        development_config.server.allow_insecure_http = true;
+        bind.validate_transport(&development_config)
+            .expect("explicit unsafe opt-in should allow trusted LAN development");
     }
 
     #[test]
