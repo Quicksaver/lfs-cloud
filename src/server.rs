@@ -1110,13 +1110,15 @@ impl LfsObjectTransferStore for GoogleDriveTransferStore {
         created_by: &'a RepositoryUser,
     ) -> ProviderFuture<'a, ServerResult<()>> {
         Box::pin(async move {
-            self.metadata_database.record_verified_object(
-                &repository.id,
-                &repository.storage_provider,
-                object,
-                backend_id,
-                created_by,
-            )?;
+            self.metadata_database
+                .record_verified_object_async(
+                    repository.id.clone(),
+                    repository.storage_provider.clone(),
+                    object.clone(),
+                    backend_id.to_owned(),
+                    created_by.clone(),
+                )
+                .await?;
             Ok(())
         })
     }

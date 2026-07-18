@@ -319,6 +319,16 @@ pub enum ServerError {
         path: PathBuf,
     },
 
+    /// A blocking metadata database task could not be joined.
+    #[error("metadata database task failed for {}: {source}", path.display())]
+    MetadataTaskJoin {
+        /// SQLite database path involved in the blocking task.
+        path: PathBuf,
+        /// Tokio blocking-task failure.
+        #[source]
+        source: tokio::task::JoinError,
+    },
+
     /// The server could not bind its configured listener.
     #[error("failed to bind server listener on {host}:{port}: {source}")]
     Bind {

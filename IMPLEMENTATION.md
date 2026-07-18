@@ -1072,6 +1072,11 @@ object and transfer records, while their route keys are tombstoned before the
 current mappings are upserted so a rename or route reassignment cannot be
 blocked by stale metadata.
 
+The MVP retains one serialized SQLite connection, but async request handlers
+must dispatch synchronous database operations through Tokio's blocking pool.
+Startup migrations and configuration reconciliation may remain synchronous
+because they complete before the listener admits requests.
+
 Start with repo-scoped object records:
 
 ```text

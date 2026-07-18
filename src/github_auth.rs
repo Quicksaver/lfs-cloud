@@ -455,6 +455,7 @@ impl IntoResponse for GitHubOAuthCallbackRouteError {
             | ServerError::MetadataMigration { .. }
             | ServerError::MetadataOperation { .. }
             | ServerError::MetadataConnectionPoisoned { .. }
+            | ServerError::MetadataTaskJoin { .. }
             | ServerError::Bind { .. }
             | ServerError::LocalAddress { .. }
             | ServerError::Serve { .. }

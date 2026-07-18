@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     fmt, fs,
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -596,6 +596,34 @@ impl MetadataDatabase {
             })
     }
 
+    /// Records verified object metadata without blocking an async runtime worker.
+    ///
+    /// Request handlers use this boundary because SQLite and the connection
+    /// mutex are synchronous. Owned inputs let the complete operation run on
+    /// Tokio's blocking pool while retaining the database's serialized access.
+    pub(crate) async fn record_verified_object_async(
+        self: &Arc<Self>,
+        repo_id: String,
+        storage_provider_id: String,
+        object: LfsObject,
+        backend_id: String,
+        creator_if_missing: RepositoryUser,
+    ) -> ServerResult<MetadataObjectRecord> {
+        let database = Arc::clone(self);
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            database.record_verified_object(
+                &repo_id,
+                &storage_provider_id,
+                &object,
+                &backend_id,
+                &creator_if_missing,
+            )
+        })
+        .await
+        .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
+    }
+
     /// Loads all persisted local sessions that have not expired.
     ///
     /// # Errors
@@ -1002,7 +1030,7 @@ impl std::fmt::Debug for MetadataDatabase {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
     use crate::{LfsObject, LfsObjectSize, LfsOid, RepositoryUser, ServerConfig, ServerError};
 
@@ -1617,6 +1645,51 @@ repositories:
             MetadataObjectVerificationStatus::Verified
         );
         assert_eq!(object_row_count(&database), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_verified_object_write_does_not_block_runtime_worker() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let database_path = directory.path().join("metadata.sqlite3");
+        let database =
+            Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should open"));
+        database
+            .sync_config(&server_config_with_repository(
+                "github-main:owner/repo",
+                "owner",
+                "repo",
+                "8675309",
+            ))
+            .expect("metadata config sync should succeed");
+        let lock_connection =
+            rusqlite::Connection::open(&database_path).expect("lock connection should open");
+        lock_connection
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("exclusive transaction should start");
+
+        let write = database.record_verified_object_async(
+            "github-main:owner/repo".to_owned(),
+            "drive-user-a".to_owned(),
+            lfs_object('f', 42),
+            "drive-file-verified".to_owned(),
+            RepositoryUser::new("github-main", "octocat", Some("user-1".to_owned())),
+        );
+        tokio::pin!(write);
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            result = &mut write => {
+                panic!("metadata write completed before the lock was released: {result:?}");
+            }
+        }
+
+        lock_connection
+            .execute_batch("COMMIT")
+            .expect("exclusive transaction should commit");
+        let record = tokio::time::timeout(Duration::from_secs(1), write)
+            .await
+            .expect("metadata write should finish after lock release")
+            .expect("metadata write should succeed");
+        assert_eq!(record.backend_id, "drive-file-verified");
     }
 
     #[test]

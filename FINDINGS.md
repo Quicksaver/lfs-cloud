@@ -662,11 +662,31 @@ independently validated or adjudicated.
    assessed here and no invalid finding attributable separately, this was
    high-quality, relevant feedback.
 
-10. **Medium — Synchronous SQLite and a standard mutex block async request
-    workers.** Upload completion directly performs serialized synchronous
-    database work on Tokio workers (`src/metadata.rs:266-269`,
-    `src/metadata.rs:429-521`, `src/server.rs:750-765`). Move operations to
-    `spawn_blocking`, `tokio-rusqlite`, or a bounded connection pool.
+10. **[DONE] Synchronous SQLite and a standard mutex block async request
+    workers** (Medium, `src/metadata.rs`, `src/server.rs`, `src/error.rs`,
+    `src/github_auth.rs`, `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and
+    actionable.** Production upload completion awaited an async transfer-store
+    future that directly acquired the standard metadata connection mutex and
+    performed a synchronous SQLite upsert. Contention or SQLite's five-second
+    busy wait could therefore stop a Tokio request worker. Verified-object
+    recording now crosses an owned-input async boundary that runs the complete
+    mutex acquisition and SQLite operation through `spawn_blocking`; the MVP
+    retains one serialized connection without blocking async workers. Blocking
+    task join failures have a typed server error and remain generic in OAuth
+    responses. Startup migrations and configuration reconciliation stay
+    synchronous because they finish before the listener admits requests. A
+    single-thread-runtime regression holds an external exclusive SQLite lock,
+    proves a Tokio timer still advances while the metadata write waits, then
+    releases the lock and verifies the write succeeds. Implementation guidance
+    and the repository learning document the request-path boundary.
+    Verification passed with `cargo fmt`, `yarn lint:fix`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+    `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`.
+    The focused reviewer identified a genuine medium-severity async-runtime
+    starvation risk, traced it to the precise request-path database write, and
+    proposed the appropriate blocking-task alternative for the current
+    single-connection MVP. With one valid finding assessed here and no invalid
+    finding attributable separately, this was high-quality, relevant feedback.
 
 11. **Low — Size-only integrity failures incorrectly report a SHA-256
     mismatch.** A correct OID with the wrong size receives a misleading hash
