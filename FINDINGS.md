@@ -1700,11 +1700,32 @@ independently validated or adjudicated.
    and no invalid finding attributable separately, this was high-quality,
    performance-relevant feedback.
 
-9. **High — Git command output limits are applied only after unbounded
-   allocation.** Helpers use `Command::output` and truncate after capture,
-   including tree enumeration (`src/migration.rs:2058-2082`,
-   `src/migration.rs:2414-2509`). Pipe and drain stdout/stderr concurrently with
-   hard byte caps, aborting and cleaning up the process tree on overflow.
+9. **[DONE] Git command output limits were applied only after unbounded
+   allocation** (High, `src/migration.rs` and `AGENTS.md`): **Valid and
+   actionable.** Migration's common Git helpers previously used
+   `Command::output`, so ref lists, commit lists, index enumeration, config
+   probes, and other discovery output could allocate without bound before the
+   parser enforced its nominal limit. They now pipe stdout and stderr through
+   concurrent hard-capped readers, apply each command's actual limit during
+   capture, and stop and reap the owned process tree as soon as either stream
+   crosses its boundary. A post-exit drain deadline also prevents a descendant
+   that inherited a pipe from keeping discovery blocked after Git exits. The
+   Git LFS installation probe uses the same bounded path, while large index,
+   ref, and history scans retain their explicit 32 MiB, 2 MiB, and 32 MiB
+   allowances instead of falling back to the smaller diagnostic limit.
+   Regression coverage runs a descendant-backed infinite producer, proves it
+   is rejected and cleaned up promptly at the first excess byte, and verifies
+   that substantial simultaneous stdout and stderr are drained without
+   deadlock. The repository learning records why post-capture truncation is not
+   an allocation boundary. Verification passed with `cargo fmt --check`,
+   `yarn lint:fix`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
+   `cargo test --all-targets -- --test-threads=1`, `cargo test --doc`, and
+   `git diff --check`. The focused reviewer identified a genuine high-severity
+   resource-exhaustion boundary, accurately distinguished output truncation
+   from allocation control, and prescribed the decisive concurrent-drain,
+   hard-cap, and process-tree cleanup behavior; with one valid finding assessed
+   here and no invalid finding attributable separately, this was high-quality,
+   security- and reliability-relevant feedback.
 
 10. **Medium — Default checkout migration gives no warning about objects on
     other refs.** The report can appear complete even though only the current

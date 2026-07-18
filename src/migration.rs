@@ -16,6 +16,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -40,6 +41,8 @@ const MAX_HISTORY_POINTER_BYTES: u64 = 64 * 1024;
 const GIT_NO_LAZY_FETCH_ENV: &str = "GIT_NO_LAZY_FETCH";
 const MIGRATION_SOURCE_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MIGRATION_SOURCE_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MIGRATION_GIT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MIGRATION_GIT_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Read-only discovery result for an existing Git LFS repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1347,11 +1350,13 @@ fn git_lfs_object_path(git_lfs_objects_dir: &Path, oid: &LfsOid) -> MigrationRes
 }
 
 fn detect_git_lfs_installation(worktree_root: &Path) -> GitLfsInstallation {
-    match read_only_git_command()
-        .args(["lfs", "version"])
-        .current_dir(worktree_root)
-        .output()
-    {
+    let mut command = read_only_git_command();
+    command.args(["lfs", "version"]).current_dir(worktree_root);
+    match run_bounded_command_output(
+        &mut command,
+        "git lfs version",
+        MAX_MIGRATION_GIT_OUTPUT_BYTES,
+    ) {
         Ok(output) if output.status.success() => match String::from_utf8(output.stdout) {
             Ok(stdout) => {
                 let version = first_non_empty_line(&stdout).map(str::to_owned);
@@ -1381,9 +1386,7 @@ fn detect_git_lfs_installation(worktree_root: &Path) -> GitLfsInstallation {
         Err(source) => GitLfsInstallation {
             installed: false,
             version: None,
-            diagnostic: Some(SanitizedMessage::new(format!(
-                "failed to start git lfs version: {source}"
-            ))),
+            diagnostic: Some(SanitizedMessage::new(source.to_string())),
         },
     }
 }
@@ -1627,7 +1630,7 @@ fn git_attributes_files(worktree_root: &Path) -> MigrationResult<Vec<PathBuf>> {
 
 fn current_checkout_lfs_tracked_blobs(worktree_root: &Path) -> MigrationResult<Vec<GitIndexBlob>> {
     const COMMAND: &str = "git ls-files -z --cached --stage";
-    let output = run_git_os(
+    let output = run_git_os_with_limit(
         worktree_root,
         [
             OsStr::new("ls-files"),
@@ -1636,6 +1639,7 @@ fn current_checkout_lfs_tracked_blobs(worktree_root: &Path) -> MigrationResult<V
             OsStr::new("--stage"),
         ],
         COMMAND,
+        MAX_CURRENT_CHECKOUT_ATTR_OUTPUT_BYTES,
     )?;
     if !output.status.success() {
         return Err(command_error(COMMAND, output.status, &output.stderr));
@@ -2350,7 +2354,7 @@ fn all_fetched_ref_names(
 ) -> MigrationResult<Vec<String>> {
     let command_name = "git for-each-ref --format=%(refname)%00%(symref) refs/heads refs/remotes/<source> refs/tags";
     let remote_refs = format!("refs/remotes/{source_remote}");
-    let output = run_git_os_vec(
+    let output = run_git_os_vec_with_limit(
         worktree_root,
         vec![
             OsString::from("for-each-ref"),
@@ -2360,6 +2364,7 @@ fn all_fetched_ref_names(
             OsString::from("refs/tags"),
         ],
         command_name,
+        MAX_HISTORY_REF_LIST_BYTES,
     )?;
     let stdout =
         required_success_stdout_with_limit(output, command_name, MAX_HISTORY_REF_LIST_BYTES)?;
@@ -2389,7 +2394,7 @@ fn rev_list_commits(
 ) -> MigrationResult<Vec<GitHistoryCommit>> {
     let command_name =
         format!("git rev-list --topo-order --format=%H%x20%T --no-commit-header {root_commit}");
-    let output = run_git_os_vec(
+    let output = run_git_os_vec_with_limit(
         worktree_root,
         vec![
             OsString::from("rev-list"),
@@ -2399,6 +2404,7 @@ fn rev_list_commits(
             OsString::from(root_commit),
         ],
         &command_name,
+        MAX_HISTORY_COMMIT_LIST_BYTES,
     )?;
     let stdout =
         required_success_stdout_with_limit(output, &command_name, MAX_HISTORY_COMMIT_LIST_BYTES)?;
@@ -3057,14 +3063,10 @@ fn git_config_get_os<const N: usize>(
 }
 
 fn run_git<const N: usize>(current_dir: &Path, args: [&str; N]) -> MigrationResult<Output> {
-    read_only_git_command()
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .map_err(|source| MigrationError::Io {
-            context: "failed to start git".to_owned(),
-            source,
-        })
+    let command_name = format!("git {}", args.join(" "));
+    let mut command = read_only_git_command();
+    command.args(args).current_dir(current_dir);
+    run_bounded_command_output(&mut command, &command_name, MAX_MIGRATION_GIT_OUTPUT_BYTES)
 }
 
 fn run_git_os<const N: usize>(
@@ -3072,14 +3074,23 @@ fn run_git_os<const N: usize>(
     args: [&OsStr; N],
     command_name: &str,
 ) -> MigrationResult<Output> {
-    read_only_git_command()
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .map_err(|source| MigrationError::Io {
-            context: format!("failed to start {command_name}"),
-            source,
-        })
+    run_git_os_with_limit(
+        current_dir,
+        args,
+        command_name,
+        MAX_MIGRATION_GIT_OUTPUT_BYTES,
+    )
+}
+
+fn run_git_os_with_limit<const N: usize>(
+    current_dir: &Path,
+    args: [&OsStr; N],
+    command_name: &str,
+    stdout_limit: usize,
+) -> MigrationResult<Output> {
+    let mut command = read_only_git_command();
+    command.args(args).current_dir(current_dir);
+    run_bounded_command_output(&mut command, command_name, stdout_limit)
 }
 
 fn run_git_os_vec(
@@ -3087,14 +3098,23 @@ fn run_git_os_vec(
     args: Vec<OsString>,
     command_name: &str,
 ) -> MigrationResult<Output> {
-    read_only_git_command()
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .map_err(|source| MigrationError::Io {
-            context: format!("failed to start {command_name}"),
-            source,
-        })
+    run_git_os_vec_with_limit(
+        current_dir,
+        args,
+        command_name,
+        MAX_MIGRATION_GIT_OUTPUT_BYTES,
+    )
+}
+
+fn run_git_os_vec_with_limit(
+    current_dir: &Path,
+    args: Vec<OsString>,
+    command_name: &str,
+    stdout_limit: usize,
+) -> MigrationResult<Output> {
+    let mut command = read_only_git_command();
+    command.args(args).current_dir(current_dir);
+    run_bounded_command_output(&mut command, command_name, stdout_limit)
 }
 
 fn read_only_git_command() -> Command {
@@ -3105,6 +3125,231 @@ fn read_only_git_command() -> Command {
     command.env(GIT_NO_LAZY_FETCH_ENV, "1");
     command
 }
+
+enum BoundedGitPipeEvent {
+    Stdout(io::Result<PipeReadResult>),
+    Stderr(io::Result<PipeReadResult>),
+}
+
+/// Runs a migration Git command without allowing either captured pipe to grow
+/// beyond its declared boundary.
+///
+/// stdout and stderr are drained concurrently so a noisy diagnostic stream
+/// cannot deadlock a command whose primary output is still being consumed. A
+/// reader reports overflow as soon as it sees the first excess byte; the parent
+/// then stops the whole owned process tree before returning the bounded prefix.
+fn run_bounded_command_output(
+    command: &mut Command,
+    command_name: &str,
+    stdout_limit: usize,
+) -> MigrationResult<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_bounded_git_process_tree(command);
+
+    let mut child = command.spawn().map_err(|source| MigrationError::Io {
+        context: format!("failed to start {command_name}"),
+        source,
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| MigrationError::Io {
+        context: format!("failed to capture stdout for {command_name}"),
+        source: io::Error::other("git stdout was not piped"),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| MigrationError::Io {
+        context: format!("failed to capture stderr for {command_name}"),
+        source: io::Error::other("git stderr was not piped"),
+    })?;
+
+    let (sender, receiver) = mpsc::channel();
+    let stdout_sender = sender.clone();
+    let stdout_reader = thread::spawn(move || {
+        let result = read_pipe_with_hard_limit(stdout, stdout_limit);
+        let _ = stdout_sender.send(BoundedGitPipeEvent::Stdout(result));
+    });
+    let stderr_reader = thread::spawn(move || {
+        let result = read_pipe_with_hard_limit(stderr, MAX_MIGRATION_GIT_OUTPUT_BYTES);
+        let _ = sender.send(BoundedGitPipeEvent::Stderr(result));
+    });
+
+    let mut status = None;
+    let mut drain_deadline = None;
+    let mut stdout = None;
+    let mut stderr = None;
+
+    loop {
+        while let Ok(event) = receiver.try_recv() {
+            let (stream_name, stream_limit, result, destination) = match event {
+                BoundedGitPipeEvent::Stdout(result) => {
+                    ("stdout", stdout_limit, result, &mut stdout)
+                }
+                BoundedGitPipeEvent::Stderr(result) => (
+                    "stderr",
+                    MAX_MIGRATION_GIT_OUTPUT_BYTES,
+                    result,
+                    &mut stderr,
+                ),
+            };
+            let output = match result {
+                Ok(output) => output,
+                Err(source) => {
+                    terminate_bounded_git_child(&mut child, command_name)?;
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(MigrationError::Io {
+                        context: format!("failed to read {stream_name} from {command_name}"),
+                        source,
+                    });
+                }
+            };
+            if output.exceeded_limit {
+                terminate_bounded_git_child(&mut child, command_name)?;
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(MigrationError::ExternalCommandOutput {
+                    command: command_name.to_owned(),
+                    message: SanitizedMessage::new(format!(
+                        "git {stream_name} exceeded the {stream_limit}-byte limit"
+                    )),
+                });
+            }
+            *destination = Some(output.bytes);
+        }
+
+        if status.is_none() {
+            status = child.try_wait().map_err(|source| MigrationError::Io {
+                context: format!("failed to wait for {command_name}"),
+                source,
+            })?;
+            if status.is_some() {
+                drain_deadline = Some(Instant::now() + MIGRATION_GIT_OUTPUT_DRAIN_GRACE);
+            }
+        }
+
+        if let Some(status) = status.filter(|_| stdout.is_some() && stderr.is_some()) {
+            stdout_reader.join().map_err(|_| MigrationError::Io {
+                context: format!("stdout reader thread panicked for {command_name}"),
+                source: io::Error::other("git stdout reader thread panicked"),
+            })?;
+            stderr_reader.join().map_err(|_| MigrationError::Io {
+                context: format!("stderr reader thread panicked for {command_name}"),
+                source: io::Error::other("git stderr reader thread panicked"),
+            })?;
+            return Ok(Output {
+                status,
+                stdout: stdout.take().expect("stdout was checked above"),
+                stderr: stderr.take().expect("stderr was checked above"),
+            });
+        }
+
+        if status.is_some_and(|_| drain_deadline.is_some_and(|deadline| Instant::now() >= deadline))
+        {
+            // A descendant inherited a pipe after the direct Git process exited.
+            // Stop the process group before waiting for EOF so discovery cannot
+            // hang on a helper that outlives Git itself.
+            stop_bounded_git_process_tree(&child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(MigrationError::Io {
+                context: format!("timed out draining output from {command_name}"),
+                source: io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "git output pipes remained open after process exit",
+                ),
+            });
+        }
+
+        thread::sleep(MIGRATION_GIT_OUTPUT_POLL_INTERVAL);
+    }
+}
+
+fn read_pipe_with_hard_limit(mut reader: impl Read, limit: usize) -> io::Result<PipeReadResult> {
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0; 8192];
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(PipeReadResult {
+                bytes,
+                exceeded_limit: false,
+            });
+        }
+
+        let remaining = limit.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        if read > remaining {
+            return Ok(PipeReadResult {
+                bytes,
+                exceeded_limit: true,
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_bounded_git_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_bounded_git_process_tree(_command: &mut Command) {}
+
+fn terminate_bounded_git_child(child: &mut Child, command_name: &str) -> MigrationResult<()> {
+    stop_bounded_git_process_tree(child);
+    if child
+        .try_wait()
+        .map_err(|source| MigrationError::Io {
+            context: format!("failed to wait for stopped {command_name}"),
+            source,
+        })?
+        .is_none()
+    {
+        child.kill().map_err(|source| MigrationError::Io {
+            context: format!("failed to stop {command_name}"),
+            source,
+        })?;
+        child.wait().map_err(|source| MigrationError::Io {
+            context: format!("failed to reap stopped {command_name}"),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_bounded_git_process_tree(child: &Child) {
+    signal_bounded_git_process_group("TERM", child.id());
+    thread::sleep(Duration::from_millis(50));
+    signal_bounded_git_process_group("KILL", child.id());
+}
+
+#[cfg(unix)]
+fn signal_bounded_git_process_group(signal: &str, process_group_id: u32) {
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(format!("-{process_group_id}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(windows)]
+fn stop_bounded_git_process_tree(child: &Child) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stop_bounded_git_process_tree(_child: &Child) {}
 
 fn required_success_stdout(output: Output, command_name: &str) -> MigrationResult<String> {
     required_success_stdout_with_limit(output, command_name, MAX_MIGRATION_GIT_OUTPUT_BYTES)
@@ -3272,6 +3517,52 @@ mod tests {
         upload_migration_objects_to_storage, validate_history_ref_name,
         verified_migration_upload_source_path, wait_for_git_lfs_fetch_command,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_git_output_stops_a_runaway_process_tree_on_overflow() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("(while :; do printf '0123456789abcdef'; done) & child=$!; wait \"$child\"");
+        let started_at = Instant::now();
+
+        let error =
+            super::run_bounded_command_output(&mut command, "git runaway-output-test", 4 * 1024)
+                .expect_err("runaway output should cross the hard limit");
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "overflow cleanup should stop the command process tree promptly"
+        );
+        assert!(matches!(
+            error,
+            MigrationError::ExternalCommandOutput { command, message }
+                if command == "git runaway-output-test"
+                    && message.as_str().contains("stdout")
+                    && message.as_str().contains("4096-byte limit")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_git_output_drains_stdout_and_stderr_concurrently() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "i=0; while [ \"$i\" -lt 8192 ]; do printf '0123456789abcdef' >&2; i=$((i + 1)); done; i=0; while [ \"$i\" -lt 8192 ]; do printf 'fedcba9876543210'; i=$((i + 1)); done",
+        );
+
+        let output = super::run_bounded_command_output(
+            &mut command,
+            "git concurrent-output-test",
+            MAX_MIGRATION_GIT_OUTPUT_BYTES,
+        )
+        .expect("bounded runner should drain both pipes without deadlocking");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 128 * 1024);
+        assert_eq!(output.stderr.len(), 128 * 1024);
+    }
 
     struct FakeMigrationStorageProvider {
         provider_id: String,
