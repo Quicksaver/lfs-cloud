@@ -1,0 +1,4 @@
+interface:
+  display_name: "Smoke Test"
+  short_description: "Run the full LFS Cloud smoke suite"
+  default_prompt: "Use $smoke-test to run the full LFS Cloud smoke suite and report failures."
