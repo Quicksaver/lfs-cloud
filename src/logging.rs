@@ -12,7 +12,7 @@ use tracing_subscriber::{EnvFilter, filter::ParseError};
 pub const DEFAULT_LOG_ENV_VAR: &str = "RUST_LOG";
 
 /// Default tracing filter for local CLI and server runs.
-pub const DEFAULT_LOG_FILTER: &str = "warn,lfs_cloud=info";
+pub const DEFAULT_LOG_FILTER: &str = "warn,lfscloud=info";
 
 /// Configuration for initializing process-wide tracing output.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,10 +41,10 @@ impl TracingConfig {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::TracingConfig;
+    /// use lfscloud::TracingConfig;
     ///
-    /// let config = TracingConfig::new("lfs_cloud=debug").without_env_filter();
-    /// assert_eq!(config.default_filter, "lfs_cloud=debug");
+    /// let config = TracingConfig::new("lfscloud=debug").without_env_filter();
+    /// assert_eq!(config.default_filter, "lfscloud=debug");
     /// ```
     #[must_use]
     pub fn new(default_filter: impl Into<String>) -> Self {
@@ -59,7 +59,7 @@ impl TracingConfig {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::TracingConfig;
+    /// use lfscloud::TracingConfig;
     ///
     /// let config = TracingConfig::default().without_env_filter();
     /// assert!(config.env_filter_var.is_none());
@@ -75,7 +75,7 @@ impl TracingConfig {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::TracingConfig;
+    /// use lfscloud::TracingConfig;
     ///
     /// let config = TracingConfig::default().with_env_filter_var("LFS_CLOUD_LOG");
     /// assert_eq!(config.env_filter_var.as_deref(), Some("LFS_CLOUD_LOG"));
@@ -91,7 +91,7 @@ impl TracingConfig {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::TracingConfig;
+    /// use lfscloud::TracingConfig;
     ///
     /// let config = TracingConfig::default().with_ansi(false);
     /// assert!(!config.ansi);
@@ -143,11 +143,11 @@ pub enum TracingInitError {
 /// # Examples
 ///
 /// ```
-/// use lfs_cloud::{TracingConfig, tracing_filter};
+/// use lfscloud::{TracingConfig, tracing_filter};
 ///
-/// let config = TracingConfig::new("warn,lfs_cloud=debug").without_env_filter();
+/// let config = TracingConfig::new("warn,lfscloud=debug").without_env_filter();
 /// tracing_filter(&config)?;
-/// # Ok::<(), lfs_cloud::TracingInitError>(())
+/// # Ok::<(), lfscloud::TracingInitError>(())
 /// ```
 pub fn tracing_filter(config: &TracingConfig) -> Result<EnvFilter, TracingInitError> {
     let value = configured_filter_value(config)?;
@@ -164,10 +164,10 @@ pub fn tracing_filter(config: &TracingConfig) -> Result<EnvFilter, TracingInitEr
 /// # Examples
 ///
 /// ```no_run
-/// use lfs_cloud::{TracingConfig, init_tracing};
+/// use lfscloud::{TracingConfig, init_tracing};
 ///
 /// init_tracing(&TracingConfig::default())?;
-/// # Ok::<(), lfs_cloud::TracingInitError>(())
+/// # Ok::<(), lfscloud::TracingInitError>(())
 /// ```
 pub fn init_tracing(config: &TracingConfig) -> Result<(), TracingInitError> {
     tracing_subscriber::fmt()
@@ -240,18 +240,18 @@ mod tests {
 
     #[test]
     fn configured_filter_uses_explicit_default_when_env_override_is_disabled() {
-        let config = TracingConfig::new("warn,lfs_cloud=debug").without_env_filter();
+        let config = TracingConfig::new("warn,lfscloud=debug").without_env_filter();
 
         assert_eq!(
             configured_filter_value(&config).expect("filter value should resolve"),
-            "warn,lfs_cloud=debug"
+            "warn,lfscloud=debug"
         );
         tracing_filter(&config).expect("filter should parse");
     }
 
     #[test]
     fn configured_filter_env_override_wins_over_default() {
-        assert_env_filter_subprocess("override", "lfs_cloud=trace".into());
+        assert_env_filter_subprocess("override", "lfscloud=trace".into());
     }
 
     #[test]
@@ -279,7 +279,7 @@ mod tests {
         let config = match case.to_str() {
             Some("override") => TracingConfig::new("warn").with_env_filter_var(TEST_LOG_ENV_VAR),
             Some("empty") => {
-                TracingConfig::new("warn,lfs_cloud=info").with_env_filter_var(TEST_LOG_ENV_VAR)
+                TracingConfig::new("warn,lfscloud=info").with_env_filter_var(TEST_LOG_ENV_VAR)
             }
             Some("non-unicode") => {
                 let config = TracingConfig::new("warn").with_env_filter_var(TEST_LOG_ENV_VAR);
@@ -300,8 +300,8 @@ mod tests {
         };
 
         let expected = match case.to_str() {
-            Some("override") => "lfs_cloud=trace",
-            Some("empty") => "warn,lfs_cloud=info",
+            Some("override") => "lfscloud=trace",
+            Some("empty") => "warn,lfscloud=info",
             _ => unreachable!("recognized string cases were handled above"),
         };
         assert_eq!(
@@ -312,12 +312,12 @@ mod tests {
 
     #[test]
     fn tracing_filter_reports_invalid_filter_value() {
-        let config = TracingConfig::new("lfs_cloud=not-a-level").without_env_filter();
+        let config = TracingConfig::new("lfscloud=not-a-level").without_env_filter();
         let error = tracing_filter(&config).expect_err("filter should fail");
 
         match error {
             TracingInitError::InvalidFilter { value, .. } => {
-                assert_eq!(value, "lfs_cloud=not-a-level");
+                assert_eq!(value, "lfscloud=not-a-level");
             }
             TracingInitError::InvalidEnvironmentFilter { .. }
             | TracingInitError::Install { .. } => {

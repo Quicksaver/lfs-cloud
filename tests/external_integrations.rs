@@ -14,7 +14,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use lfs_cloud::{
+use lfscloud::{
     GitHubOAuthAccessToken, GitHubProviderConfig, GitHubRepositoryPermissionClient,
     GitHubUserClient, GoogleDriveAccessToken, GoogleDriveCredential, GoogleDriveRootValidator,
     GoogleDriveStorageConfig, GoogleDriveTokenRefresher, LFS_BASIC_TRANSFER, LfsBatchAction,
@@ -52,7 +52,7 @@ async fn github_disposable_repo_permission_check() {
         env::var("LFS_CLOUD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_owned());
     let repo_host =
         env::var("LFS_CLOUD_GITHUB_HOST").unwrap_or_else(|_| github_host_from_api_url(&api_url));
-    let repo_name = disposable_name("lfs-cloud-it");
+    let repo_name = disposable_name("lfscloud-it");
     let provider = GitHubProviderConfig {
         id: "github-main".to_owned(),
         api_url: api_url.clone(),
@@ -89,7 +89,7 @@ async fn github_disposable_repo_permission_check() {
             )
             .await?;
 
-        Ok::<_, lfs_cloud::ServerError>(authorization)
+        Ok::<_, lfscloud::ServerError>(authorization)
     }
     .await;
 
@@ -129,7 +129,7 @@ async fn google_drive_disposable_folder_root_validation() {
         .await
         .expect("Google Drive refresh token should produce an access token");
     let http = Client::new();
-    let folder_name = disposable_name("lfs-cloud-drive-it");
+    let folder_name = disposable_name("lfscloud-drive-it");
     let parent_folder_id = env::var("LFS_CLOUD_GOOGLE_DRIVE_PARENT_FOLDER_ID").ok();
     let folder = create_drive_folder(
         &http,
@@ -175,7 +175,7 @@ async fn live_server_upload_download_records_drive_and_sqlite_state() {
 #[test]
 fn live_server_transfer_config_fixture_uses_production_provider_ids() {
     let test_dir = tempfile::tempdir().expect("config fixture temp directory should be created");
-    let config_path = test_dir.path().join("lfs-cloud.yml");
+    let config_path = test_dir.path().join("lfscloud.yml");
     let metadata_path = test_dir.path().join("metadata.sqlite3");
     let repository = GitHubCreatedRepo {
         id: 8675309,
@@ -247,13 +247,13 @@ async fn run_live_provider_transfer_scenario() -> Result<(), String> {
         &github_api_url,
         &github_token,
         github_owner.as_deref(),
-        &disposable_name("lfs-cloud-live-it"),
+        &disposable_name("lfscloud-live-it"),
     )
     .await?;
     let folder = match create_drive_folder(
         &client,
         drive_access_token.as_str(),
-        &disposable_name("lfs-cloud-live-drive-it"),
+        &disposable_name("lfscloud-live-drive-it"),
         env::var("LFS_CLOUD_GOOGLE_DRIVE_PARENT_FOLDER_ID")
             .ok()
             .as_deref(),
@@ -307,7 +307,7 @@ async fn exercise_live_server_transfer(
     let test_dir = tempfile::tempdir()
         .map_err(|error| format!("live transfer temp directory should be created: {error}"))?;
     let metadata_path = test_dir.path().join("metadata.sqlite3");
-    let config_path = test_dir.path().join("lfs-cloud.yml");
+    let config_path = test_dir.path().join("lfscloud.yml");
     let port = available_loopback_port()?;
     let server_url = format!("http://127.0.0.1:{port}");
     let repository_id = format!(
@@ -345,7 +345,7 @@ async fn exercise_live_server_transfer(
         .map_err(|error| format!("GitHub user client should build: {error}"))?
         .fetch_authenticated_user(
             match &config.repository_providers[LIVE_GITHUB_PROVIDER_ID] {
-                lfs_cloud::RepositoryProviderConfig::GitHub(provider) => provider,
+                lfscloud::RepositoryProviderConfig::GitHub(provider) => provider,
             },
             &github_access_token,
         )
@@ -882,7 +882,7 @@ fn github_request(
     let mut request = client
         .request(method, endpoint)
         .header(ACCEPT, GITHUB_ACCEPT)
-        .header(USER_AGENT, concat!("lfs-cloud/", env!("CARGO_PKG_VERSION")))
+        .header(USER_AGENT, concat!("lfscloud/", env!("CARGO_PKG_VERSION")))
         .bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);

@@ -36,7 +36,7 @@ const MAX_LOCAL_LFS_SESSIONS_PER_PRINCIPAL: usize = 16;
 const MAX_LFS_SESSION_ISSUANCES_PER_WINDOW: usize = 8;
 const LFS_SESSION_ISSUANCE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LFS_SESSION_TOKEN_GENERATION_ATTEMPTS: usize = 8;
-const SESSION_ENCRYPTION_CONTEXT: &[u8] = b"lfs-cloud durable session encryption v1\0";
+const SESSION_ENCRYPTION_CONTEXT: &[u8] = b"lfscloud durable session encryption v1\0";
 const SESSION_TOKEN_NONCE_LEN: usize = 12;
 
 /// Opaque bearer token issued by LFS Cloud for Git LFS clients.
@@ -52,7 +52,7 @@ impl LfsSessionToken {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::LfsSessionToken;
+    /// use lfscloud::LfsSessionToken;
     ///
     /// let token = LfsSessionToken::generate();
     ///
@@ -74,12 +74,12 @@ impl LfsSessionToken {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::LfsSessionToken;
+    /// use lfscloud::LfsSessionToken;
     ///
     /// let token = LfsSessionToken::from_secret("lfs-token")?;
     ///
     /// assert_eq!(token.as_str(), "lfs-token");
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     pub fn from_secret(secret: impl Into<String>) -> ServerResult<Self> {
         validate_lfs_session_secret(secret.into()).map(Self)

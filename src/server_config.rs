@@ -1,4 +1,4 @@
-//! Typed loading and validation for private `lfs-cloud.yml` server config.
+//! Typed loading and validation for private `lfscloud.yml` server config.
 //!
 //! The config file is server-owned state. Repository `.lfsconfig` files only
 //! point Git LFS clients at an LFS Cloud route; this module decides which
@@ -19,9 +19,9 @@ use crate::{
 };
 
 /// Default server config path used when no explicit path is supplied.
-pub const DEFAULT_CONFIG_PATH: &str = "lfs-cloud.yml";
+pub const DEFAULT_CONFIG_PATH: &str = "lfscloud.yml";
 /// Default metadata state directory relative to the config file.
-pub const DEFAULT_METADATA_DIR: &str = ".lfs-cloud";
+pub const DEFAULT_METADATA_DIR: &str = ".lfscloud";
 /// Default SQLite metadata database filename.
 pub const DEFAULT_METADATA_DB_FILE: &str = "metadata.sqlite3";
 
@@ -52,7 +52,7 @@ impl ServerConfig {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{ServerConfig, DEFAULT_CONFIG_PATH};
+    /// use lfscloud::{ServerConfig, DEFAULT_CONFIG_PATH};
     ///
     /// assert_eq!(ServerConfig::default_path(), std::path::Path::new(DEFAULT_CONFIG_PATH));
     /// ```
@@ -61,7 +61,7 @@ impl ServerConfig {
         Path::new(DEFAULT_CONFIG_PATH)
     }
 
-    /// Loads `lfs-cloud.yml` from the default path.
+    /// Loads `lfscloud.yml` from the default path.
     ///
     /// # Errors
     ///
@@ -585,7 +585,7 @@ impl RepositoryMapping {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::RepositoryMapping;
+    /// use lfscloud::RepositoryMapping;
     ///
     /// let mapping = RepositoryMapping {
     ///     id: "github-main:owner/repo".to_owned(),
@@ -1230,7 +1230,7 @@ repositories:
     #[test]
     fn explicit_path_loading_reads_yaml_file() {
         let directory = tempfile::tempdir().expect("tempdir should be created");
-        let config_path = directory.path().join("custom-lfs-cloud.yml");
+        let config_path = directory.path().join("custom-lfscloud.yml");
         fs::write(
             &config_path,
             r#"
@@ -1264,10 +1264,10 @@ storage_providers:
     }
 
     #[test]
-    fn default_path_is_lfs_cloud_yml() {
+    fn default_path_is_lfscloud_yml() {
         assert_eq!(
             ServerConfig::default_path(),
-            std::path::Path::new("lfs-cloud.yml")
+            std::path::Path::new("lfscloud.yml")
         );
     }
 
@@ -1287,7 +1287,7 @@ server:
     #[test]
     fn explicit_relative_metadata_path_resolves_from_config_directory() {
         let directory = tempfile::tempdir().expect("tempdir should be created");
-        let config_path = directory.path().join("config").join("lfs-cloud.yml");
+        let config_path = directory.path().join("config").join("lfscloud.yml");
         fs::create_dir_all(
             config_path
                 .parent()
@@ -1448,7 +1448,7 @@ server:
   public_url: http://127.0.0.1:8080
   metadata_path: state/metadata.sqlite3
 "#,
-            "./lfs-cloud.yml",
+            "./lfscloud.yml",
             Path::new("."),
             test_env,
         )

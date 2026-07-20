@@ -9,8 +9,8 @@ This file provides context for AI agents working in this codebase.
 The initially supported shape is:
 
 - Git repositories remain on GitHub.
-- Git LFS clients point at an `lfs-cloud` endpoint through `.lfsconfig` or local Git config.
-- `lfs-cloud` authorizes users through the repository provider's permissions.
+- Git LFS clients point at an LFS Cloud endpoint through `.lfsconfig` or local Git config.
+- LFS Cloud authorizes users through the repository provider's permissions.
 - Actual large-file bytes are stored in Google Drive.
 - The local CLI reduces disk duplication by using a shared content-addressed cache and copy-on-write materialization where supported.
 
@@ -43,7 +43,7 @@ This repository is currently in planning/early scaffold state. Do not imply that
 Current scaffold:
 
 ```text
-lfs-cloud/
+lfscloud/
   AGENTS.md
   Cargo.lock
   Cargo.toml
@@ -65,10 +65,10 @@ Expected future structure may include:
 
 ```text
 crates/
-  lfs-cloud-cli/
-  lfs-cloud-server/
-  lfs-cloud-core/
-  lfs-cloud-providers/
+  lfscloud-cli/
+  lfscloud-server/
+  lfscloud-core/
+  lfscloud-providers/
 
 docs/
   cli/
@@ -247,7 +247,7 @@ You have access to the following specialized protocols. **Activate** a skill by 
 > **Example**:
 >
 > ```
-> - **[migration] Pointer stability**: Git LFS pointers contain SHA-256 and size, not provider URLs, so provider migration should copy object bytes and update LFS config rather than rewrite history. See \`LfsPointer\` in crates/lfs-cloud-core/src/pointer.rs.
+> - **[migration] Pointer stability**: Git LFS pointers contain SHA-256 and size, not provider URLs, so provider migration should copy object bytes and update LFS config rather than rewrite history. See \`LfsPointer\` in crates/lfscloud-core/src/pointer.rs.
 > ```
 
 - **[build] Reqwest Rustls feature**: Current `reqwest` uses the `rustls` feature name with `default-features = false`; the older `rustls-tls` spelling is invalid for this dependency line. See `reqwest` in Cargo.toml.
@@ -281,7 +281,7 @@ You have access to the following specialized protocols. **Activate** a skill by 
 - **[auth] Callback CSRF registry**: The callback router must consume a registered state per authorization attempt, not store one fixed expected state, so long-lived routers support concurrent logins and reject replay. See `GitHubOAuthStateRegistry` in src/github_auth.rs.
 - **[auth] Callback state admission**: Consume digest-keyed callback states before handling provider-denied OAuth errors, expire them at the exact TTL, and reject new login admission at capacity rather than evicting an active attempt. See `GitHubOAuthStateRegistry` in src/github_auth.rs.
 - **[auth] OAuth PKCE attempt ownership**: Consume each authorization into the pending-state registry so its S256 verifier has one server-side owner, then remove state and verifier together before exchanging the callback code. See `GitHubOAuthStateRegistry::register` in src/github_auth.rs.
-- **[auth] Local LFS sessions**: Git LFS credentials are separate `lfs-cloud` bearer tokens backed by local session metadata; never store or hand GitHub OAuth access tokens to Git credential-helper paths. See `LocalLfsSessionStore` in src/sessions.rs.
+- **[auth] Local LFS sessions**: Git LFS credentials are separate LFS Cloud bearer tokens backed by local session metadata; never store or hand GitHub OAuth access tokens to Git credential-helper paths. See `LocalLfsSessionStore` in src/sessions.rs.
 - **[auth] Session verification hot path**: Verify only the presented token's expiry and share its OAuth-bearing record through `Arc`; reserve full-store expiry pruning for admission and diagnostics so normal authenticated requests do not scan every session. See `LocalLfsSessionStore::verify_record` in src/sessions.rs.
 - **[auth] GitHub permission denial**: Treat GitHub collaborator `404`, `none`, SSO-required, and unknown permission states as authorization denials; do not convert the permission endpoint's `404` into repository-not-found. See `GitHubRepositoryPermissionClient` in src/github_auth.rs.
 - **[auth] Git credential path scope**: Persist `credential.<lfs-host>.useHttpPath=true` in the target repository before approving tokens; global or one-shot settings can be overridden locally or disappear before later Git LFS lookups, leaking host-matched credentials across repo paths. See `GitCredentialApproval` in src/credentials.rs.
@@ -290,8 +290,8 @@ You have access to the following specialized protocols. **Activate** a skill by 
 - **[auth] Credential lookup scope**: Credential fill must prove protocol, host, path, and username match the configured LFS URL before accepting a stored token, so a host-scoped helper entry cannot satisfy another repo path. See `GitCredentialLookup` in src/credentials.rs.
 - **[auth] Credential lookup diagnostics**: Suppress `git credential fill` stderr because a failing helper can echo a stored password before lookup output reveals which value must be redacted. See `GitCredentialLookup::lookup_with_git_program` in src/credentials.rs.
 - **[auth] Credential lookup prompts**: Treat credential fill as a non-interactive cache probe; disable terminal, askpass, and GCM interaction together because any remaining prompt path can hang unattended status checks. See `GitCredentialLookup::lookup_with_git_program` in src/credentials.rs.
-- **[auth] LFS token transport**: Server auth accepts Bearer tokens and Git LFS Basic credentials where username is `lfs-cloud` and the password is the local session token; route matching still happens before auth so unknown repos remain 404. See `authenticate_lfs_session` in src/server.rs.
-- **[auth] Batch authorization token boundary**: Local LFS sessions retain GitHub OAuth tokens only as private server-side state so batch requests can re-check repository permissions while Git LFS receives only the local `lfs-cloud` token. See `LfsSessionRecord` in src/sessions.rs.
+- **[auth] LFS token transport**: Server auth accepts Bearer tokens and Git LFS Basic credentials where username is `lfscloud` and the password is the local session token; route matching still happens before auth so unknown repos remain 404. See `authenticate_lfs_session` in src/server.rs.
+- **[auth] Batch authorization token boundary**: Local LFS sessions retain GitHub OAuth tokens only as private server-side state so batch requests can re-check repository permissions while Git LFS receives only the local LFS Cloud token. See `LfsSessionRecord` in src/sessions.rs.
 - **[storage] Drive credential refs**: Bare Drive `credentials_ref` values map to prefixed env vars containing flat OAuth JSON; use `env:NAME` only when the server operator needs an explicit secret variable. See `GoogleDriveCredentialLoader` in src/google_drive.rs.
 - **[storage] Drive token URI safety**: Custom Google OAuth `token_uri` values must use HTTPS and cannot carry query strings or fragments; HTTP is reserved for loopback-only test endpoints. See `validate_token_url` in src/google_drive.rs.
 - **[storage] Drive API base safety**: Custom Google Drive API base URLs receive bearer tokens during root validation, so plaintext HTTP is allowed only for loopback test endpoints. See `validate_drive_api_base_url` in src/google_drive.rs.
@@ -310,7 +310,7 @@ You have access to the following specialized protocols. **Activate** a skill by 
 - **[storage] Drive upload idempotency**: Processes writing one Drive root must share the metadata path so its bounded object-keyed file locks span lookup and upload; exact historical duplicates resolve to the smallest validated Drive file ID. See `MetadataDatabase::acquire_object_upload_lock` in src/metadata.rs.
 - **[storage] Drive download gate**: Drive downloads must resolve file IDs through repository/OID/size app-property lookup before streaming `alt=media`; check media content length before proxying and hash the streamed bytes before completing the response. See `GoogleDriveObjectStore::download_object_response` in src/google_drive.rs.
 - **[storage] Drive provider trait**: `GoogleDriveObjectStore` implements the generic storage-provider trait for migration/direct storage flows; server LFS transfers still wrap it separately to record verified-object metadata. See `GoogleDriveObjectStore` in src/google_drive.rs.
-- **[metadata] Config-relative DB default**: Omitted `server.metadata_path` resolves to `.lfs-cloud/metadata.sqlite3` beside the config file, keeping server-owned state out of served repositories by default. See `ServerSettings` in src/server_config.rs.
+- **[metadata] Config-relative DB default**: Omitted `server.metadata_path` resolves to `.lfscloud/metadata.sqlite3` beside the config file, keeping server-owned state out of served repositories by default. See `ServerSettings` in src/server_config.rs.
 - **[metadata] Connection boundary**: `MetadataDatabase` keeps migrations private and wraps the SQLite connection so future server state can share the handle without exposing migration reruns. See `MetadataDatabase` in src/metadata.rs.
 - **[metadata] SQLite table changes**: Schema changes to existing columns need explicit versioned migrations because `CREATE TABLE IF NOT EXISTS` only affects fresh databases. See `NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION` in src/metadata.rs.
 - **[metadata] Forward schema guard**: Read and reject a `user_version` newer than `METADATA_SCHEMA_VERSION` before executing any schema SQL, so an older binary cannot mutate an unknown future database. See `MetadataDatabase::run_migrations` in src/metadata.rs.
@@ -329,7 +329,7 @@ You have access to the following specialized protocols. **Activate** a skill by 
 - **[server] Upload staging admission**: Reserve declared bytes atomically and retain global/per-user staging slots through backend completion; independent filesystem snapshots race across concurrent uploads. See `UploadStagingCoordinator` in src/server.rs.
 - **[server] Upload single-flight locks**: Store per-object upload locks weakly and purge dead keys during admission, so retries share a live lock without retaining one allocation per historical OID. See `LfsServerState::upload_lock_for` in src/server.rs.
 - **[server] Shutdown drain boundary**: SIGINT and SIGTERM stop listener admission and drain active transfers for 30 seconds; keep the deadline outside Axum's unbounded graceful wait so termination cannot hang indefinitely. See `serve_with_graceful_shutdown` in src/server.rs.
-- **[cli] Global config flag**: Keep `--config` as a root `clap` global so future commands share config-path handling while existing `lfs-cloud serve --config ...` usage still parses. See `Cli` in src/cli.rs.
+- **[cli] Global config flag**: Keep `--config` as a root `clap` global so future commands share config-path handling while existing `lfscloud serve --config ...` usage still parses. See `Cli` in src/cli.rs.
 - **[cli] Remote credential safety**: Git remote parsing rejects credentialed HTTPS URLs, plaintext HTTP, query strings, and credential-like scp users before deriving route identity; debug output also redacts raw scp-like userinfo. See `GitRemote` in src/git.rs.
 - **[cli] Dot-prefixed repositories**: GitHub repository names may start with a dot, such as `.github`; remote parsing should reject traversal segments without treating a leading repository dot as traversal. See `GitRemote` in src/git.rs.
 - **[cli] Init route base URL**: `init --server` normalizes HTTP(S) server bases, rejects trailing slash, unsafe characters, and dot path segments, then appends Git remote route pieces with URL path segments while preserving safe proxy base paths. See `LfsInitRoute` in src/init.rs.
@@ -338,7 +338,7 @@ You have access to the following specialized protocols. **Activate** a skill by 
 - **[tests] Git temp paths**: Git may canonicalize macOS temp paths from `/var` to `/private/var`; init tests should compare against canonicalized worktree paths instead of raw `TempDir` paths. See `init_writes_lfsconfig_from_current_repo_origin` in src/cli.rs.
 - **[tests] External gates**: Real provider integration tests are ignored by default and guarded by explicit env flags so normal CI compiles them without creating GitHub repos or Drive folders. See `github_disposable_repo_permission_check` in tests/external_integrations.rs.
 - **[tests] Process-tree portability**: Re-execute the native Rust test binary for timeout descendants instead of relying on shell fixtures, so Linux/macOS process groups and Windows recursive `taskkill` cleanup run under the same regression contract. See `command_timeout_stops_descendant_helpers` in src/credentials.rs.
-- **[cli] Login token boundary**: `login` stores only the callback's local `lfs-cloud` token in Git credentials; the GitHub OAuth token remains server-side for permission checks. See `run_login_from_dir` in src/cli.rs.
+- **[cli] Login token boundary**: `login` stores only the callback's local LFS Cloud token in Git credentials; the GitHub OAuth token remains server-side for permission checks. See `run_login_from_dir` in src/cli.rs.
 - **[cli] Login token input**: Read interactive local tokens with terminal echo disabled, but keep piped automation input on stdin; both paths must share the same byte-bounded line reader so hiding the terminal does not reintroduce unbounded allocation. See `read_hidden_login_token` in src/cli.rs.
 - **[cli] Browser opener detachment**: Print the OAuth URL before spawning the platform opener with null stdio and an independent process group, then reap it asynchronously; desktop launchers may stay alive indefinitely and must not block token entry. See `spawn_browser_launcher` in src/cli.rs.
 - **[cli] Status probe boundary**: `status` performs local readiness checks plus TCP reachability and Drive credential parsing; it intentionally does not call GitHub permission APIs or Drive root probes, which remain server/runtime checks. See `run_status_from_dir` in src/cli.rs.
@@ -348,7 +348,7 @@ You have access to the following specialized protocols. **Activate** a skill by 
 - **[cache] Verified ingest**: Repository-local Git LFS objects are stream-hashed while copying into a no-clobber temp-file publication path; existing cache files and publish races are reverified instead of overwritten. See `ingest_git_lfs_object` in src/local_cache.rs.
 - **[cache] Worktree registry**: Local cache GC must start from absolute registered worktree roots in `worktrees.json`; relative paths are rejected so future GC does not depend on process cwd. See `LocalCacheWorktreeRegistration` in src/local_cache.rs.
 - **[cache] Registry path encoding**: Persist platform-native path units in the current worktree-registry schema and keep v1 UTF-8 reads compatible, so valid non-UTF-8 Unix worktrees remain GC roots. See `serialize_worktree_registry_path` in src/local_cache.rs.
-- **[cache] Worktree registry writes**: Register/remove operations hold a separate `worktrees.json.lock` file across load-mutate-save so concurrent `lfs-cloud` processes cannot drop each other's GC roots. See `LocalCacheLayout::lock_worktree_registry` in src/local_cache.rs.
+- **[cache] Worktree registry writes**: Register/remove operations hold a separate `worktrees.json.lock` file across load-mutate-save so concurrent LFS Cloud processes cannot drop each other's GC roots. See `LocalCacheLayout::lock_worktree_registry` in src/local_cache.rs.
 - **[cache] GC operation boundary**: Cache ingest, materialization, hydration, and dehydration hold a shared `objects.lock`, while GC holds it exclusively; dehydration must retain the lock through pointer publication so GC cannot delete the newly preserved only copy. See `LocalCacheLayout::dehydrate_file` in src/local_cache.rs.
 - **[cache] Worktree root identity**: Worktree registration comparisons use canonical path keys when the path exists, so symlinked roots update/remove the same registry row instead of creating duplicate logical worktrees. See `normalized_path_key` in src/local_cache.rs.
 - **[cache] Materialization safety**: Cache-to-worktree materialization verifies the cache source first, treats macOS CoW as successful only when `fclonefileat` confirms a clone, and replaces existing worktree files only when they are exact cached bytes or matching LFS pointers. See `materialize_verified_object` in src/local_cache.rs.

@@ -94,12 +94,12 @@ pub struct GoogleDriveCredentialLoader {
 }
 
 impl GoogleDriveCredentialLoader {
-    /// Creates a loader using the default `lfs-cloud` Google Drive env prefix.
+    /// Creates a loader using the default LFS Cloud Google Drive env prefix.
     ///
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::GoogleDriveCredentialLoader;
+    /// use lfscloud::GoogleDriveCredentialLoader;
     ///
     /// let loader = GoogleDriveCredentialLoader::new();
     /// assert!(format!("{loader:?}").contains("GoogleDriveCredentialLoader"));
@@ -596,7 +596,7 @@ impl GoogleDriveObjectKey {
     /// Returns the deterministic Drive folder name for this object's shard.
     #[must_use]
     fn shard_folder_name(&self) -> String {
-        format!("lfs-cloud-sha256-{}", self.shard_prefix())
+        format!("lfscloud-sha256-{}", self.shard_prefix())
     }
 
     /// Returns the human-readable object path below the configured Drive root.
@@ -2007,7 +2007,7 @@ async fn persist_verified_drive_download_file(
             drive_download_destination_file_error(&storage, &destination, error)
         })?;
         let mut destination_file = tempfile::Builder::new()
-            .prefix(".lfs-cloud-download-")
+            .prefix(".lfscloud-download-")
             .tempfile_in(destination_parent)
             .map_err(|error| {
                 drive_download_destination_file_error(&storage, &destination, error)
@@ -3990,10 +3990,10 @@ mod tests {
         assert_eq!(key.repo_namespace(), "github.com/Owner Repo/repo.git");
         assert_eq!(key.object(), &lfs_object());
         assert_eq!(key.file_name(), format!("sha256-{OBJECT_OID}-42.lfs"));
-        assert_eq!(key.shard_folder_name(), "lfs-cloud-sha256-aa");
+        assert_eq!(key.shard_folder_name(), "lfscloud-sha256-aa");
         assert_eq!(
             key.display_path(),
-            format!("lfs-cloud-sha256-aa/sha256-{OBJECT_OID}-42.lfs")
+            format!("lfscloud-sha256-aa/sha256-{OBJECT_OID}-42.lfs")
         );
     }
 
@@ -4121,7 +4121,7 @@ mod tests {
 
         assert_eq!(url.path(), "/proxy/drive/v3/files");
         assert!(query["q"].contains("'drive-root' in parents"));
-        assert!(query["q"].contains("name = 'lfs-cloud-sha256-aa'"));
+        assert!(query["q"].contains("name = 'lfscloud-sha256-aa'"));
         assert!(
             query["q"]
                 .contains("appProperties has { key='lfsCloudFolderKind' and value='objectShard' }")
@@ -4129,7 +4129,7 @@ mod tests {
         assert!(query["q"].contains("appProperties has { key='lfsCloudShard' and value='aa' }"));
 
         let metadata = super::drive_shard_folder_metadata("drive-root", &key);
-        assert_eq!(metadata["name"], "lfs-cloud-sha256-aa");
+        assert_eq!(metadata["name"], "lfscloud-sha256-aa");
         assert_eq!(metadata["mimeType"], "application/vnd.google-apps.folder");
         assert_eq!(metadata["parents"], serde_json::json!(["drive-root"]));
         assert_eq!(
@@ -4670,7 +4670,7 @@ mod tests {
                         }
                         Json(serde_json::json!({
                             "id": "drive-shard-aa",
-                            "name": "lfs-cloud-sha256-aa",
+                            "name": "lfscloud-sha256-aa",
                             "mimeType": "application/vnd.google-apps.folder",
                             "parents": ["drive-root"],
                             "trashed": false,
@@ -4739,7 +4739,7 @@ mod tests {
                             );
                         Json(serde_json::json!({
                             "id": "drive-shard-aa",
-                            "name": "lfs-cloud-sha256-aa",
+                            "name": "lfscloud-sha256-aa",
                             "mimeType": "application/vnd.google-apps.folder",
                             "parents": ["drive-root"],
                             "trashed": false,
@@ -4788,7 +4788,7 @@ mod tests {
         assert_eq!(bodies.len(), 1);
         let metadata: serde_json::Value =
             serde_json::from_str(&bodies[0]).expect("shard create body should be JSON");
-        assert_eq!(metadata["name"], "lfs-cloud-sha256-aa");
+        assert_eq!(metadata["name"], "lfscloud-sha256-aa");
         assert_eq!(metadata["parents"], serde_json::json!(["drive-root"]));
     }
 
@@ -7057,7 +7057,7 @@ mod tests {
             format!(
                 r#"{{"files":[{{
                     "id":"drive-shard-{shard_prefix}",
-                    "name":"lfs-cloud-sha256-{shard_prefix}",
+                    "name":"lfscloud-sha256-{shard_prefix}",
                     "mimeType":"application/vnd.google-apps.folder",
                     "parents":["drive-root"],
                     "trashed":false,

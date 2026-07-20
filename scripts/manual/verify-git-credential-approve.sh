@@ -18,7 +18,7 @@ GIT_CONFIG_GLOBAL="$global_config" git -C "$repo_dir" config --local \
 GIT_CONFIG_GLOBAL="$global_config" git -C "$repo_dir" config --local \
   credential.https://lfs.example.invalid/.useHttpPath true
 
-printf 'url=%s\nusername=lfs-cloud\npassword=%s\n\n' "$lfs_url" "$token" |
+printf 'url=%s\nusername=lfscloud\npassword=%s\n\n' "$lfs_url" "$token" |
   GIT_CONFIG_GLOBAL="$global_config" \
     git -C "$repo_dir" -c "credential.helper=store --file=$store_file" \
       credential approve
@@ -33,7 +33,7 @@ approved="$(
 printf '%s\n' "$approved" | grep -Fx 'protocol=https' >/dev/null
 printf '%s\n' "$approved" | grep -Fx 'host=lfs.example.invalid' >/dev/null
 printf '%s\n' "$approved" | grep -Fx 'path=github.com/owner/repo.git/info/lfs' >/dev/null
-printf '%s\n' "$approved" | grep -Fx 'username=lfs-cloud' >/dev/null
+printf '%s\n' "$approved" | grep -Fx 'username=lfscloud' >/dev/null
 printf '%s\n' "$approved" | grep -Fx "password=$token" >/dev/null
 
 if printf 'url=%s\n\n' "$other_lfs_url" |

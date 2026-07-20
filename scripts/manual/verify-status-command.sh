@@ -55,7 +55,7 @@ fi
 port="$(cat "$port_file")"
 server_url="http://127.0.0.1:$port"
 lfs_url="$server_url/github.com/owner/repo.git/info/lfs"
-config_file="$tmp_dir/lfs-cloud.yml"
+config_file="$tmp_dir/lfscloud.yml"
 
 mkdir -p "$repo_dir" "$cache_root/objects"
 git -C "$repo_dir" init >/dev/null
@@ -93,7 +93,7 @@ GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
   git config --global credential.helper "store --file=$store_file"
 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
   git config --global "credential.$server_url.useHttpPath" true
-printf 'protocol=http\nhost=127.0.0.1:%s\npath=github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\npassword=%s\n\n' \
+printf 'protocol=http\nhost=127.0.0.1:%s\npath=github.com/owner/repo.git/info/lfs\nusername=lfscloud\npassword=%s\n\n' \
   "$port" "$token" |
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
     git credential approve
@@ -130,4 +130,4 @@ if grep -F "$token" "$tmp_dir/status-output" >/dev/null; then
   exit 1
 fi
 
-echo "lfs-cloud status verified repository, server, auth, storage, and cache checks"
+echo "lfscloud status verified repository, server, auth, storage, and cache checks"

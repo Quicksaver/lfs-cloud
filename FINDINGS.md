@@ -309,7 +309,7 @@ independently validated or adjudicated.
     GitHub token left its local bearer session active. The full server now
     mounts authenticated `DELETE /auth/session`, consumes the presented local
     token, and removes both its in-process record and durable SQLite row.
-    `lfs-cloud logout --server` resolves the current repository route, performs
+    `lfscloud logout --server` resolves the current repository route, performs
     a non-redirecting authenticated revocation request, and only then erases the
     exact path-scoped credential through `git credential reject`; an already
     expired or revoked server token still permits local cleanup, while an
@@ -966,7 +966,7 @@ independently validated or adjudicated.
    configured root, despite Drive's per-folder item limit, and production
    existence/download checks ignored SQLite's stored backend ID in favor of a
    paginated `files.list` query. New uploads now use one of 256 deterministic
-   `lfs-cloud-sha256-<first-2>` folders. Private folder properties distinguish
+   `lfscloud-sha256-<first-2>` folders. Private folder properties distinguish
    application shards from same-named operator folders; discovery validates
    every matching physical shard, tolerates concurrent duplicate shard-folder
    creation, and retains lookup for objects written directly under the root by
@@ -1847,7 +1847,7 @@ independently validated or adjudicated.
     `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid and actionable.** The script
     previously ran only focused unit tests backed by
     `FakeMigrationStorageProvider`, but its manual-verification name and the
-    migration checklist implied that it exercised a live `lfs-cloud`/Google
+    migration checklist implied that it exercised a live LFS Cloud/Google
     Drive upload. It never constructed `GoogleDriveObjectStore`, loaded real
     Drive credentials, or contacted an external service. The verifier is now
     named `verify-migration-upload-simulation.sh`, identifies its fake-provider
@@ -2250,7 +2250,7 @@ independently validated or adjudicated.
    clearly instead of silently skipping the test. The test exposed a real
    protocol defect hidden by direct router coverage: the reference client does
    not carry batch-request credentials to advertised transfer URLs. Batch
-   upload and download actions now include only the local `lfs-cloud` Basic
+   upload and download actions now include only the local LFS Cloud Basic
    session credential, never the private GitHub or Drive token, and focused
    unit tests assert both action types carry that authorization. Verification
    passed with `yarn lint:fix`, `cargo fmt --all -- --check`,

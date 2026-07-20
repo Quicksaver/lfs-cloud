@@ -41,8 +41,8 @@ cache_root = pathlib.Path(sys.argv[3])
 keep_oid_file = pathlib.Path(sys.argv[4])
 remove_oid_file = pathlib.Path(sys.argv[5])
 
-keep_payload = b"lfs-cloud gc retained payload\n"
-remove_payload = b"lfs-cloud gc removable payload\n"
+keep_payload = b"lfscloud gc retained payload\n"
+remove_payload = b"lfscloud gc removable payload\n"
 
 def cache_object(payload: bytes) -> str:
     oid = hashlib.sha256(payload).hexdigest()
@@ -139,4 +139,4 @@ if grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null; then
   exit 1
 fi
 
-echo "lfs-cloud gc verified unavailable-root protection and explicit pruning"
+echo "lfscloud gc verified unavailable-root protection and explicit pruning"

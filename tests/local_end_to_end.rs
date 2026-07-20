@@ -21,7 +21,7 @@ use axum::{
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
 };
-use lfs_cloud::{
+use lfscloud::{
     GitCredentialApproval, GitHubOAuthAccessToken, GitLfsConfigTarget, GitRepository,
     LfsBatchResponse, LfsInitRoute, LocalCacheDehydrationStatus, LocalCacheLayout,
     LocalLfsSessionStore, RepositoryPermission, RepositoryUser, ServerConfig, ServerError,
@@ -116,7 +116,7 @@ async fn real_git_lfs_push_fetch_and_checkout_cross_the_tcp_boundary() {
             .arg("-C")
             .arg(source.path())
             .args(["lfs", "push", "origin", "main"]),
-        "Git LFS push through lfs-cloud",
+        "Git LFS push through lfscloud",
     );
     let object = lfs_object_for_bytes(bytes);
     assert_eq!(
@@ -154,7 +154,7 @@ async fn real_git_lfs_push_fetch_and_checkout_cross_the_tcp_boundary() {
             .arg("-C")
             .arg(&checkout)
             .args(["lfs", "fetch", "origin", "main"]),
-        "Git LFS fetch through lfs-cloud",
+        "Git LFS fetch through lfscloud",
     );
     assert_command_success(
         Command::new("git")
@@ -221,7 +221,7 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
         )
         .expect("local LFS session should be issued");
 
-    let bytes = b"large model bytes fetched through lfs-cloud";
+    let bytes = b"large model bytes fetched through lfscloud";
     let object = lfs_object_for_bytes(bytes);
     let drive = Arc::new(FakeStorageProvider::new("drive-user-a"));
     let router = lfs_server_router_with_provider_adapters(
@@ -513,13 +513,13 @@ repositories:
 fn configure_test_credential(
     repository: &TempGitRepo,
     lfs_url: &str,
-    token: lfs_cloud::LfsSessionToken,
+    token: lfscloud::LfsSessionToken,
 ) {
     repository.git([
         "config",
         "--local",
         "credential.helper",
-        "store --file=.git/lfs-cloud-test-credentials",
+        "store --file=.git/lfscloud-test-credentials",
     ]);
     GitCredentialApproval::new(lfs_url, token)
         .expect("loopback LFS credential URL should be accepted")
@@ -530,14 +530,14 @@ fn configure_test_credential(
 fn configure_test_credential_path(
     repository: &Path,
     lfs_url: &str,
-    token: lfs_cloud::LfsSessionToken,
+    token: lfscloud::LfsSessionToken,
 ) {
     assert_command_success(
         Command::new("git").arg("-C").arg(repository).args([
             "config",
             "--local",
             "credential.helper",
-            "store --file=.git/lfs-cloud-test-credentials",
+            "store --file=.git/lfscloud-test-credentials",
         ]),
         "checkout-local credential helper configuration",
     );
@@ -565,7 +565,7 @@ fn path_str(path: &Path) -> &str {
         .expect("temporary test repository paths should be valid UTF-8")
 }
 
-fn lfs_batch_request(operation: &str, object: &lfs_cloud::LfsObject) -> String {
+fn lfs_batch_request(operation: &str, object: &lfscloud::LfsObject) -> String {
     serde_json::json!({
         "operation": operation,
         "transfers": ["basic"],
@@ -623,7 +623,7 @@ async fn lfs_batch_response(response: axum::response::Response) -> LfsBatchRespo
     serde_json::from_slice(&body).expect("response should be Git LFS batch JSON")
 }
 
-fn assert_action_href(href: &str, object: &lfs_cloud::LfsObject) {
+fn assert_action_href(href: &str, object: &lfscloud::LfsObject) {
     let url = Url::parse(href).expect("server action href should be an absolute URL");
     let expected_query = format!("size={}", object.size.bytes());
 

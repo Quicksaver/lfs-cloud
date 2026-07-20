@@ -101,7 +101,7 @@ impl LfsCloudError {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{CliError, ErrorCategory, LfsCloudError};
+    /// use lfscloud::{CliError, ErrorCategory, LfsCloudError};
     ///
     /// let error = LfsCloudError::from(CliError::InvalidArguments {
     ///     message: "missing --config".to_owned(),
@@ -787,7 +787,7 @@ impl SanitizedMessage {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::SanitizedMessage;
+    /// use lfscloud::SanitizedMessage;
     ///
     /// let message = SanitizedMessage::new("rate limit exceeded");
     /// assert_eq!(message.as_str(), "rate limit exceeded");

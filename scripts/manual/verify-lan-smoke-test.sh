@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t lfs-cloud-lan)"
+tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t lfscloud-lan)"
 server_pid=""
 trap 'if [[ -n "${server_pid:-}" ]]; then kill "$server_pid" >/dev/null 2>&1 || true; fi; rm -rf "$tmp_dir"' EXIT
 
@@ -51,7 +51,7 @@ PY
 fi
 
 public_url="${LFS_CLOUD_LAN_PUBLIC_URL:-http://127.0.0.1:$port}"
-config_file="${LFS_CLOUD_LAN_CONFIG:-$tmp_dir/lfs-cloud-lan.yml}"
+config_file="${LFS_CLOUD_LAN_CONFIG:-$tmp_dir/lfscloud-lan.yml}"
 route_host="${LFS_CLOUD_LAN_ROUTE_HOST:-github.com}"
 route_owner="${LFS_CLOUD_LAN_ROUTE_OWNER:-owner}"
 route_repo="${LFS_CLOUD_LAN_ROUTE_REPO:-repo}"
@@ -129,7 +129,7 @@ require_file_matches() {
   fi
 }
 
-build_lfs_cloud_binary() {
+build_lfscloud_binary() {
   cargo build --quiet --manifest-path "$project_dir/Cargo.toml" --message-format=json |
     "$python_bin" -c '
 import json
@@ -140,14 +140,14 @@ for line in sys.stdin:
     target = message.get("target") or {}
     if (
         message.get("reason") == "compiler-artifact"
-        and target.get("name") == "lfs-cloud"
+        and target.get("name") == "lfscloud"
         and "bin" in target.get("kind", [])
         and message.get("executable")
     ):
         print(message["executable"])
         sys.exit(0)
 
-raise SystemExit("Cargo did not report a built lfs-cloud executable")
+raise SystemExit("Cargo did not report a built lfscloud executable")
 '
 }
 
@@ -216,7 +216,7 @@ if [[ "$route_path" != /* ]] || [[ "$route_path" == *"?"* ]] || [[ "$route_path"
 fi
 
 if ! is_loopback_host "$host"; then
-  echo "Notice: lfs-cloud will bind to $host and may be reachable from your LAN." >&2
+  echo "Notice: LFS Cloud will bind to $host and may be reachable from your LAN." >&2
 fi
 
 if [[ -z "${LFS_CLOUD_LAN_CONFIG:-}" ]]; then
@@ -261,9 +261,9 @@ fi
 server_log="$tmp_dir/server.log"
 expected_local_url="$(advertised_local_url "$host" "$port")"
 
-lfs_cloud_bin="$(build_lfs_cloud_binary)"
+lfscloud_bin="$(build_lfscloud_binary)"
 
-"$lfs_cloud_bin" --config "$config_file" serve --host "$host" --port "$port" \
+"$lfscloud_bin" --config "$config_file" serve --host "$host" --port "$port" \
   >"$server_log" 2>&1 &
 server_pid="$!"
 
@@ -283,7 +283,7 @@ for _ in $(seq 1 "$startup_attempts"); do
   if ! kill -0 "$server_pid" >/dev/null 2>&1; then
     cat "$server_log" >&2
     cat "$tmp_dir/startup-curl-error" >&2
-    echo "lfs-cloud serve exited before reporting startup" >&2
+    echo "lfscloud serve exited before reporting startup" >&2
     exit 1
   fi
   sleep 0.25
@@ -292,7 +292,7 @@ done
 if [[ "$startup_http_status" != "401" ]]; then
   cat "$server_log" >&2
   cat "$tmp_dir/startup-curl-error" >&2
-  echo "lfs-cloud serve did not respond with HTTP 401 before timeout" >&2
+  echo "lfscloud serve did not respond with HTTP 401 before timeout" >&2
   exit 1
 fi
 
@@ -352,8 +352,8 @@ Manual cross-machine checklist:
    Expected: HTTP 401, Git LFS JSON content, and a Basic or Bearer auth challenge.
 4. With a disposable GitHub repo mapped in the real server config, run from the
    client worktree:
-   lfs-cloud init --server http://<server-lan-ip>:$port --allow-insecure-http
-   lfs-cloud login --server http://<server-lan-ip>:$port --allow-insecure-http
+   lfscloud init --server http://<server-lan-ip>:$port --allow-insecure-http
+   lfscloud login --server http://<server-lan-ip>:$port --allow-insecure-http
    git lfs env
    Expected: the Git LFS endpoint points at the LAN URL for the disposable repo.
 5. Track and push one small Git LFS file from the client, then clone or pull

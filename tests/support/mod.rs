@@ -16,7 +16,7 @@ use std::{
     sync::Mutex,
 };
 
-use lfs_cloud::{
+use lfscloud::{
     LfsObject, LfsObjectSize, LfsOid, LfsPointer, ProviderFuture, RepositoryAuthentication,
     RepositoryAuthorization, RepositoryIdentity, RepositoryPermission, RepositoryProvider,
     RepositoryProviderError, ServerError, ServerResult, StorageDeleteOutcome, StorageError,
@@ -54,7 +54,7 @@ impl TempGitRepo {
             }
         }
 
-        repo.git(["config", "user.email", "lfs-cloud@example.invalid"]);
+        repo.git(["config", "user.email", "lfscloud@example.invalid"]);
         repo.git(["config", "user.name", "LFS Cloud Test"]);
 
         repo

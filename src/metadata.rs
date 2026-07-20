@@ -1476,7 +1476,7 @@ PRAGMA user_version = 1;
         let db_path = directory
             .path()
             .join("state")
-            .join(".lfs-cloud")
+            .join(".lfscloud")
             .join("metadata.sqlite3");
 
         let database = MetadataDatabase::open(&db_path).expect("metadata DB should open");

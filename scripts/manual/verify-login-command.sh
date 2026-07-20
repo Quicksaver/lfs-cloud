@@ -49,7 +49,7 @@ approved="$(
 printf '%s\n' "$approved" | grep -Fx 'protocol=https' >/dev/null
 printf '%s\n' "$approved" | grep -Fx 'host=lfs.example.invalid' >/dev/null
 printf '%s\n' "$approved" | grep -Fx 'path=github.com/owner/repo.git/info/lfs' >/dev/null
-printf '%s\n' "$approved" | grep -Fx 'username=lfs-cloud' >/dev/null
+printf '%s\n' "$approved" | grep -Fx 'username=lfscloud' >/dev/null
 printf '%s\n' "$approved" | grep -Fx "password=$token" >/dev/null
 
 other_approved="$(
@@ -64,4 +64,4 @@ if printf '%s\n' "$other_approved" | grep -Fx "password=$token" >/dev/null; then
   exit 1
 fi
 
-echo "lfs-cloud login stored a path-scoped local LFS token"
+echo "lfscloud login stored a path-scoped local LFS token"

@@ -47,7 +47,7 @@ const GITHUB_USER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_PERMISSION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PENDING_GITHUB_OAUTH_STATES: usize = 1024;
-const GITHUB_USER_AGENT: &str = concat!("lfs-cloud/", env!("CARGO_PKG_VERSION"));
+const GITHUB_USER_AGENT: &str = concat!("lfscloud/", env!("CARGO_PKG_VERSION"));
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION_HEADER: &str = "x-github-api-version";
 const GITHUB_API_VERSION: &str = "2022-11-28";
@@ -104,7 +104,7 @@ impl GitHubOAuthCallbackRouteState {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{
+    /// use lfscloud::{
     ///     GitHubOAuthCallbackRouteState, GitHubOAuthStateRegistry, GitHubProviderConfig,
     /// };
     ///
@@ -124,7 +124,7 @@ impl GitHubOAuthCallbackRouteState {
     /// )?;
     ///
     /// assert!(format!("{route_state:?}").contains("GitHubOAuthCallbackRouteState"));
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     ///
     /// # Errors
@@ -153,7 +153,7 @@ impl GitHubOAuthCallbackRouteState {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{
+    /// use lfscloud::{
     ///     GitHubOAuthCallbackRouteState, GitHubOAuthTokenExchanger,
     ///     GitHubOAuthStateRegistry, GitHubProviderConfig, GitHubUserClient,
     /// };
@@ -178,7 +178,7 @@ impl GitHubOAuthCallbackRouteState {
     /// )?;
     ///
     /// assert!(format!("{route_state:?}").contains("GitHubOAuthCallbackRouteState"));
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     ///
     /// # Errors
@@ -497,12 +497,12 @@ impl GitHubOAuthAccessToken {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::GitHubOAuthAccessToken;
+    /// use lfscloud::GitHubOAuthAccessToken;
     ///
     /// let token = GitHubOAuthAccessToken::from_secret("gho_example")?;
     ///
     /// assert_eq!(token.as_str(), "gho_example");
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     pub fn from_secret(secret: impl Into<String>) -> ServerResult<Self> {
         validate_sensitive_oauth_value(secret.into(), "github oauth access token").map(Self)
@@ -563,12 +563,12 @@ impl GitHubUserClient {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::GitHubUserClient;
+    /// use lfscloud::GitHubUserClient;
     ///
     /// let client = GitHubUserClient::new()?;
     ///
     /// assert!(format!("{client:?}").contains("GitHubUserClient"));
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     pub fn new() -> ServerResult<Self> {
         Ok(Self::with_client(default_github_api_http_client()?))
@@ -725,12 +725,12 @@ impl GitHubRepositoryPermissionClient {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::GitHubRepositoryPermissionClient;
+    /// use lfscloud::GitHubRepositoryPermissionClient;
     ///
     /// let client = GitHubRepositoryPermissionClient::new()?;
     ///
     /// assert!(format!("{client:?}").contains("GitHubRepositoryPermissionClient"));
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     pub fn new() -> ServerResult<Self> {
         Ok(Self::with_client(default_github_api_http_client()?))
@@ -975,12 +975,12 @@ impl GitHubOAuthTokenExchanger {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::GitHubOAuthTokenExchanger;
+    /// use lfscloud::GitHubOAuthTokenExchanger;
     ///
     /// let exchanger = GitHubOAuthTokenExchanger::new()?;
     ///
     /// assert!(format!("{exchanger:?}").contains("GitHubOAuthTokenExchanger"));
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     pub fn new() -> ServerResult<Self> {
         Self::with_token_url(GITHUB_OAUTH_TOKEN_URL)
@@ -1136,7 +1136,7 @@ impl GitHubOAuthAuthorization {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{GitHubOAuthAuthorization, GitHubProviderConfig};
+    /// use lfscloud::{GitHubOAuthAuthorization, GitHubProviderConfig};
     ///
     /// let provider = GitHubProviderConfig {
     ///     id: "github-main".to_owned(),
@@ -1152,7 +1152,7 @@ impl GitHubOAuthAuthorization {
     /// )?;
     ///
     /// assert_eq!(authorization.authorization_url.host_str(), Some("github.com"));
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     pub fn new(
         provider: &GitHubProviderConfig,
@@ -1296,7 +1296,7 @@ impl GitHubOAuthStateRegistry {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{
+    /// use lfscloud::{
     ///     GitHubOAuthAuthorization, GitHubOAuthStateRegistry, GitHubProviderConfig,
     /// };
     ///
@@ -1315,7 +1315,7 @@ impl GitHubOAuthStateRegistry {
     /// let authorization_url = registry.register(authorization)?;
     ///
     /// assert_eq!(authorization_url.host_str(), Some("github.com"));
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     ///
     /// # Errors
@@ -1434,12 +1434,12 @@ impl GitHubOAuthState {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::GitHubOAuthState;
+    /// use lfscloud::GitHubOAuthState;
     ///
     /// let state = GitHubOAuthState::from_secret("csrf-state")?;
     ///
     /// assert_eq!(state.as_str(), "csrf-state");
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     pub fn from_secret(secret: impl Into<String>) -> ServerResult<Self> {
         validate_sensitive_oauth_value(secret.into(), "github oauth state").map(Self)
@@ -1511,7 +1511,7 @@ impl GitHubOAuthCallbackQuery {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::GitHubOAuthCallbackQuery;
+    /// use lfscloud::GitHubOAuthCallbackQuery;
     ///
     /// let query = GitHubOAuthCallbackQuery::authorization_code("oauth-code", "csrf-state");
     ///
@@ -1568,7 +1568,7 @@ impl GitHubOAuthCallback {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{
+    /// use lfscloud::{
     ///     GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery,
     ///     GitHubProviderConfig,
     /// };
@@ -1590,7 +1590,7 @@ impl GitHubOAuthCallback {
     /// let callback = GitHubOAuthCallback::validate(query, authorization)?;
     ///
     /// assert_eq!(callback.code.as_str(), "oauth-code");
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     pub fn validate(
         query: GitHubOAuthCallbackQuery,
@@ -1710,7 +1710,7 @@ impl fmt::Debug for GitHubOAuthCallback {
 /// # Examples
 ///
 /// ```
-/// use lfs_cloud::{GitHubProviderConfig, github_oauth_authorization_url};
+/// use lfscloud::{GitHubProviderConfig, github_oauth_authorization_url};
 ///
 /// let provider = GitHubProviderConfig {
 ///     id: "github-main".to_owned(),
@@ -1726,7 +1726,7 @@ impl fmt::Debug for GitHubOAuthCallback {
 /// )?;
 ///
 /// assert_eq!(authorization.authorization_url.host_str(), Some("github.com"));
-/// # Ok::<(), lfs_cloud::ServerError>(())
+/// # Ok::<(), lfscloud::ServerError>(())
 /// ```
 pub fn github_oauth_authorization_url(
     provider: &GitHubProviderConfig,

@@ -69,7 +69,7 @@ GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
   git config --global credential.helper "store --file=$store_file"
 git -C "$repo_dir" config --local \
   "credential.$server_url/.useHttpPath" true
-printf 'url=%s\nusername=lfs-cloud\npassword=%s\n\n' "$lfs_url" "$token" |
+printf 'url=%s\nusername=lfscloud\npassword=%s\n\n' "$lfs_url" "$token" |
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
     git -C "$repo_dir" credential approve
 
@@ -89,11 +89,11 @@ if grep -F "$token" "$tmp_dir/logout-output" >/dev/null; then
   echo "logout output leaked the local LFS token" >&2
   exit 1
 fi
-if printf 'url=%s\nusername=lfs-cloud\n\n' "$lfs_url" |
+if printf 'url=%s\nusername=lfscloud\n\n' "$lfs_url" |
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
     git -C "$repo_dir" credential fill >/dev/null 2>&1; then
   echo "logout left the local LFS credential available" >&2
   exit 1
 fi
 
-echo "lfs-cloud logout revoked the session and erased its Git credential"
+echo "lfscloud logout revoked the session and erased its Git credential"

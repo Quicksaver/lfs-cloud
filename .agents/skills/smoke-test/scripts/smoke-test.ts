@@ -34,7 +34,7 @@ const repoRoot = resolve(dirname(scriptPath), '../../../..');
 dotenv.config({ path: join(repoRoot, '.env.local'), quiet: true });
 const throwawayRoot = resolve(process.env.LFS_CLOUD_SMOKE_THROWAWAY ?? join(homedir(), 'Sites', 'throwaway'));
 const targetDir = join(repoRoot, 'target');
-const binaryPath = join(targetDir, 'debug', 'lfs-cloud');
+const binaryPath = join(targetDir, 'debug', 'lfscloud');
 const commandOutputLimit = 4 * 1024 * 1024;
 const defaultTimeoutMs = 15 * 60 * 1000;
 const githubCredentialEnv = 'LFS_CLOUD_GITHUB_TOKEN';
@@ -234,7 +234,7 @@ async function migrationDryRunSmoke(): Promise<void> {
   const statusAfter = await git(migrationRepo, 'status', '--porcelain=v1', '--untracked-files=all');
   const configAfter = await readFile(join(migrationRepo, '.git', 'config'), 'utf8');
 
-  assert(output.includes('lfs-cloud migrate dry-run'), 'migration did not render a dry-run report');
+  assert(output.includes('lfscloud migrate dry-run'), 'migration did not render a dry-run report');
   assert(output.includes('mode: current-checkout'), 'migration did not use current-checkout scope');
   assert(output.includes('objects discovered: 1'), 'migration did not discover the LFS object');
   assert(statusAfter === statusBefore, 'migration dry-run changed worktree status');
@@ -283,7 +283,7 @@ async function statusSmoke(): Promise<void> {
     await command('git', ['credential', 'approve'], {
       cwd: repo,
       env: gitEnv,
-      input: `url=${lfsUrl}\nusername=lfs-cloud\npassword=smoke-status-token\n\n`,
+      input: `url=${lfsUrl}\nusername=lfscloud\npassword=smoke-status-token\n\n`,
     });
 
     const output = await command(binaryPath, ['--config', configPath, 'status', '--cache-root', cacheRoot], {
@@ -384,7 +384,7 @@ function tests(): SmokeTest[] {
         ]) {
           assert(help.includes(subcommand), `CLI help omitted ${subcommand}`);
         }
-        assert(version.startsWith('lfs-cloud '), 'CLI version output was unexpected');
+        assert(version.startsWith('lfscloud '), 'CLI version output was unexpected');
       },
     },
     {
@@ -480,7 +480,7 @@ function sanitizeDetail(detail: string): string {
 async function cleanup(): Promise<void> {
   if (!sandbox) return;
   const relativeSandbox = relative(throwawayRoot, sandbox);
-  if (relativeSandbox.startsWith('..') || !relativeSandbox.startsWith('.lfs-cloud-smoke-')) {
+  if (relativeSandbox.startsWith('..') || !relativeSandbox.startsWith('.lfscloud-smoke-')) {
     throw new Error(`refusing to remove unexpected smoke path: ${sandbox}`);
   }
   await rm(sandbox, { recursive: true, force: true });
@@ -496,7 +496,7 @@ async function main(): Promise<void> {
   assert(await pathExists(join(repoRoot, 'Cargo.toml')), 'run the skill from an LFS Cloud checkout');
   assert(await pathExists(join(throwawayRoot, '.git')), `throwaway repository not found at ${throwawayRoot}`);
 
-  sandbox = await mkdtemp(join(throwawayRoot, '.lfs-cloud-smoke-'));
+  sandbox = await mkdtemp(join(throwawayRoot, '.lfscloud-smoke-'));
   process.once('SIGINT', () => void handleSignal('SIGINT'));
   process.once('SIGTERM', () => void handleSignal('SIGTERM'));
 

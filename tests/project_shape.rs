@@ -75,7 +75,7 @@ fn mvp_uses_single_root_package_with_library_and_binary_targets() {
             .get("package")
             .and_then(|package| package.get("name"))
             .and_then(Value::as_str),
-        Some("lfs-cloud")
+        Some("lfscloud")
     );
     assert!(
         manifest.get("workspace").is_none(),
@@ -91,6 +91,25 @@ fn mvp_uses_single_root_package_with_library_and_binary_targets() {
     );
     assert!(manifest_dir().join("src/lib.rs").is_file());
     assert!(manifest_dir().join("src/main.rs").is_file());
+}
+
+#[test]
+fn cli_binary_uses_the_unhyphenated_name() {
+    let binary_targets = cargo_manifest()
+        .get("bin")
+        .and_then(Value::as_array)
+        .expect("Cargo.toml should declare the CLI binary explicitly");
+
+    assert!(binary_targets.iter().any(|target| {
+        target
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name == "lfscloud")
+            && target
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path == "src/main.rs")
+    }));
 }
 
 #[test]

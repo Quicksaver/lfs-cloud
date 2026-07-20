@@ -47,7 +47,7 @@ import sys
 cache_root = pathlib.Path(sys.argv[1])
 payload_file = pathlib.Path(sys.argv[2])
 oid_file = pathlib.Path(sys.argv[3])
-payload = b"lfs-cloud hydrate/dehydrate CLI manual verifier\n"
+payload = b"lfscloud hydrate/dehydrate CLI manual verifier\n"
 oid = hashlib.sha256(payload).hexdigest()
 cache_path = cache_root / "objects" / oid[:2] / oid[2:4] / oid
 
@@ -59,9 +59,9 @@ PY
 
 git -C "$tmp_dir" init --quiet repo
 git -C "$repo_dir" config user.name "LFS Cloud Manual Verifier"
-git -C "$repo_dir" config user.email "lfs-cloud-manual@example.invalid"
+git -C "$repo_dir" config user.email "lfscloud-manual@example.invalid"
 git -C "$repo_dir" config commit.gpgSign false
-git -C "$repo_dir" remote add origin git@github.com:lfs-cloud/manual-verifier.git
+git -C "$repo_dir" remote add origin git@github.com:lfscloud/manual-verifier.git
 git -C "$repo_dir" lfs install --local >/dev/null
 git -C "$repo_dir" lfs track "asset/model.bin" >/dev/null
 mkdir -p "$repo_dir/asset"
@@ -101,4 +101,4 @@ grep -F "asset/model.bin" "$tmp_dir/hydrate-output" >/dev/null
 grep -F "dehydrated" "$tmp_dir/dehydrate-output" >/dev/null
 grep -F "asset/model.bin" "$tmp_dir/dehydrate-output" >/dev/null
 
-echo "lfs-cloud hydrate/dehydrate and Git LFS push verified"
+echo "lfscloud hydrate/dehydrate and Git LFS push verified"

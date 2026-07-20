@@ -54,7 +54,7 @@ import sys
 repo_dir = pathlib.Path(sys.argv[1])
 payload_file = pathlib.Path(sys.argv[2])
 oid_file = pathlib.Path(sys.argv[3])
-payload = b"lfs-cloud pull manual verifier\n"
+payload = b"lfscloud pull manual verifier\n"
 oid = hashlib.sha256(payload).hexdigest()
 size = len(payload)
 pointer = (
@@ -92,7 +92,7 @@ oid="$(cat "$oid_file")"
 cmp "$payload_file" "$repo_dir/asset/model.bin" >/dev/null
 cmp "$payload_file" "$cache_root/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
 grep -F "fetch" "$fetch_log" >/dev/null
-grep -F "lfs-cloud pull" "$tmp_dir/pull-output" >/dev/null
+grep -F "lfscloud pull" "$tmp_dir/pull-output" >/dev/null
 grep -F "tracked paths: 1" "$tmp_dir/pull-output" >/dev/null
 grep -F "pointers: 1" "$tmp_dir/pull-output" >/dev/null
 grep -F "asset/model.bin" "$tmp_dir/pull-output" >/dev/null
@@ -109,4 +109,4 @@ fi
 grep -F "oid sha256:$oid" "$repo_dir/asset/untracked.bin" >/dev/null
 grep -F "oid sha256:$oid" "$repo_dir/docs/pointer-example.txt" >/dev/null
 
-echo "lfs-cloud pull verified against fetched Git LFS cache objects"
+echo "lfscloud pull verified against fetched Git LFS cache objects"

@@ -10,8 +10,8 @@ The initial target is:
 - Git LFS endpoint hosted by this project.
 - Large file contents stored outside GitHub LFS.
 - Google Drive storage backend, potentially using an existing Google One account.
-- Multiple repositories served by one `lfs-cloud` instance.
-- Multiple storage accounts/providers configured on one `lfs-cloud` instance.
+- Multiple repositories served by one LFS Cloud instance.
+- Multiple storage accounts/providers configured on one LFS Cloud instance.
 - Provider abstractions kept generic enough to add more Git hosts and storage backends later.
 
 The core idea is:
@@ -20,7 +20,7 @@ The core idea is:
 git / repository host
   stores commits, trees, refs, and small LFS pointer files
 
-lfs-cloud
+LFS Cloud
   implements the Git LFS server API, repository-host authorization,
   and storage-provider routing
 
@@ -47,7 +47,7 @@ The normal Git repository and the LFS storage can be separate services. A reposi
     url = https://lfs.example.com/owner/repo.git/info/lfs
 ```
 
-This may live in local Git config or in a committed `.lfsconfig` file. The LFS URL identifies the `lfs-cloud` endpoint for the repository. It should not expose storage-provider credentials or decide directly which backend account is used. That routing should be private server configuration.
+This may live in local Git config or in a committed `.lfsconfig` file. The LFS URL identifies the LFS Cloud endpoint for the repository. It should not expose storage-provider credentials or decide directly which backend account is used. That routing should be private server configuration.
 
 ## Custom LFS Provider
 
@@ -63,7 +63,7 @@ The storage backend can be almost anything, as long as the LFS server can reliab
 
 ```text
 Git LFS client
-  -> lfs-cloud API
+  -> LFS Cloud API
     -> storage backend
 ```
 
@@ -84,7 +84,7 @@ For production, object storage is a better fit than Google Drive. Google Drive i
 
 ## Provider Abstractions
 
-`lfs-cloud` should separate repository providers from storage providers.
+LFS Cloud should separate repository providers from storage providers.
 
 Repository providers answer questions about identity, repository existence, and authorization:
 
@@ -152,7 +152,7 @@ by test adapters rather than calling a concrete provider client directly.
 
 ## Server Configuration
 
-A hosted `lfs-cloud` instance should load private server-side configuration at boot. This configuration should not be committed to the Git repositories being served, because it may contain storage account IDs, credential references, bucket names, Drive folder IDs, and policy decisions.
+A hosted LFS Cloud instance should load private server-side configuration at boot. This configuration should not be committed to the Git repositories being served, because it may contain storage account IDs, credential references, bucket names, Drive folder IDs, and policy decisions.
 
 A YAML file is a reasonable starting point:
 
@@ -192,7 +192,7 @@ storage_providers:
   s3-user-c:
     type: s3
     endpoint: https://s3.amazonaws.com
-    bucket: lfs-cloud-user-c
+    bucket: lfscloud-user-c
     credentials_ref: s3-user-c
 
 repositories:
@@ -283,13 +283,13 @@ storage namespace.
 
 ## Deployment Strategy
 
-Because `lfs-cloud` may proxy large file uploads and downloads, deployment choice directly affects cost and feasibility.
+Because LFS Cloud may proxy large file uploads and downloads, deployment choice directly affects cost and feasibility.
 
 The ideal early deployment is a local server that is reachable from the developer machine and, when needed, from the local network:
 
 ```text
 local machine
-  runs lfs-cloud
+  runs LFS Cloud
 
 localhost endpoint
   used by the same machine
@@ -298,13 +298,13 @@ local-network endpoint
   used by other machines on the same trusted network
 
 storage provider
-  receives/stores bytes through lfs-cloud
+  receives/stores bytes through LFS Cloud
 ```
 
 For example:
 
 ```bash
-lfs-cloud serve --config ./lfs-cloud.yml --port 8080
+lfscloud serve --config ./lfscloud.yml --port 8080
 ```
 
 By default, the CLI can bind to `127.0.0.1` for safer single-machine use. LAN
@@ -314,13 +314,13 @@ and the matching client `--allow-insecure-http` flag before binding to `0.0.0.0`
 or a selected interface:
 
 ```bash
-lfs-cloud serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080
+lfscloud serve --config ./lfscloud.yml --host 0.0.0.0 --port 8080
 ```
 
 The CLI should print both addresses when possible:
 
 ```text
-lfs-cloud server running
+LFS Cloud server running
   local:   http://127.0.0.1:8080
   network: http://192.168.1.25:8080
 ```
@@ -369,7 +369,7 @@ separate transfer service
   actual LFS object upload/download streaming
 ```
 
-For storage providers that support narrow, short-lived signed URLs, such as S3-compatible storage, `lfs-cloud` can eventually authorize the request and return a direct upload/download URL. For Google Drive, the safer default is proxy mode because Drive does not provide the same clean object-specific signed URL model.
+For storage providers that support narrow, short-lived signed URLs, such as S3-compatible storage, LFS Cloud can eventually authorize the request and return a direct upload/download URL. For Google Drive, the safer default is proxy mode because Drive does not provide the same clean object-specific signed URL model.
 
 For production, prefer one of:
 
@@ -388,15 +388,15 @@ The production goal is not necessarily zero bandwidth cost. The goal is controll
 
 ## Google Drive Backend
 
-Using Google Drive means `lfs-cloud` should own the Drive integration. End users should not receive direct write access to the Drive folder.
+Using Google Drive means LFS Cloud should own the Drive integration. End users should not receive direct write access to the Drive folder.
 
 Recommended model:
 
 ```text
 User
-  authenticates to lfs-cloud using the configured repository provider
+  authenticates to LFS Cloud using the configured repository provider
 
-lfs-cloud
+LFS Cloud
   checks repository permissions
   stores/retrieves bytes through the Google Drive API
 
@@ -413,7 +413,7 @@ Important limits and constraints:
 - Drive API quota units measure request cost, not bytes.
 - Byte-side constraints such as daily upload/copy and egress limits matter more than request-count quotas for LFS workloads.
 - A single-owner Drive backend makes that account the central storage owner, quota owner, and availability dependency.
-- A single `lfs-cloud` instance may configure multiple Google Drive accounts as separate storage providers.
+- A single LFS Cloud instance may configure multiple Google Drive accounts as separate storage providers.
 
 ## Authorization Strategy
 
@@ -478,10 +478,10 @@ This can support ref-aware authorization later. For the initial implementation, 
 Preferred flow:
 
 ```text
-1. User runs an lfs-cloud login command or visits a login URL.
+1. User runs an LFS Cloud login command or visits a login URL.
 2. User authenticates with the repository provider, such as GitHub OAuth or GitLab OAuth.
-3. lfs-cloud identifies the repository-provider user.
-4. lfs-cloud issues a short-lived LFS credential/token.
+3. LFS Cloud identifies the repository-provider user.
+4. LFS Cloud issues a short-lived LFS credential/token.
 5. The local Git credential helper stores that credential for the LFS URL.
 6. Git LFS uses that credential for batch/upload/download requests.
 ```
@@ -517,25 +517,25 @@ credentials process-wide. Capacity exhaustion returns HTTP 429 with a
 `Retry-After` value rather than evicting an unrelated active credential.
 
 The authenticated `DELETE /auth/session` endpoint revokes the presented local
-LFS credential. `lfs-cloud logout` calls that endpoint before erasing the
+LFS credential. `lfscloud logout` calls that endpoint before erasing the
 repository-scoped Git credential, while an already expired or revoked session
 still permits local cleanup. Unexpected server failures preserve the local
 credential for retry. A definitive upstream GitHub authentication rejection
 also revokes the corresponding local session so a stale local bearer token
 cannot keep retrying with invalid private provider credentials.
 
-Avoid asking users to paste personal access tokens into the LFS server if possible. That can work for a quick prototype, but it means `lfs-cloud` receives and handles powerful user repository-host credentials.
+Avoid asking users to paste personal access tokens into the LFS server if possible. That can work for a quick prototype, but it means LFS Cloud receives and handles powerful user repository-host credentials.
 
 Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service can use one Google account's OAuth refresh token to access the backing Drive folder. For a multi-tenant or shared instance, each configured storage provider should have its own credential reference and policy boundary.
 
 ## CLI Initialization Strategy
 
-The `lfs-cloud` CLI should provide an `init` command that prepares a repository for this system, similar in spirit to `git lfs install`, but with project-specific configuration and local storage behavior.
+The LFS Cloud CLI should provide an `init` command that prepares a repository for this system, similar in spirit to `git lfs install`, but with project-specific configuration and local storage behavior.
 
 Expected behavior:
 
 ```bash
-lfs-cloud init
+lfscloud init
 ```
 
 Could perform:
@@ -543,10 +543,10 @@ Could perform:
 ```text
 1. Verify the current directory is inside a Git repository.
 2. Configure Git LFS filters and hooks if needed.
-3. Write or update .lfsconfig with the lfs-cloud LFS server URL.
-4. Configure authentication for the lfs-cloud endpoint.
+3. Write or update .lfsconfig with the LFS Cloud LFS server URL.
+4. Configure authentication for the LFS Cloud endpoint.
 5. Configure or register a shared local object cache.
-6. Register this repo/worktree in local lfs-cloud metadata.
+6. Register this repo/worktree in local LFS Cloud metadata.
 7. Install hooks or helper behavior that materializes files as CoW clones.
 ```
 
@@ -562,29 +562,29 @@ The CLI should make deduplicated checkout the default rather than requiring user
 
 ## Migration Strategy
 
-The `lfs-cloud` CLI should provide a `migrate` command that converts an existing Git LFS-enabled clone to use `lfs-cloud` with as little friction as possible.
+The LFS Cloud CLI should provide a `migrate` command that converts an existing Git LFS-enabled clone to use LFS Cloud with as little friction as possible.
 
 Expected command:
 
 ```bash
-lfs-cloud migrate --server http://127.0.0.1:8080
+lfscloud migrate --server http://127.0.0.1:8080
 ```
 
 Possible optional purge request:
 
 ```bash
-lfs-cloud migrate --server http://127.0.0.1:8080 --purge-source-lfs
+lfscloud migrate --server http://127.0.0.1:8080 --purge-source-lfs
 ```
 
 Dry run:
 
 ```bash
-lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
+lfscloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 ```
 
 `--dry-run` must make no repo, file, config, cache, database, or storage-provider changes. It should report:
 
-- current Git LFS endpoint and proposed `lfs-cloud` endpoint
+- current Git LFS endpoint and proposed LFS Cloud endpoint
 - tracked LFS patterns
 - refs that would be scanned
 - LFS pointers discovered
@@ -594,7 +594,7 @@ lfs-cloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
   execution checks the configured storage provider
 - local files and config files that would be touched
 - source endpoint configuration and local Git LFS availability
-- target `lfs-cloud` server TCP reachability
+- target LFS Cloud server TCP reachability
 - local LFS credential availability
 - configured storage credential loading
 - warnings for missing objects, unsupported purge, quota risks, or permission gaps
@@ -629,7 +629,7 @@ oid sha256:<object-hash>
 size <bytes>
 ```
 
-The migration should copy the referenced objects from the current LFS provider into the configured `lfs-cloud` storage provider, then repoint the repository's LFS URL to `lfs-cloud`. The objects do not need to be present in the working tree; LFS pointer files in Git history contain the object IDs needed to fetch them from the source provider.
+The migration should copy the referenced objects from the current LFS provider into the configured LFS Cloud storage provider, then repoint the repository's LFS URL to LFS Cloud. The objects do not need to be present in the working tree; LFS pointer files in Git history contain the object IDs needed to fetch them from the source provider.
 
 Suggested flow:
 
@@ -639,12 +639,12 @@ Suggested flow:
 3. Discover required LFS objects for the current checkout, selected refs, or all refs.
 4. For selected-ref or all-ref migration, require Git 2.40.0 for `git check-attr --source` and reject shallow repositories before enumerating LFS pointers from Git history, because older Git cannot evaluate historical attributes and truncated history cannot produce a complete inventory.
 5. Ensure each object exists locally, fetching from the source LFS provider when needed.
-6. Upload objects to the configured lfs-cloud server/storage provider with
+6. Upload objects to the configured LFS Cloud server/storage provider with
    bounded concurrency, recording each completed object durably before
    reporting it and retaining structured failures for retry.
 7. Verify uploaded object SHA-256 and size.
-8. Write or update .lfsconfig to point to the lfs-cloud endpoint.
-9. Configure local lfs-cloud cache and CoW materialization behavior.
+8. Write or update .lfsconfig to point to the LFS Cloud endpoint.
+9. Configure local LFS Cloud cache and CoW materialization behavior.
 10. Optionally run a local dedup/materialization pass.
 11. Report source-provider cleanup options.
 ```
@@ -670,7 +670,7 @@ all refs
   checked out in the working tree; requires a non-shallow repository
 ```
 
-The safest default should be to migrate the current checkout and warn if other refs still reference objects that have not been copied. For a full provider move, the user should choose an explicit all-refs mode. In all-refs mode, the command should fetch refs first, enumerate LFS pointers across those refs, fetch missing object bytes from the source LFS provider, and upload every discovered object to `lfs-cloud`.
+The safest default should be to migrate the current checkout and warn if other refs still reference objects that have not been copied. For a full provider move, the user should choose an explicit all-refs mode. In all-refs mode, the command should fetch refs first, enumerate LFS pointers across those refs, fetch missing object bytes from the source LFS provider, and upload every discovered object to LFS Cloud.
 
 The `--purge-source-lfs` option should be best-effort and provider-dependent.
 It should never claim to guarantee deletion unless the source provider exposes
@@ -715,7 +715,7 @@ general GitHub Support repository contact flow and attach this migration
 report.
 ```
 
-For source providers that do support LFS object deletion, `--purge-source-lfs` can call the provider-specific purge API after the objects have been verified in `lfs-cloud`.
+For source providers that do support LFS object deletion, `--purge-source-lfs` can call the provider-specific purge API after the objects have been verified in LFS Cloud.
 
 ## Storage Layout
 
@@ -724,7 +724,7 @@ LFS objects should be stored by content hash, not by branch.
 Avoid this as the primary layout:
 
 ```text
-.lfs-cloud/
+.lfscloud/
   owner/repo/
     branches/main/...
     branches/feature-x/...
@@ -735,7 +735,7 @@ The same LFS object may be referenced by many branches, tags, commits, or forks.
 Better initial layout:
 
 ```text
-.lfs-cloud/
+.lfscloud/
   repos/
     github.com__owner__repo/
       objects/
@@ -748,7 +748,7 @@ Better initial layout:
 Better long-term layout:
 
 ```text
-.lfs-cloud/
+.lfscloud/
   objects/
     aa/
       bb/
@@ -780,12 +780,12 @@ working-tree/path/to/file
   normal checked-out file
 ```
 
-The `lfs-cloud` client should reduce this by using a shared content-addressed cache and copy-on-write materialization.
+The LFS Cloud client should reduce this by using a shared content-addressed cache and copy-on-write materialization.
 
 Target local model:
 
 ```text
-~/.lfs-cloud/objects/aa/bb/<sha256>
+~/.lfscloud/objects/aa/bb/<sha256>
   canonical cached object
 
 repo/path/to/file
@@ -803,32 +803,32 @@ This reduces:
 Useful CLI commands:
 
 ```bash
-lfs-cloud pull
-lfs-cloud hydrate path/to/file
-lfs-cloud dehydrate path/to/file
-lfs-cloud gc
-lfs-cloud status
+lfscloud pull
+lfscloud hydrate path/to/file
+lfscloud dehydrate path/to/file
+lfscloud gc
+lfscloud status
 ```
 
 Expected behavior:
 
 ```text
-lfs-cloud pull
+lfscloud pull
   fetch missing objects
   verify SHA-256 and size
   materialize required working-tree files as CoW clones
 
-lfs-cloud hydrate
+lfscloud hydrate
   replace pointer/placeholders with usable file contents
 
-lfs-cloud dehydrate
+lfscloud dehydrate
   require a contained Git-tracked filter=lfs path
   derive the expected object identity from the Git index pointer
   reject dirty or unrelated worktree bytes
   preserve verified bytes in shared cache and repository Git LFS media
   replace the file with its canonical pointer
 
-lfs-cloud gc
+lfscloud gc
   remove local cached objects not referenced by any registered repo/worktree
 ```
 
@@ -865,12 +865,12 @@ There are two likely implementation strategies:
 Git LFS compatible path:
   use normal Git LFS protocol compatibility
   use custom LFS server
-  add lfs-cloud helper behavior after checkout/pull
+  add LFS Cloud helper behavior after checkout/pull
   possibly run a dedup/materialization pass automatically
 
 Custom filter path:
   replace or augment Git LFS smudge/filter-process behavior
-  materialize files directly from the lfs-cloud cache
+  materialize files directly from the LFS Cloud cache
   gives more control but increases Git compatibility risk
 ```
 
@@ -906,17 +906,17 @@ Initial upload flow:
 
 ```text
 1. Git LFS sends an upload batch request.
-2. lfs-cloud authenticates the user.
-3. lfs-cloud checks repository-provider write access for the repository.
-4. lfs-cloud checks whether each object already exists.
-5. For missing objects, lfs-cloud returns upload actions.
-6. Client uploads bytes to lfs-cloud.
-7. lfs-cloud verifies size and SHA-256.
-8. lfs-cloud writes the object to the configured storage provider.
-9. lfs-cloud records the object mapping and metadata.
+2. LFS Cloud authenticates the user.
+3. LFS Cloud checks repository-provider write access for the repository.
+4. LFS Cloud checks whether each object already exists.
+5. For missing objects, LFS Cloud returns upload actions.
+6. Client uploads bytes to LFS Cloud.
+7. LFS Cloud verifies size and SHA-256.
+8. LFS Cloud writes the object to the configured storage provider.
+9. LFS Cloud records the object mapping and metadata.
 ```
 
-For Google Drive, direct signed upload URLs are not as natural as S3-style object storage. The simplest implementation is to proxy uploads through `lfs-cloud`.
+For Google Drive, direct signed upload URLs are not as natural as S3-style object storage. The simplest implementation is to proxy uploads through LFS Cloud.
 
 ## Download Flow
 
@@ -924,32 +924,32 @@ Initial download flow:
 
 ```text
 1. Git LFS sends a download batch request.
-2. lfs-cloud authenticates the user.
-3. lfs-cloud checks repository-provider read access for the repository.
-4. lfs-cloud resolves each object OID to a backend object.
-5. lfs-cloud returns download actions.
-6. Client downloads bytes from lfs-cloud.
-7. lfs-cloud proxies bytes from the configured storage provider with bounded
+2. LFS Cloud authenticates the user.
+3. LFS Cloud checks repository-provider read access for the repository.
+4. LFS Cloud resolves each object OID to a backend object.
+5. LFS Cloud returns download actions.
+6. Client downloads bytes from LFS Cloud.
+7. LFS Cloud proxies bytes from the configured storage provider with bounded
    memory, terminating the response if end-to-end hash or size verification fails.
 ```
 
-For Google Drive, avoid exposing public or broadly shared Drive links unless there is a strong reason. Proxying downloads through `lfs-cloud` keeps authorization centralized and avoids relying on Drive sharing semantics.
+For Google Drive, avoid exposing public or broadly shared Drive links unless there is a strong reason. Proxying downloads through LFS Cloud keeps authorization centralized and avoids relying on Drive sharing semantics.
 
 ## Multi-Repository Strategy
 
-One hosted `lfs-cloud` instance should support multiple repositories and multiple storage providers. A repository-specific server configuration decides which storage provider is used for that repository.
+One hosted LFS Cloud instance should support multiple repositories and multiple storage providers. A repository-specific server configuration decides which storage provider is used for that repository.
 
 Client-side repository configuration:
 
 ```text
 repo .lfsconfig
-  points Git LFS to the lfs-cloud endpoint for that repo
+  points Git LFS to the LFS Cloud endpoint for that repo
 ```
 
 Server-side private configuration:
 
 ```text
-lfs-cloud.yml
+lfscloud.yml
   maps repo endpoint -> repository provider -> storage provider
 ```
 
@@ -958,7 +958,7 @@ One Google Drive can hold LFS objects for multiple repositories, but the server 
 Initial structure:
 
 ```text
-.lfs-cloud/
+.lfscloud/
   repos/
     github.com__owner-a__repo-a/
     github.com__owner-b__repo-b/
@@ -967,7 +967,7 @@ Initial structure:
 With provider-aware naming:
 
 ```text
-.lfs-cloud/
+.lfscloud/
   repos/
     github-main__owner-a__repo-a/
     github-main__owner-b__repo-b/
@@ -977,7 +977,7 @@ With provider-aware naming:
 Longer-term deduplication may store identical objects only once globally:
 
 ```text
-.lfs-cloud/
+.lfscloud/
   objects/
     <hash-sharded-objects>
 ```
@@ -1017,7 +1017,7 @@ areas:
 | Async runtime               | `tokio`                         | Network I/O, server runtime, signal handling  |
 | Errors                      | `anyhow`, `thiserror`           | CLI boundaries and library/domain errors      |
 | Logging                     | `tracing`, `tracing-subscriber` | Structured application logs and env filtering |
-| Serialization/config        | `serde`, `config`               | Typed `lfs-cloud.yml` loading                 |
+| Serialization/config        | `serde`, `config`               | Typed `lfscloud.yml` loading                  |
 | SQLite metadata             | `rusqlite`                      | Local MVP object/session metadata             |
 | OAuth and provider HTTP     | `oauth2`, `reqwest`             | OAuth request construction and HTTP calls     |
 | Session encryption          | `ring`                          | Protect durable upstream-token state at rest  |
@@ -1049,26 +1049,26 @@ The code should still use repository-provider and storage-provider traits/interf
 
 ### Authentication
 
-Use GitHub OAuth for user login, then store the resulting `lfs-cloud` LFS credential through Git's credential helper when possible.
+Use GitHub OAuth for user login, then store the resulting LFS Cloud LFS credential through Git's credential helper when possible.
 
 For an OAuth App MVP, private repository and organization permission checks may require broad GitHub OAuth scopes such as `repo`, and org scenarios may require `read:org`. This is acceptable for a local/private MVP if clearly disclosed, but it is a reason to consider a GitHub App later because GitHub App user/installation tokens can use narrower metadata permissions for the repository permission endpoint.
 
 Target flow:
 
 ```text
-lfs-cloud login / lfs-cloud init
+lfscloud login / lfscloud init
   opens browser for GitHub OAuth
 
-lfs-cloud server
+LFS Cloud server
   receives OAuth callback
   verifies GitHub identity
-  issues short-lived lfs-cloud token
+  issues short-lived LFS Cloud token
 
 local CLI
   stores token for the LFS endpoint via git credential approve
 
 git lfs client
-  sends token to lfs-cloud for batch/upload/download requests
+  sends token to LFS Cloud for batch/upload/download requests
 ```
 
 The CLI must print the OAuth login URL before requesting the platform browser
@@ -1089,7 +1089,7 @@ The endpoint returns base permissions such as `read`, `write`, `admin`, and role
 
 ### Google Drive Storage
 
-All Google Drive access is configured server-side in `lfs-cloud.yml`. Git users never receive Drive tokens or direct Drive access.
+All Google Drive access is configured server-side in `lfscloud.yml`. Git users never receive Drive tokens or direct Drive access.
 
 Each configured Google Drive storage provider should include:
 
@@ -1120,9 +1120,9 @@ Best MVP storage setup procedure:
 
 ```text
 user authorizes Google OAuth
-lfs-cloud creates or records an app-accessible root folder
-lfs-cloud validates root_folder_id with a non-mutating Drive metadata probe
-lfs-cloud.yml stores the root_folder_id and credential reference
+LFS Cloud creates or records an app-accessible root folder
+LFS Cloud validates root_folder_id with a non-mutating Drive metadata probe
+lfscloud.yml stores the root_folder_id and credential reference
 ```
 
 Avoid requiring full-Drive access merely to browse for arbitrary folders. If a manually created folder is used, the setup flow must verify that the app can create, list, read, and delete test objects under that folder before accepting the config.
@@ -1138,7 +1138,7 @@ New Drive objects are placed in deterministic SHA-256 prefix folders below the
 configured root folder:
 
 ```text
-lfs-cloud-sha256-<first-2>/sha256-<oid>-<size>.lfs
+lfscloud-sha256-<first-2>/sha256-<oid>-<size>.lfs
 ```
 
 The 256 logical shard names bound each new object's folder population while
@@ -1180,7 +1180,7 @@ download read; a stalled operation returns a retryable storage failure.
 MVP transfer mode is proxy mode:
 
 ```text
-Git LFS client <-> lfs-cloud <-> Google Drive
+Git LFS client <-> LFS Cloud <-> Google Drive
 ```
 
 Direct signed URLs are not part of the MVP. They are a future optimization for S3-compatible providers, not needed for the GitHub + Google Drive local-network version.
@@ -1237,15 +1237,15 @@ The CLI should print both localhost and LAN-accessible addresses when available.
 In scope:
 
 ```text
-lfs-cloud serve
-lfs-cloud login
-lfs-cloud init
-lfs-cloud migrate
-lfs-cloud status
-lfs-cloud pull
-lfs-cloud hydrate
-lfs-cloud dehydrate
-lfs-cloud gc
+lfscloud serve
+lfscloud login
+lfscloud init
+lfscloud migrate
+lfscloud status
+lfscloud pull
+lfscloud hydrate
+lfscloud dehydrate
+lfscloud gc
 ```
 
 `migrate --dry-run` is required.
@@ -1275,11 +1275,11 @@ A practical MVP could implement:
 - SQLite or simple database-backed object mapping.
 - Hash and size verification on upload.
 - Private proxy downloads through the LFS server.
-- Local `lfs-cloud serve` deployment that prints localhost and LAN addresses.
-- `lfs-cloud login` for GitHub OAuth and local credential setup.
-- `lfs-cloud init` for repository setup.
-- `lfs-cloud migrate` for converting an existing Git LFS clone to `lfs-cloud`.
-- `lfs-cloud migrate --dry-run` for migration planning and local readiness reporting.
+- Local `lfscloud serve` deployment that prints localhost and LAN addresses.
+- `lfscloud login` for GitHub OAuth and local credential setup.
+- `lfscloud init` for repository setup.
+- `lfscloud migrate` for converting an existing Git LFS clone to LFS Cloud.
+- `lfscloud migrate --dry-run` for migration planning and local readiness reporting.
 - Shared local content-addressed cache.
 - CoW materialization on filesystems that support it.
 - Manual `hydrate`, `dehydrate`, `gc`, and `status` commands.
@@ -1310,7 +1310,7 @@ Defer:
 - Should repository-to-storage mappings be static boot-time YAML at first, or should the server support runtime registration through an admin API?
 - Should one repository be allowed to write to multiple storage providers for redundancy later, or exactly one provider beyond the MVP too?
 - How should config validation detect unsafe mappings, such as two repos sharing a storage namespace without explicit deduplication policy?
-- Should `lfs-cloud migrate` default to current-checkout migration or require the user to choose current checkout, selected refs, or all refs?
+- Should `lfscloud migrate` default to current-checkout migration or require the user to choose current checkout, selected refs, or all refs?
 - How should migration reports represent objects that were copied successfully but cannot be purged from the source provider?
 
 ## Key Risks
@@ -1334,7 +1334,7 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 6 CLI command work has started. `lfs-cloud serve`
+> **Status**: Phase 6 CLI command work has started. `lfscloud serve`
 > loads validated server config, applies `--host`/`--port` overrides, opens
 > server-owned metadata storage, binds an Axum listener, reports local and
 > best-effort LAN URLs, resolves configured repository LFS paths, and requires
@@ -1359,23 +1359,23 @@ Defer:
 > and `--log-level` flags, initializes tracing from CLI or `RUST_LOG`, and
 > dispatches `serve` through the server runtime. CLI support code can now
 > detect the current Git worktree and parse GitHub-style HTTPS/SSH remotes
-> into host, owner, and repository name components. `lfs-cloud init --server`
+> into host, owner, and repository name components. `lfscloud init --server`
 > now resolves the current repository's intended Git LFS endpoint, writes or
 > updates `.lfsconfig` with a before/after `lfs.url` summary, and supports
-> `--local` for writing only repository-local Git config. The `lfs-cloud login`
+> `--local` for writing only repository-local Git config. The `lfscloud login`
 > command opens or prints the server GitHub OAuth login URL, accepts the
-> returned local `lfs-cloud` token, and stores only that local token in Git's
+> returned local LFS Cloud token, and stores only that local token in Git's
 > credential helper for the current repository's LFS URL.
-> The `lfs-cloud logout` command authenticates session revocation with that
+> The `lfscloud logout` command authenticates session revocation with that
 > local token before erasing the repository-scoped Git credential, and the
 > server also revokes sessions after definitive upstream authentication denial.
-> The `lfs-cloud status` command now checks the current Git repository against
+> The `lfscloud status` command now checks the current Git repository against
 > loaded server config, probes configured server TCP reachability, verifies a
 > local LFS credential for the derived repository LFS URL, validates the
 > configured storage credential reference, and reports local cache directory
 > readiness.
 > Local cache path helpers now define the shared content-addressed object layout
-> under `~/.lfs-cloud/objects`, using two-level SHA-256 sharding. Existing
+> under `~/.lfscloud/objects`, using two-level SHA-256 sharding. Existing
 > repository-local Git LFS cache objects can now be ingested into that shared
 > cache only after SHA-256 and byte-size verification, and already cached
 > objects are reverified before reuse. Local cache roots now also track
@@ -1427,7 +1427,7 @@ Defer:
 > pointer blob that exists only on a promisor remote produces an explicit local
 > availability error. Migration transfer planning can now check discovered object identities
 > against both repository Git LFS media storage and an optional shared
-> `lfs-cloud` cache, verifying SHA-256 and size before treating local bytes as
+> LFS Cloud cache, verifying SHA-256 and size before treating local bytes as
 > available. Missing migration objects can now be fetched from the source Git
 > LFS provider into local media storage without smudging or changing worktree
 > files. Locally available migration objects can now be uploaded idempotently
@@ -1463,7 +1463,7 @@ Defer:
 > regression checks. `scripts/manual/verify-lan-smoke-test.sh` now verifies
 > local LAN-serving preflight behavior and prints the cross-machine smoke test
 > checklist for disposable GitHub/Google Drive validation. Server
-> configuration docs now include GitHub plus Google Drive `lfs-cloud.yml`
+> configuration docs now include GitHub plus Google Drive `lfscloud.yml`
 > examples, credential-reference behavior, metadata defaults, and validation
 > rules. The README now distinguishes implemented commands from the remaining
 > full migration execution work, and install/build docs define the current
@@ -1524,7 +1524,7 @@ Defer:
 
 #### Epic 1.1: YAML Schema
 
-- [x] [T] Define `lfs-cloud.yml` schema for server bind, public URL, GitHub provider, Google Drive providers, and repository mappings.
+- [x] [T] Define `lfscloud.yml` schema for server bind, public URL, GitHub provider, Google Drive providers, and repository mappings.
 - [x] [T] Implement config loading from explicit path and default path.
 - [x] [T] Implement environment-variable interpolation for non-secret and secret references.
 - [x] [T] Reject duplicate provider IDs, storage IDs, repo IDs, and route paths.
@@ -1545,7 +1545,7 @@ Defer:
 - [x] [T] Implement OAuth callback route that uses the validated callback.
 - [x] [T] Implement GitHub OAuth code-to-token exchange.
 - [x] [T] Fetch authenticated GitHub user identity with the OAuth token.
-- [x] [T] Store local `lfs-cloud` session/token metadata without exposing the GitHub token to Git LFS.
+- [x] [T] Store local LFS Cloud session/token metadata without exposing the GitHub token to Git LFS.
 
 #### Epic 2.2: Git Credential Helper Integration
 
@@ -1574,7 +1574,7 @@ Defer:
 
 - [x] [T] Define Drive object naming/path convention under the configured root folder.
 - [x] [T] Implement object existence lookup by repo namespace, OID, and size.
-- [x] [M] Implement resumable upload from staged temp file. Manual verification: with a real app-accessible Drive root folder and `drive.file` credential, upload a staged file whose SHA-256 and size match an `LfsObject`, then confirm Drive contains `sha256-<oid>-<size>.lfs` in the matching `lfs-cloud-sha256-<first-2>` folder with matching private app properties and binary size.
+- [x] [M] Implement resumable upload from staged temp file. Manual verification: with a real app-accessible Drive root folder and `drive.file` credential, upload a staged file whose SHA-256 and size match an `LfsObject`, then confirm Drive contains `sha256-<oid>-<size>.lfs` in the matching `lfscloud-sha256-<first-2>` folder with matching private app properties and binary size.
 - [x] [M] Implement download streaming from Drive to HTTP response. Manual verification: with a real app-accessible Drive root folder and `drive.file` credential, upload or locate a verified object, request it through `GoogleDriveObjectStore::download_object_response`, and confirm the streamed HTTP body length and SHA-256 match the requested `LfsObject` without exposing a Drive URL to the client.
 - [x] [T] Implement provider error classification for auth, quota, not found, conflict, and retryable failures.
 
@@ -1598,10 +1598,10 @@ Defer:
 
 #### Epic 5.1: HTTP Server
 
-- [x] [T] Implement `lfs-cloud serve --host --port --config`.
-- [x] [M] Print localhost and LAN URLs when serving. Manual verification: run `cargo run -- serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080` with a valid local config and confirm the startup output contains both `local:` and `network:` lines.
+- [x] [T] Implement `lfscloud serve --host --port --config`.
+- [x] [M] Print localhost and LAN URLs when serving. Manual verification: run `cargo run -- serve --config ./lfscloud.yml --host 0.0.0.0 --port 8080` with a valid local config and confirm the startup output contains both `local:` and `network:` lines.
 - [x] [T] Implement route parsing for configured repo LFS endpoints.
-- [x] [T] Add auth middleware for `lfs-cloud` LFS tokens.
+- [x] [T] Add auth middleware for LFS Cloud LFS tokens.
 
 #### Epic 5.2: Batch API
 
@@ -1613,7 +1613,7 @@ Defer:
 #### Epic 5.3: Transfer Endpoints
 
 - [x] [M] Implement upload endpoint with temp-file staging, SHA-256 hashing, and size verification. Manual verification: with a valid GitHub OAuth-backed local LFS session and a real app-accessible Drive `drive.file` credential, request an upload batch for a missing object, confirm the response includes an `upload` action, `PUT` matching bytes to that action URL, then confirm the HTTP response is success, Drive contains the expected `sha256-<oid>-<size>.lfs` object, and metadata has a verified row for the configured repository/storage/OID/size.
-- [x] [M] Implement download endpoint streaming bytes from Google Drive through `lfs-cloud`. Manual verification: with a valid GitHub OAuth-backed local LFS session and a real app-accessible Drive `drive.file` credential, request a download batch for an existing object, confirm the response includes a `download` action, `GET` that action URL, then confirm the HTTP response streams bytes whose length and SHA-256 match the requested LFS object without exposing a Drive URL to the client.
+- [x] [M] Implement download endpoint streaming bytes from Google Drive through LFS Cloud. Manual verification: with a valid GitHub OAuth-backed local LFS session and a real app-accessible Drive `drive.file` credential, request a download batch for an existing object, confirm the response includes a `download` action, `GET` that action URL, then confirm the HTTP response streams bytes whose length and SHA-256 match the requested LFS object without exposing a Drive URL to the client.
 - [x] [T] Return Git LFS-compatible error payloads and HTTP status codes.
 - [x] [T] Add request size, temp-space, and timeout guardrails with clear errors.
 
@@ -1623,23 +1623,23 @@ Defer:
 
 - [x] [T] Implement `clap` root command and shared global flags.
 - [x] [T] Implement config-path and log-level handling.
-- [x] [T] Implement `lfs-cloud serve` command wiring to server runtime.
+- [x] [T] Implement `lfscloud serve` command wiring to server runtime.
 
 #### Epic 6.2: Login And Init
 
-- [x] [M] Implement `lfs-cloud login` browser flow for GitHub OAuth. Manual verification: `scripts/manual/verify-login-command.sh`.
+- [x] [M] Implement `lfscloud login` browser flow for GitHub OAuth. Manual verification: `scripts/manual/verify-login-command.sh`.
 - [x] [T] Implement Git repository detection and remote parsing.
-- [x] [T] Implement `lfs-cloud init --server` route resolution for the current repo.
+- [x] [T] Implement `lfscloud init --server` route resolution for the current repo.
 - [x] [T] Implement `.lfsconfig` write/update with backup or diff output.
 - [x] [T] Implement local-only `git config lfs.url` option if the user does not want committed `.lfsconfig`.
 
 #### Epic 6.3: Operations
 
-- [x] [M] Implement `lfs-cloud status` for server reachability, repo mapping, auth, storage, and local cache status. Manual verification: `scripts/manual/verify-status-command.sh`.
-- [x] [M] Implement `lfs-cloud pull` wrapper for fetch plus CoW materialization. depends: [8.2.1], [8.2.2], [8.2.3]. Manual verification: `scripts/manual/verify-pull-command.sh`.
-- [x] [M] Implement `lfs-cloud hydrate <path...>`. depends: [8.2.1], [8.2.2], [8.2.3]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
-- [x] [M] Implement `lfs-cloud dehydrate <path...>`. depends: [8.2.4]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
-- [x] [M] Implement `lfs-cloud gc` for local cache cleanup. depends: [8.1.4]. Manual verification: `scripts/manual/verify-local-cache-gc.sh`.
+- [x] [M] Implement `lfscloud status` for server reachability, repo mapping, auth, storage, and local cache status. Manual verification: `scripts/manual/verify-status-command.sh`.
+- [x] [M] Implement `lfscloud pull` wrapper for fetch plus CoW materialization. depends: [8.2.1], [8.2.2], [8.2.3]. Manual verification: `scripts/manual/verify-pull-command.sh`.
+- [x] [M] Implement `lfscloud hydrate <path...>`. depends: [8.2.1], [8.2.2], [8.2.3]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
+- [x] [M] Implement `lfscloud dehydrate <path...>`. depends: [8.2.4]. Manual verification: `scripts/manual/verify-local-cache-cli.sh`.
+- [x] [M] Implement `lfscloud gc` for local cache cleanup. depends: [8.1.4]. Manual verification: `scripts/manual/verify-local-cache-gc.sh`.
 
 ### Phase 7: Migration
 
@@ -1669,7 +1669,7 @@ Defer:
 
 #### Epic 8.1: Shared Cache
 
-- [x] [T] Define local cache root and object path layout under `~/.lfs-cloud/objects`.
+- [x] [T] Define local cache root and object path layout under `~/.lfscloud/objects`.
 - [x] [T] Implement ingest from existing `.git/lfs/objects`.
 - [x] [T] Implement cache object hash and size verification.
 - [x] [T] Track repo/worktree registrations for safe local cache GC.
@@ -1693,6 +1693,6 @@ Defer:
 #### Epic 9.2: Security And Documentation
 
 - [x] [M] Review logs and errors to ensure OAuth tokens, Drive tokens, and object contents are not leaked. Manual verification: `scripts/manual/verify-secret-redaction.sh`.
-- [x] [M] Document `lfs-cloud.yml` with GitHub + Google Drive examples.
+- [x] [M] Document `lfscloud.yml` with GitHub + Google Drive examples.
 - [x] [M] Update README once commands are implemented, removing "planned" wording where appropriate.
 - [x] [M] Add install/build instructions and release artifact expectations.

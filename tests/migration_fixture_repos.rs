@@ -9,7 +9,7 @@ mod support;
 
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
-use lfs_cloud::{
+use lfscloud::{
     LfsObject, MigrationError, check_local_migration_objects,
     enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
     enumerate_selected_ref_lfs_pointers,
@@ -260,7 +260,7 @@ fn fixture_repo_migrate_dry_run_leaves_repo_and_cache_untouched() {
     let temp = tempfile::tempdir().expect("temporary migration fixture should be created");
     let repo = initialized_migration_repo();
     let cache_root = temp.path().join("cache");
-    let config_path = temp.path().join("lfs-cloud.yml");
+    let config_path = temp.path().join("lfscloud.yml");
     let object = lfs_object_for_bytes(b"dry-run fixture object");
 
     repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
@@ -274,7 +274,7 @@ fn fixture_repo_migrate_dry_run_leaves_repo_and_cache_untouched() {
     fs::write(&config_path, server_config(SERVER_URL)).expect("fixture config should be written");
     let before_status = git_status(repo.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_lfs-cloud"))
+    let output = Command::new(env!("CARGO_BIN_EXE_lfscloud"))
         .args([
             "--config",
             config_path
@@ -291,7 +291,7 @@ fn fixture_repo_migrate_dry_run_leaves_repo_and_cache_untouched() {
         ])
         .current_dir(repo.path())
         .output()
-        .expect("lfs-cloud migrate dry-run should start");
+        .expect("lfscloud migrate dry-run should start");
 
     assert!(
         output.status.success(),
@@ -300,7 +300,7 @@ fn fixture_repo_migrate_dry_run_leaves_repo_and_cache_untouched() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("dry-run output should be UTF-8");
-    assert!(stdout.contains("lfs-cloud migrate dry-run"));
+    assert!(stdout.contains("lfscloud migrate dry-run"));
     assert!(stdout.contains("mode: current-checkout"));
     assert!(stdout.contains("scope: current checkout index only"));
     assert!(
@@ -329,7 +329,7 @@ fn initialized_migration_repo() -> TempGitRepo {
     repo
 }
 
-fn history_objects(pointers: &[lfs_cloud::GitLfsHistoryPointer]) -> BTreeSet<LfsObject> {
+fn history_objects(pointers: &[lfscloud::GitLfsHistoryPointer]) -> BTreeSet<LfsObject> {
     pointers
         .iter()
         .map(|pointer| pointer.object.clone())

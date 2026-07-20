@@ -144,11 +144,11 @@ pub enum LfsObjectError {
 /// ```
 /// use std::str::FromStr;
 ///
-/// use lfs_cloud::LfsOid;
+/// use lfscloud::LfsOid;
 ///
 /// let oid = LfsOid::from_str("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
 /// assert_eq!(oid.as_hex(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-/// # Ok::<(), lfs_cloud::LfsObjectError>(())
+/// # Ok::<(), lfscloud::LfsObjectError>(())
 /// ```
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LfsOid(String);
@@ -261,7 +261,7 @@ impl<'de> Deserialize<'de> for LfsOid {
 /// # Examples
 ///
 /// ```
-/// use lfs_cloud::LfsObjectSize;
+/// use lfscloud::LfsObjectSize;
 ///
 /// let size = LfsObjectSize::new(42);
 /// assert_eq!(size.bytes(), 42);
@@ -380,7 +380,7 @@ impl LfsPointer {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::LfsPointer;
+    /// use lfscloud::LfsPointer;
     ///
     /// let pointer = LfsPointer::parse(
     ///     "version https://git-lfs.github.com/spec/v1\n\
@@ -389,7 +389,7 @@ impl LfsPointer {
     /// )?;
     ///
     /// assert_eq!(pointer.object.size.bytes(), 42);
-    /// # Ok::<(), lfs_cloud::LfsObjectError>(())
+    /// # Ok::<(), lfscloud::LfsObjectError>(())
     /// ```
     pub fn parse(contents: &str) -> Result<Self, LfsObjectError> {
         let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
@@ -683,7 +683,7 @@ pub enum LfsBatchRequestParseError {
 /// # Examples
 ///
 /// ```
-/// use lfs_cloud::{LfsBatchOperation, parse_lfs_batch_request_json};
+/// use lfscloud::{LfsBatchOperation, parse_lfs_batch_request_json};
 ///
 /// let request = parse_lfs_batch_request_json(
 ///     br#"{
@@ -700,7 +700,7 @@ pub enum LfsBatchRequestParseError {
 ///
 /// assert_eq!(request.operation, LfsBatchOperation::Download);
 /// assert_eq!(request.objects[0].size.bytes(), 42);
-/// # Ok::<(), lfs_cloud::LfsBatchRequestParseError>(())
+/// # Ok::<(), lfscloud::LfsBatchRequestParseError>(())
 /// ```
 pub fn parse_lfs_batch_request_json(
     body: impl AsRef<[u8]>,
@@ -730,7 +730,7 @@ impl LfsBatchResponse {
     /// ```
     /// use std::str::FromStr;
     ///
-    /// use lfs_cloud::{
+    /// use lfscloud::{
     ///     LfsBatchDownloadObject, LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid,
     /// };
     ///
@@ -745,7 +745,7 @@ impl LfsBatchResponse {
     /// );
     ///
     /// assert!(response.objects[0].actions.contains_key("download"));
-    /// # Ok::<(), lfs_cloud::LfsObjectError>(())
+    /// # Ok::<(), lfscloud::LfsObjectError>(())
     /// ```
     #[must_use]
     pub fn download(
@@ -778,7 +778,7 @@ impl LfsBatchResponse {
     /// ```
     /// use std::str::FromStr;
     ///
-    /// use lfs_cloud::{
+    /// use lfscloud::{
     ///     LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid,
     /// };
     ///
@@ -793,7 +793,7 @@ impl LfsBatchResponse {
     /// );
     ///
     /// assert!(response.objects[0].actions.contains_key("upload"));
-    /// # Ok::<(), lfs_cloud::LfsObjectError>(())
+    /// # Ok::<(), lfscloud::LfsObjectError>(())
     /// ```
     #[must_use]
     pub fn upload(

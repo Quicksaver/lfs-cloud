@@ -1,4 +1,4 @@
-//! Route planning for `lfs-cloud init`.
+//! Route planning for `lfscloud init`.
 //!
 //! The init command eventually owns Git LFS configuration writes. This module
 //! currently keeps the first step narrow: derive the LFS Cloud endpoint for the
@@ -11,7 +11,7 @@ use crate::{
     http_transport::{HttpUrlPolicy, HttpUrlValidationError, validate_http_url},
 };
 
-/// Resolved Git LFS endpoint for an `lfs-cloud init --server` invocation.
+/// Resolved Git LFS endpoint for an `lfscloud init --server` invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LfsInitRoute {
     /// Server base URL supplied by the user.
@@ -32,7 +32,7 @@ impl LfsInitRoute {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{GitRemote, LfsInitRoute};
+    /// use lfscloud::{GitRemote, LfsInitRoute};
     ///
     /// let remote = GitRemote::parse("origin", "git@github.com:owner/repo.git")?;
     /// let route = LfsInitRoute::resolve("http://127.0.0.1:8080", &remote)?;
@@ -41,7 +41,7 @@ impl LfsInitRoute {
     ///     route.lfs_url,
     ///     "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs"
     /// );
-    /// # Ok::<(), lfs_cloud::CliError>(())
+    /// # Ok::<(), lfscloud::CliError>(())
     /// ```
     pub fn resolve(server_url: impl AsRef<str>, remote: &GitRemote) -> CliResult<Self> {
         Self::resolve_with_insecure_http(server_url, remote, false)

@@ -1,6 +1,6 @@
 # Server Configuration
 
-`lfs-cloud.yml` is private server-owned configuration. Do not commit it to the
+`lfscloud.yml` is private server-owned configuration. Do not commit it to the
 Git repositories being served: it contains repository-to-storage routing,
 credential references, Drive folder IDs, and metadata database paths.
 
@@ -24,7 +24,7 @@ server:
   max_concurrent_requests: 64
   max_concurrent_uploads: 8
   max_concurrent_uploads_per_user: 2
-  metadata_path: ./.lfs-cloud/metadata.sqlite3
+  metadata_path: ./.lfscloud/metadata.sqlite3
 
 repository_providers:
   github-main:
@@ -77,7 +77,7 @@ server:
 The `serve` command can also override the bind address and port:
 
 ```bash
-lfs-cloud serve --config ./lfs-cloud.yml --host 0.0.0.0 --port 8080
+lfscloud serve --config ./lfscloud.yml --host 0.0.0.0 --port 8080
 ```
 
 `public_url` is the URL embedded in Git LFS batch action responses. Set it to
@@ -161,7 +161,7 @@ The configured `root_folder_id` must be a folder that the app credential can
 access and create children in. Git users never receive Drive tokens or direct
 Drive access.
 
-`lfs-cloud serve` loads and refreshes the credential for every configured
+`lfscloud serve` loads and refreshes the credential for every configured
 Drive provider, then performs a non-mutating metadata probe that confirms the
 root is a live folder with child-write capability. These checks complete before
 the HTTP listener binds; a missing/invalid credential or unusable root prevents
@@ -186,14 +186,14 @@ remove them before changing it.
 If `server.metadata_path` is omitted, the server stores SQLite metadata at:
 
 ```text
-<config directory>/.lfs-cloud/metadata.sqlite3
+<config directory>/.lfscloud/metadata.sqlite3
 ```
 
 Relative `metadata_path` values resolve against the directory containing the
 config file.
 
 The server creates an `upload-locks` directory beside the metadata database.
-All `lfs-cloud` processes that can write to the same Google Drive root must use
+All LFS Cloud processes that can write to the same Google Drive root must use
 the same metadata location. Those OS-backed object-keyed locks serialize the
 final Drive existence check and upload across local processes and are released
 automatically if a process exits. Cross-host writers are not supported by the

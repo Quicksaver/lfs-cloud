@@ -2,7 +2,7 @@
 
 mod support;
 
-use lfs_cloud::{LfsPointer, StorageError, StorageProvider};
+use lfscloud::{LfsPointer, StorageError, StorageProvider};
 use support::{
     FakeStorageProvider, TEST_OID_A, TEST_OID_B, TempGitRepo, lfs_object, lfs_object_for_bytes,
     lfs_pointer_file, write_lfs_pointer,
@@ -56,7 +56,7 @@ async fn fake_storage_provider_uploads_downloads_and_deletes_bytes() {
         .await
         .expect("fixture deletion should succeed");
 
-    assert_eq!(deletion, lfs_cloud::StorageDeleteOutcome::Deleted);
+    assert_eq!(deletion, lfscloud::StorageDeleteOutcome::Deleted);
     assert!(
         !provider
             .object_exists(TEST_REPOSITORY_NAMESPACE, &object)

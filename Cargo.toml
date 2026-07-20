@@ -1,11 +1,15 @@
 [package]
-name = "lfs-cloud"
+name = "lfscloud"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 publish = false
 description = "Git LFS-compatible server and CLI for routing LFS objects to user-controlled storage."
+
+[[bin]]
+name = "lfscloud"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"

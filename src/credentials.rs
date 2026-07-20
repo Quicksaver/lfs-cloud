@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Username stored alongside local LFS Cloud bearer tokens in Git credentials.
-pub const DEFAULT_GIT_CREDENTIAL_USERNAME: &str = "lfs-cloud";
+pub const DEFAULT_GIT_CREDENTIAL_USERNAME: &str = "lfscloud";
 
 const MAX_CREDENTIAL_FIELD_LEN: usize = 2048;
 const MAX_CREDENTIAL_OUTPUT_LEN: usize = 8192;
@@ -114,14 +114,14 @@ impl GitCredentialLookup {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::GitCredentialLookup;
+    /// use lfscloud::GitCredentialLookup;
     ///
     /// let lookup = GitCredentialLookup::new(
     ///     "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
     /// )?;
     ///
     /// assert_eq!(lookup.lfs_url().host_str(), Some("lfs.example.com"));
-    /// # Ok::<(), lfs_cloud::CliError>(())
+    /// # Ok::<(), lfscloud::CliError>(())
     /// ```
     pub fn new(lfs_url: impl AsRef<str>) -> CliResult<Self> {
         Self::with_username(lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME)
@@ -295,15 +295,15 @@ impl GitCredentialRejection {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{GitCredentialRejection, LfsSessionToken};
+    /// use lfscloud::{GitCredentialRejection, LfsSessionToken};
     ///
     /// let rejection = GitCredentialRejection::new(
     ///     "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
     ///     LfsSessionToken::from_secret("local-lfs-token")?,
     /// )?;
     ///
-    /// assert_eq!(rejection.username(), "lfs-cloud");
-    /// # Ok::<(), lfs_cloud::LfsCloudError>(())
+    /// assert_eq!(rejection.username(), "lfscloud");
+    /// # Ok::<(), lfscloud::LfsCloudError>(())
     /// ```
     ///
     /// # Errors
@@ -476,7 +476,7 @@ impl GitCredentialApproval {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{GitCredentialApproval, LfsSessionToken};
+    /// use lfscloud::{GitCredentialApproval, LfsSessionToken};
     ///
     /// let approval = GitCredentialApproval::new(
     ///     "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
@@ -484,7 +484,7 @@ impl GitCredentialApproval {
     /// )?;
     ///
     /// assert_eq!(approval.lfs_url().host_str(), Some("lfs.example.com"));
-    /// # Ok::<(), lfs_cloud::LfsCloudError>(())
+    /// # Ok::<(), lfscloud::LfsCloudError>(())
     /// ```
     pub fn new(lfs_url: impl AsRef<str>, token: LfsSessionToken) -> CliResult<Self> {
         Self::with_username(lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME, token)
@@ -535,7 +535,7 @@ impl GitCredentialApproval {
 
     /// Returns the local LFS Cloud session token to approve.
     ///
-    /// This is a local `lfs-cloud` token, not an upstream GitHub OAuth token.
+    /// This is a local LFS Cloud token, not an upstream GitHub OAuth token.
     #[must_use]
     pub fn token(&self) -> &LfsSessionToken {
         &self.token
@@ -774,14 +774,14 @@ impl GitCredentialApproval {
 /// # Examples
 ///
 /// ```
-/// use lfs_cloud::git_credential_helper_fallback_instructions;
+/// use lfscloud::git_credential_helper_fallback_instructions;
 ///
 /// let instructions = git_credential_helper_fallback_instructions(
 ///     "https://lfs.example.com/github.com/owner/repo.git/info/lfs",
 /// )?;
 ///
 /// assert!(instructions.contains("credential.helper"));
-/// # Ok::<(), lfs_cloud::CliError>(())
+/// # Ok::<(), lfscloud::CliError>(())
 /// ```
 pub fn git_credential_helper_fallback_instructions(lfs_url: impl AsRef<str>) -> CliResult<String> {
     let lfs_url = validate_lfs_credential_url(lfs_url.as_ref(), false)?;
@@ -802,7 +802,7 @@ fn missing_credential_helper_error(lfs_url: &Url, username: &str) -> CliError {
 
 fn credential_helper_fallback_instructions(lfs_url: &Url, username: &str) -> String {
     [
-        "Configure a Git credential helper, then retry the lfs-cloud login or init command."
+        "Configure a Git credential helper, then retry the lfscloud login or init command."
             .to_owned(),
         "Recommended persistent helpers:".to_owned(),
         "  macOS:   git config --global credential.helper osxkeychain".to_owned(),
@@ -816,9 +816,9 @@ fn credential_helper_fallback_instructions(lfs_url: &Url, username: &str) -> Str
         "Avoid plaintext storage unless you deliberately accept unencrypted credentials on disk."
             .to_owned(),
         format!(
-            "After a helper is configured, lfs-cloud will store username '{username}' for {lfs_url}."
+            "After a helper is configured, LFS Cloud will store username '{username}' for {lfs_url}."
         ),
-        "Do not store a GitHub OAuth token or personal access token here; Git LFS should receive only the local lfs-cloud session token.".to_owned(),
+        "Do not store a GitHub OAuth token or personal access token here; Git LFS should receive only the local LFS Cloud session token.".to_owned(),
     ]
     .join("\n")
 }
@@ -1617,7 +1617,7 @@ mod tests {
         assert_eq!(approval.username(), DEFAULT_GIT_CREDENTIAL_USERNAME);
         assert_eq!(
             approval.credential_input(),
-            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\npassword=local-lfs-token\n\n"
+            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfscloud\npassword=local-lfs-token\n\n"
         );
         assert!(!format!("{approval:?}").contains("local-lfs-token"));
     }
@@ -1634,7 +1634,7 @@ mod tests {
         assert_eq!(rejection.username(), DEFAULT_GIT_CREDENTIAL_USERNAME);
         assert_eq!(
             rejection.credential_input(),
-            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\npassword=local-lfs-token\n\n"
+            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfscloud\npassword=local-lfs-token\n\n"
         );
         assert!(!format!("{rejection:?}").contains("local-lfs-token"));
     }
@@ -1674,7 +1674,7 @@ cat > '{}'
 
         assert_eq!(
             fs::read_to_string(stdin_path).expect("stdin capture should be readable"),
-            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\npassword=local-lfs-token\n\n"
+            "url=https://lfs.example.com/github.com/owner/repo.git/info/lfs\nusername=lfscloud\npassword=local-lfs-token\n\n"
         );
         let recorded_cwd = fs::read_to_string(cwd_path).expect("cwd capture should be readable");
         assert_eq!(
@@ -1751,7 +1751,7 @@ cat > '{}'
         assert!(!instructions.contains("git config --global credential.helper store"));
         assert!(instructions.contains("GitHub OAuth token"));
         assert!(instructions.contains("personal access token"));
-        assert!(instructions.contains("local lfs-cloud session token"));
+        assert!(instructions.contains("local LFS Cloud session token"));
     }
 
     #[test]
@@ -1801,7 +1801,7 @@ printf '%s\n' \
   'protocol=https' \
   'host=lfs.example.com' \
   'path=github.com/owner/repo.git/info/lfs' \
-  'username=lfs-cloud' \
+  'username=lfscloud' \
   'password=local-lfs-token' \
   ''
 "#,
@@ -1818,7 +1818,7 @@ printf '%s\n' \
 
         assert_eq!(
             fs::read_to_string(stdin_path).expect("stdin capture should be readable"),
-            "protocol=https\nhost=lfs.example.com\npath=github.com/owner/repo.git/info/lfs\nusername=lfs-cloud\n\n"
+            "protocol=https\nhost=lfs.example.com\npath=github.com/owner/repo.git/info/lfs\nusername=lfscloud\n\n"
         );
         assert_eq!(credential.lfs_url(), lookup.lfs_url());
         assert_eq!(credential.username(), DEFAULT_GIT_CREDENTIAL_USERNAME);
@@ -1877,7 +1877,7 @@ printf '%s\n' \
   'protocol=https' \
   'host=lfs.example.com' \
   'path=github.com/owner/other.git/info/lfs' \
-  'username=lfs-cloud' \
+  'username=lfscloud' \
   'password=local-lfs-token' \
   ''
 "#,
@@ -1908,7 +1908,7 @@ printf '%s\n' \
   'protocol=https' \
   'host=lfs.example.com' \
   'path=github.com/owner/repo.git/info/lfs' \
-  'username=lfs-cloud' \
+  'username=lfscloud' \
   'password=local token' \
   ''
 "#,

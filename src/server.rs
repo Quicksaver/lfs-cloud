@@ -57,7 +57,7 @@ use crate::{
     sessions::LfsSessionRecord,
 };
 
-const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfs-cloud\"";
+const LFS_AUTH_CHALLENGE: &str = "Basic realm=\"lfscloud\"";
 /// Authenticated endpoint for revoking the presented local LFS session.
 pub const LFS_SESSION_REVOKE_PATH: &str = "/auth/session";
 const GIT_LFS_JSON_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
@@ -78,7 +78,7 @@ enum ServerShutdownOutcome {
     TimedOut,
 }
 
-/// Runtime options supplied by `lfs-cloud serve`.
+/// Runtime options supplied by `lfscloud serve`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServeOptions {
     /// Optional explicit server config path.
@@ -887,7 +887,7 @@ impl StorageProviderTransferStore {
 
     fn synthetic_existing_backend_id(&self, object: &LfsObject) -> String {
         format!(
-            "lfs-cloud-provider-adapter-existing://{}/objects/{}",
+            "lfscloud-provider-adapter-existing://{}/objects/{}",
             self.provider.provider_id(),
             object.oid.as_hex()
         )
@@ -2486,17 +2486,17 @@ async fn stage_upload_request_body_with_lease(
 ) -> Result<StagedUpload, UploadStagingError> {
     let preflight_size = upload_staging_preflight_size(expected_size, guardrails.max_upload_bytes)?;
     let temp_file = tempfile::Builder::new()
-        .prefix("lfs-cloud-upload-")
+        .prefix("lfscloud-upload-")
         .tempfile()
         .map_err(|source| StorageError::Retryable {
-            provider: "lfs-cloud".to_owned(),
+            provider: "lfscloud".to_owned(),
             message: format!("upload staging file could not be created: {source}"),
         })?;
     let staging_dir = temp_file
         .path()
         .parent()
         .ok_or_else(|| StorageError::Retryable {
-            provider: "lfs-cloud".to_owned(),
+            provider: "lfscloud".to_owned(),
             message: format!(
                 "upload staging file {} did not have a parent directory",
                 temp_file.path().display()
@@ -2511,7 +2511,7 @@ async fn stage_upload_request_body_with_lease(
     let std_file = temp_file
         .reopen()
         .map_err(|source| StorageError::StagedFileRead {
-            provider: "lfs-cloud".to_owned(),
+            provider: "lfscloud".to_owned(),
             path: temp_file.path().to_path_buf(),
             source,
         })?;
@@ -2528,7 +2528,7 @@ async fn stage_upload_request_body_with_lease(
             break;
         };
         let chunk = chunk.map_err(|source| StorageError::Retryable {
-            provider: "lfs-cloud".to_owned(),
+            provider: "lfscloud".to_owned(),
             message: format!("upload request body could not be read: {source}"),
         })?;
         let next_size = actual_size
@@ -2726,13 +2726,13 @@ impl UploadStagingLease {
             tokio::task::spawn_blocking(move || fs4::available_space(staging_dir))
                 .await
                 .map_err(|source| StorageError::Retryable {
-                    provider: "lfs-cloud".to_owned(),
+                    provider: "lfscloud".to_owned(),
                     message: format!(
                         "upload staging directory free-space check did not complete: {source}"
                     ),
                 })?
                 .map_err(|source| StorageError::Retryable {
-                    provider: "lfs-cloud".to_owned(),
+                    provider: "lfscloud".to_owned(),
                     message: format!(
                         "upload staging directory free space could not be inspected: {source}"
                     ),
@@ -2809,7 +2809,7 @@ fn upload_staging_file_io_error(source: io::Error, action: &str) -> UploadStagin
     }
 
     StorageError::Retryable {
-        provider: "lfs-cloud".to_owned(),
+        provider: "lfscloud".to_owned(),
         message: format!("upload staging file could not be {action}: {source}"),
     }
     .into()
@@ -2842,11 +2842,11 @@ impl UploadStagingError {
     fn into_storage_error(self) -> StorageError {
         match self {
             Self::PayloadTooLarge => StorageError::QuotaExceeded {
-                provider: "lfs-cloud".to_owned(),
+                provider: "lfscloud".to_owned(),
                 message: "upload object exceeded request size limit".to_owned(),
             },
             Self::ConcurrencyLimit => StorageError::Retryable {
-                provider: "lfs-cloud".to_owned(),
+                provider: "lfscloud".to_owned(),
                 message: "upload staging concurrency limit reached".to_owned(),
             },
             Self::InsufficientTempSpace {
@@ -2864,12 +2864,12 @@ impl UploadStagingError {
                 };
 
                 StorageError::QuotaExceeded {
-                    provider: "lfs-cloud".to_owned(),
+                    provider: "lfscloud".to_owned(),
                     message,
                 }
             }
             Self::TimedOut => StorageError::Retryable {
-                provider: "lfs-cloud".to_owned(),
+                provider: "lfscloud".to_owned(),
                 message: "upload request body timed out while reading".to_owned(),
             },
             Self::Storage(error) => error,
@@ -3160,7 +3160,7 @@ fn git_lfs_authorization_error_response(error: ServerError) -> Response {
         );
         headers.append(
             WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer realm=\"lfs-cloud\""),
+            HeaderValue::from_static("Bearer realm=\"lfscloud\""),
         );
     }
 
@@ -3369,7 +3369,7 @@ fn authentication_required_response() -> Response {
     );
     headers.append(
         WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer realm=\"lfs-cloud\""),
+        HeaderValue::from_static("Bearer realm=\"lfscloud\""),
     );
 
     (
@@ -3486,7 +3486,7 @@ impl LfsRouteResolver {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::{LfsRouteEndpoint, LfsRouteResolver, ServerConfig};
+    /// use lfscloud::{LfsRouteEndpoint, LfsRouteResolver, ServerConfig};
     ///
     /// let config = ServerConfig::load_from_str(
     ///     r#"
@@ -3517,7 +3517,7 @@ impl LfsRouteResolver {
     /// let route = resolver.resolve_path("/github.com/owner/repo.git/info/lfs/objects/batch")?;
     ///
     /// assert_eq!(route.endpoint, LfsRouteEndpoint::Batch);
-    /// # Ok::<(), lfs_cloud::ServerError>(())
+    /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     #[must_use]
     pub fn new(config: &ServerConfig) -> Self {
@@ -3703,13 +3703,13 @@ fn is_valid_dns_hostname(host: &str) -> bool {
         })
 }
 
-/// Renders the startup message shown by `lfs-cloud serve`.
+/// Renders the startup message shown by `lfscloud serve`.
 #[must_use]
 pub fn render_server_startup_message(urls: &AdvertisedServerUrls) -> String {
     let network = urls.network.as_deref().unwrap_or("(not detected)");
 
     format!(
-        "lfs-cloud server running\n  local:   {}\n  network: {}",
+        "LFS Cloud server running\n  local:   {}\n  network: {}",
         urls.local, network
     )
 }
@@ -3950,7 +3950,7 @@ repositories:
         let server_port = unused_tcp_port();
         let server_url = format!("http://127.0.0.1:{server_port}");
         let directory = tempfile::tempdir().expect("composition tempdir should be created");
-        let config_path = directory.path().join("lfs-cloud.yml");
+        let config_path = directory.path().join("lfscloud.yml");
         let metadata_path = directory.path().join("state/metadata.sqlite3");
         fs::write(
             &config_path,
@@ -5262,7 +5262,7 @@ repositories:
         assert_eq!(all_ipv6_interfaces.local, "http://127.0.0.1:8080");
 
         let message = render_server_startup_message(&all_interfaces);
-        assert!(message.contains("lfs-cloud server running"));
+        assert!(message.contains("LFS Cloud server running"));
         assert!(message.contains("local:   http://127.0.0.1:8080"));
         assert!(message.contains("network: "));
     }
@@ -5565,7 +5565,7 @@ repositories:
             .map(|value| value.to_str().expect("challenge should be valid ASCII"))
             .collect::<Vec<_>>();
         assert!(challenge_values.contains(&LFS_AUTH_CHALLENGE));
-        assert!(challenge_values.contains(&"Bearer realm=\"lfs-cloud\""));
+        assert!(challenge_values.contains(&"Bearer realm=\"lfscloud\""));
         assert_lfs_json_error(
             unauthenticated,
             StatusCode::UNAUTHORIZED,
@@ -7384,7 +7384,7 @@ repositories:
         assert!(
             challenge_values
                 .iter()
-                .any(|value| value.to_str().ok() == Some("Bearer realm=\"lfs-cloud\""))
+                .any(|value| value.to_str().ok() == Some("Bearer realm=\"lfscloud\""))
         );
     }
 

@@ -212,7 +212,7 @@ impl GitRepository {
     }
 }
 
-/// Target config location for `lfs-cloud init`.
+/// Target config location for `lfscloud init`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GitLfsConfigTarget {
     /// Write the LFS URL to the worktree `.lfsconfig` file.
@@ -904,7 +904,7 @@ mod tests {
             "-c",
             "user.name=LFS Cloud Test",
             "-c",
-            "user.email=lfs-cloud@example.invalid",
+            "user.email=lfscloud@example.invalid",
             "commit",
             "--allow-empty",
             "-m",
@@ -974,7 +974,7 @@ mod tests {
             "-c",
             "user.name=LFS Cloud Test",
             "-c",
-            "user.email=lfs-cloud@example.invalid",
+            "user.email=lfscloud@example.invalid",
             "commit",
             "--allow-empty",
             "-m",

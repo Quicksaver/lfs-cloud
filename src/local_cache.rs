@@ -37,7 +37,7 @@ use crate::{
 };
 
 /// Default directory name used below a user's home directory for local state.
-pub const DEFAULT_LOCAL_CACHE_HOME_DIR: &str = ".lfs-cloud";
+pub const DEFAULT_LOCAL_CACHE_HOME_DIR: &str = ".lfscloud";
 /// Directory below the local cache root that stores immutable object bytes.
 pub const LOCAL_CACHE_OBJECTS_DIR: &str = "objects";
 /// JSON registry file below the local cache root that tracks known worktrees.
@@ -302,7 +302,7 @@ pub enum LocalCacheIngestStatus {
 
 /// Repository worktree registered as a consumer of the shared local cache.
 ///
-/// `lfs-cloud gc` uses this kind of record to know which worktrees must be
+/// `lfscloud gc` uses this kind of record to know which worktrees must be
 /// inspected before deleting cached objects. Paths are required to be absolute
 /// so the registry does not depend on a future process's current directory.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -683,9 +683,9 @@ pub struct LocalCacheGarbageCollectionObject {
 /// ```
 /// use std::path::PathBuf;
 ///
-/// use lfs_cloud::{LocalCacheLayout, LfsOid};
+/// use lfscloud::{LocalCacheLayout, LfsOid};
 ///
-/// let layout = LocalCacheLayout::new("/home/alice/.lfs-cloud");
+/// let layout = LocalCacheLayout::new("/home/alice/.lfscloud");
 /// let oid = LfsOid::new(
 ///     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 /// )
@@ -694,7 +694,7 @@ pub struct LocalCacheGarbageCollectionObject {
 /// assert_eq!(
 ///     layout.object_path_for_oid(&oid),
 ///     PathBuf::from(
-///         "/home/alice/.lfs-cloud/objects/01/23/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+///         "/home/alice/.lfscloud/objects/01/23/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 ///     )
 /// );
 /// ```
@@ -707,7 +707,7 @@ impl LocalCacheLayout {
     /// Creates a local cache layout rooted at a concrete cache directory.
     ///
     /// `root` is the directory that should contain the `objects` subdirectory,
-    /// normally `~/.lfs-cloud`.
+    /// normally `~/.lfscloud`.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -722,7 +722,7 @@ impl LocalCacheLayout {
         Self::new(home_dir.as_ref().join(DEFAULT_LOCAL_CACHE_HOME_DIR))
     }
 
-    /// Returns the cache root directory, normally `~/.lfs-cloud`.
+    /// Returns the cache root directory, normally `~/.lfscloud`.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -3094,7 +3094,7 @@ mod tests {
         );
         assert_eq!(
             layout.objects_dir(),
-            PathBuf::from("/home/alice/.lfs-cloud/objects")
+            PathBuf::from("/home/alice/.lfscloud/objects")
         );
     }
 
@@ -4728,7 +4728,7 @@ mod tests {
         initialize_git_worktree(&repo);
         write_file(&layout.object_path(&object), bytes);
         write_file(
-            &repo.join(".git/lfs-cloud-pointer"),
+            &repo.join(".git/lfscloud-pointer"),
             LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
         layout

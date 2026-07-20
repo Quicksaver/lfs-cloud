@@ -53,7 +53,7 @@ const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
 const MAX_LOGIN_TOKEN_INPUT_BYTES: usize = 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "lfs-cloud", version, about, propagate_version = true)]
+#[command(name = "lfscloud", version, about, propagate_version = true)]
 #[command(arg_required_else_help = true)]
 struct Cli {
     /// Server config path to load.
@@ -158,21 +158,21 @@ struct StatusCommand {
     #[arg(long)]
     allow_insecure_http: bool,
 
-    /// Local cache root to inspect instead of ~/.lfs-cloud.
+    /// Local cache root to inspect instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
     cache_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct PullCommand {
-    /// Local cache root to use instead of ~/.lfs-cloud.
+    /// Local cache root to use instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
     cache_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct HydrateCommand {
-    /// Local cache root to use instead of ~/.lfs-cloud.
+    /// Local cache root to use instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
     cache_root: Option<PathBuf>,
 
@@ -183,7 +183,7 @@ struct HydrateCommand {
 
 #[derive(Debug, Args)]
 struct DehydrateCommand {
-    /// Local cache root to use instead of ~/.lfs-cloud.
+    /// Local cache root to use instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
     cache_root: Option<PathBuf>,
 
@@ -194,7 +194,7 @@ struct DehydrateCommand {
 
 #[derive(Debug, Args)]
 struct GcCommand {
-    /// Local cache root to clean instead of ~/.lfs-cloud.
+    /// Local cache root to clean instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
     cache_root: Option<PathBuf>,
 
@@ -217,7 +217,7 @@ struct MigrateCommand {
     #[arg(long)]
     allow_insecure_http: bool,
 
-    /// Local cache root to inspect instead of ~/.lfs-cloud.
+    /// Local cache root to inspect instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
     cache_root: Option<PathBuf>,
 
@@ -313,19 +313,19 @@ where
     match cli.command {
         Command::Serve(command) => serve(command.serve_options(cli.config))
             .await
-            .context("failed to run lfs-cloud server"),
-        Command::Login(command) => login(command).context("failed to complete lfs-cloud login"),
-        Command::Logout(command) => logout(command).context("failed to complete lfs-cloud logout"),
-        Command::Init(command) => init(command).context("failed to resolve lfs-cloud init route"),
+            .context("failed to run lfscloud server"),
+        Command::Login(command) => login(command).context("failed to complete lfscloud login"),
+        Command::Logout(command) => logout(command).context("failed to complete lfscloud logout"),
+        Command::Init(command) => init(command).context("failed to resolve lfscloud init route"),
         Command::Status(command) => {
-            status(command, cli.config).context("failed to check lfs-cloud status")
+            status(command, cli.config).context("failed to check lfscloud status")
         }
         Command::Pull(command) => pull(command).context("failed to pull LFS objects"),
         Command::Hydrate(command) => hydrate(command).context("failed to hydrate paths"),
         Command::Dehydrate(command) => dehydrate(command).context("failed to dehydrate paths"),
         Command::Gc(command) => gc(command).context("failed to garbage collect local cache"),
         Command::Migrate(command) => {
-            migrate(command, cli.config).context("failed to plan lfs-cloud migration")
+            migrate(command, cli.config).context("failed to plan lfscloud migration")
         }
     }
 }
@@ -799,7 +799,7 @@ fn login_discovery_error(error: CliError) -> CliError {
     match error {
         CliError::ExternalCommand { command, .. } if command == "git remote get-url origin" => {
             CliError::InvalidArguments {
-                message: "lfs-cloud login requires an origin remote; add the repository remote before logging in".to_owned(),
+                message: "lfscloud login requires an origin remote; add the repository remote before logging in".to_owned(),
             }
         }
         error => error,
@@ -1010,7 +1010,7 @@ where
     register_current_worktree(&layout, &repository.worktree_root)?;
 
     let pointer_scan = current_checkout_lfs_pointer_scan(&repository.worktree_root)?;
-    writeln!(output, "lfs-cloud pull").map_err(output_error)?;
+    writeln!(output, "lfscloud pull").map_err(output_error)?;
     writeln!(output, "  fetched Git LFS objects").map_err(output_error)?;
     writeln!(
         output,
@@ -1146,7 +1146,7 @@ where
 {
     if !command.dry_run {
         return Err(CliError::InvalidArguments {
-            message: "lfs-cloud migrate currently supports planning with --dry-run only".to_owned(),
+            message: "lfscloud migrate currently supports planning with --dry-run only".to_owned(),
         });
     }
 
@@ -1628,7 +1628,7 @@ where
     let fetch_bytes =
         migration_objects_total_bytes(unavailable_objects.iter().map(|local| &local.object));
 
-    writeln!(output, "lfs-cloud migrate dry-run")?;
+    writeln!(output, "lfscloud migrate dry-run")?;
     writeln!(
         output,
         "  worktree: {}",
@@ -2869,7 +2869,7 @@ where
         "removed"
     };
 
-    writeln!(output, "lfs-cloud gc")?;
+    writeln!(output, "lfscloud gc")?;
     writeln!(output, "  cache: {}", cache_root.display())?;
     writeln!(
         output,
@@ -3013,7 +3013,7 @@ impl StatusReport {
     where
         W: Write,
     {
-        writeln!(output, "lfs-cloud status")?;
+        writeln!(output, "lfscloud status")?;
         for check in &self.checks {
             writeln!(
                 output,
@@ -3133,7 +3133,7 @@ fn resolve_socket_addresses_with_timeout(host: String, port: u16) -> CliResult<V
     let (sender, receiver) = mpsc::sync_channel(1);
     let thread_host = host.clone();
     std::thread::Builder::new()
-        .name("lfs-cloud-status-resolver".to_owned())
+        .name("lfscloud-status-resolver".to_owned())
         .spawn(move || {
             let result = (thread_host.as_str(), port)
                 .to_socket_addrs()
@@ -3242,7 +3242,7 @@ fn spawn_browser_launcher(program: &str, args: &[&str]) -> CliResult<()> {
     // Reap the process off the CLI's critical path so token entry can begin
     // immediately even when the desktop integration remains open indefinitely.
     let _ = std::thread::Builder::new()
-        .name("lfs-cloud-browser-reaper".to_owned())
+        .name("lfscloud-browser-reaper".to_owned())
         .spawn(move || {
             let _ = child.wait();
         });
@@ -3426,19 +3426,19 @@ mod tests {
 
     #[test]
     fn root_command_requires_a_subcommand() {
-        let error = Cli::try_parse_from(["lfs-cloud"]).expect_err("command should be required");
+        let error = Cli::try_parse_from(["lfscloud"]).expect_err("command should be required");
         let rendered = error.to_string();
 
-        assert!(rendered.contains("Usage: lfs-cloud"));
+        assert!(rendered.contains("Usage: lfscloud"));
         assert!(rendered.contains("Commands:"));
     }
 
     #[test]
     fn init_command_accepts_required_server_url() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "--config",
-            "custom-lfs-cloud.yml",
+            "custom-lfscloud.yml",
             "init",
             "--server",
             "http://127.0.0.1:8080",
@@ -3450,7 +3450,7 @@ mod tests {
             panic!("init subcommand should parse");
         };
 
-        assert_eq!(cli.config, Some("custom-lfs-cloud.yml".into()));
+        assert_eq!(cli.config, Some("custom-lfscloud.yml".into()));
         assert_eq!(command.server, "http://127.0.0.1:8080");
         assert!(command.allow_insecure_http);
         assert!(!command.local);
@@ -3459,7 +3459,7 @@ mod tests {
     #[test]
     fn init_command_accepts_local_config_option() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "init",
             "--server",
             "http://127.0.0.1:8080",
@@ -3478,7 +3478,7 @@ mod tests {
     #[test]
     fn login_command_accepts_server_url_and_no_open_option() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "login",
             "--server",
             "http://127.0.0.1:8080",
@@ -3499,7 +3499,7 @@ mod tests {
     #[test]
     fn logout_command_accepts_server_url_and_insecure_http_option() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "logout",
             "--server",
             "http://127.0.0.1:8080",
@@ -3518,15 +3518,15 @@ mod tests {
     #[test]
     fn status_command_accepts_server_and_cache_root_options() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "--config",
-            "lfs-cloud.test.yml",
+            "lfscloud.test.yml",
             "status",
             "--server",
             "http://127.0.0.1:8080",
             "--allow-insecure-http",
             "--cache-root",
-            "/tmp/lfs-cloud-cache",
+            "/tmp/lfscloud-cache",
         ])
         .expect("status command should parse");
 
@@ -3534,32 +3534,31 @@ mod tests {
             panic!("status subcommand should parse");
         };
 
-        assert_eq!(cli.config, Some("lfs-cloud.test.yml".into()));
+        assert_eq!(cli.config, Some("lfscloud.test.yml".into()));
         assert_eq!(command.server, Some("http://127.0.0.1:8080".to_owned()));
         assert!(command.allow_insecure_http);
-        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert_eq!(command.cache_root, Some("/tmp/lfscloud-cache".into()));
     }
 
     #[test]
     fn pull_command_accepts_cache_root_option() {
-        let cli =
-            Cli::try_parse_from(["lfs-cloud", "pull", "--cache-root", "/tmp/lfs-cloud-cache"])
-                .expect("pull command should parse");
+        let cli = Cli::try_parse_from(["lfscloud", "pull", "--cache-root", "/tmp/lfscloud-cache"])
+            .expect("pull command should parse");
 
         let super::Command::Pull(command) = cli.command else {
             panic!("pull subcommand should parse");
         };
 
-        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert_eq!(command.cache_root, Some("/tmp/lfscloud-cache".into()));
     }
 
     #[test]
     fn hydrate_command_accepts_cache_root_and_paths() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "hydrate",
             "--cache-root",
-            "/tmp/lfs-cloud-cache",
+            "/tmp/lfscloud-cache",
             "asset/model.bin",
             "asset/texture.bin",
         ])
@@ -3569,7 +3568,7 @@ mod tests {
             panic!("hydrate subcommand should parse");
         };
 
-        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert_eq!(command.cache_root, Some("/tmp/lfscloud-cache".into()));
         assert_eq!(
             command.paths,
             vec![
@@ -3582,10 +3581,10 @@ mod tests {
     #[test]
     fn dehydrate_command_accepts_cache_root_and_paths() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "dehydrate",
             "--cache-root",
-            "/tmp/lfs-cloud-cache",
+            "/tmp/lfscloud-cache",
             "asset/model.bin",
         ])
         .expect("dehydrate command should parse");
@@ -3594,17 +3593,17 @@ mod tests {
             panic!("dehydrate subcommand should parse");
         };
 
-        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert_eq!(command.cache_root, Some("/tmp/lfscloud-cache".into()));
         assert_eq!(command.paths, vec![PathBuf::from("asset/model.bin")]);
     }
 
     #[test]
     fn gc_command_accepts_cache_root_dry_run_and_explicit_prune_options() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "gc",
             "--cache-root",
-            "/tmp/lfs-cloud-cache",
+            "/tmp/lfscloud-cache",
             "--dry-run",
             "--prune-unavailable-worktrees",
         ])
@@ -3614,7 +3613,7 @@ mod tests {
             panic!("gc subcommand should parse");
         };
 
-        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert_eq!(command.cache_root, Some("/tmp/lfscloud-cache".into()));
         assert!(command.dry_run);
         assert!(command.prune_unavailable_worktrees);
     }
@@ -3622,16 +3621,16 @@ mod tests {
     #[test]
     fn migrate_command_accepts_dry_run_scope_and_cache_options() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "--config",
-            "lfs-cloud.test.yml",
+            "lfscloud.test.yml",
             "migrate",
             "--server",
             "http://127.0.0.1:8080",
             "--dry-run",
             "--all-refs",
             "--cache-root",
-            "/tmp/lfs-cloud-cache",
+            "/tmp/lfscloud-cache",
             "--purge-source-lfs",
             "--allow-insecure-http",
             "--source-remote",
@@ -3644,7 +3643,7 @@ mod tests {
             panic!("migrate subcommand should parse");
         };
 
-        assert_eq!(cli.config, Some("lfs-cloud.test.yml".into()));
+        assert_eq!(cli.config, Some("lfscloud.test.yml".into()));
         assert_eq!(command.server, "http://127.0.0.1:8080");
         assert!(command.allow_insecure_http);
         assert_eq!(command.source_remote, "upstream");
@@ -3653,13 +3652,13 @@ mod tests {
         assert!(command.all_refs);
         assert!(command.purge_source_lfs);
         assert!(command.refs.is_empty());
-        assert_eq!(command.cache_root, Some("/tmp/lfs-cloud-cache".into()));
+        assert_eq!(command.cache_root, Some("/tmp/lfscloud-cache".into()));
     }
 
     #[test]
     fn migrate_command_defaults_source_remote_to_origin() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "migrate",
             "--server",
             "http://127.0.0.1:8080",
@@ -3678,12 +3677,12 @@ mod tests {
     #[test]
     fn migrate_command_rejects_missing_dry_run_and_conflicting_ref_scopes() {
         let missing_dry_run =
-            Cli::try_parse_from(["lfs-cloud", "migrate", "--server", "http://127.0.0.1:8080"])
+            Cli::try_parse_from(["lfscloud", "migrate", "--server", "http://127.0.0.1:8080"])
                 .expect_err("migrate should require explicit dry-run planning");
         assert!(missing_dry_run.to_string().contains("--dry-run"));
 
         let purge_without_dry_run = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "migrate",
             "--server",
             "http://127.0.0.1:8080",
@@ -3693,7 +3692,7 @@ mod tests {
         assert!(purge_without_dry_run.to_string().contains("--dry-run"));
 
         let conflicting_scopes = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "migrate",
             "--server",
             "http://127.0.0.1:8080",
@@ -3724,9 +3723,9 @@ mod tests {
     #[test]
     fn serve_command_accepts_global_config_before_subcommand() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "--config",
-            "custom-lfs-cloud.yml",
+            "custom-lfscloud.yml",
             "serve",
             "--host",
             "0.0.0.0",
@@ -3743,7 +3742,7 @@ mod tests {
         assert_eq!(
             options,
             ServeOptions::new(
-                Some("custom-lfs-cloud.yml".into()),
+                Some("custom-lfscloud.yml".into()),
                 Some("0.0.0.0".to_owned()),
                 Some(9000),
             )
@@ -3753,10 +3752,10 @@ mod tests {
     #[test]
     fn serve_command_accepts_global_config_after_subcommand() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "serve",
             "--config",
-            "custom-lfs-cloud.yml",
+            "custom-lfscloud.yml",
             "--host",
             "0.0.0.0",
             "--port",
@@ -3772,7 +3771,7 @@ mod tests {
         assert_eq!(
             options,
             ServeOptions::new(
-                Some("custom-lfs-cloud.yml".into()),
+                Some("custom-lfscloud.yml".into()),
                 Some("0.0.0.0".to_owned()),
                 Some(9000),
             )
@@ -3781,7 +3780,7 @@ mod tests {
 
     #[test]
     fn default_tracing_config_uses_rust_log_env_override() {
-        let cli = Cli::try_parse_from(["lfs-cloud", "serve"]).expect("serve command should parse");
+        let cli = Cli::try_parse_from(["lfscloud", "serve"]).expect("serve command should parse");
         let config = tracing_config(&cli);
 
         assert_eq!(config.default_filter, DEFAULT_LOG_FILTER);
@@ -3790,21 +3789,20 @@ mod tests {
 
     #[test]
     fn explicit_log_level_overrides_rust_log_env() {
-        let cli =
-            Cli::try_parse_from(["lfs-cloud", "--log-level", "warn,lfs_cloud=debug", "serve"])
-                .expect("serve command should parse");
+        let cli = Cli::try_parse_from(["lfscloud", "--log-level", "warn,lfscloud=debug", "serve"])
+            .expect("serve command should parse");
         let config = tracing_config(&cli);
 
-        assert_eq!(config.default_filter, "warn,lfs_cloud=debug");
+        assert_eq!(config.default_filter, "warn,lfscloud=debug");
         assert!(config.env_filter_var.is_none());
     }
 
     #[tokio::test]
     async fn dispatches_serve_with_global_config_and_overrides() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "--config",
-            "lfs-cloud.test.yml",
+            "lfscloud.test.yml",
             "serve",
             "--host",
             "127.0.0.2",
@@ -3840,7 +3838,7 @@ mod tests {
         assert_eq!(
             *captured.lock().expect("capture mutex should lock"),
             Some(ServeOptions::new(
-                Some("lfs-cloud.test.yml".into()),
+                Some("lfscloud.test.yml".into()),
                 Some("127.0.0.2".to_owned()),
                 Some(8088),
             ))
@@ -3849,7 +3847,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_init_with_server_url() {
-        let cli = Cli::try_parse_from(["lfs-cloud", "init", "--server", "http://127.0.0.1:8080"])
+        let cli = Cli::try_parse_from(["lfscloud", "init", "--server", "http://127.0.0.1:8080"])
             .expect("init command should parse");
         let captured = Arc::new(Mutex::new(None));
         let captured_for_runner = Arc::clone(&captured);
@@ -3883,7 +3881,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_login_with_server_url() {
-        let cli = Cli::try_parse_from(["lfs-cloud", "login", "--server", "http://127.0.0.1:8080"])
+        let cli = Cli::try_parse_from(["lfscloud", "login", "--server", "http://127.0.0.1:8080"])
             .expect("login command should parse");
         let captured = Arc::new(Mutex::new(None));
         let captured_for_runner = Arc::clone(&captured);
@@ -3917,7 +3915,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_logout_with_server_url() {
-        let cli = Cli::try_parse_from(["lfs-cloud", "logout", "--server", "http://127.0.0.1:8080"])
+        let cli = Cli::try_parse_from(["lfscloud", "logout", "--server", "http://127.0.0.1:8080"])
             .expect("logout command should parse");
         let captured = Arc::new(Mutex::new(None));
         let captured_for_runner = Arc::clone(&captured);
@@ -3952,9 +3950,9 @@ mod tests {
     #[tokio::test]
     async fn dispatches_status_with_global_config() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "--config",
-            "lfs-cloud.test.yml",
+            "lfscloud.test.yml",
             "status",
             "--server",
             "http://127.0.0.1:8080",
@@ -3988,16 +3986,15 @@ mod tests {
             *captured.lock().expect("capture mutex should lock"),
             Some((
                 Some("http://127.0.0.1:8080".to_owned()),
-                Some("lfs-cloud.test.yml".into())
+                Some("lfscloud.test.yml".into())
             ))
         );
     }
 
     #[tokio::test]
     async fn dispatches_pull_with_cache_root() {
-        let cli =
-            Cli::try_parse_from(["lfs-cloud", "pull", "--cache-root", "/tmp/lfs-cloud-cache"])
-                .expect("pull command should parse");
+        let cli = Cli::try_parse_from(["lfscloud", "pull", "--cache-root", "/tmp/lfscloud-cache"])
+            .expect("pull command should parse");
         let captured = Arc::new(Mutex::new(None));
         let captured_for_runner = Arc::clone(&captured);
 
@@ -4024,13 +4021,13 @@ mod tests {
 
         assert_eq!(
             *captured.lock().expect("capture mutex should lock"),
-            Some(Some(PathBuf::from("/tmp/lfs-cloud-cache")))
+            Some(Some(PathBuf::from("/tmp/lfscloud-cache")))
         );
     }
 
     #[tokio::test]
     async fn dispatches_hydrate_with_paths() {
-        let cli = Cli::try_parse_from(["lfs-cloud", "hydrate", "asset/model.bin"])
+        let cli = Cli::try_parse_from(["lfscloud", "hydrate", "asset/model.bin"])
             .expect("hydrate command should parse");
         let captured = Arc::new(Mutex::new(None));
         let captured_for_runner = Arc::clone(&captured);
@@ -4064,7 +4061,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_dehydrate_with_paths() {
-        let cli = Cli::try_parse_from(["lfs-cloud", "dehydrate", "asset/model.bin"])
+        let cli = Cli::try_parse_from(["lfscloud", "dehydrate", "asset/model.bin"])
             .expect("dehydrate command should parse");
         let captured = Arc::new(Mutex::new(None));
         let captured_for_runner = Arc::clone(&captured);
@@ -4099,7 +4096,7 @@ mod tests {
     #[tokio::test]
     async fn dispatches_gc_with_dry_run() {
         let cli =
-            Cli::try_parse_from(["lfs-cloud", "gc", "--dry-run"]).expect("gc command should parse");
+            Cli::try_parse_from(["lfscloud", "gc", "--dry-run"]).expect("gc command should parse");
         let captured = Arc::new(Mutex::new(None));
         let captured_for_runner = Arc::clone(&captured);
 
@@ -4133,9 +4130,9 @@ mod tests {
     #[tokio::test]
     async fn dispatches_migrate_with_global_config() {
         let cli = Cli::try_parse_from([
-            "lfs-cloud",
+            "lfscloud",
             "--config",
-            "lfs-cloud.test.yml",
+            "lfscloud.test.yml",
             "migrate",
             "--server",
             "http://127.0.0.1:8080",
@@ -4172,7 +4169,7 @@ mod tests {
             Some((
                 "http://127.0.0.1:8080".to_owned(),
                 true,
-                Some("lfs-cloud.test.yml".into())
+                Some("lfscloud.test.yml".into())
             ))
         );
     }
@@ -4355,7 +4352,7 @@ mod tests {
             &repo,
             &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
         );
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let mut output = Vec::new();
@@ -4382,7 +4379,7 @@ mod tests {
         .expect("status should pass when every check is ready");
 
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("lfs-cloud status"));
+        assert!(rendered.contains("lfscloud status"));
         assert!(rendered.contains("config     ok"));
         assert!(rendered.contains("repository ok"));
         assert!(rendered.contains("server     ok"));
@@ -4408,7 +4405,7 @@ mod tests {
             &repo,
             &["remote", "add", "origin", "git@github.com:owner/repo.git"],
         );
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let mut output = Vec::new();
@@ -4461,7 +4458,7 @@ mod tests {
             &repo,
             &["remote", "add", "origin", "git@github.com:owner/repo.git"],
         );
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let unsafe_server_url =
@@ -4565,7 +4562,7 @@ mod tests {
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
         write_git_lfs_source_object(&repo, &object, b"migration object already local");
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let mut output = Vec::new();
@@ -4606,7 +4603,7 @@ mod tests {
             "dry-run must not create local cache state"
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("lfs-cloud migrate dry-run"));
+        assert!(rendered.contains("lfscloud migrate dry-run"));
         assert!(rendered.contains("mode: current-checkout"));
         assert!(rendered.contains("scope: current checkout index only"));
         assert!(rendered.contains(
@@ -4742,7 +4739,7 @@ mod tests {
             LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let mut output = Vec::new();
@@ -4810,7 +4807,7 @@ mod tests {
             LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let mut output = Vec::new();
@@ -4888,7 +4885,7 @@ mod tests {
             LfsPointer::new(object).to_pointer_file().as_bytes(),
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let mut output = Vec::new();
@@ -4941,7 +4938,7 @@ mod tests {
             );
         }
         run_git(&repo, &["add", "."]);
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let mut output = Vec::new();
@@ -4995,7 +4992,7 @@ mod tests {
             );
         }
         run_git(&repo, &["add", "."]);
-        let config_path = temp.path().join("lfs-cloud.yml");
+        let config_path = temp.path().join("lfscloud.yml");
         fs::write(&config_path, status_config("http://127.0.0.1:8080"))
             .expect("status config should be written");
         let mut output = Vec::new();
@@ -5124,7 +5121,7 @@ mod tests {
             bytes
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("lfs-cloud pull"));
+        assert!(rendered.contains("lfscloud pull"));
         assert!(rendered.contains("fetched Git LFS objects"));
         assert!(rendered.contains("tracked paths: 1"));
         assert!(rendered.contains("pointers: 1"));
@@ -5188,10 +5185,7 @@ mod tests {
         let repo = temp.path().join("repo");
         let linked = temp.path().join("linked");
         init_git_repo_with_origin(&repo);
-        run_git(
-            &repo,
-            &["config", "user.email", "lfs-cloud@example.invalid"],
-        );
+        run_git(&repo, &["config", "user.email", "lfscloud@example.invalid"]);
         run_git(&repo, &["config", "user.name", "LFS Cloud Test"]);
         let bytes = b"object fetched into common git lfs storage";
         let object = object_for_bytes(bytes);
@@ -5819,10 +5813,7 @@ mod tests {
         let remote = temp.path().join("remote.git");
         init_git_repo_with_origin(&repo);
         run_git(&repo, &["config", "user.name", "LFS Cloud Test"]);
-        run_git(
-            &repo,
-            &["config", "user.email", "lfs-cloud@example.invalid"],
-        );
+        run_git(&repo, &["config", "user.email", "lfscloud@example.invalid"]);
         run_git(&repo, &["lfs", "install", "--local"]);
         run_git(temp.path(), &["init", "--bare", "remote.git"]);
         write_file(
@@ -6047,7 +6038,7 @@ mod tests {
         assert!(layout.object_path(&keep_object).exists());
         assert!(!layout.object_path(&remove_object).exists());
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("lfs-cloud gc"));
+        assert!(rendered.contains("lfscloud gc"));
         assert!(rendered.contains("worktrees: 1 active, 0 unavailable, 0 pruned"));
         assert!(rendered.contains("objects: 1 retained, 0 protected, 1 removed, 0 skipped"));
         assert!(rendered.contains(remove_object.oid.as_hex()));
@@ -6292,7 +6283,7 @@ mod tests {
             *approved.lock().expect("capture mutex should lock"),
             Some((
                 "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs".to_owned(),
-                "lfs-cloud".to_owned(),
+                "lfscloud".to_owned(),
                 "local-lfs-token".to_owned(),
             ))
         );
@@ -6308,7 +6299,7 @@ mod tests {
                     .expect("browser status should be printed")
         );
         assert!(rendered.contains("stored local LFS credential"));
-        assert!(rendered.contains("username: lfs-cloud"));
+        assert!(rendered.contains("username: lfscloud"));
         assert!(!rendered.contains("local-lfs-token"));
     }
 

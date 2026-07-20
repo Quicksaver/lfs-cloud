@@ -324,7 +324,7 @@ impl MigrationStorageUploadOptions {
     /// # Examples
     ///
     /// ```
-    /// use lfs_cloud::MigrationStorageUploadOptions;
+    /// use lfscloud::MigrationStorageUploadOptions;
     ///
     /// let options = MigrationStorageUploadOptions::new(".git/lfs/migration.jsonl")
     ///     .with_max_concurrent_uploads(2);
@@ -1108,7 +1108,7 @@ fn default_migration_upload_checkpoint_path(
 ) -> PathBuf {
     let checkpoint_identity = format!("{storage_provider_id}\0{repository_namespace}");
     let checkpoint_digest = Sha256::digest(checkpoint_identity.as_bytes());
-    let filename = format!("lfs-cloud-migration-upload-{checkpoint_digest:x}.jsonl");
+    let filename = format!("lfscloud-migration-upload-{checkpoint_digest:x}.jsonl");
     availability
         .git_lfs_objects_dir
         .parent()
@@ -6655,7 +6655,7 @@ mod tests {
                 tempfile::tempdir().expect("temporary repository directory should be created");
             let repo = Self { root };
             repo.git(["init", "--initial-branch", "main"]);
-            repo.git(["config", "user.email", "lfs-cloud@example.invalid"]);
+            repo.git(["config", "user.email", "lfscloud@example.invalid"]);
             repo.git(["config", "user.name", "LFS Cloud Test"]);
             repo
         }

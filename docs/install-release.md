@@ -7,10 +7,10 @@ yet.
 ## Prerequisites
 
 - Rust toolchain compatible with the crate's `rust-version`.
-- Git. Historical migration scans with `lfs-cloud migrate --ref ...` or
+- Git. Historical migration scans with `lfscloud migrate --ref ...` or
   `--all-refs` require Git 2.40.0 or newer because they evaluate attributes with
   `git check-attr --source`. Current-checkout planning does not use that option.
-- Git LFS for `lfs-cloud pull` and migration source-fetch steps. Read-only
+- Git LFS for `lfscloud pull` and migration source-fetch steps. Read-only
   migration planning can still report repository config without fetching, but
   fetching missing source objects depends on `git lfs fetch`.
 - `cargo-audit` 0.22.2 for local RustSec scans. Install the same pinned version
@@ -62,7 +62,7 @@ Run the CLI from the workspace:
 
 ```bash
 cargo run -- --help
-cargo run -- serve --config ./lfs-cloud.yml
+cargo run -- serve --config ./lfscloud.yml
 ```
 
 ## Release Build
@@ -71,7 +71,7 @@ Build the optimized binary:
 
 ```bash
 cargo build --release
-./target/release/lfs-cloud --help
+./target/release/lfscloud --help
 ```
 
 For a local PATH install from this checkout:
@@ -83,7 +83,7 @@ cargo install --path .
 ## Expected Release Artifact
 
 Until packaging is implemented, the expected artifact is the compiled
-`lfs-cloud` binary plus documentation for:
+`lfscloud` binary plus documentation for:
 
 - supported platform and architecture
 - config file schema
