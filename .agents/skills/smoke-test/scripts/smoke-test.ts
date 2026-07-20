@@ -7,6 +7,7 @@ import { type AddressInfo, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import dotenv from 'dotenv';
 
 type CommandOptions = {
   cwd?: string;
@@ -30,11 +31,17 @@ type SmokeTest = {
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = resolve(dirname(scriptPath), '../../../..');
+dotenv.config({ path: join(repoRoot, '.env.local'), quiet: true });
 const throwawayRoot = resolve(process.env.LFS_CLOUD_SMOKE_THROWAWAY ?? join(homedir(), 'Sites', 'throwaway'));
 const targetDir = join(repoRoot, 'target');
 const binaryPath = join(targetDir, 'debug', 'lfs-cloud');
 const commandOutputLimit = 4 * 1024 * 1024;
 const defaultTimeoutMs = 15 * 60 * 1000;
+const githubCredentialEnv = 'LFS_CLOUD_GITHUB_TOKEN';
+const driveCredentialEnvs = [
+  'LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON',
+  'LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_FILE',
+] as const;
 
 let sandbox = '';
 let currentChild: ChildProcess | undefined;
@@ -148,8 +155,8 @@ function baseEnv(): NodeJS.ProcessEnv {
   };
 }
 
-async function script(name: string, timeoutMs = defaultTimeoutMs): Promise<void> {
-  await command('bash', [join(repoRoot, 'scripts', 'manual', name)], { timeoutMs });
+async function script(name: string, timeoutMs = defaultTimeoutMs, env: NodeJS.ProcessEnv = {}): Promise<void> {
+  await command('bash', [join(repoRoot, 'scripts', 'manual', name)], { env, timeoutMs });
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -332,6 +339,18 @@ function enabledFlag(name: string, description: string): () => string | undefine
   return () => (isEnabled(process.env[name]) ? undefined : `${description}; set ${name}=1 to enable`);
 }
 
+function hasCredential(name: string): boolean {
+  return (process.env[name]?.trim().length ?? 0) > 0;
+}
+
+function hasDriveCredential(): boolean {
+  return driveCredentialEnvs.some(hasCredential);
+}
+
+function missingCredential(available: () => boolean, description: string): () => string | undefined {
+  return () => (available() ? undefined : description);
+}
+
 function tests(): SmokeTest[] {
   return [
     {
@@ -416,21 +435,30 @@ function tests(): SmokeTest[] {
     },
     {
       name: 'GitHub disposable repository',
-      skip: enabledFlag('LFS_CLOUD_RUN_GITHUB_INTEGRATION', 'requires disposable-capable GitHub credentials'),
-      run: () => script('verify-github-integration.sh', 30 * 60 * 1000),
+      skip: missingCredential(() => hasCredential(githubCredentialEnv), `requires ${githubCredentialEnv}`),
+      run: () =>
+        script('verify-github-integration.sh', 30 * 60 * 1000, {
+          LFS_CLOUD_RUN_GITHUB_INTEGRATION: '1',
+        }),
     },
     {
       name: 'Google Drive disposable folder',
-      skip: enabledFlag('LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION', 'requires disposable Google Drive credentials'),
-      run: () => script('verify-google-drive-integration.sh', 30 * 60 * 1000),
+      skip: missingCredential(hasDriveCredential, `requires ${driveCredentialEnvs.join(' or ')}`),
+      run: () =>
+        script('verify-google-drive-integration.sh', 30 * 60 * 1000, {
+          LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION: '1',
+        }),
     },
     {
       name: 'live GitHub and Drive transfer',
-      skip: enabledFlag(
-        'LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION',
-        'requires disposable GitHub and Google Drive credentials',
+      skip: missingCredential(
+        () => hasCredential(githubCredentialEnv) && hasDriveCredential(),
+        `requires ${githubCredentialEnv} and ${driveCredentialEnvs.join(' or ')}`,
       ),
-      run: () => script('verify-live-provider-transfer.sh', 45 * 60 * 1000),
+      run: () =>
+        script('verify-live-provider-transfer.sh', 45 * 60 * 1000, {
+          LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION: '1',
+        }),
     },
   ];
 }

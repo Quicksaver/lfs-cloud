@@ -13,6 +13,7 @@
     "merge": "./scripts/git/merge.sh"
   },
   "devDependencies": {
+    "dotenv": "^17.4.2",
     "prettier": "^3.8.3"
   }
 }
