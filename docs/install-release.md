@@ -57,8 +57,11 @@ coverage, so Windows exercises the same recursive termination boundary as Unix.
 
 Pull requests run the complete local smoke coverage without repository secrets.
 On pushes and manual runs, the GitHub, Google Drive, and black-box Git LFS checks
-also run when `LFS_CLOUD_GITHUB_TOKEN` and
-`LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON` are configured as repository secrets.
+also run when `LFS_CLOUD_GITHUB_TOKEN` and the three Google Drive OAuth values
+`LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID`, `LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET`, and
+`LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN` are configured as repository secrets.
+The live-test boundary combines those values into the provider credential JSON;
+CI does not require one composite JSON secret.
 
 The separate dependency-audit workflow installs the repository-pinned
 `cargo-audit` version and fails when the locked Rust graph contains an

@@ -21,16 +21,15 @@ if [[ -z "${LFS_CLOUD_GITHUB_TOKEN:-}" ]]; then
   exit 1
 fi
 
-if [[ -z "${LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON:-}" ]]; then
-  if [[ -z "${LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_FILE:-}" ]]; then
-    echo "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON or LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_FILE is required" >&2
-    echo "Provide flat OAuth JSON with client_id, client_secret, refresh_token, and optional token_uri." >&2
+for credential_env in \
+  LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID \
+  LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET \
+  LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN; do
+  if [[ -z "${!credential_env:-}" ]]; then
+    echo "$credential_env is required" >&2
     exit 1
   fi
-
-  LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON="$(<"${LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_FILE}")"
-  export LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON
-fi
+done
 
 cargo test --test external_integrations black_box_git_lfs_push_fetch_uses_live_github_and_drive -- --ignored --exact
 

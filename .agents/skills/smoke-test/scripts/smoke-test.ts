@@ -45,8 +45,9 @@ const commandOutputLimit = 4 * 1024 * 1024;
 const defaultTimeoutMs = 15 * 60 * 1000;
 const githubCredentialEnv = 'LFS_CLOUD_GITHUB_TOKEN';
 const driveCredentialEnvs = [
-  'LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON',
-  'LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_FILE',
+  'LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID',
+  'LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET',
+  'LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN',
 ] as const;
 
 let sandbox = '';
@@ -350,7 +351,7 @@ function hasCredential(name: string): boolean {
 }
 
 function hasDriveCredential(): boolean {
-  return driveCredentialEnvs.some(hasCredential);
+  return driveCredentialEnvs.every(hasCredential);
 }
 
 function missingCredential(available: () => boolean, description: string): () => string | undefined {
@@ -461,7 +462,7 @@ function tests(): SmokeTest[] {
     },
     {
       name: 'Google Drive disposable folder',
-      skip: missingCredential(hasDriveCredential, `requires ${driveCredentialEnvs.join(' or ')}`),
+      skip: missingCredential(hasDriveCredential, `requires ${driveCredentialEnvs.join(', ')}`),
       run: () =>
         script('verify-google-drive-integration.sh', 30 * 60 * 1000, {
           LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION: '1',
@@ -471,7 +472,7 @@ function tests(): SmokeTest[] {
       name: 'black-box Git LFS live transfer',
       skip: missingCredential(
         () => hasCredential(githubCredentialEnv) && hasDriveCredential(),
-        `requires ${githubCredentialEnv} and ${driveCredentialEnvs.join(' or ')}`,
+        `requires ${githubCredentialEnv} and ${driveCredentialEnvs.join(', ')}`,
       ),
       run: () =>
         script('verify-live-provider-transfer.sh', 45 * 60 * 1000, {

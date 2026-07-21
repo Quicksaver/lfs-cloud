@@ -40,7 +40,10 @@ const DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 const LIVE_GITHUB_PROVIDER_ID: &str = "github-live";
 const LIVE_DRIVE_PROVIDER_ID: &str = "drive-live";
 const LIVE_OAUTH_CLIENT_SECRET: &str = "live-external-integration-session-key";
-const LIVE_DRIVE_CREDENTIAL_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON";
+const LIVE_DRIVE_CLIENT_ID_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID";
+const LIVE_DRIVE_CLIENT_SECRET_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET";
+const LIVE_DRIVE_REFRESH_TOKEN_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN";
+const LIVE_DRIVE_SERVER_CREDENTIAL_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_LIVE_INTEGRATION";
 
 #[tokio::test]
 #[ignore = "requires LFS_CLOUD_RUN_GITHUB_INTEGRATION=1 and a disposable-capable GitHub token"]
@@ -234,7 +237,7 @@ async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
         env::var("LFS_CLOUD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_owned());
     let github_host = env::var("LFS_CLOUD_GITHUB_HOST")
         .unwrap_or_else(|_| github_host_from_api_url(&github_api_url));
-    let drive_credential_json = required_env(LIVE_DRIVE_CREDENTIAL_ENV);
+    let drive_credential_json = google_drive_credential_json();
     let drive_credential = GoogleDriveCredential::from_json(
         LIVE_DRIVE_PROVIDER_ID,
         "external-live-transfer",
@@ -286,8 +289,11 @@ async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
         &github_host,
         &github_token,
         &repository,
-        &folder,
-        &drive_access_token,
+        LiveDriveFixture {
+            credential_json: &drive_credential_json,
+            folder: &folder,
+            access_token: &drive_access_token,
+        },
     )
     .await;
     let drive_cleanup = delete_drive_file(&client, drive_access_token.as_str(), &folder.id).await;
@@ -302,14 +308,19 @@ async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
     finish_scenario_with_cleanup(scenario, drive_cleanup, github_cleanup)
 }
 
+struct LiveDriveFixture<'a> {
+    credential_json: &'a str,
+    folder: &'a DriveFolder,
+    access_token: &'a GoogleDriveAccessToken,
+}
+
 async fn exercise_black_box_git_lfs_transfer(
     client: &Client,
     github_api_url: &str,
     github_host: &str,
     github_token: &str,
     repository: &GitHubCreatedRepo,
-    folder: &DriveFolder,
-    drive_access_token: &GoogleDriveAccessToken,
+    drive: LiveDriveFixture<'_>,
 ) -> Result<(), String> {
     let test_dir = tempfile::tempdir()
         .map_err(|error| format!("live transfer temp directory should be created: {error}"))?;
@@ -328,7 +339,7 @@ async fn exercise_black_box_git_lfs_transfer(
         github_api_url,
         github_host,
         repository,
-        folder,
+        drive.folder,
     );
     fs::write(
         &config_path,
@@ -374,10 +385,12 @@ async fn exercise_black_box_git_lfs_transfer(
         &config_path,
         &server_stdout,
         &server_stderr,
+        &[(LIVE_DRIVE_SERVER_CREDENTIAL_ENV, drive.credential_json)],
         &[
             github_token,
+            drive.credential_json,
             session.token.as_str(),
-            drive_access_token.as_str(),
+            drive.access_token.as_str(),
         ],
     )?;
     let scenario = async {
@@ -390,7 +403,7 @@ async fn exercise_black_box_git_lfs_transfer(
             &repository_id,
             &github_user,
             &metadata,
-            drive_access_token,
+            drive.access_token,
             &object,
         )
         .await
@@ -432,7 +445,7 @@ fn live_server_config_json(
         "storage_providers": {
             LIVE_DRIVE_PROVIDER_ID: {
                 "type": "google_drive",
-                "credentials_ref": format!("env:{LIVE_DRIVE_CREDENTIAL_ENV}"),
+                "credentials_ref": format!("env:{LIVE_DRIVE_SERVER_CREDENTIAL_ENV}"),
                 "root_folder_id": folder.id,
                 "display_name": folder.name,
             }
@@ -461,6 +474,7 @@ impl LiveServerProcess {
         config_path: &Path,
         stdout_path: &Path,
         stderr_path: &Path,
+        environment: &[(&str, &str)],
         secrets: &[&str],
     ) -> Result<Self, String> {
         let stdout = File::create(stdout_path)
@@ -470,13 +484,18 @@ impl LiveServerProcess {
         let lfscloud_binary = env::var_os("LFS_CLOUD_SMOKE_BINARY")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_lfscloud")));
-        let child = Command::new(lfscloud_binary)
+        let mut command = Command::new(lfscloud_binary);
+        command
             .args(["--config"])
             .arg(config_path)
             .arg("serve")
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::from(stderr));
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let child = command
             .spawn()
             .map_err(|error| format!("compiled lfscloud server should start: {error}"))?;
 
@@ -944,13 +963,64 @@ fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
 }
 
-fn google_drive_credential_json() -> String {
-    if let Ok(contents) = env::var("LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON") {
-        return contents;
-    }
+#[test]
+fn live_drive_credential_json_combines_separate_environment_values() {
+    let credential_json = google_drive_credential_json_with(|name| match name {
+        "LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID" => Some("client-id".to_owned()),
+        "LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET" => Some("client-\"secret".to_owned()),
+        "LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN" => Some("refresh-token".to_owned()),
+        _ => None,
+    })
+    .expect("all three Drive credential values should compose");
+    let credential: Value =
+        serde_json::from_str(&credential_json).expect("composed Drive credential should be JSON");
 
-    let path = required_env("LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_FILE");
-    fs::read_to_string(&path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
+    assert_eq!(credential["client_id"], "client-id");
+    assert_eq!(credential["client_secret"], "client-\"secret");
+    assert_eq!(credential["refresh_token"], "refresh-token");
+}
+
+#[test]
+fn live_drive_credential_json_identifies_each_missing_environment_value() {
+    for missing in [
+        "LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID",
+        "LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET",
+        "LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN",
+    ] {
+        let error = google_drive_credential_json_with(|name| {
+            (name != missing).then(|| format!("value-for-{name}"))
+        })
+        .expect_err("a missing Drive credential value should fail");
+
+        assert_eq!(error, format!("{missing} must be set"));
+        assert!(!error.contains("value-for-"));
+    }
+}
+
+fn google_drive_credential_json() -> String {
+    google_drive_credential_json_with(|name| env::var(name).ok())
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn google_drive_credential_json_with(
+    mut environment: impl FnMut(&str) -> Option<String>,
+) -> Result<String, String> {
+    let client_id = environment(LIVE_DRIVE_CLIENT_ID_ENV)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{LIVE_DRIVE_CLIENT_ID_ENV} must be set"))?;
+    let client_secret = environment(LIVE_DRIVE_CLIENT_SECRET_ENV)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{LIVE_DRIVE_CLIENT_SECRET_ENV} must be set"))?;
+    let refresh_token = environment(LIVE_DRIVE_REFRESH_TOKEN_ENV)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{LIVE_DRIVE_REFRESH_TOKEN_ENV} must be set"))?;
+
+    Ok(json!({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+    })
+    .to_string())
 }
 
 fn disposable_name(prefix: &str) -> String {

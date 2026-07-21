@@ -40,7 +40,9 @@ jobs:
       LFS_CLOUD_SMOKE_BINARY: ${{ github.workspace }}/${{ matrix.binary }}
       LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS: "1"
       LFS_CLOUD_GITHUB_TOKEN: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GITHUB_TOKEN || '' }}
-      LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON || '' }}
+      LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID || '' }}
+      LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET || '' }}
+      LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN || '' }}
 
     steps:
       - name: Check out repository

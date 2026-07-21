@@ -15,11 +15,15 @@ if ! is_enabled "${LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION:-}"; then
   exit 0
 fi
 
-if [[ -z "${LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON:-}" && -z "${LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_FILE:-}" ]]; then
-  echo "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON or LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_FILE is required" >&2
-  echo "Provide flat OAuth JSON with client_id, client_secret, refresh_token, and optional token_uri." >&2
-  exit 1
-fi
+for credential_env in \
+  LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID \
+  LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET \
+  LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN; do
+  if [[ -z "${!credential_env:-}" ]]; then
+    echo "$credential_env is required" >&2
+    exit 1
+  fi
+done
 
 cargo test --test external_integrations google_drive_disposable_folder_root_validation -- --ignored --exact
 
