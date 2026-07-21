@@ -4324,7 +4324,8 @@ mod tests {
                 "configured local Git config\n  path: {}\n  - lfs.url: <unset>\n  + lfs.url: {lfs_url}\n",
                 dunce::canonicalize(repo.path())
                     .expect("repo path should canonicalize")
-                    .join(".git/config")
+                    .join(".git")
+                    .join("config")
                     .display()
             )
         );
@@ -5568,7 +5569,14 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert!(rendered.contains("copied"));
-        assert!(rendered.contains(&Path::new("asset/model.bin").display().to_string()));
+        assert!(
+            rendered.contains(
+                &dunce::canonicalize(&worktree_file)
+                    .expect("worktree file should canonicalize")
+                    .display()
+                    .to_string()
+            )
+        );
         assert!(rendered.contains(object.oid.as_hex()));
     }
 
@@ -5609,7 +5617,14 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("dehydrated"));
         assert!(rendered.contains("cached-and-replaced-with-pointer"));
-        assert!(rendered.contains(&Path::new("asset/model.bin").display().to_string()));
+        assert!(
+            rendered.contains(
+                &dunce::canonicalize(&worktree_file)
+                    .expect("worktree file should canonicalize")
+                    .display()
+                    .to_string()
+            )
+        );
         assert!(rendered.contains(object.oid.as_hex()));
 
         let mut gc_output = Vec::new();
