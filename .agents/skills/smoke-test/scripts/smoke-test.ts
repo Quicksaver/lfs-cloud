@@ -450,7 +450,7 @@ function tests(): SmokeTest[] {
         }),
     },
     {
-      name: 'live GitHub and Drive transfer',
+      name: 'black-box Git LFS live transfer',
       skip: missingCredential(
         () => hasCredential(githubCredentialEnv) && hasDriveCredential(),
         `requires ${githubCredentialEnv} and ${driveCredentialEnvs.join(' or ')}`,

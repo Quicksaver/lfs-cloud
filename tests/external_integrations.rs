@@ -7,8 +7,11 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    fs::File,
+    io::Write,
     net::TcpListener as StdTcpListener,
-    process,
+    path::{Path, PathBuf},
+    process::{self, Child, Command, Output, Stdio},
     str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -17,15 +20,13 @@ use std::{
 use lfscloud::{
     GitHubOAuthAccessToken, GitHubProviderConfig, GitHubRepositoryPermissionClient,
     GitHubUserClient, GoogleDriveAccessToken, GoogleDriveCredential, GoogleDriveRootValidator,
-    GoogleDriveStorageConfig, GoogleDriveTokenRefresher, LFS_BASIC_TRANSFER, LfsBatchAction,
-    LfsBatchHashAlgorithm, LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsObject,
-    LfsObjectSize, LfsOid, LocalLfsSessionStore, MetadataDatabase,
-    MetadataObjectVerificationStatus, RepositoryIdentity, RepositoryPermission, RepositoryUser,
-    ServeOptions, ServerConfig, serve,
+    GoogleDriveStorageConfig, GoogleDriveTokenRefresher, LfsObject, LfsObjectSize, LfsOid,
+    LocalLfsSessionStore, MetadataDatabase, MetadataObjectVerificationStatus, RepositoryIdentity,
+    RepositoryPermission, RepositoryUser, ServerConfig,
 };
 use reqwest::{
     Client, Method, StatusCode,
-    header::{ACCEPT, CONTENT_TYPE, USER_AGENT},
+    header::{ACCEPT, USER_AGENT},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -164,12 +165,12 @@ async fn google_drive_disposable_folder_root_validation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION=1 plus disposable GitHub and Drive credentials"]
-async fn live_server_upload_download_records_drive_and_sqlite_state() {
+async fn black_box_git_lfs_push_fetch_uses_live_github_and_drive() {
     require_enabled("LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION");
 
-    run_live_provider_transfer_scenario()
+    run_black_box_git_lfs_transfer_scenario()
         .await
-        .expect("live provider transfer scenario should pass and clean up its resources");
+        .expect("black-box Git LFS scenario should pass and clean up its resources");
 }
 
 #[test]
@@ -220,7 +221,13 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
     assert_eq!(config.repositories[0].id, repository_id);
 }
 
-async fn run_live_provider_transfer_scenario() -> Result<(), String> {
+async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
+    let git_lfs = Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .map_err(|error| format!("Git LFS prerequisite check should start: {error}"))?;
+    require_command_success(git_lfs, "Git LFS prerequisite check", &[])?;
+
     let github_token = required_env("LFS_CLOUD_GITHUB_TOKEN");
     let github_owner = env::var("LFS_CLOUD_GITHUB_OWNER").ok();
     let github_api_url =
@@ -273,7 +280,7 @@ async fn run_live_provider_transfer_scenario() -> Result<(), String> {
         }
     };
 
-    let scenario = exercise_live_server_transfer(
+    let scenario = exercise_black_box_git_lfs_transfer(
         &client,
         &github_api_url,
         &github_host,
@@ -295,7 +302,7 @@ async fn run_live_provider_transfer_scenario() -> Result<(), String> {
     finish_scenario_with_cleanup(scenario, drive_cleanup, github_cleanup)
 }
 
-async fn exercise_live_server_transfer(
+async fn exercise_black_box_git_lfs_transfer(
     client: &Client,
     github_api_url: &str,
     github_host: &str,
@@ -360,39 +367,38 @@ async fn exercise_live_server_transfer(
     })
     .map_err(|error| format!("durable live LFS session should be issued: {error}"))?;
 
-    let serve_options = ServeOptions::new(Some(config_path), None, None);
-    let server = tokio::spawn(async move { serve(serve_options).await });
-    let scenario = async {
-        wait_for_live_server(port).await?;
-        let batch_url = format!(
-            "{server_url}{}/objects/batch",
-            config.repositories[0].route_path()
-        );
-        transfer_live_object(
-            client,
-            &batch_url,
+    let lfs_url = format!("{server_url}{}", config.repositories[0].route_path());
+    let server_stdout = test_dir.path().join("lfscloud.stdout.log");
+    let server_stderr = test_dir.path().join("lfscloud.stderr.log");
+    let mut server = LiveServerProcess::spawn(
+        &config_path,
+        &server_stdout,
+        &server_stderr,
+        &[
+            github_token,
             session.token.as_str(),
+            drive_access_token.as_str(),
+        ],
+    )?;
+    let scenario = async {
+        wait_for_live_server(port, &mut server).await?;
+        let bytes = b"live Git LFS bytes crossing the compiled LFS Cloud process";
+        let object = lfs_object_for_bytes(bytes)?;
+        git_lfs_push_fetch_round_trip(test_dir.path(), &lfs_url, session.token.as_str(), bytes)?;
+        verify_live_object_storage(
+            client,
             &repository_id,
             &github_user,
             &metadata,
             drive_access_token,
+            &object,
         )
         .await
     }
     .await;
-    let server_finished = server.is_finished();
-    server.abort();
-    let server_result = server.await;
+    let stop = server.stop();
 
-    if server_finished {
-        return match server_result {
-            Ok(Ok(())) => Err("live LFS server exited before the scenario completed".to_owned()),
-            Ok(Err(error)) => Err(format!("live LFS server failed: {error}")),
-            Err(error) => Err(format!("live LFS server task failed: {error}")),
-        };
-    }
-
-    scenario
+    combine_process_result(scenario, stop)
 }
 
 fn live_server_config_json(
@@ -443,36 +449,325 @@ fn live_server_config_json(
     })
 }
 
-async fn transfer_live_object(
-    client: &Client,
-    batch_url: &str,
+struct LiveServerProcess {
+    child: Option<Child>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    secrets: Vec<String>,
+}
+
+impl LiveServerProcess {
+    fn spawn(
+        config_path: &Path,
+        stdout_path: &Path,
+        stderr_path: &Path,
+        secrets: &[&str],
+    ) -> Result<Self, String> {
+        let stdout = File::create(stdout_path)
+            .map_err(|error| format!("live server stdout log should be created: {error}"))?;
+        let stderr = File::create(stderr_path)
+            .map_err(|error| format!("live server stderr log should be created: {error}"))?;
+        let child = Command::new(env!("CARGO_BIN_EXE_lfscloud"))
+            .args(["--config"])
+            .arg(config_path)
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .map_err(|error| format!("compiled lfscloud server should start: {error}"))?;
+
+        Ok(Self {
+            child: Some(child),
+            stdout_path: stdout_path.to_owned(),
+            stderr_path: stderr_path.to_owned(),
+            secrets: secrets.iter().map(|secret| (*secret).to_owned()).collect(),
+        })
+    }
+
+    fn try_wait(&mut self) -> Result<Option<process::ExitStatus>, String> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| "live server process is no longer available".to_owned())?
+            .try_wait()
+            .map_err(|error| format!("live server process status should be readable: {error}"))
+    }
+
+    fn unexpected_exit(&self, status: process::ExitStatus) -> String {
+        let diagnostics = self.diagnostics();
+        if diagnostics.is_empty() {
+            format!("compiled lfscloud server exited unexpectedly with {status}")
+        } else {
+            format!("compiled lfscloud server exited unexpectedly with {status}\n{diagnostics}")
+        }
+    }
+
+    fn diagnostics(&self) -> String {
+        let stdout = fs::read_to_string(&self.stdout_path).unwrap_or_default();
+        let stderr = fs::read_to_string(&self.stderr_path).unwrap_or_default();
+        let combined = format!("server stdout:\n{stdout}\nserver stderr:\n{stderr}");
+        tail_lines(&redact_secrets(&combined, &self.secrets), 80)
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("live server process status should be readable: {error}"))?
+        {
+            return Err(self.unexpected_exit(status));
+        }
+
+        child
+            .kill()
+            .map_err(|error| format!("live server process should stop: {error}"))?;
+        child
+            .wait()
+            .map_err(|error| format!("live server process should be reaped: {error}"))?;
+        Ok(())
+    }
+}
+
+impl Drop for LiveServerProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+struct IsolatedGit {
+    global_config: PathBuf,
+    credential_store: PathBuf,
+    secrets: Vec<String>,
+}
+
+impl IsolatedGit {
+    fn initialize(root: &Path, secrets: &[&str]) -> Result<Self, String> {
+        let git = Self {
+            global_config: root.join("gitconfig"),
+            credential_store: root.join("credentials"),
+            secrets: secrets.iter().map(|secret| (*secret).to_owned()).collect(),
+        };
+        let helper = format!("store --file={}", git.credential_store.display());
+        git.run(None, "isolated Git credential helper setup", |command| {
+            command.args(["config", "--global", "credential.helper", &helper]);
+        })?;
+        git.run(None, "isolated Git path-scoping setup", |command| {
+            command.args(["config", "--global", "credential.useHttpPath", "true"]);
+        })?;
+        Ok(git)
+    }
+
+    fn approve(&self, url: &str, username: &str, password: &str) -> Result<(), String> {
+        if [url, username, password]
+            .iter()
+            .any(|field| field.contains(['\r', '\n']))
+        {
+            return Err("Git credential fixture fields must not contain line breaks".to_owned());
+        }
+        let input = format!("url={url}\nusername={username}\npassword={password}\n\n");
+        let mut command = self.command();
+        command
+            .args(["credential", "approve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("Git credential approval should start: {error}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "Git credential approval stdin should be available".to_owned())?
+            .write_all(input.as_bytes())
+            .map_err(|error| format!("Git credential approval input should be written: {error}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("Git credential approval should finish: {error}"))?;
+        require_command_success(output, "Git credential approval", &self.secrets)?;
+        Ok(())
+    }
+
+    fn run(
+        &self,
+        cwd: Option<&Path>,
+        context: &str,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<Output, String> {
+        let mut command = self.command();
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        configure(&mut command);
+        let output = command
+            .output()
+            .map_err(|error| format!("{context} should start: {error}"))?;
+        require_command_success(output, context, &self.secrets)
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new("git");
+        command
+            .env("GIT_CONFIG_GLOBAL", &self.global_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "Never")
+            .env("LC_ALL", "C")
+            .env("NO_COLOR", "1")
+            .env_remove("GIT_CONFIG_COUNT");
+        command
+    }
+}
+
+fn git_lfs_push_fetch_round_trip(
+    root: &Path,
+    lfs_url: &str,
     session_token: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let bare_remote = root.join("remote.git");
+    let source = root.join("source");
+    let checkout = root.join("checkout");
+    let git = IsolatedGit::initialize(root, &[session_token])?;
+    git.approve(lfs_url, "lfscloud", session_token)?;
+
+    git.run(None, "bare Git remote initialization", |command| {
+        command
+            .args(["init", "--bare", "--initial-branch", "main"])
+            .arg(&bare_remote);
+    })?;
+    git.run(None, "source Git repository initialization", |command| {
+        command
+            .args(["init", "--initial-branch", "main"])
+            .arg(&source);
+    })?;
+    git.run(Some(&source), "source Git remote setup", |command| {
+        command
+            .arg("remote")
+            .arg("add")
+            .arg("origin")
+            .arg(&bare_remote);
+    })?;
+    git.run(Some(&source), "Git test identity setup", |command| {
+        command.args(["config", "user.name", "LFS Cloud Smoke Test"]);
+    })?;
+    git.run(Some(&source), "Git test email setup", |command| {
+        command.args(["config", "user.email", "smoke@example.invalid"]);
+    })?;
+    git.run(
+        Some(&source),
+        "repository-local Git LFS installation",
+        |command| {
+            command.args(["lfs", "install", "--local"]);
+        },
+    )?;
+    git.run(Some(&source), "Git LFS tracking setup", |command| {
+        command.args(["lfs", "track", "assets/*.bin"]);
+    })?;
+    git.run(Some(&source), "repository LFS endpoint setup", |command| {
+        command.args(["config", "--file", ".lfsconfig", "lfs.url", lfs_url]);
+    })?;
+    fs::create_dir_all(source.join("assets"))
+        .map_err(|error| format!("Git LFS fixture directory should be created: {error}"))?;
+    fs::write(source.join("assets/model.bin"), bytes)
+        .map_err(|error| format!("Git LFS fixture bytes should be written: {error}"))?;
+    git.run(Some(&source), "Git LFS fixture staging", |command| {
+        command.args(["add", ".gitattributes", ".lfsconfig", "assets/model.bin"]);
+    })?;
+    git.run(Some(&source), "Git LFS fixture commit", |command| {
+        command.args(["commit", "-m", "Add live LFS fixture"]);
+    })?;
+    git.run(Some(&source), "Git push with Git LFS pre-push", |command| {
+        command.args(["push", "origin", "HEAD:refs/heads/main"]);
+    })?;
+
+    git.run(None, "pointer-only Git clone", |command| {
+        command
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .args(["clone", "--branch", "main"])
+            .arg(&bare_remote)
+            .arg(&checkout);
+    })?;
+    git.run(
+        Some(&checkout),
+        "checkout-local Git LFS installation",
+        |command| {
+            command.args(["lfs", "install", "--local"]);
+        },
+    )?;
+    git.run(
+        Some(&checkout),
+        "Git LFS download through LFS Cloud",
+        |command| {
+            command.args(["lfs", "pull"]);
+        },
+    )?;
+    let downloaded = fs::read(checkout.join("assets/model.bin"))
+        .map_err(|error| format!("downloaded Git LFS fixture should be readable: {error}"))?;
+    require_equal(downloaded.as_slice(), bytes, "downloaded Git LFS bytes")
+}
+
+fn require_command_success(
+    output: Output,
+    context: &str,
+    secrets: &[String],
+) -> Result<Output, String> {
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = redact_secrets(&format!("stdout:\n{stdout}\nstderr:\n{stderr}"), secrets);
+    Err(format!(
+        "{context} failed with {}\n{}",
+        output.status,
+        tail_lines(&detail, 80)
+    ))
+}
+
+fn redact_secrets(value: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(value.to_owned(), |sanitized, secret| {
+        if secret.is_empty() {
+            sanitized
+        } else {
+            sanitized.replace(secret, "[redacted]")
+        }
+    })
+}
+
+fn tail_lines(value: &str, limit: usize) -> String {
+    let lines = value.lines().collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(limit)..].join("\n")
+}
+
+fn combine_process_result(
+    scenario: Result<(), String>,
+    stop: Result<(), String>,
+) -> Result<(), String> {
+    match (scenario, stop) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(stop_error)) => {
+            Err(format!("{error}; server cleanup also failed: {stop_error}"))
+        }
+    }
+}
+
+async fn verify_live_object_storage(
+    client: &Client,
     repository_id: &str,
     github_user: &RepositoryUser,
     metadata: &MetadataDatabase,
     drive_access_token: &GoogleDriveAccessToken,
+    object: &LfsObject,
 ) -> Result<(), String> {
-    let bytes = b"live GitHub-authorized LFS bytes stored and read through Google Drive";
-    let object = lfs_object_for_bytes(bytes)?;
-    let upload = request_batch_action(
-        client,
-        batch_url,
-        session_token,
-        LfsBatchOperation::Upload,
-        &object,
-        "upload",
-    )
-    .await?;
-    let upload_response = action_request(client, Method::PUT, &upload)
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(bytes.as_slice().to_vec())
-        .send()
-        .await
-        .map_err(|error| format!("live LFS upload request should complete: {error}"))?;
-    require_status(upload_response, StatusCode::OK, "live LFS upload").await?;
-
     let record = metadata
-        .lookup_object(repository_id, LIVE_DRIVE_PROVIDER_ID, &object)
+        .lookup_object(repository_id, LIVE_DRIVE_PROVIDER_ID, object)
         .map_err(|error| format!("live upload metadata lookup should succeed: {error}"))?
         .ok_or_else(|| "live upload should record an SQLite object row".to_owned())?;
     require_equal(
@@ -509,101 +804,6 @@ async fn transfer_live_object(
         &drive_metadata.app_properties,
         "lfsCloudSize",
         &object.size.bytes().to_string(),
-    )?;
-
-    let download = request_batch_action(
-        client,
-        batch_url,
-        session_token,
-        LfsBatchOperation::Download,
-        &object,
-        "download",
-    )
-    .await?;
-    let response = action_request(client, Method::GET, &download)
-        .send()
-        .await
-        .map_err(|error| format!("live LFS download request should complete: {error}"))?;
-    if response.status() != StatusCode::OK {
-        return Err(response_error("live LFS download", response).await);
-    }
-    let downloaded = response
-        .bytes()
-        .await
-        .map_err(|error| format!("live LFS download body should be readable: {error}"))?;
-    require_equal(
-        downloaded.as_ref(),
-        bytes.as_slice(),
-        "downloaded object bytes",
-    )
-}
-
-async fn request_batch_action(
-    client: &Client,
-    batch_url: &str,
-    session_token: &str,
-    operation: LfsBatchOperation,
-    object: &LfsObject,
-    action_name: &str,
-) -> Result<LfsBatchAction, String> {
-    let request = LfsBatchRequest {
-        operation,
-        transfers: vec![LFS_BASIC_TRANSFER.to_owned()],
-        ref_context: None,
-        hash_algo: LfsBatchHashAlgorithm::Sha256,
-        objects: vec![object.clone()],
-    };
-    let response = client
-        .post(batch_url)
-        .header(ACCEPT, "application/vnd.git-lfs+json")
-        .header(CONTENT_TYPE, "application/vnd.git-lfs+json")
-        .bearer_auth(session_token)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|error| format!("live LFS {action_name} batch should complete: {error}"))?;
-    if response.status() != StatusCode::OK {
-        return Err(response_error(&format!("live LFS {action_name} batch"), response).await);
-    }
-    let response: LfsBatchResponse = response
-        .json()
-        .await
-        .map_err(|error| format!("live LFS {action_name} batch JSON should decode: {error}"))?;
-    require_equal(
-        response.transfer.as_str(),
-        LFS_BASIC_TRANSFER,
-        "batch transfer",
-    )?;
-    let mut objects = response.objects.into_iter();
-    let object_response = objects
-        .next()
-        .ok_or_else(|| format!("live LFS {action_name} batch should return one object"))?;
-    if objects.next().is_some() {
-        return Err(format!(
-            "live LFS {action_name} batch returned extra objects"
-        ));
-    }
-    if let Some(error) = object_response.error {
-        return Err(format!(
-            "live LFS {action_name} batch returned object error {}: {}",
-            error.code, error.message
-        ));
-    }
-    object_response
-        .actions
-        .get(action_name)
-        .cloned()
-        .ok_or_else(|| format!("live LFS batch should advertise a {action_name} action"))
-}
-
-fn action_request(
-    client: &Client,
-    method: Method,
-    action: &LfsBatchAction,
-) -> reqwest::RequestBuilder {
-    action.header.iter().fold(
-        client.request(method, &action.href),
-        |request, (name, value)| request.header(name.as_str(), value.as_str()),
     )
 }
 
@@ -645,7 +845,7 @@ fn available_loopback_port() -> Result<u16, String> {
         .map_err(|error| format!("temporary loopback port should resolve: {error}"))
 }
 
-async fn wait_for_live_server(port: u16) -> Result<(), String> {
+async fn wait_for_live_server(port: u16, server: &mut LiveServerProcess) -> Result<(), String> {
     for _ in 0..600 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -653,31 +853,20 @@ async fn wait_for_live_server(port: u16) -> Result<(), String> {
         {
             return Ok(());
         }
+        if let Some(status) = server.try_wait()? {
+            return Err(server.unexpected_exit(status));
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    Err("live LFS server did not become ready within 60 seconds".to_owned())
-}
-
-async fn require_status(
-    response: reqwest::Response,
-    expected: StatusCode,
-    context: &str,
-) -> Result<(), String> {
-    if response.status() == expected {
-        Ok(())
+    let diagnostics = server.diagnostics();
+    if diagnostics.is_empty() {
+        Err("compiled lfscloud server did not become ready within 60 seconds".to_owned())
     } else {
-        Err(response_error(context, response).await)
+        Err(format!(
+            "compiled lfscloud server did not become ready within 60 seconds\n{diagnostics}"
+        ))
     }
-}
-
-async fn response_error(context: &str, response: reqwest::Response) -> String {
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable body>".to_owned());
-    format!("{context} failed with HTTP {status}: {body}")
 }
 
 fn require_property(

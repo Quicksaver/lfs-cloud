@@ -32,6 +32,6 @@ if [[ -z "${LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON:-}" ]]; then
   export LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON
 fi
 
-cargo test --test external_integrations live_server_upload_download_records_drive_and_sqlite_state -- --ignored --exact
+cargo test --test external_integrations black_box_git_lfs_push_fetch_uses_live_github_and_drive -- --ignored --exact
 
-echo "Live GitHub-authorized Google Drive transfer integration check passed"
+echo "Black-box Git LFS transfer through the compiled LFS Cloud server passed"

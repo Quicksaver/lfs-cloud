@@ -578,9 +578,10 @@ This repository currently contains planning documents, project configuration, a 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
 
 The gated full-provider transfer check goes beyond the standalone permission
-and root-folder probes: it starts the production server with disposable
-GitHub and Google Drive resources, exercises upload and download actions,
-verifies private Drive properties plus SQLite object metadata and byte
-integrity, and cleans up both resources. Run it through
+and root-folder probes: it launches the compiled server with disposable GitHub
+and Google Drive resources, pushes from a disposable bare Git remote through
+the real Git LFS pre-push hook, clones pointer-only, pulls the object through
+LFS Cloud, verifies private Drive properties plus SQLite object metadata and
+checkout byte integrity, and cleans up both provider resources. Run it through
 `scripts/manual/verify-live-provider-transfer.sh` with the required provider
 credentials.

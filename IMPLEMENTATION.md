@@ -1470,10 +1470,12 @@ Defer:
 > local binary and release-artifact expectations. Gated external integration
 > checks now cover disposable GitHub repository permission validation,
 > disposable Google Drive folder root validation, and a GitHub-authorized
-> production server upload/download through Google Drive. The full transfer
-> scenario verifies private Drive object properties, durable SQLite metadata,
-> downloaded byte integrity, and provider-resource cleanup when explicitly
-> enabled with real credentials.
+> black-box transfer through the compiled server and real Git LFS client. The
+> full transfer scenario keeps normal Git transport in a disposable bare
+> repository while GitHub authorizes every LFS operation, uploads and downloads
+> LFS bytes through Google Drive, verifies private Drive object properties,
+> durable SQLite metadata, checkout byte integrity, and provider-resource
+> cleanup when explicitly enabled with real credentials.
 
 ### Progress Summary
 

@@ -21,4 +21,5 @@ Follow these rules:
 - Leave general temporary-directory tests in the system temp location so they do not inherit `throwaway` Git state.
 - Create linked worktrees only for behavior that specifically depends on multiple worktrees.
 - Enable GitHub and Drive checks when their credentials are present. Enable LAN checks with their explicit flag and config.
+- Use the compiled server and real Git LFS client for the live provider transfer.
 - Report every failure and the final summary. Do not rerun individual tests unless diagnosing a failure.
