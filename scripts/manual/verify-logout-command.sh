@@ -62,13 +62,24 @@ server.handle_request()
 PY
 server_pid="$!"
 
-for _ in {1..100}; do
-  [[ -s "$port_file" ]] && break
-  sleep 0.05
+port=""
+for _ in $(seq 1 300); do
+  if [[ -s "$port_file" ]]; then
+    port="$(cat "$port_file" 2>/dev/null || true)"
+    [[ "$port" =~ ^[0-9]+$ ]] && break
+  fi
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    wait "$server_pid" || true
+    server_pid=""
+    echo "test HTTP server exited before reporting a port" >&2
+    exit 1
+  fi
+  sleep 0.1
 done
-[[ -s "$port_file" ]]
-
-port="$(cat "$port_file")"
+if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+  echo "test HTTP server did not report a port" >&2
+  exit 1
+fi
 server_url="http://127.0.0.1:$port"
 lfs_url="$server_url/github.com/owner/repo.git/info/lfs"
 
