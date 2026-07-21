@@ -574,7 +574,10 @@ impl IsolatedGit {
             credential_store: root.join("credentials"),
             secrets: secrets.iter().map(|secret| (*secret).to_owned()).collect(),
         };
-        let helper = format!("store --file={}", git.credential_store.display());
+        // Git evaluates helper values as shell snippets, including under Git
+        // Bash on Windows, where unescaped backslashes would be consumed.
+        let helper_path = git.credential_store.to_string_lossy().replace('\\', "/");
+        let helper = format!("store --file={helper_path}");
         git.run(None, "isolated Git credential helper setup", |command| {
             command.args(["config", "--global", "credential.helper", &helper]);
         })?;

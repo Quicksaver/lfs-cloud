@@ -96,8 +96,8 @@ git -C "$repo_dir" lfs push lfs-verifier HEAD
 cmp "$payload_file" "$tmp_dir/lfs-remote.git/lfs/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
 
 grep -F "hydrated" "$tmp_dir/hydrate-output" >/dev/null
-grep -F "asset/model.bin" "$tmp_dir/hydrate-output" >/dev/null
+tr '\\' '/' <"$tmp_dir/hydrate-output" | grep -F "asset/model.bin" >/dev/null
 grep -F "dehydrated" "$tmp_dir/dehydrate-output" >/dev/null
-grep -F "asset/model.bin" "$tmp_dir/dehydrate-output" >/dev/null
+tr '\\' '/' <"$tmp_dir/dehydrate-output" | grep -F "asset/model.bin" >/dev/null
 
 echo "lfscloud hydrate/dehydrate and Git LFS push verified"

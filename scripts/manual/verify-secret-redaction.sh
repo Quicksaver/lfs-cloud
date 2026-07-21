@@ -7,7 +7,6 @@ redaction_tests=(
   "cli::tests::init_summary_redacts_sensitive_previous_lfs_url"
   "cli::tests::status_redacts_unsafe_server_override_before_route_validation"
   "cli::tests::status_reports_failures_without_leaking_credential_secrets"
-  "credentials::tests::approve_failure_redacts_token_from_command_error"
   "credentials::tests::command_stderr_redacts_token_before_truncating"
   "credentials::tests::lookup_failure_suppresses_helper_stderr"
   "credentials::tests::lookup_rejects_invalid_local_lfs_tokens_without_leaking_them"
@@ -26,6 +25,13 @@ redaction_tests=(
   "server::tests::server_tracing_events_never_render_request_or_provider_secrets"
   "sessions::tests::session_token_validates_restored_secret_and_redacts_debug"
 )
+
+# This regression uses a Unix shell fixture and is not compiled into Windows
+# test binaries. Keep requiring it on every target where cfg(unix) includes it.
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) ;;
+  *) redaction_tests+=("credentials::tests::approve_failure_redacts_token_from_command_error") ;;
+esac
 
 available_tests="$(cargo test --all-targets -- --list)"
 
