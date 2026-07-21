@@ -1281,15 +1281,23 @@ repositories:
 
     #[test]
     fn rejects_removed_github_oauth_fields() {
-        let contents = valid_yaml().replace(
-            "    personal_access_token: ${GITHUB_PAT}",
-            "    oauth_client_id: client-id\n    oauth_client_secret: client-secret",
-        );
-        let error = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", test_env)
-            .expect_err("removed GitHub OAuth fields should be rejected");
+        for (key, value) in [
+            ("oauth_client_id", "client-id"),
+            ("oauth_client_secret", "client-secret"),
+        ] {
+            let contents = valid_yaml().replace(
+                "    personal_access_token: ${GITHUB_PAT}",
+                &format!("    personal_access_token: ${{GITHUB_PAT}}\n    {key}: {value}"),
+            );
+            let error = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", test_env)
+                .expect_err("removed GitHub OAuth field should be rejected");
 
-        assert!(matches!(error, ServerError::ConfigParse { .. }));
-        assert!(error.to_string().contains("oauth_client_id"));
+            assert!(matches!(error, ServerError::ConfigParse { .. }));
+            assert!(
+                error.to_string().contains(key),
+                "unexpected diagnostic for {key}: {error}"
+            );
+        }
     }
 
     #[test]
