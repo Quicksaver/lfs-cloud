@@ -63,6 +63,17 @@ also run when `LFS_CLOUD_GITHUB_TOKEN` and the three Google Drive OAuth values
 The live-test boundary combines those values into the provider credential JSON;
 CI does not require one composite JSON secret.
 
+Rotate the local smoke-test values and matching GitHub repository secrets with:
+
+```bash
+yarn rotate:github
+yarn rotate:google-drive
+```
+
+The scripts read hidden terminal input, update the existing keys in the ignored
+root `.env.local`, and sync them to the repository resolved from the `origin`
+remote. Leaving a prompt empty retains and re-syncs its current local value.
+
 The separate dependency-audit workflow installs the repository-pinned
 `cargo-audit` version and fails when the locked Rust graph contains an
 applicable RustSec vulnerability. It runs for dependency changes on pull

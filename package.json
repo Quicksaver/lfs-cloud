@@ -10,7 +10,9 @@
     "lint:check": "yarn lint:prettier",
     "lint:fix": "yarn lint:prettier --write",
     "lint:prettier": "prettier --log-level=warn --check .",
-    "merge": "./scripts/git/merge.sh"
+    "merge": "./scripts/git/merge.sh",
+    "rotate:github": "./scripts/keys/github.sh",
+    "rotate:google-drive": "./scripts/keys/google-drive.sh"
   },
   "devDependencies": {
     "dotenv": "^17.4.2",
