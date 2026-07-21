@@ -3377,12 +3377,13 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
     use std::{
         fs, io,
         path::{Path, PathBuf},
         process::Command as ProcessCommand,
         sync::{Arc, Mutex},
-        time::{Duration, Instant},
     };
 
     use clap::{CommandFactory, Parser};
@@ -3395,11 +3396,13 @@ mod tests {
         SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
         current_checkout_lfs_pointer_scan, dispatch, is_git_worktree_discovery_error,
         login_url_for_server, probe_server_reachable, read_bounded_login_token,
-        read_hidden_login_token, run_bounded_child_command, run_dehydrate_from_dir,
-        run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir, run_login_from_dir,
-        run_logout_from_dir, run_migrate_from_dir, run_pull_from_dir, run_status_from_dir,
-        spawn_browser_launcher, tracing_config, validate_status_storage, write_init_change,
+        read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir,
+        run_init_from_dir, run_login_from_dir, run_logout_from_dir, run_migrate_from_dir,
+        run_pull_from_dir, run_status_from_dir, tracing_config, validate_status_storage,
+        write_init_change,
     };
+    #[cfg(unix)]
+    use super::{run_bounded_child_command, spawn_browser_launcher};
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig,

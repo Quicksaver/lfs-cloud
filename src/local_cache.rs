@@ -2308,7 +2308,7 @@ fn remap_integrity_path<T>(result: LocalCacheResult<T>, public_path: &Path) -> L
 }
 
 fn replace_retaining_displaced<F>(
-    mut temp: tempfile::NamedTempFile,
+    temp: tempfile::NamedTempFile,
     destination_path: &Path,
     verify_displaced: F,
 ) -> LocalCacheResult<()>
@@ -2317,6 +2317,7 @@ where
 {
     #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
     {
+        let mut temp = temp;
         exchange_paths(temp.path(), destination_path).map_err(|source| LocalCacheError::Io {
             context: "failed to atomically exchange worktree content",
             path: destination_path.to_path_buf(),
@@ -2378,8 +2379,8 @@ fn existing_file_mode(path: &Path) -> LocalCacheResult<u32> {
 }
 
 #[cfg(not(unix))]
-fn existing_file_mode(_path: &Path) -> LocalCacheResult<()> {
-    Ok(())
+fn existing_file_mode(_path: &Path) -> LocalCacheResult<u32> {
+    Ok(0)
 }
 
 #[cfg(unix)]
@@ -2403,7 +2404,7 @@ fn set_temporary_file_mode(
 fn set_temporary_file_mode(
     _temp_path: &Path,
     _destination_path: &Path,
-    _mode: (),
+    _mode: u32,
 ) -> LocalCacheResult<()> {
     Ok(())
 }

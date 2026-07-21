@@ -1198,16 +1198,18 @@ fn wait_for_git_command_output(
 }
 
 fn git_command(git_program: &Path) -> Command {
-    let mut command = Command::new(git_program);
+    let command = Command::new(git_program);
     #[cfg(unix)]
-    {
+    let command = {
         use std::os::unix::process::CommandExt;
 
         // Git may invoke credential helpers that fork. A dedicated process
         // group gives the command boundary deterministic ownership of those
         // descendants even after the direct Git child has exited.
+        let mut command = command;
         command.process_group(0);
-    }
+        command
+    };
     command
 }
 
@@ -1580,19 +1582,22 @@ fn command_status_text(status: ExitStatus) -> String {
 mod tests {
     use std::{
         fs,
-        path::Path,
         process::{Command, Stdio},
         thread,
-        time::{Duration, Instant},
+        time::Duration,
     };
+    #[cfg(unix)]
+    use std::{path::Path, time::Instant};
 
+    #[cfg(unix)]
+    use super::wait_for_git_command_output;
     use super::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, GitCredentialLookup,
         GitCredentialRejection, MAX_COMMAND_STDERR_LEN, MAX_CREDENTIAL_FIELD_LEN,
         MAX_CREDENTIAL_OUTPUT_LEN, MAX_RETAINED_COMMAND_STDERR_LEN, git_command,
         git_config_output_has_helper, git_credential_helper_fallback_instructions,
         parse_git_credential_fill_output, retain_stderr_data, retain_stdout_data,
-        sanitize_command_stderr, wait_for_git_command_output, wait_for_git_command_timeout,
+        sanitize_command_stderr, wait_for_git_command_timeout,
     };
     use crate::{CliError, LfsSessionToken};
 

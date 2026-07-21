@@ -57,7 +57,7 @@ impl GitRepository {
         let remote_url = git_stdout(
             start_dir,
             ["remote", "get-url", remote_name.as_str()],
-            &format!("git remote get-url {}", remote_name),
+            &format!("git remote get-url {remote_name}"),
         )?;
 
         Ok(Self {
@@ -702,7 +702,9 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::TempDir;
 
-    use super::{GitLfsConfigTarget, GitRemote, GitRepository, redacted_url_for_display};
+    #[cfg(unix)]
+    use super::GitLfsConfigTarget;
+    use super::{GitRemote, GitRepository, redacted_url_for_display};
     use crate::CliError;
 
     proptest! {
