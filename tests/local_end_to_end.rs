@@ -85,7 +85,7 @@ async fn real_git_lfs_push_fetch_and_checkout_cross_the_tcp_boundary() {
     let bare_remote = tempfile::tempdir().expect("bare remote tempdir should be created");
     assert_command_success(
         Command::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "--bare", "--initial-branch=main"])
             .arg(bare_remote.path()),
         "bare Git remote initialization",
     );

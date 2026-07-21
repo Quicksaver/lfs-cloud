@@ -6911,7 +6911,7 @@ repositories:
         let error = match stage_upload_request_body_with_guardrails(
             &LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 .expect("test oid should parse"),
-            None,
+            Some(1),
             request,
             UploadStagingGuardrails {
                 max_upload_bytes: MAX_UPLOAD_OBJECT_BYTES,

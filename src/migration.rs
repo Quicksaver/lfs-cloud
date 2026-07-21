@@ -1616,17 +1616,18 @@ fn run_git_lfs_fetch_command(
     worktree_root: &Path,
     command: &MigrationSourceFetchCommand,
 ) -> MigrationResult<()> {
-    let mut child = Command::new("git")
+    let mut process = Command::new("git");
+    process
         .args(&command.args)
         .current_dir(worktree_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| MigrationError::Io {
-            context: "failed to start git lfs fetch".to_owned(),
-            source,
-        })?;
+        .stderr(Stdio::piped());
+    configure_bounded_git_process_tree(&mut process);
+    let mut child = process.spawn().map_err(|source| MigrationError::Io {
+        context: "failed to start git lfs fetch".to_owned(),
+        source,
+    })?;
     let (status, stderr) = wait_for_git_lfs_fetch_command(
         &mut child,
         &command.display,
@@ -1677,7 +1678,7 @@ fn wait_for_git_lfs_fetch_command(
 }
 
 fn stop_timed_out_git_lfs_fetch_child(child: &mut Child, command: &str) -> MigrationResult<()> {
-    stop_timed_out_git_lfs_fetch_process_tree(child);
+    stop_bounded_git_process_tree(child);
 
     if child
         .try_wait()
@@ -1699,88 +1700,6 @@ fn stop_timed_out_git_lfs_fetch_child(child: &mut Child, command: &str) -> Migra
 
     Ok(())
 }
-
-#[cfg(unix)]
-fn stop_timed_out_git_lfs_fetch_process_tree(child: &Child) {
-    let descendants = collect_git_lfs_fetch_descendant_pids(child.id());
-    for pid in descendants.iter().rev() {
-        signal_process("TERM", *pid);
-    }
-    thread::sleep(Duration::from_millis(50));
-    for pid in descendants.iter().rev() {
-        signal_process("KILL", *pid);
-    }
-}
-
-#[cfg(unix)]
-fn collect_git_lfs_fetch_descendant_pids(root_pid: u32) -> Vec<u32> {
-    let mut descendants = Vec::new();
-    let mut pending = child_pids(root_pid);
-
-    while let Some(pid) = pending.pop() {
-        descendants.push(pid);
-        pending.extend(child_pids(pid));
-    }
-
-    descendants
-}
-
-#[cfg(target_os = "linux")]
-fn child_pids(parent_pid: u32) -> Vec<u32> {
-    let children_path = format!("/proc/{parent_pid}/task/{parent_pid}/children");
-    let Ok(children) = fs::read_to_string(children_path) else {
-        return Vec::new();
-    };
-
-    children
-        .split_whitespace()
-        .filter_map(|pid| pid.parse().ok())
-        .collect()
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn child_pids(parent_pid: u32) -> Vec<u32> {
-    let Ok(output) = Command::new("pgrep")
-        .args(["-P", &parent_pid.to_string()])
-        .stdin(Stdio::null())
-        .output()
-    else {
-        return Vec::new();
-    };
-
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
-}
-
-#[cfg(unix)]
-fn signal_process(signal: &str, pid: u32) {
-    let _ = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(windows)]
-fn stop_timed_out_git_lfs_fetch_process_tree(child: &Child) {
-    let _ = Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn stop_timed_out_git_lfs_fetch_process_tree(_child: &Child) {}
 
 fn join_git_lfs_fetch_stderr_reader(
     reader: thread::JoinHandle<io::Result<PipeReadResult>>,
@@ -4239,6 +4158,7 @@ mod tests {
         StorageDeleteOutcome, StorageError, StorageProvider, StorageResult, StoredObject,
     };
 
+    use super::configure_bounded_git_process_tree;
     use super::{
         GitLfsSourceEndpointSource, LocalMigrationObject, LocalMigrationObjectLocation,
         LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus,
@@ -6299,14 +6219,15 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let marker_path = temp.path().join("descendant-survived");
         let test_executable = std::env::current_exe().expect("test executable should resolve");
-        let mut child = Command::new(test_executable)
+        let mut command = Command::new(test_executable);
+        command
             .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
             .env(PROCESS_TREE_MARKER_ENV, &marker_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("test shell should start");
+            .stderr(Stdio::piped());
+        configure_bounded_git_process_tree(&mut command);
+        let mut child = command.spawn().expect("test shell should start");
 
         let started_at = Instant::now();
         let error = wait_for_git_lfs_fetch_command(

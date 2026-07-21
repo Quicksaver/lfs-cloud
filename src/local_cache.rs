@@ -54,7 +54,7 @@ const WORKTREE_REGISTRY_VERSION: u32 = 2;
 #[cfg(unix)]
 const DEFAULT_MATERIALIZED_FILE_MODE: u32 = 0o600;
 #[cfg(not(unix))]
-const DEFAULT_MATERIALIZED_FILE_MODE: () = ();
+const DEFAULT_MATERIALIZED_FILE_MODE: u32 = 0;
 
 /// Result type for local cache operations.
 pub type LocalCacheResult<T> = Result<T, LocalCacheError>;
@@ -4559,13 +4559,12 @@ mod tests {
         assert!(report.deleted_objects.is_empty());
         assert!(layout.object_path(&referenced).exists());
         assert!(layout.object_path(&unreferenced).exists());
-        assert_eq!(
-            layout
-                .load_worktree_registry()
-                .expect("registry should reload")
-                .worktrees(),
-            &[active_registration, missing_registration]
-        );
+        let registry = layout
+            .load_worktree_registry()
+            .expect("registry should reload");
+        assert_eq!(registry.worktrees().len(), 2);
+        assert!(registry.worktrees().contains(&active_registration));
+        assert!(registry.worktrees().contains(&missing_registration));
     }
 
     #[test]
