@@ -39,7 +39,7 @@ jobs:
       CARGO_TERM_COLOR: never
       LFS_CLOUD_SMOKE_BINARY: ${{ github.workspace }}/${{ matrix.binary }}
       LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS: "1"
-      LFS_CLOUD_GITHUB_TOKEN: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GITHUB_TOKEN || '' }}
+      LFS_CLOUD_GITHUB_PAT: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GITHUB_PAT || '' }}
       LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON || '' }}
 
     steps:

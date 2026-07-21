@@ -21,6 +21,7 @@ Follow these rules:
 - Leave general temporary-directory tests in the system temp location so they do not inherit `throwaway` Git state.
 - Create linked worktrees only for behavior that specifically depends on multiple worktrees.
 - Enable GitHub and Drive checks when their credentials are present. Enable LAN checks with their explicit flag and config.
+- Run GitHub checks when `LFS_CLOUD_GITHUB_PAT` is set. The disposable-resource checks require a classic PAT with `repo` and `delete_repo` scopes.
 - Point `LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR` at the isolated `CLOUDSDK_CONFIG` directory containing `application_default_credentials.json`; Drive checks also require `gcloud` on `PATH`.
 - Use the compiled server and real Git LFS client for the live provider transfer.
 - Set `LFS_CLOUD_SMOKE_BINARY` to smoke an exact prebuilt executable; all CLI verifiers must honor it.

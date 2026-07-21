@@ -15,11 +15,11 @@ if ! is_enabled "${LFS_CLOUD_RUN_GITHUB_INTEGRATION:-}"; then
   exit 0
 fi
 
-if [[ -z "${LFS_CLOUD_GITHUB_TOKEN:-}" ]]; then
-  echo "LFS_CLOUD_GITHUB_TOKEN is required" >&2
-  echo "Use a token that can create and delete disposable repositories, and read collaborator permissions." >&2
+if [[ -z "${LFS_CLOUD_GITHUB_PAT:-}" ]]; then
+  echo "LFS_CLOUD_GITHUB_PAT is required" >&2
   exit 1
 fi
+echo "The PAT must grant repository creation and deletion for disposable smoke resources." >&2
 
 cargo test --test external_integrations github_disposable_repo_permission_check -- --ignored --exact
 

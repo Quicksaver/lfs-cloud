@@ -347,7 +347,7 @@ pub(crate) struct MetadataSessionRecord {
     pub(crate) login: String,
     /// Provider-specific stable user ID.
     pub(crate) stable_id: Option<String>,
-    /// JSON-encoded OAuth scope list.
+    /// JSON-encoded provider permission/scope list.
     pub(crate) granted_scopes_json: String,
     /// Session issue time as Unix seconds.
     pub(crate) issued_at_unix_seconds: i64,
@@ -1825,8 +1825,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: test-client
-    oauth_client_secret: test-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -2458,8 +2457,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: test-client
-    oauth_client_secret: test-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive

@@ -23,7 +23,7 @@ independently validated or adjudicated.
    stable-identity defense; with one valid finding assessed here and no invalid
    finding attributable separately, this was high-quality, relevant feedback.
 
-2. **[DONE] OAuth tokens are not bound to the session user's stable identity**
+2. **[DONE] GitHub tokens are not bound to the session user's stable identity**
    (High, `src/github_auth.rs` and `src/server.rs`): **Valid and actionable.**
    Login already retained GitHub's numeric user ID when present, but accepted
    identity responses without it; repository authorization then used only the
@@ -70,7 +70,7 @@ independently validated or adjudicated.
    `src/server.rs`, `src/init.rs`, `src/cli.rs`, `src/credentials.rs`,
    `src/github_auth.rs`, and `src/google_drive.rs`): **Valid and actionable.**
    The shared transport policy now requires HTTPS or an exact literal IPv4/IPv6
-   loopback address for URLs carrying OAuth, local LFS credentials, provider
+   loopback address for URLs carrying PATs, local LFS credentials, provider
    tokens, or object bytes. Server configuration rejects unsafe public and
    GitHub API URLs by default, and startup rejects a plaintext non-loopback bind
    even when the configured public URL is loopback. Trusted-LAN development is
@@ -78,7 +78,7 @@ independently validated or adjudicated.
    setting and matching `--allow-insecure-http` flags on client commands. Git
    credential approval and lookup independently enforce the same boundary so a
    caller cannot persist or retrieve a local LFS token for an unapproved
-   plaintext endpoint. Default GitHub OAuth/API and Google provider clients no
+   plaintext endpoint. Default GitHub API and Google provider clients no
    longer follow redirects, preventing token-bearing requests from being
    redirected to a downgraded or unrelated endpoint. Configuration, CLI,
    operator documentation, the repository learning, and the LAN smoke verifier
@@ -102,8 +102,8 @@ independently validated or adjudicated.
    authorization. Production now opens a durable session store on the shared
    metadata database, persists only the local token's SHA-256 digest, restores
    unexpired identity/scope/expiry data, and protects the GitHub token with
-   AES-256-GCM using a dedicated key derived from the configured GitHub OAuth
-   client secret. Identity, scopes, and timestamps are authenticated as AEAD
+   AES-256-GCM using a dedicated key derived from the configured GitHub PAT.
+   Identity, scopes, and timestamps are authenticated as AEAD
    associated data, so tampering or a different secret fails restoration
    without exposing either token. Metadata schema version 3 adds the protected
    token fields and durable load/record/delete/prune operations; in-memory
@@ -272,41 +272,18 @@ independently validated or adjudicated.
     and no invalid finding attributable separately, this was high-quality,
     relevant feedback.
 
-12. **[DONE] The OAuth authorization flow omitted PKCE** (Medium,
+12. **[SUPERSEDED] The OAuth authorization flow omitted PKCE** (Medium,
     `src/github_auth.rs`, `README.md`, `IMPLEMENTATION.md`, and `AGENTS.md`):
-    **Valid and actionable.** The browser authorization previously bound the
-    callback only with CSRF state and redirect URI, while code exchange used the
-    client secret but no proof tied to the originating attempt. GitHub's
-    [OAuth App web-flow documentation](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps)
-    strongly recommends S256 PKCE and requires the original verifier at token
-    exchange when a challenge was sent. Each authorization now generates a
-    fresh 32-byte verifier through the `oauth2` crate, sends its 43-character
-    SHA-256 challenge and `S256` method, and transfers exclusive verifier
-    ownership into the digest-keyed pending-state registry before redirecting.
-    Callback admission removes the matching state and verifier together before
-    provider-error handling or code exchange, and the token request includes
-    `code_verifier`; reflected verifier values are redacted with the client
-    secret and authorization code. Regression coverage proves the challenge is
-    derived from the retained verifier, the verifier reaches token exchange,
-    an intercepted code paired with another attempt's state/verifier is denied,
-    the original attempt still succeeds, and its replay is rejected before a
-    second exchange. README and implementation guidance document the PKCE
-    contract, while the repository learning records one-owner attempt state.
-    Verification passed with `cargo fmt`, `yarn lint:fix`,
-    `cargo clippy --all-targets -- -D warnings`, `cargo build`,
-    `cargo test --all-targets`, `cargo test --doc`, and `git diff --check`. The
-    focused reviewer identified a genuine medium-severity authorization-code
-    interception defense gap and prescribed the correct state-bound S256 PKCE
-    lifecycle plus decisive interception/replay tests; with one valid finding
-    assessed here and no invalid finding attributable separately, this was
-    high-quality, security-relevant feedback.
+    This finding applied to the former GitHub browser-login mode. GitHub
+    authentication is now PAT-only, and the authorization-code, callback, CSRF,
+    PKCE, and token-exchange implementation has been removed.
 
 13. **[DONE] Session revocation had no user-facing route or CLI flow** (Medium,
     `src/server.rs`, `src/sessions.rs`, `src/credentials.rs`, and `src/cli.rs`):
     **Valid and actionable.** The session store already supported in-memory and
     durable token revocation, but production exposed no authenticated endpoint
     or CLI command that could invoke it, and a definitively invalid private
-    GitHub token left its local bearer session active. The full server now
+    GitHub PAT left its local bearer session active. The full server now
     mounts authenticated `DELETE /auth/session`, consumes the presented local
     token, and removes both its in-process record and durable SQLite row.
     `lfscloud logout --server` resolves the current repository route, performs
@@ -334,13 +311,13 @@ independently validated or adjudicated.
     was high-quality feedback with one minor outdated detail.
 
 14. **[DONE] Authentication performs a serialized O(n) session scan and clones
-    OAuth-bearing records** (Low, `src/sessions.rs` and `src/server.rs`):
+    PAT-bearing records** (Low, `src/sessions.rs` and `src/server.rs`):
     **Valid and actionable.** Session authentication previously retained every
     map entry while holding the mutex, then deep-cloned the matching record,
-    including its private GitHub OAuth token. Verification now hashes the
+    including its private GitHub PAT. Verification now hashes the
     presented token before taking the lock, performs one direct `BTreeMap`
     entry lookup, removes only that entry when it has expired, and returns an
-    `Arc` to the stored OAuth-bearing record. The authenticated server request
+    `Arc` to the stored PAT-bearing record. The authenticated server request
     carries that same shared record, and revocation likewise removes only the
     presented token instead of scanning unrelated sessions. Full-map expiry
     pruning remains only on session admission and diagnostic length paths,
@@ -415,7 +392,7 @@ independently validated or adjudicated.
 ## Server and metadata
 
 1. **[DONE] Unbounded batches and per-object authorization can amplify into
-   thousands of GitHub, OAuth, and Drive API calls** (High, `src/server.rs`,
+   thousands of GitHub and Drive API calls** (High, `src/server.rs`,
    `src/server_config.rs`, and server configuration documentation): **Valid and
    actionable.** Batch requests now accept at most the configured
    `server.max_batch_objects` entries (100 by default); duplicate entries count
@@ -458,7 +435,7 @@ independently validated or adjudicated.
    size limit while enforcing a 15-second inter-chunk idle timeout and a
    60-second end-to-end deadline; timeout failures return protocol-compatible
    Git LFS JSON with HTTP 408. A process-wide middleware semaphore admits at
-   most `server.max_concurrent_requests` active HTTP requests across OAuth,
+   most `server.max_concurrent_requests` active HTTP requests across login,
    session, batch, and transfer routes (64 by default), rejecting excess work
    immediately with HTTP 503 and `Retry-After: 1` rather than creating an
    unbounded waiter queue. Request admission is the decisive boundary for this
@@ -1151,32 +1128,11 @@ independently validated or adjudicated.
    prerequisite handling; with one valid finding assessed here and no invalid
    finding attributable separately, this was high-quality, relevant feedback.
 
-7. **[DONE] Browser launch during login could block the CLI** (Low,
-   `src/cli.rs`, `README.md`, `IMPLEMENTATION.md`, and `AGENTS.md`): **Valid
-   and actionable.** The platform browser command used synchronous `.output()`,
-   so login could not reach token entry until `open`, `xdg-open`, or `rundll32`
-   exited; some desktop integrations are not required to return after accepting
-   a URL. Browser handoff now bounds foreground work to process creation, gives
-   the launcher null standard streams, places it in an independent Unix process
-   group or Windows detached process group, and reaps it asynchronously without
-   delaying the CLI. Login already printed the OAuth URL before invoking the
-   launcher; regression coverage now fixes that ordering as the reliable
-   fallback, while `--no-open` retains the manual-only path. Success output says
-   that the browser open was requested instead of claiming unobservable browser
-   completion. User and implementation documentation describe the URL fallback
-   and non-blocking contract, and the repository learning records the process
-   boundary. A test-first regression failed before the helper existed and now
-   proves the launcher call returns in under one second while its child remains
-   alive for three seconds. Verification passed with `yarn lint:fix`,
-   `cargo fmt --all -- --check`,
-   `cargo clippy --all-targets -- -D warnings`, `cargo build`,
-   `cargo test --all-targets` (590 passed, 3 ignored), `cargo test --doc`
-   (38 passed), `scripts/manual/verify-login-command.sh`, and
-   `git diff --check`. The focused reviewer identified a genuine low-severity
-   usability and reliability flaw, pinpointed the blocking process boundary,
-   and prescribed both the non-blocking launch and reliable fallback required
-   for a complete repair. With one valid finding assessed here and no invalid
-   finding attributable separately, this was high-quality, relevant feedback.
+7. **[SUPERSEDED] Browser launch during login could block the CLI** (Low,
+   `src/cli.rs`, `README.md`, `IMPLEMENTATION.md`, and `AGENTS.md`): This finding
+   applied to the former GitHub browser-login mode. GitHub authentication is now
+   PAT-only, and the browser launcher, callback flow, URL fallback, and related
+   CLI flags have been removed.
 
 ## Local cache
 
@@ -2151,8 +2107,8 @@ independently validated or adjudicated.
    bypassed by production authorization** (Medium, `src/providers.rs`,
    `src/github_auth.rs`, `src/server.rs`, and provider integration fixtures):
    **Valid and actionable.** The trait previously accepted only a repository
-   identity and user, while production authorization needed the private OAuth
-   token retained by the local session. Production therefore skipped the trait
+   identity and user, while production authorization needed the private PAT
+   retained by the local session. Production therefore skipped the trait
    and constructed `GitHubRepositoryPermissionClient` directly, leaving the
    public provider contract and fake-provider path unable to model the real
    authorization boundary. `RepositoryAuthentication` now carries the stable
@@ -2162,7 +2118,7 @@ independently validated or adjudicated.
    unauthenticated identity-resolution method was removed because private
    repository verification also requires the session credential.
    `GitHubRepositoryProvider` now implements the trait by validating the generic
-   token as a GitHub OAuth token and delegating stable repository, stable user,
+   token as a GitHub PAT and delegating stable repository, stable user,
    and permission checks to the existing GitHub client. Production batch
    composition builds a provider-trait registry from server configuration, so
    normal serving and injected test adapters share the same authorization path.
@@ -2337,7 +2293,7 @@ independently validated or adjudicated.
    request paths, or backend file IDs. A new tracing subscriber regression
    captures the actual formatted event stream across invalid credential,
    request-URL, repository-provider, and storage-provider failures; it verifies
-   the expected events were emitted while OAuth, credential, Drive, URL, and
+   the expected events were emitted while provider-token, credential, Drive, URL, and
    helper sentinel secrets remain absent even when injected error text retains
    them. The manual secret-redaction verifier now includes that regression, and
    the repository learning records the safe server diagnostic boundary.

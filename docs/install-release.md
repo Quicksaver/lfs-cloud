@@ -20,7 +20,7 @@ yet.
 
 For real GitHub and Google Drive operation you also need:
 
-- A GitHub OAuth app with callback URL matching the running server.
+- A GitHub PAT restricted to the repositories served by LFS Cloud.
 - Google Cloud CLI installed for the account running the server.
 - Google ADC generated with a Desktop OAuth client and Drive scope.
 - A Drive folder accessible to the OAuth client with `drive.file` scope.
@@ -57,9 +57,9 @@ suite uses platform-native child processes for timeout and process-tree cleanup
 coverage, so Windows exercises the same recursive termination boundary as Unix.
 
 Pull requests run the complete local smoke coverage without repository secrets.
-On pushes and manual runs, the GitHub, Google Drive, and black-box Git LFS checks
-also run when `LFS_CLOUD_GITHUB_TOKEN` and
-`LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON` are configured as repository secrets. CI
+On pushes and manual runs, live GitHub checks run when
+`LFS_CLOUD_GITHUB_PAT` is configured. The disposable-resource PAT needs classic
+`repo` and `delete_repo` scopes. CI
 writes the ADC JSON to an isolated
 `application_default_credentials.json`, installs `gcloud`, and gives the smoke
 runner only `LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR`, which points to the containing
@@ -125,7 +125,7 @@ release artifact remains the compiled `lfscloud` binary plus documentation for:
 
 - supported platform and architecture
 - config file schema
-- GitHub OAuth setup
+- GitHub PAT setup
 - Google Drive credential setup
 - manual verification scripts that were run
 - known MVP limitations

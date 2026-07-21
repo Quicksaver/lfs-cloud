@@ -431,14 +431,9 @@ impl RepositoryProviderConfig {
                     allow_insecure_http,
                     env,
                 )?,
-                oauth_client_id: resolve_required(
-                    raw.oauth_client_id,
-                    format!("{base_path}.oauth_client_id"),
-                    env,
-                )?,
-                oauth_client_secret: resolve_required(
-                    raw.oauth_client_secret,
-                    format!("{base_path}.oauth_client_secret"),
+                authentication: GitHubAuthenticationConfig::from_raw(
+                    raw.personal_access_token,
+                    &base_path,
                     env,
                 )?,
                 allow_insecure_http,
@@ -458,10 +453,8 @@ pub struct GitHubProviderConfig {
     pub id: String,
     /// GitHub API base URL, such as `https://api.github.com`.
     pub api_url: String,
-    /// OAuth client ID used for GitHub login.
-    pub oauth_client_id: String,
-    /// OAuth client secret used for token exchange.
-    pub oauth_client_secret: String,
+    /// Authentication used to obtain the GitHub identity and API token.
+    pub authentication: GitHubAuthenticationConfig,
     /// Whether non-loopback plaintext HTTP was explicitly enabled.
     pub allow_insecure_http: bool,
 }
@@ -472,9 +465,62 @@ impl fmt::Debug for GitHubProviderConfig {
             .debug_struct("GitHubProviderConfig")
             .field("id", &self.id)
             .field("api_url", &self.api_url)
-            .field("oauth_client_id", &self.oauth_client_id)
-            .field("oauth_client_secret", &RedactedSecret)
+            .field("authentication", &self.authentication)
             .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
+}
+
+/// Personal-access-token authentication configured for one GitHub provider.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitHubAuthenticationConfig {
+    /// Personal access token used for identity and repository API requests.
+    token: String,
+}
+
+impl GitHubAuthenticationConfig {
+    /// Creates GitHub authentication from one personal access token.
+    ///
+    /// This constructor is intended for programmatic configuration and test
+    /// adapters. Server startup validates the token before accepting logins.
+    #[must_use]
+    pub fn new(personal_access_token: impl Into<String>) -> Self {
+        Self {
+            token: personal_access_token.into(),
+        }
+    }
+
+    fn from_raw(
+        personal_access_token: Option<String>,
+        base_path: &str,
+        env: &mut impl FnMut(&str) -> Option<String>,
+    ) -> ServerResult<Self> {
+        let token = resolve_required(
+            personal_access_token,
+            format!("{base_path}.personal_access_token"),
+            env,
+        )?;
+        Ok(Self::new(token))
+    }
+
+    /// Returns the configured personal access token.
+    #[must_use]
+    pub fn personal_access_token(&self) -> &str {
+        &self.token
+    }
+
+    /// Returns the stable secret used to encrypt durable local sessions.
+    #[must_use]
+    pub(crate) fn session_encryption_secret(&self) -> &[u8] {
+        self.token.as_bytes()
+    }
+}
+
+impl fmt::Debug for GitHubAuthenticationConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersonalAccessToken")
+            .field("token", &RedactedSecret)
             .finish()
     }
 }
@@ -768,9 +814,7 @@ struct RawRepositoryProviderConfig {
     #[serde(default)]
     api_url: Option<String>,
     #[serde(default)]
-    oauth_client_id: Option<String>,
-    #[serde(default)]
-    oauth_client_secret: Option<String>,
+    personal_access_token: Option<String>,
 }
 
 impl fmt::Debug for RawRepositoryProviderConfig {
@@ -779,8 +823,7 @@ impl fmt::Debug for RawRepositoryProviderConfig {
             .debug_struct("RawRepositoryProviderConfig")
             .field("provider_type", &self.provider_type)
             .field("api_url", &self.api_url)
-            .field("oauth_client_id", &self.oauth_client_id)
-            .field("oauth_client_secret", &RedactedSecret)
+            .field("personal_access_token", &RedactedSecret)
             .finish()
     }
 }
@@ -1137,8 +1180,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: ${GITHUB_CLIENT_ID}
-    oauth_client_secret: ${GITHUB_CLIENT_SECRET}
+    personal_access_token: ${GITHUB_PAT}
 
 storage_providers:
   drive-user-a:
@@ -1161,12 +1203,9 @@ repositories:
     }
 
     fn test_env(name: &str) -> Option<String> {
-        BTreeMap::from([
-            ("GITHUB_CLIENT_ID", "client-id"),
-            ("GITHUB_CLIENT_SECRET", "client-secret"),
-        ])
-        .get(name)
-        .map(ToString::to_string)
+        BTreeMap::from([("GITHUB_PAT", "github_pat_secret")])
+            .get(name)
+            .map(ToString::to_string)
     }
 
     fn load_with_test_env(contents: &str) -> ServerConfig {
@@ -1199,13 +1238,11 @@ repositories:
         match &config.repository_providers["github-main"] {
             RepositoryProviderConfig::GitHub(GitHubProviderConfig {
                 api_url,
-                oauth_client_id,
-                oauth_client_secret,
+                authentication,
                 ..
             }) => {
                 assert_eq!(api_url, "https://api.github.com");
-                assert_eq!(oauth_client_id, "client-id");
-                assert_eq!(oauth_client_secret, "client-secret");
+                assert_eq!(authentication.personal_access_token(), "github_pat_secret");
             }
         }
 
@@ -1224,6 +1261,43 @@ repositories:
         );
         assert_eq!(root_folder_id, "drive-root-folder");
         assert_eq!(display_name.as_deref(), Some("Main Drive"));
+    }
+
+    #[test]
+    fn parses_github_personal_access_token_authentication() {
+        let config = load_with_test_env(valid_yaml());
+        let RepositoryProviderConfig::GitHub(provider) =
+            &config.repository_providers["github-main"];
+
+        assert_eq!(
+            provider.authentication.personal_access_token(),
+            "github_pat_secret"
+        );
+    }
+
+    #[test]
+    fn rejects_removed_github_oauth_fields() {
+        let contents = valid_yaml().replace(
+            "    personal_access_token: ${GITHUB_PAT}",
+            "    oauth_client_id: client-id\n    oauth_client_secret: client-secret",
+        );
+        let error = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", test_env)
+            .expect_err("removed GitHub OAuth fields should be rejected");
+
+        assert!(matches!(error, ServerError::ConfigParse { .. }));
+        assert!(error.to_string().contains("oauth_client_id"));
+    }
+
+    #[test]
+    fn requires_github_personal_access_token() {
+        let contents = valid_yaml().replace("    personal_access_token: ${GITHUB_PAT}\n", "");
+        let error = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", test_env)
+            .expect_err("missing GitHub PAT should be rejected");
+
+        assert_error_contains(
+            &error,
+            "repository_providers.github-main.personal_access_token is required",
+        );
     }
 
     #[test]
@@ -1421,35 +1495,46 @@ storage_providers:
     }
 
     #[test]
-    fn server_config_debug_redacts_github_oauth_client_secret() {
+    fn server_config_debug_redacts_github_personal_access_token() {
         let config = load_with_test_env(valid_yaml());
         let RepositoryProviderConfig::GitHub(provider) =
             &config.repository_providers["github-main"];
-        let configured_secret = provider.oauth_client_secret.as_str();
+        let configured_secret = provider.authentication.personal_access_token();
         let rendered = format!("{config:?}");
 
         assert!(rendered.contains("GitHubProviderConfig"));
-        assert!(rendered.contains("oauth_client_secret"));
+        assert!(rendered.contains("PersonalAccessToken"));
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains(configured_secret));
     }
 
     #[test]
-    fn raw_repository_provider_debug_redacts_github_oauth_client_secret() {
+    fn literal_github_personal_access_token_is_redacted() {
+        let contents = valid_yaml().replace("${GITHUB_PAT}", "github_pat_configured_secret");
+        let config = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", |_| None)
+            .expect("PAT config should load");
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("PersonalAccessToken"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("github_pat_configured_secret"));
+    }
+
+    #[test]
+    fn raw_repository_provider_debug_redacts_github_personal_access_token() {
         let raw = RawRepositoryProviderConfig {
             provider_type: Some("github".to_owned()),
             api_url: Some("https://api.github.com".to_owned()),
-            oauth_client_id: Some("client-id".to_owned()),
-            oauth_client_secret: Some("raw-client-secret".to_owned()),
+            personal_access_token: Some("raw-github-pat".to_owned()),
         };
         let configured_secret = raw
-            .oauth_client_secret
+            .personal_access_token
             .as_deref()
             .expect("fixture should include a secret");
         let rendered = format!("{raw:?}");
 
         assert!(rendered.contains("RawRepositoryProviderConfig"));
-        assert!(rendered.contains("oauth_client_secret"));
+        assert!(rendered.contains("personal_access_token"));
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains(configured_secret));
     }
@@ -1467,8 +1552,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -1726,7 +1810,7 @@ server:
 
         assert_error_contains(
             &error,
-            "repository_providers.github-main.oauth_client_id references unset environment variable GITHUB_CLIENT_ID",
+            "repository_providers.github-main.personal_access_token references unset environment variable GITHUB_PAT",
         );
     }
 
@@ -1868,8 +1952,7 @@ server:
 repository_providers:
   github-main:
     type: github
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 "#,
             "<test>",
             test_env,
@@ -1892,8 +1975,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -2002,8 +2084,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 repositories:
   - id: github-main:owner/repo
     repo_provider: github-main
@@ -2034,8 +2115,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -2080,8 +2160,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -2126,8 +2205,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -2172,13 +2250,11 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 "#,
             "<test>",
             test_env,
@@ -2228,8 +2304,7 @@ repository_providers:
   'bad id':
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 "#,
             "<test>",
             test_env,
@@ -2308,8 +2383,7 @@ repository_providers:
   github-main:
     type: github
     api_url: ftp://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 "#,
             "<test>",
             test_env,
@@ -2343,8 +2417,7 @@ repository_providers:
   github-main:
     type: github
     api_url: http://github.example.test/api/v3
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 "#,
             "<test>",
             test_env,
@@ -2367,8 +2440,7 @@ repository_providers:
   github-main:
     type: github
     api_url: http://192.168.1.30:8081/api/v3
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 "#,
             "<test>",
             test_env,
@@ -2391,8 +2463,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -2430,8 +2501,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive

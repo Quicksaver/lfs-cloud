@@ -168,8 +168,4 @@ fn dependency_features_match_mvp_decisions() {
         "tracing-subscriber",
         "fmt"
     ));
-    assert!(
-        dependency_disables_default_features(manifest, "dependencies", "oauth2"),
-        "oauth2 should not enable an additional HTTP client stack yet"
-    );
 }

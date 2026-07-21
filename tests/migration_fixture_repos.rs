@@ -409,8 +409,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 
 storage_providers:
   drive-user-a:

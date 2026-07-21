@@ -1,6 +1,6 @@
 //! Git credential-helper integration for local LFS Cloud tokens.
 //!
-//! The GitHub OAuth token stays inside provider-facing code. This module stores
+//! The GitHub PAT stays inside provider-facing code. This module stores
 //! only the short-lived local LFS Cloud token that Git LFS should use when it
 //! contacts the configured LFS URL.
 
@@ -535,7 +535,7 @@ impl GitCredentialApproval {
 
     /// Returns the local LFS Cloud session token to approve.
     ///
-    /// This is a local LFS Cloud token, not an upstream GitHub OAuth token.
+    /// This is a local LFS Cloud token, not the upstream GitHub PAT.
     #[must_use]
     pub fn token(&self) -> &LfsSessionToken {
         &self.token
@@ -764,7 +764,7 @@ impl GitCredentialApproval {
 ///
 /// The returned text is suitable for CLI error output because it contains only
 /// the configured LFS URL and static setup commands. It never asks users to
-/// paste GitHub OAuth tokens or personal access tokens into Git LFS.
+/// paste GitHub personal access tokens into Git LFS.
 ///
 /// # Errors
 ///
@@ -818,7 +818,7 @@ fn credential_helper_fallback_instructions(lfs_url: &Url, username: &str) -> Str
         format!(
             "After a helper is configured, LFS Cloud will store username '{username}' for {lfs_url}."
         ),
-        "Do not store a GitHub OAuth token or personal access token here; Git LFS should receive only the local LFS Cloud session token.".to_owned(),
+        "Do not store a GitHub personal access token here; Git LFS should receive only the local LFS Cloud session token.".to_owned(),
     ]
     .join("\n")
 }
@@ -1754,7 +1754,7 @@ cat > '{}'
         assert!(instructions.contains("global Git helper setting"));
         assert!(instructions.contains("Avoid plaintext storage"));
         assert!(!instructions.contains("git config --global credential.helper store"));
-        assert!(instructions.contains("GitHub OAuth token"));
+        assert!(instructions.contains("GitHub personal access token"));
         assert!(instructions.contains("personal access token"));
         assert!(instructions.contains("local LFS Cloud session token"));
     }
@@ -2208,7 +2208,7 @@ exit 0
         assert!(display.contains("credential.helper osxkeychain"));
         assert!(display.contains("credential.helper 'cache --timeout=3600'"));
         assert!(display.contains("writes a global Git helper setting"));
-        assert!(display.contains("Do not store a GitHub OAuth token"));
+        assert!(display.contains("Do not store a GitHub personal access token"));
         assert!(!display.contains("local-lfs-token"));
         assert!(!approve_path.exists());
     }

@@ -169,8 +169,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: ${GITHUB_CLIENT_ID}
-    oauth_client_secret: ${GITHUB_CLIENT_SECRET}
+    personal_access_token: ${LFS_CLOUD_GITHUB_PAT}
 
   gitlab-internal:
     type: gitlab
@@ -243,6 +242,11 @@ When a request arrives, the server should:
 ```
 
 If a repository is not listed in the server config, the server should deny it by default. This prevents arbitrary repositories from using the instance and makes storage routing explicit.
+
+GitHub providers use one configured `personal_access_token`. This is a
+single-account mode intended for a private operator: the caller presents that
+exact PAT once to the protected login endpoint and receives a short-lived local
+LFS token. The upstream PAT is never put in Git's credential helper.
 
 The server bounds each batch's object-entry count and shares one concurrency
 limit across repository and storage provider calls. Duplicate object
@@ -479,15 +483,14 @@ This can support ref-aware authorization later. For the initial implementation, 
 
 ## Authentication Strategy
 
-Preferred flow:
+PAT login flow:
 
 ```text
-1. User runs an LFS Cloud login command or visits a login URL.
-2. User authenticates with the repository provider, such as GitHub OAuth or GitLab OAuth.
-3. LFS Cloud identifies the repository-provider user.
-4. LFS Cloud issues a short-lived LFS credential/token.
-5. The local Git credential helper stores that credential for the LFS URL.
-6. Git LFS uses that credential for batch/upload/download requests.
+1. User runs `lfscloud login` and enters the configured GitHub PAT.
+2. LFS Cloud verifies the exact PAT and fetches its GitHub identity.
+3. LFS Cloud issues a short-lived LFS credential/token.
+4. The local Git credential helper stores that credential for the LFS URL.
+5. Git LFS uses that credential for batch/upload/download requests.
 ```
 
 Interactive CLI token entry must disable terminal echo before reading the
@@ -502,18 +505,12 @@ The local session retains that ID, and repository permission checks compare it
 with the collaborator response's nested user ID before granting access. The
 mutable login remains useful for the API path but is not sufficient identity.
 
-Every GitHub browser authorization uses S256 PKCE in addition to CSRF state.
-Retain the one-time verifier with the corresponding pending state, consume both
-at callback admission, and submit the verifier during code exchange so an
-intercepted authorization code cannot be redeemed without its original login
-attempt.
-
 Production sessions persist in SQLite until their short-lived expiry so a
 server restart does not invalidate credentials already stored by Git. Persist
 only a SHA-256 digest of the local bearer token. Authenticated-encrypt the
-private GitHub token together with the session identity, scopes, and timestamps
-using a dedicated key derived from the configured GitHub OAuth client secret;
-never store either token in plaintext.
+private GitHub PAT together with the session identity and timestamps using a
+dedicated key derived from the configured PAT; never store either token in
+plaintext.
 
 Session admission is bounded to 16 active credentials and eight successful
 issuances per minute for each stable provider user, plus 1,024 active
@@ -528,7 +525,11 @@ credential for retry. A definitive upstream GitHub authentication rejection
 also revokes the corresponding local session so a stale local bearer token
 cannot keep retrying with invalid private provider credentials.
 
-Avoid asking users to paste personal access tokens into the LFS server if possible. That can work for a quick prototype, but it means LFS Cloud receives and handles powerful user repository-host credentials.
+Require the user to present the exact configured GitHub PAT over HTTPS (or
+literal loopback HTTP) before issuing a local LFS session. Prefer a fine-grained
+PAT limited to the configured repositories. This remains inappropriate as a
+multi-user identity model because every session represents the one configured
+account.
 
 Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service uses one Google account's isolated Google Cloud CLI Application Default Credentials (ADC) directory to access the backing Drive folder; LFS Cloud asks `gcloud` for short-lived access tokens without parsing the generated ADC file. For a multi-tenant or shared instance, each configured storage provider should have its own isolated ADC directory and policy boundary.
 
@@ -1032,8 +1033,6 @@ areas:
 Use the `config` crate with only its YAML feature enabled for server
 configuration. Avoid adding a direct dependency on deprecated YAML parsers.
 Use `reqwest` with Rustls and no default TLS features for provider HTTP calls.
-Keep the `oauth2` crate's HTTP-client features disabled initially so OAuth URL,
-CSRF, and token types can be used without pulling in a second HTTP client stack.
 
 ### Supported Providers
 
@@ -1053,18 +1052,19 @@ The code should still use repository-provider and storage-provider traits/interf
 
 ### Authentication
 
-Use GitHub OAuth for user login, then store the resulting LFS Cloud LFS credential through Git's credential helper when possible.
-
-For an OAuth App MVP, private repository and organization permission checks may require broad GitHub OAuth scopes such as `repo`, and org scenarios may require `read:org`. This is acceptable for a local/private MVP if clearly disclosed, but it is a reason to consider a GitHub App later because GitHub App user/installation tokens can use narrower metadata permissions for the repository permission endpoint.
+Use one configured GitHub PAT for single-account login, then store only the
+resulting LFS Cloud credential through Git's credential helper. Prefer a
+fine-grained PAT restricted to the configured repositories and the minimum
+permissions needed for repository permission checks.
 
 Target flow:
 
 ```text
-lfscloud login / lfscloud init
-  opens browser for GitHub OAuth
+lfscloud login
+  prompts for the configured GitHub PAT without echoing it
 
 LFS Cloud server
-  receives OAuth callback
+  verifies the exact configured PAT
   verifies GitHub identity
   issues short-lived LFS Cloud token
 
@@ -1075,13 +1075,10 @@ git lfs client
   sends token to LFS Cloud for batch/upload/download requests
 ```
 
-The CLI must print the OAuth login URL before requesting the platform browser
-launcher. Start that launcher with null standard streams in a separate process
-group and reap it asynchronously; desktop integrations are not required to
-exit after accepting a URL, so login must continue to token entry without
-waiting for them. `--no-open` retains a fully manual URL-only path.
-
-Personal access tokens may be considered only as a local-development fallback. They should not be the default MVP path.
+The PAT exchange route must require the caller to present the exact configured
+PAT over protected transport. It must never expose an unauthenticated route
+that mints sessions as the configured account, and its response must contain
+only the local LFS Cloud token and non-secret identity metadata.
 
 For GitHub permission checks, use:
 
@@ -1271,7 +1268,7 @@ A practical MVP could implement:
 - Git LFS batch API for upload and download.
 - Basic authenticated HTTP transfers.
 - Repository-provider abstraction with GitHub as the first implementation.
-- GitHub OAuth login.
+- GitHub PAT-only single-account login.
 - Repository-level permission checks through the provider abstraction.
 - Storage-provider abstraction with Google Drive as the first implementation.
 - Private YAML server configuration mapping repositories to storage providers.
@@ -1280,7 +1277,7 @@ A practical MVP could implement:
 - Hash and size verification on upload.
 - Private proxy downloads through the LFS server.
 - Local `lfscloud serve` deployment that prints localhost and LAN addresses.
-- `lfscloud login` for GitHub OAuth and local credential setup.
+- `lfscloud login` for GitHub PAT exchange and local credential setup.
 - `lfscloud init` for repository setup.
 - `lfscloud migrate` for converting an existing Git LFS clone to LFS Cloud.
 - `lfscloud migrate --dry-run` for migration planning and local readiness reporting.
@@ -1367,9 +1364,9 @@ Defer:
 > now resolves the current repository's intended Git LFS endpoint, writes or
 > updates `.lfsconfig` with a before/after `lfs.url` summary, and supports
 > `--local` for writing only repository-local Git config. The `lfscloud login`
-> command opens or prints the server GitHub OAuth login URL, accepts the
-> returned local LFS Cloud token, and stores only that local token in Git's
-> credential helper for the current repository's LFS URL.
+> command prompts for the configured single-account PAT, exchanges it through
+> the protected server route, and stores only the returned
+> local token in Git's credential helper for the current repository's LFS URL.
 > The `lfscloud logout` command authenticates session revocation with that
 > local token before erasing the repository-scoped Git credential, and the
 > server also revokes sessions after definitive upstream authentication denial.
@@ -1537,21 +1534,21 @@ Defer:
 
 #### Epic 1.2: Config Validation
 
-- [x] [T] Validate GitHub provider entries require API URL and OAuth client settings.
+- [x] [T] Validate GitHub provider entries require an API URL and personal access token.
 - [x] [T] Validate Google Drive storage entries require credential reference and root folder ID.
 - [x] [T] Validate each repository mapping points to existing repository and storage providers.
 - [x] [T] Add config error messages that identify the exact invalid path/key.
 
 ### Phase 2: GitHub Auth
 
-#### Epic 2.1: OAuth Login
+#### Epic 2.1: Personal Access Token Login
 
-- [x] [T] Implement GitHub OAuth authorization URL generation with CSRF state and S256 PKCE.
-- [x] [T] Implement OAuth callback query parsing and CSRF state validation helper.
-- [x] [T] Implement OAuth callback route that uses the validated callback.
-- [x] [T] Implement GitHub OAuth code-to-token exchange.
-- [x] [T] Fetch authenticated GitHub user identity with the OAuth token.
-- [x] [T] Store local LFS Cloud session/token metadata without exposing the GitHub token to Git LFS.
+- [x] [T] Add single-account PAT provider configuration with secret redaction.
+- [x] [T] Exchange an exact configured PAT for a short-lived local LFS session without returning or storing the PAT in Git credentials.
+- [x] [T] Fetch the authenticated GitHub user's stable identity with the PAT.
+- [x] [T] Persist PAT-backed local session metadata without storing the PAT in plaintext.
+- [x] [T] Reject removed GitHub OAuth configuration fields.
+- [x] [T] Add PAT-only `lfscloud login` and live smoke coverage.
 
 #### Epic 2.2: Git Credential Helper Integration
 
@@ -1617,8 +1614,8 @@ Defer:
 
 #### Epic 5.3: Transfer Endpoints
 
-- [x] [M] Implement upload endpoint with temp-file staging, SHA-256 hashing, and size verification. Manual verification: with a valid GitHub OAuth-backed local LFS session and a real app-accessible Drive `drive.file` credential, request an upload batch for a missing object, confirm the response includes an `upload` action, `PUT` matching bytes to that action URL, then confirm the HTTP response is success, Drive contains the expected `sha256-<oid>-<size>.lfs` object, and metadata has a verified row for the configured repository/storage/OID/size.
-- [x] [M] Implement download endpoint streaming bytes from Google Drive through LFS Cloud. Manual verification: with a valid GitHub OAuth-backed local LFS session and a real app-accessible Drive `drive.file` credential, request a download batch for an existing object, confirm the response includes a `download` action, `GET` that action URL, then confirm the HTTP response streams bytes whose length and SHA-256 match the requested LFS object without exposing a Drive URL to the client.
+- [x] [M] Implement upload endpoint with temp-file staging, SHA-256 hashing, and size verification. Manual verification: with a valid GitHub PAT-backed local LFS session and a real app-accessible Drive `drive.file` credential, request an upload batch for a missing object, confirm the response includes an `upload` action, `PUT` matching bytes to that action URL, then confirm the HTTP response is success, Drive contains the expected `sha256-<oid>-<size>.lfs` object, and metadata has a verified row for the configured repository/storage/OID/size.
+- [x] [M] Implement download endpoint streaming bytes from Google Drive through LFS Cloud. Manual verification: with a valid GitHub PAT-backed local LFS session and a real app-accessible Drive `drive.file` credential, request a download batch for an existing object, confirm the response includes a `download` action, `GET` that action URL, then confirm the HTTP response streams bytes whose length and SHA-256 match the requested LFS object without exposing a Drive URL to the client.
 - [x] [T] Return Git LFS-compatible error payloads and HTTP status codes.
 - [x] [T] Add request size, temp-space, and timeout guardrails with clear errors.
 
@@ -1632,7 +1629,7 @@ Defer:
 
 #### Epic 6.2: Login And Init
 
-- [x] [M] Implement `lfscloud login` browser flow for GitHub OAuth. Manual verification: `scripts/manual/verify-login-command.sh`.
+- [x] [M] Implement PAT-only `lfscloud login`. Manual verification: `scripts/manual/verify-login-command.sh`.
 - [x] [T] Implement Git repository detection and remote parsing.
 - [x] [T] Implement `lfscloud init --server` route resolution for the current repo.
 - [x] [T] Implement `.lfsconfig` write/update with backup or diff output.
@@ -1697,7 +1694,7 @@ Defer:
 
 #### Epic 9.2: Security And Documentation
 
-- [x] [M] Review logs and errors to ensure OAuth tokens, Drive tokens, and object contents are not leaked. Manual verification: `scripts/manual/verify-secret-redaction.sh`.
+- [x] [M] Review logs and errors to ensure GitHub PATs, Drive tokens, and object contents are not leaked. Manual verification: `scripts/manual/verify-secret-redaction.sh`.
 - [x] [M] Document `lfscloud.yml` with GitHub + Google Drive examples.
 - [x] [M] Update README once commands are implemented, removing "planned" wording where appropriate.
 - [x] [M] Add install/build instructions and release artifact expectations.

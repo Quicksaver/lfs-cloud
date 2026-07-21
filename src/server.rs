@@ -40,17 +40,16 @@ use tokio_util::io::ReaderStream;
 use url::{Url, form_urlencoded};
 
 use crate::{
-    DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GITHUB_OAUTH_CALLBACK_PATH,
-    GitHubOAuthCallbackRouteState, GitHubOAuthStateRegistry, GitHubRepositoryProvider,
-    GoogleDriveAccessToken, GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore,
-    GoogleDriveRootValidator, GoogleDriveStorageConfig, LFS_BASIC_TRANSFER, LfsBatchDownloadObject,
-    LfsBatchObjectError, LfsBatchOperation, LfsBatchRequest, LfsBatchResponse,
-    LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore,
-    MetadataDatabase, MetadataObjectVerificationStatus, ProviderFuture, RepositoryAuthentication,
-    RepositoryIdentity, RepositoryMapping, RepositoryPermission, RepositoryProvider,
-    RepositoryProviderConfig, RepositoryProviderError, RepositoryUser, SanitizedMessage,
-    ServerConfig, ServerError, ServerResult, StorageError, StorageProvider, StorageProviderConfig,
-    StorageResult, StoredObject, github_oauth_callback_router, github_oauth_login_router,
+    DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GitHubPersonalAccessTokenLoginRouteState,
+    GitHubRepositoryProvider, GoogleDriveAccessToken, GoogleDriveGcloudTokenProvider,
+    GoogleDriveObjectStore, GoogleDriveRootValidator, GoogleDriveStorageConfig, LFS_BASIC_TRANSFER,
+    LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation, LfsBatchRequest,
+    LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken,
+    LocalLfsSessionStore, MetadataDatabase, MetadataObjectVerificationStatus, ProviderFuture,
+    RepositoryAuthentication, RepositoryIdentity, RepositoryMapping, RepositoryPermission,
+    RepositoryProvider, RepositoryProviderConfig, RepositoryProviderError, RepositoryUser,
+    SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError, StorageProvider,
+    StorageProviderConfig, StorageResult, StoredObject, github_personal_access_token_login_router,
     metadata::{MetadataTransferOperation, MetadataTransferResult},
     parse_lfs_batch_request_json,
     sessions::LfsSessionRecord,
@@ -121,7 +120,6 @@ type ServerShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 struct ServerCompositionClients {
     drive_token_source: Arc<dyn GoogleDriveAccessTokenSource>,
     drive_root_validator: GoogleDriveRootValidator,
-    github_token_exchanger: crate::GitHubOAuthTokenExchanger,
     github_user_client: crate::GitHubUserClient,
 }
 
@@ -130,7 +128,6 @@ impl ServerCompositionClients {
         Ok(Self {
             drive_token_source: Arc::new(GoogleDriveGcloudTokenProvider::new()),
             drive_root_validator: GoogleDriveRootValidator::new()?,
-            github_token_exchanger: crate::GitHubOAuthTokenExchanger::new()?,
             github_user_client: crate::GitHubUserClient::new()?,
         })
     }
@@ -219,7 +216,6 @@ impl ServerBuilder {
             session_store,
             transfer_store,
             metadata_database,
-            clients.github_token_exchanger,
             clients.github_user_client,
         )?;
         let listener = tokio::net::TcpListener::bind((bind.host.as_str(), bind.port))
@@ -339,7 +335,7 @@ fn production_session_store(
         [] => Ok(LocalLfsSessionStore::new()),
         [provider] => LocalLfsSessionStore::open_durable(
             metadata_database,
-            provider.oauth_client_secret.as_bytes(),
+            provider.authentication.session_encryption_secret(),
         ),
         _ => Err(ServerError::InvalidConfiguration {
             message: "multiple GitHub repository providers are not yet supported by durable session storage".to_owned(),
@@ -354,14 +350,13 @@ pub fn lfs_server_router(config: ServerConfig) -> Router {
 
 /// Builds the full server router with authentication and Git LFS routes.
 ///
-/// GitHub OAuth callbacks and Git LFS endpoints share `session_store` so an
-/// OAuth callback can issue a local LFS Cloud token that the LFS routes accept
-/// immediately.
+/// GitHub PAT login and Git LFS endpoints share `session_store` so a successful
+/// login can issue a local LFS Cloud token that the LFS routes accept immediately.
 ///
 /// # Errors
 ///
-/// Returns [`ServerError`] if OAuth callback state cannot be initialized from
-/// the validated server configuration.
+/// Returns [`ServerError`] if PAT login state cannot be initialized from the
+/// validated server configuration.
 pub fn server_router_with_sessions(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
@@ -376,7 +371,7 @@ pub fn server_router_with_sessions(
         None,
     );
     let session_router = lfs_session_revoke_router(session_store.clone());
-    let Some(auth_router) = github_oauth_router(config, session_store)? else {
+    let Some(auth_router) = github_auth_router(config, session_store)? else {
         return Ok(with_http_request_limit(
             session_router.merge(lfs_router),
             max_concurrent_requests,
@@ -394,7 +389,6 @@ fn server_router_with_sessions_and_transfer_store(
     session_store: LocalLfsSessionStore,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
     metadata_database: Arc<MetadataDatabase>,
-    github_token_exchanger: crate::GitHubOAuthTokenExchanger,
     github_user_client: crate::GitHubUserClient,
 ) -> ServerResult<Router> {
     let max_concurrent_requests = config.server.max_concurrent_requests;
@@ -407,12 +401,8 @@ fn server_router_with_sessions_and_transfer_store(
         Some(metadata_database),
     );
     let session_router = lfs_session_revoke_router(session_store.clone());
-    let Some(auth_router) = github_oauth_router_with_clients(
-        config,
-        session_store,
-        github_token_exchanger,
-        github_user_client,
-    )?
+    let Some(auth_router) =
+        github_auth_router_with_client(config, session_store, github_user_client)?
     else {
         return Ok(with_http_request_limit(
             session_router.merge(lfs_router),
@@ -469,7 +459,7 @@ async fn revoke_lfs_session_route(
 
 /// Builds the Axum router with an explicit local LFS session store.
 ///
-/// This constructor lets login/callback wiring and tests share the same
+/// This constructor lets login wiring and tests share the same
 /// [`LocalLfsSessionStore`] used by request authentication. Git LFS endpoint
 /// requests must present a valid local LFS session token before protocol
 /// handlers receive the resolved route.
@@ -488,7 +478,7 @@ pub fn lfs_server_router_with_sessions(
 ///
 /// This is a narrow test seam for exercising the normal route, authentication,
 /// authorization, and transfer handlers without real GitHub or Google Drive
-/// network calls. It does not mount OAuth routes or durable metadata storage;
+/// network calls. It does not mount login routes or durable metadata storage;
 /// production serving still uses the configured GitHub and Google Drive
 /// clients. The configured repository provider and storage provider IDs must
 /// match the injected providers. Existing-object lookups synthesize backend IDs
@@ -652,22 +642,16 @@ async fn enforce_http_request_limit(
     next.run(request).await
 }
 
-fn github_oauth_router(
+fn github_auth_router(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
 ) -> ServerResult<Option<Router>> {
-    github_oauth_router_with_clients(
-        config,
-        session_store,
-        crate::GitHubOAuthTokenExchanger::new()?,
-        crate::GitHubUserClient::new()?,
-    )
+    github_auth_router_with_client(config, session_store, crate::GitHubUserClient::new()?)
 }
 
-fn github_oauth_router_with_clients(
+fn github_auth_router_with_client(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
-    token_exchanger: crate::GitHubOAuthTokenExchanger,
     user_client: crate::GitHubUserClient,
 ) -> ServerResult<Option<Router>> {
     let github_providers = config
@@ -683,28 +667,16 @@ fn github_oauth_router_with_clients(
         [provider] => provider,
         _ => {
             return Err(ServerError::InvalidConfiguration {
-                message: "multiple GitHub repository providers are not yet supported by the OAuth callback router".to_owned(),
+                message: "multiple GitHub repository providers are not yet supported by the PAT login router".to_owned(),
             });
         }
     };
-    let redirect_url = format!(
-        "{}{}",
-        config.server.public_url.trim_end_matches('/'),
-        GITHUB_OAUTH_CALLBACK_PATH
-    );
-    let route_state = GitHubOAuthCallbackRouteState::with_clients_and_session_store(
+    let route_state = GitHubPersonalAccessTokenLoginRouteState::with_client_and_session_store(
         (*provider).clone(),
-        GitHubOAuthStateRegistry::new(),
-        redirect_url,
-        token_exchanger,
         user_client,
         session_store,
     )?;
-
-    Ok(Some(
-        github_oauth_login_router(route_state.clone())
-            .merge(github_oauth_callback_router(route_state)),
-    ))
+    Ok(Some(github_personal_access_token_login_router(route_state)))
 }
 
 trait LfsBatchAuthorizer: Send + Sync {
@@ -826,14 +798,13 @@ impl LfsBatchAuthorizer for ProviderBatchAuthorizer {
                 });
             }
 
-            let token =
-                session
-                    .github_access_token()
-                    .ok_or_else(|| ServerError::RepositoryProvider {
-                        source: RepositoryProviderError::AuthenticationRequired {
-                            provider: repository.repo_provider.clone(),
-                        },
-                    })?;
+            let token = session.github_personal_access_token().ok_or_else(|| {
+                ServerError::RepositoryProvider {
+                    source: RepositoryProviderError::AuthenticationRequired {
+                        provider: repository.repo_provider.clone(),
+                    },
+                }
+            })?;
             let identity = RepositoryIdentity {
                 provider_id: repository.repo_provider.clone(),
                 stable_id: Some(repository.provider_repository_id.clone()),
@@ -3492,8 +3463,7 @@ impl LfsRouteResolver {
     ///   github-main:
     ///     type: github
     ///     api_url: https://api.github.com
-    ///     oauth_client_id: test-client
-    ///     oauth_client_secret: test-secret
+    ///     personal_access_token: github-pat
     /// storage_providers:
     ///   drive-user-a:
     ///     type: google_drive
@@ -3750,7 +3720,7 @@ mod tests {
             },
         },
         response::{IntoResponse, Response},
-        routing::{get, post},
+        routing::get,
     };
     use tokio::sync::{Barrier, Notify};
     use tower::ServiceExt;
@@ -3777,13 +3747,13 @@ mod tests {
     use tracing::instrument::WithSubscriber as _;
 
     use crate::{
-        DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, GitHubOAuthTokenExchanger,
-        GitHubUserClient, GoogleDriveAccessToken, GoogleDriveRootValidator,
-        GoogleDriveStorageConfig, LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize,
-        LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture,
-        RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
-        SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
-        StorageProviderConfig, StorageResult, StoredObject,
+        DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubPersonalAccessToken, GitHubUserClient,
+        GoogleDriveAccessToken, GoogleDriveRootValidator, GoogleDriveStorageConfig,
+        LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken,
+        LocalLfsSessionStore, MetadataDatabase, ProviderFuture, RepositoryMapping,
+        RepositoryPermission, RepositoryProviderError, RepositoryUser, SanitizedMessage,
+        ServerConfig, ServerError, ServerResult, StorageError, StorageProviderConfig,
+        StorageResult, StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -3831,8 +3801,7 @@ repository_providers:
   github-main:
     type: github
     api_url: {api_url}
-    oauth_client_id: test-client
-    oauth_client_secret: test-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -3904,16 +3873,6 @@ repositories:
     async fn production_server_builder_exercises_complete_composition() {
         let upstream = Router::new()
             .route(
-                "/github-token",
-                post(|| async {
-                    Json(serde_json::json!({
-                        "access_token": "gho_composition_test",
-                        "token_type": "bearer",
-                        "scope": "read:user,repo"
-                    }))
-                }),
-            )
-            .route(
                 "/user",
                 get(|| async { Json(serde_json::json!({ "login": "octocat", "id": 42 })) }),
             )
@@ -3977,8 +3936,7 @@ repository_providers:
   github-main:
     type: github
     api_url: {upstream_url}
-    oauth_client_id: composition-client
-    oauth_client_secret: composition-secret
+    personal_access_token: github-pat-composition
 storage_providers:
   drive-user-a:
     type: google_drive
@@ -4005,10 +3963,6 @@ repositories:
                 &upstream_url,
             )
             .expect("composition Drive root validator should build"),
-            github_token_exchanger: GitHubOAuthTokenExchanger::with_token_url(format!(
-                "{upstream_url}/github-token"
-            ))
-            .expect("composition GitHub token exchanger should build"),
             github_user_client: GitHubUserClient::new()
                 .expect("composition GitHub user client should build"),
         };
@@ -4027,48 +3981,22 @@ repositories:
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("composition HTTP client should build");
-        let login_response =
-            wait_for_server_response(&client, format!("{server_url}/auth/github/login")).await;
-        assert_eq!(
-            login_response.status(),
-            reqwest::StatusCode::TEMPORARY_REDIRECT
-        );
-        let authorization_url = login_response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| url::Url::parse(value).ok())
-            .expect("login should redirect to a valid GitHub authorization URL");
-        let state = authorization_url
-            .query_pairs()
-            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
-            .expect("authorization URL should include state");
-        assert!(
-            authorization_url
-                .query_pairs()
-                .any(|(key, value)| { key == "code_challenge_method" && value == "S256" })
-        );
-
-        let mut callback_url = url::Url::parse(&format!("{server_url}/auth/github/callback"))
-            .expect("callback URL should parse");
-        callback_url
-            .query_pairs_mut()
-            .append_pair("code", "composition-code")
-            .append_pair("state", &state);
-        let callback_response = client
-            .get(callback_url)
+        wait_for_server_response(&client, format!("{server_url}/status")).await;
+        let login_response = client
+            .post(format!("{server_url}/auth/github/pat"))
+            .bearer_auth("github-pat-composition")
             .send()
             .await
-            .expect("composition OAuth callback should respond");
-        assert_eq!(callback_response.status(), reqwest::StatusCode::OK);
-        let callback_body: serde_json::Value = callback_response
+            .expect("composition PAT login should respond");
+        assert_eq!(login_response.status(), reqwest::StatusCode::OK);
+        let login_body: serde_json::Value = login_response
             .json()
             .await
-            .expect("composition OAuth callback should return JSON");
-        let lfs_token = callback_body["lfs_token"]
+            .expect("composition PAT login should return JSON");
+        let lfs_token = login_body["lfs_token"]
             .as_str()
-            .expect("composition callback should issue an LFS token");
-        assert_ne!(lfs_token, "gho_composition_test");
+            .expect("composition PAT login should issue an LFS token");
+        assert_ne!(lfs_token, "github-pat-composition");
 
         let object_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let basic_auth =
@@ -4136,8 +4064,8 @@ repositories:
         );
         assert!(
             !metadata_bytes
-                .windows(b"gho_composition_test".len())
-                .any(|window| window == b"gho_composition_test")
+                .windows(b"github_pat_composition_test".len())
+                .any(|window| window == b"github_pat_composition_test")
         );
 
         upstream_task.abort();
@@ -5388,14 +5316,15 @@ repositories:
                 Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should open"));
             let store = production_session_store(&config, database)
                 .expect("production session store should open");
-            let github_token = GitHubOAuthAccessToken::from_secret("gho_production_restart")
-                .expect("GitHub token should parse");
+            let github_pat =
+                GitHubPersonalAccessToken::from_secret("github_pat_production_restart")
+                    .expect("GitHub PAT should parse");
 
             store
-                .issue_session_with_github_token(
+                .issue_session_with_github_pat(
                     &RepositoryUser::new("github-main", "octocat", Some("42".to_owned())),
                     ["repo"],
-                    github_token,
+                    github_pat,
                 )
                 .expect("session should be issued")
         };
@@ -5411,10 +5340,10 @@ repositories:
         assert_eq!(restored.metadata().stable_id.as_deref(), Some("42"));
         assert_eq!(
             restored
-                .github_access_token()
-                .expect("GitHub token should be restored")
+                .github_personal_access_token()
+                .expect("GitHub PAT should be restored")
                 .as_str(),
-            "gho_production_restart"
+            "github_pat_production_restart"
         );
     }
 
@@ -5479,7 +5408,7 @@ repositories:
     #[tokio::test]
     async fn server_tracing_events_never_render_request_or_provider_secrets() {
         const CREDENTIAL_SECRET: &str = "credential-secret-sentinel";
-        const OAUTH_SECRET: &str = "oauth-secret-sentinel";
+        const PROVIDER_SECRET: &str = "provider-secret-sentinel";
         const DRIVE_SECRET: &str = "drive-secret-sentinel";
         const URL_SECRET: &str = "url-query-secret-sentinel";
         const HELPER_SECRET: &str = "helper-secret-sentinel";
@@ -5528,7 +5457,7 @@ repositories:
                 test_config(),
                 store,
                 Arc::new(SecretBearingBatchAuthorizer {
-                    message: format!("provider diagnostic {OAUTH_SECRET} {HELPER_SECRET}"),
+                    message: format!("provider diagnostic {PROVIDER_SECRET} {HELPER_SECRET}"),
                 }),
                 Arc::new(RecordingTransferStore::missing()),
             );
@@ -5576,7 +5505,7 @@ repositories:
         assert!(rendered.contains("Git LFS download transfer storage read failed"));
         for secret in [
             CREDENTIAL_SECRET,
-            OAUTH_SECRET,
+            PROVIDER_SECRET,
             DRIVE_SECRET,
             URL_SECRET,
             HELPER_SECRET,
@@ -7250,7 +7179,7 @@ repositories:
     }
 
     #[tokio::test]
-    async fn batch_route_returns_auth_challenge_when_github_token_is_missing() {
+    async fn batch_route_returns_auth_challenge_when_github_pat_is_missing() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
         let router = lfs_server_router_with_sessions(test_config(), store);
 
@@ -7284,10 +7213,10 @@ repositories:
         let config = test_config_with_github_api_url(&github_api_url);
         let store = LocalLfsSessionStore::new();
         let user = RepositoryUser::new("github-main", "octocat", Some("42".to_owned()));
-        let github_token =
-            GitHubOAuthAccessToken::from_secret("gho_authorization").expect("token should parse");
+        let github_pat = GitHubPersonalAccessToken::from_secret("github_pat_authorization")
+            .expect("token should parse");
         let issued = store
-            .issue_session_with_github_token(&user, ["read:user", "repo"], github_token)
+            .issue_session_with_github_pat(&user, ["read:user", "repo"], github_pat)
             .expect("session should be issued");
         let router = lfs_server_router_with_sessions(config, store);
 
@@ -7321,10 +7250,10 @@ repositories:
         let config = test_config_with_github_api_url(&github_api_url);
         let store = LocalLfsSessionStore::new();
         let user = RepositoryUser::new("github-main", "octocat", Some("42".to_owned()));
-        let github_token =
-            GitHubOAuthAccessToken::from_secret("gho_authorization").expect("token should parse");
+        let github_pat = GitHubPersonalAccessToken::from_secret("github_pat_authorization")
+            .expect("token should parse");
         let issued = store
-            .issue_session_with_github_token(&user, ["read:user", "repo"], github_token)
+            .issue_session_with_github_pat(&user, ["read:user", "repo"], github_pat)
             .expect("session should be issued");
         let router = lfs_server_router_with_sessions(config, store);
 
@@ -7578,20 +7507,7 @@ repositories:
     }
 
     #[tokio::test]
-    async fn server_router_mounts_github_oauth_callback_before_lfs_fallback() {
-        let router = server_router_with_sessions(test_config(), LocalLfsSessionStore::new())
-            .expect("server router should build");
-
-        let response = router
-            .oneshot(lfs_request("/auth/github/callback", None))
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn server_router_rejects_multiple_github_oauth_providers() {
+    async fn server_router_mounts_github_pat_login_in_pat_mode() {
         let config = ServerConfig::load_from_str(
             r#"
 server:
@@ -7600,13 +7516,57 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: test-client-a
-    oauth_client_secret: test-secret-a
+    personal_access_token: github_pat_configured
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
+    root_folder_id: root
+repositories:
+  - id: github-main:owner/repo
+    repo_provider: github-main
+    host: github.com
+    owner: owner
+    name: repo
+    provider_repository_id: "8675309"
+    storage_provider: drive-user-a
+"#,
+        )
+        .expect("PAT server config should load");
+        let router = server_router_with_sessions(config, LocalLfsSessionStore::new())
+            .expect("PAT server router should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(crate::GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH)
+                    .body(Body::empty())
+                    .expect("PAT login request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn server_router_rejects_multiple_github_pat_providers() {
+        let config = ServerConfig::load_from_str(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    personal_access_token: github-pat-a
   github-secondary:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: test-client-b
-    oauth_client_secret: test-secret-b
+    personal_access_token: github-pat-b
 storage_providers:
   drive-user-a:
     type: google_drive

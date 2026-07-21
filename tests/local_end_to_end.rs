@@ -22,7 +22,7 @@ use axum::{
     },
 };
 use lfscloud::{
-    GitCredentialApproval, GitHubOAuthAccessToken, GitLfsConfigTarget, GitRepository,
+    GitCredentialApproval, GitHubPersonalAccessToken, GitLfsConfigTarget, GitRepository,
     LfsBatchResponse, LfsInitRoute, LocalCacheDehydrationStatus, LocalCacheLayout,
     LocalLfsSessionStore, RepositoryPermission, RepositoryUser, ServerConfig, ServerError,
     lfs_server_router_with_provider_adapters,
@@ -65,10 +65,10 @@ async fn real_git_lfs_push_fetch_and_checkout_cross_the_tcp_boundary() {
     );
     let sessions = LocalLfsSessionStore::new();
     let session = sessions
-        .issue_session_with_github_token(
+        .issue_session_with_github_pat(
             &RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned())),
             ["repo"],
-            GitHubOAuthAccessToken::from_secret("fake-provider-token")
+            GitHubPersonalAccessToken::from_secret("fake-provider-token")
                 .expect("fake provider token should parse"),
         )
         .expect("local LFS session should be issued");
@@ -213,10 +213,10 @@ async fn local_init_upload_download_and_checkout_flow_uses_fake_providers() {
     let user = RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned()));
     let sessions = LocalLfsSessionStore::new();
     let session = sessions
-        .issue_session_with_github_token(
+        .issue_session_with_github_pat(
             &user,
             ["repo"],
-            GitHubOAuthAccessToken::from_secret("fake-provider-token")
+            GitHubPersonalAccessToken::from_secret("fake-provider-token")
                 .expect("fake provider token should parse"),
         )
         .expect("local LFS session should be issued");
@@ -352,10 +352,10 @@ async fn shared_storage_provider_does_not_expose_another_repository_object() {
     let user = RepositoryUser::new("github-main", "octocat", Some("user-123".to_owned()));
     let sessions = LocalLfsSessionStore::new();
     let session = sessions
-        .issue_session_with_github_token(
+        .issue_session_with_github_pat(
             &user,
             ["repo"],
-            GitHubOAuthAccessToken::from_secret("fake-provider-token")
+            GitHubPersonalAccessToken::from_secret("fake-provider-token")
                 .expect("fake provider token should parse"),
         )
         .expect("local LFS session should be issued");
@@ -483,8 +483,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: test-client
-    oauth_client_secret: test-secret
+    personal_access_token: github-pat
 storage_providers:
   drive-user-a:
     type: google_drive

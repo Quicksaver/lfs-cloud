@@ -27,14 +27,14 @@ use url::Url;
 
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
-    GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitCredentialRejection,
-    GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers, GitLfsMigrationDiscovery,
-    GitLfsSourceEndpointSource, GitRemote, GitRepository, GoogleDriveGcloudTokenProvider,
-    GoogleDriveStorageConfig, LFS_POINTER_SIZE_CUTOFF, LFS_SESSION_REVOKE_PATH, LfsInitRoute,
-    LfsObject, LfsPointer, LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
-    LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
-    LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
-    LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
+    GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup,
+    GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers,
+    GitLfsMigrationDiscovery, GitLfsSourceEndpointSource, GitRemote, GitRepository,
+    GoogleDriveGcloudTokenProvider, GoogleDriveStorageConfig, LFS_POINTER_SIZE_CUTOFF,
+    LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsPointer, LfsSessionToken,
+    LocalCacheDehydration, LocalCacheDehydrationStatus, LocalCacheGarbageCollection,
+    LocalCacheGarbageCollectionObject, LocalCacheIngest, LocalCacheIngestStatus, LocalCacheLayout,
+    LocalCacheMaterialization, LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
     LocalMigrationObjectAvailability, ServeOptions, ServerConfig, StorageProviderConfig,
     TracingConfig, check_local_migration_objects, discover_git_lfs_migration_from_remote,
     enumerate_current_checkout_lfs_pointers, enumerate_fetched_ref_lfs_pointers_for_remote,
@@ -72,7 +72,7 @@ struct Cli {
 enum Command {
     /// Run the local Git LFS-compatible HTTP server.
     Serve(ServeCommand),
-    /// Start GitHub OAuth login and store the local LFS token for this repo.
+    /// Authenticate with GitHub and store the local LFS token for this repo.
     Login(LoginCommand),
     /// Revoke the local LFS session and erase its Git credential.
     Logout(LogoutCommand),
@@ -116,10 +116,6 @@ struct LoginCommand {
     /// Allow plaintext HTTP to a non-loopback server on a trusted network.
     #[arg(long)]
     allow_insecure_http: bool,
-
-    /// Print the login URL without trying to open a browser.
-    #[arg(long)]
-    no_open: bool,
 }
 
 #[derive(Debug, Args)]
@@ -493,25 +489,25 @@ where
         &current_dir,
         output,
         read_token,
-        open_url_in_default_browser,
+        request_personal_access_token_lfs_session,
         |approval| approval.approve_in_dir(&current_dir),
     )
     .map_err(anyhow::Error::from)
 }
 
 #[cfg(test)]
-fn run_login_from_dir<R, W, O, A>(
+fn run_login_from_dir<R, W, E, A>(
     command: LoginCommand,
     start_dir: impl AsRef<Path>,
     input: &mut R,
     output: &mut W,
-    open_browser: O,
+    exchange_personal_access_token: E,
     approve_credential: A,
 ) -> CliResult<()>
 where
     R: BufRead,
     W: Write,
-    O: FnMut(&str) -> CliResult<()>,
+    E: FnMut(&str, &str) -> CliResult<LfsSessionToken>,
     A: FnMut(GitCredentialApproval) -> CliResult<()>,
 {
     run_login_from_dir_with_token_reader(
@@ -519,23 +515,23 @@ where
         start_dir,
         output,
         || read_bounded_login_token(input),
-        open_browser,
+        exchange_personal_access_token,
         approve_credential,
     )
 }
 
-fn run_login_from_dir_with_token_reader<W, T, O, A>(
+fn run_login_from_dir_with_token_reader<W, T, E, A>(
     command: LoginCommand,
     start_dir: impl AsRef<Path>,
     output: &mut W,
     mut read_token: T,
-    mut open_browser: O,
+    mut exchange_personal_access_token: E,
     mut approve_credential: A,
 ) -> CliResult<()>
 where
     W: Write,
     T: FnMut() -> CliResult<String>,
-    O: FnMut(&str) -> CliResult<()>,
+    E: FnMut(&str, &str) -> CliResult<LfsSessionToken>,
     A: FnMut(GitCredentialApproval) -> CliResult<()>,
 {
     let repository = GitRepository::discover(start_dir.as_ref()).map_err(login_discovery_error)?;
@@ -544,33 +540,11 @@ where
         &repository.remote,
         command.allow_insecure_http,
     )?;
-    let login_url = login_url_for_server(&route.server_url)?;
-
-    writeln!(output, "authorize LFS Cloud with GitHub:").map_err(output_error)?;
-    writeln!(output, "  {login_url}").map_err(output_error)?;
-    if command.no_open {
-        writeln!(output, "browser open skipped").map_err(output_error)?;
-    } else {
-        match open_browser(&login_url) {
-            Ok(()) => {
-                writeln!(output, "requested browser open for GitHub OAuth").map_err(output_error)?
-            }
-            Err(error) => writeln!(output, "browser open failed: {error}").map_err(output_error)?,
-        }
-    }
-    writeln!(
-        output,
-        "paste the lfs_token value from the callback response, then press Enter."
-    )
-    .map_err(output_error)?;
-    write!(output, "lfs_token: ").map_err(output_error)?;
+    write!(output, "GitHub personal access token: ").map_err(output_error)?;
     output.flush().map_err(output_error)?;
-
-    let token = read_token()?;
+    let personal_access_token = read_token()?;
     writeln!(output).map_err(output_error)?;
-    let token = LfsSessionToken::from_secret(token).map_err(|_| CliError::InvalidArguments {
-        message: "lfs_token was invalid or blank".to_owned(),
-    })?;
+    let token = exchange_personal_access_token(&route.server_url, &personal_access_token)?;
     let approval = GitCredentialApproval::new_with_insecure_http(
         &route.lfs_url,
         token,
@@ -589,6 +563,69 @@ where
     writeln!(output, "  username: {approval_username}").map_err(output_error)?;
 
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct PersonalAccessTokenLoginResponse {
+    lfs_token: String,
+}
+
+fn request_personal_access_token_lfs_session(
+    server_url: &str,
+    personal_access_token: &str,
+) -> CliResult<LfsSessionToken> {
+    crate::GitHubPersonalAccessToken::from_secret(personal_access_token.to_owned()).map_err(
+        |_| CliError::InvalidArguments {
+            message: "GitHub personal access token was invalid or blank".to_owned(),
+        },
+    )?;
+    let login_url = github_personal_access_token_login_url_for_server(server_url)?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .map_err(|source| CliError::Io {
+            context: "failed to create GitHub PAT login client".to_owned(),
+            source: io::Error::other(source),
+        })?;
+    let response = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            client
+                .post(login_url)
+                .bearer_auth(personal_access_token)
+                .timeout(SESSION_REVOCATION_TIMEOUT)
+                .send(),
+        )
+    })
+    .map_err(|source| CliError::Io {
+        context: "failed to exchange GitHub personal access token".to_owned(),
+        source: io::Error::other(source),
+    })?;
+    if !response.status().is_success() {
+        return Err(CliError::ExternalCommandOutput {
+            command: "GitHub personal access token login".to_owned(),
+            message: SanitizedMessage::new(format!(
+                "server returned HTTP status {}",
+                response.status().as_u16()
+            )),
+        });
+    }
+    let response = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(response.json::<PersonalAccessTokenLoginResponse>())
+    })
+    .map_err(|source| CliError::Io {
+        context: "failed to read GitHub PAT login response".to_owned(),
+        source: io::Error::other(source),
+    })?;
+
+    LfsSessionToken::from_secret(response.lfs_token).map_err(|_| CliError::ExternalCommandOutput {
+        command: "GitHub personal access token login".to_owned(),
+        message: SanitizedMessage::new("server returned an invalid local LFS token"),
+    })
+}
+
+fn github_personal_access_token_login_url_for_server(server_url: &str) -> CliResult<String> {
+    auth_url_for_server(server_url, GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH)
 }
 
 trait LoginTerminal: BufRead {
@@ -613,7 +650,7 @@ impl LoginTerminal for terminal_prompt::Terminal {
 
 fn read_login_token_from_terminal() -> CliResult<String> {
     let mut terminal = terminal_prompt::Terminal::open().map_err(|source| CliError::Io {
-        context: "failed to open terminal for hidden lfs_token input".to_owned(),
+        context: "failed to open terminal for hidden login input".to_owned(),
         source,
     })?;
 
@@ -3176,7 +3213,7 @@ fn validate_google_drive_status_storage(storage: &GoogleDriveStorageConfig) -> C
         })
 }
 
-fn login_url_for_server(server_url: &str) -> CliResult<String> {
+fn auth_url_for_server(server_url: &str, route_path: &str) -> CliResult<String> {
     let mut login_url = Url::parse(server_url).map_err(|source| CliError::InvalidArguments {
         message: format!("server URL is not valid: {source}"),
     })?;
@@ -3207,67 +3244,11 @@ fn login_url_for_server(server_url: &str) -> CliResult<String> {
                 .map_err(|()| CliError::InvalidArguments {
                     message: "server URL cannot be used as a route base".to_owned(),
                 })?;
-        segments.extend(GITHUB_OAUTH_LOGIN_PATH.trim_start_matches('/').split('/'));
+        segments.extend(route_path.trim_start_matches('/').split('/'));
     }
 
     Ok(login_url.to_string())
 }
-
-fn open_url_in_default_browser(url: &str) -> CliResult<()> {
-    let (program, args): (&str, Vec<&str>) = match std::env::consts::OS {
-        "macos" => ("open", vec![url]),
-        "windows" => ("rundll32", vec!["url.dll,FileProtocolHandler", url]),
-        _ => ("xdg-open", vec![url]),
-    };
-
-    spawn_browser_launcher(program, &args)
-}
-
-fn spawn_browser_launcher(program: &str, args: &[&str]) -> CliResult<()> {
-    let mut command = ProcessCommand::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    configure_browser_launcher(&mut command);
-
-    let mut child = command.spawn().map_err(|source| CliError::Io {
-        context: format!("failed to start {program}"),
-        source,
-    })?;
-
-    // Desktop launchers are not required to exit after handing off the URL.
-    // Reap the process off the CLI's critical path so token entry can begin
-    // immediately even when the desktop integration remains open indefinitely.
-    let _ = std::thread::Builder::new()
-        .name("lfscloud-browser-reaper".to_owned())
-        .spawn(move || {
-            let _ = child.wait();
-        });
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn configure_browser_launcher(command: &mut ProcessCommand) {
-    use std::os::unix::process::CommandExt;
-
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-fn configure_browser_launcher(command: &mut ProcessCommand) {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_browser_launcher(_command: &mut ProcessCommand) {}
 
 fn process_status_text(status: std::process::ExitStatus) -> String {
     status
@@ -3389,19 +3370,19 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    use super::run_bounded_child_command;
     use super::{
         Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, LoginTerminal,
         LogoutCommand, MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, PullCommand,
         SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
-        current_checkout_lfs_pointer_scan, dispatch, is_git_worktree_discovery_error,
-        login_url_for_server, probe_server_reachable, read_bounded_login_token,
-        read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir,
-        run_init_from_dir, run_login_from_dir, run_logout_from_dir, run_migrate_from_dir,
-        run_pull_from_dir, run_status_from_dir, tracing_config, validate_status_storage,
-        write_init_change,
+        current_checkout_lfs_pointer_scan, dispatch,
+        github_personal_access_token_login_url_for_server, is_git_worktree_discovery_error,
+        probe_server_reachable, read_bounded_login_token, read_hidden_login_token,
+        run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
+        run_login_from_dir, run_logout_from_dir, run_migrate_from_dir, run_pull_from_dir,
+        run_status_from_dir, tracing_config, validate_status_storage, write_init_change,
     };
-    #[cfg(unix)]
-    use super::{run_bounded_child_command, spawn_browser_launcher};
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig,
@@ -3478,13 +3459,12 @@ mod tests {
     }
 
     #[test]
-    fn login_command_accepts_server_url_and_no_open_option() {
+    fn login_command_accepts_server_url() {
         let cli = Cli::try_parse_from([
             "lfscloud",
             "login",
             "--server",
             "http://127.0.0.1:8080",
-            "--no-open",
             "--allow-insecure-http",
         ])
         .expect("login command should parse");
@@ -3495,7 +3475,6 @@ mod tests {
 
         assert_eq!(command.server, "http://127.0.0.1:8080");
         assert!(command.allow_insecure_http);
-        assert!(command.no_open);
     }
 
     #[test]
@@ -6266,11 +6245,13 @@ mod tests {
     }
 
     #[test]
-    fn login_url_preserves_server_base_path() {
+    fn personal_access_token_login_url_preserves_server_base_path() {
         assert_eq!(
-            login_url_for_server("https://lfs.example.com/custom/base")
-                .expect("login URL should resolve"),
-            "https://lfs.example.com/custom/base/auth/github/login"
+            github_personal_access_token_login_url_for_server(
+                "https://lfs.example.com/custom/base"
+            )
+            .expect("login URL should resolve"),
+            "https://lfs.example.com/custom/base/auth/github/pat"
         );
     }
 
@@ -6282,8 +6263,8 @@ mod tests {
             "https://lfs.example.com/custom/base?token=secret",
             "https://lfs.example.com/custom/base#fragment",
         ] {
-            let error =
-                login_url_for_server(server_url).expect_err("unsafe server URL should be rejected");
+            let error = github_personal_access_token_login_url_for_server(server_url)
+                .expect_err("unsafe server URL should be rejected");
             assert!(
                 matches!(error, CliError::InvalidArguments { .. }),
                 "unexpected error for {server_url}: {error}"
@@ -6292,7 +6273,7 @@ mod tests {
     }
 
     #[test]
-    fn login_opens_browser_and_stores_local_lfs_token_for_current_repo() {
+    fn login_exchanges_pat_and_stores_only_local_lfs_token_for_current_repo() {
         require_git();
 
         let repo = TempDir::new().expect("temporary repository should be created");
@@ -6301,27 +6282,31 @@ mod tests {
             repo.path(),
             &["remote", "add", "origin", "git@github.com:owner/repo.git"],
         );
-        let opened_url = Arc::new(Mutex::new(None));
+        let exchange = Arc::new(Mutex::new(None));
         let approved = Arc::new(Mutex::new(None));
-        let opened_url_for_runner = Arc::clone(&opened_url);
+        let exchange_for_runner = Arc::clone(&exchange);
         let approved_for_runner = Arc::clone(&approved);
-        let mut input = io::Cursor::new(b" \tlocal-lfs-token \r\n".to_vec());
+        let mut input = io::Cursor::new(b" \tgithub-pat \r\n".to_vec());
         let mut output = Vec::new();
 
         run_login_from_dir(
             LoginCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
-                no_open: false,
             },
             repo.path(),
             &mut input,
             &mut output,
-            move |url| {
-                *opened_url_for_runner
+            move |server_url, personal_access_token| {
+                *exchange_for_runner
                     .lock()
-                    .expect("capture mutex should lock") = Some(url.to_owned());
-                Ok(())
+                    .expect("capture mutex should lock") =
+                    Some((server_url.to_owned(), personal_access_token.to_owned()));
+                LfsSessionToken::from_secret("local-lfs-token").map_err(|error| {
+                    CliError::InvalidArguments {
+                        message: error.to_string(),
+                    }
+                })
             },
             move |approval: GitCredentialApproval| {
                 let credential = (
@@ -6338,8 +6323,8 @@ mod tests {
         .expect("login should complete");
 
         assert_eq!(
-            *opened_url.lock().expect("capture mutex should lock"),
-            Some("http://127.0.0.1:8080/auth/github/login".to_owned())
+            *exchange.lock().expect("capture mutex should lock"),
+            Some(("http://127.0.0.1:8080".to_owned(), "github-pat".to_owned(),))
         );
         assert_eq!(
             *approved.lock().expect("capture mutex should lock"),
@@ -6350,61 +6335,11 @@ mod tests {
             ))
         );
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("authorize LFS Cloud with GitHub:"));
-        assert!(rendered.contains("requested browser open for GitHub OAuth"));
-        assert!(
-            rendered
-                .find("http://127.0.0.1:8080/auth/github/login")
-                .expect("login URL should be printed")
-                < rendered
-                    .find("requested browser open for GitHub OAuth")
-                    .expect("browser status should be printed")
-        );
+        assert!(rendered.contains("GitHub personal access token:"));
         assert!(rendered.contains("stored local LFS credential"));
         assert!(rendered.contains("username: lfscloud"));
         assert!(!rendered.contains("local-lfs-token"));
-    }
-
-    #[test]
-    fn login_no_open_skips_browser_but_stores_token() {
-        require_git();
-
-        let repo = TempDir::new().expect("temporary repository should be created");
-        run_git(repo.path(), &["init"]);
-        run_git(
-            repo.path(),
-            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
-        );
-        let approved = Arc::new(Mutex::new(None));
-        let approved_for_runner = Arc::clone(&approved);
-        let mut input = io::Cursor::new(b"local-lfs-token\n".to_vec());
-        let mut output = Vec::new();
-
-        run_login_from_dir(
-            LoginCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
-                allow_insecure_http: false,
-                no_open: true,
-            },
-            repo.path(),
-            &mut input,
-            &mut output,
-            |_| panic!("browser opener should not be called with --no-open"),
-            move |approval: GitCredentialApproval| {
-                *approved_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some(approval.lfs_url().to_string());
-                Ok(())
-            },
-        )
-        .expect("login should complete");
-
-        assert_eq!(
-            *approved.lock().expect("capture mutex should lock"),
-            Some("http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs".to_owned())
-        );
-        let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("browser open skipped"));
+        assert!(!rendered.contains("github-pat"));
     }
 
     #[test]
@@ -6612,12 +6547,11 @@ mod tests {
             LoginCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
-                no_open: true,
             },
             repo.path(),
             &mut input,
             &mut output,
-            |_| panic!("browser opener should not be called without a remote"),
+            |_, _| panic!("PAT exchange should not run without a remote"),
             |_| panic!("credential approval should not run without a remote"),
         )
         .expect_err("missing origin remote should fail before login");
@@ -6627,20 +6561,6 @@ mod tests {
             CliError::InvalidArguments { message }
                 if message.contains("requires an origin remote")
         ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn browser_launcher_does_not_wait_for_the_desktop_process() {
-        let started = Instant::now();
-
-        spawn_browser_launcher("/bin/sh", &["-c", "sleep 3"])
-            .expect("browser launcher should start");
-
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "browser launcher waited for the desktop process"
-        );
     }
 
     fn status_config(public_url: &str) -> String {
@@ -6655,8 +6575,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: client-id
-    oauth_client_secret: client-secret
+    personal_access_token: github-pat
 
 storage_providers:
   drive-user-a:

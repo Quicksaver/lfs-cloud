@@ -1,8 +1,8 @@
 //! Local LFS session token metadata.
 //!
-//! GitHub OAuth tokens are used only for repository-provider API calls. This
+//! GitHub personal access tokens are used only for repository-provider API calls. This
 //! module issues separate short-lived LFS Cloud bearer tokens that Git LFS can
-//! use without receiving the upstream GitHub token.
+//! use without receiving the upstream GitHub PAT.
 
 use std::{
     collections::{BTreeMap, VecDeque, btree_map::Entry},
@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use oauth2::CsrfToken;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::{
     aead,
     rand::{SecureRandom, SystemRandom},
@@ -19,7 +19,7 @@ use ring::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    GitHubOAuthAccessToken, MetadataDatabase, RepositoryUser, ServerError, ServerResult,
+    GitHubPersonalAccessToken, MetadataDatabase, RepositoryUser, ServerError, ServerResult,
     metadata::MetadataSessionRecord,
 };
 
@@ -31,7 +31,7 @@ const MAX_LOCAL_LFS_SESSIONS: usize = 1024;
 // A user can authenticate multiple worktrees or machines without one principal
 // monopolizing the bounded process-wide credential store.
 const MAX_LOCAL_LFS_SESSIONS_PER_PRINCIPAL: usize = 16;
-// Short-window issuance throttling prevents repeated successful OAuth callbacks
+// Short-window issuance throttling prevents repeated successful PAT exchanges
 // from churning tokens even when the caller immediately revokes older sessions.
 const MAX_LFS_SESSION_ISSUANCES_PER_WINDOW: usize = 8;
 const LFS_SESSION_ISSUANCE_WINDOW: Duration = Duration::from_secs(60);
@@ -41,7 +41,7 @@ const SESSION_TOKEN_NONCE_LEN: usize = 12;
 
 /// Opaque bearer token issued by LFS Cloud for Git LFS clients.
 ///
-/// This token is distinct from any upstream GitHub OAuth token. It is the only
+/// This token is distinct from the upstream GitHub PAT. It is the only
 /// token value that should be stored in Git's credential helper for LFS routes.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct LfsSessionToken(String);
@@ -60,8 +60,11 @@ impl LfsSessionToken {
     /// ```
     #[must_use]
     pub fn generate() -> Self {
-        Self::from_secret(CsrfToken::new_random().secret().clone())
-            .expect("oauth2-generated CSRF token should be a valid local LFS token")
+        let mut random = [0_u8; 32];
+        SystemRandom::new()
+            .fill(&mut random)
+            .expect("operating-system randomness should generate a local LFS token");
+        Self(URL_SAFE_NO_PAD.encode(random))
     }
 
     /// Restores an existing local LFS session token secret.
@@ -107,7 +110,7 @@ pub struct LfsSessionMetadata {
     pub login: String,
     /// Provider-specific stable user ID, when available.
     pub stable_id: Option<String>,
-    /// OAuth scopes granted by the repository provider during login.
+    /// Authentication labels recorded by the repository provider during login.
     pub granted_scopes: Vec<String>,
     /// Time the local LFS session token was issued.
     pub issued_at: SystemTime,
@@ -117,24 +120,24 @@ pub struct LfsSessionMetadata {
 
 /// Private server-side state associated with a local LFS session.
 ///
-/// Git LFS clients receive only [`LfsSessionToken`]. The optional GitHub token
+/// Git LFS clients receive only [`LfsSessionToken`]. The optional GitHub PAT
 /// is retained server-side so batch requests can re-check repository
 /// permissions without handing the upstream token to Git.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct LfsSessionRecord {
     /// Non-secret metadata for the local LFS session.
     metadata: LfsSessionMetadata,
-    github_access_token: Option<GitHubOAuthAccessToken>,
+    github_personal_access_token: Option<GitHubPersonalAccessToken>,
 }
 
 impl LfsSessionRecord {
     fn new(
         metadata: LfsSessionMetadata,
-        github_access_token: Option<GitHubOAuthAccessToken>,
+        github_personal_access_token: Option<GitHubPersonalAccessToken>,
     ) -> Self {
         Self {
             metadata,
-            github_access_token,
+            github_personal_access_token,
         }
     }
 
@@ -144,10 +147,10 @@ impl LfsSessionRecord {
         &self.metadata
     }
 
-    /// Returns the private GitHub OAuth token kept server-side for permission checks.
+    /// Returns the private GitHub PAT kept server-side for permission checks.
     #[must_use]
-    pub(crate) fn github_access_token(&self) -> Option<&GitHubOAuthAccessToken> {
-        self.github_access_token.as_ref()
+    pub(crate) fn github_personal_access_token(&self) -> Option<&GitHubPersonalAccessToken> {
+        self.github_personal_access_token.as_ref()
     }
 }
 
@@ -157,8 +160,11 @@ impl fmt::Debug for LfsSessionRecord {
             .debug_struct("LfsSessionRecord")
             .field("metadata", &self.metadata)
             .field(
-                "github_access_token",
-                &self.github_access_token.as_ref().map(|_| "<redacted>"),
+                "github_personal_access_token",
+                &self
+                    .github_personal_access_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
             )
             .finish()
     }
@@ -410,27 +416,27 @@ impl LocalLfsSessionStore {
         self.issue_session_record(user, granted_scopes, DEFAULT_LFS_SESSION_TTL, None)
     }
 
-    /// Issues a local LFS session that retains a GitHub token server-side.
+    /// Issues a local LFS session that retains a GitHub PAT server-side.
     ///
     /// The returned local token is still the only secret intended for Git LFS
-    /// and Git credential-helper storage. The GitHub token remains private
+    /// and Git credential-helper storage. The GitHub PAT remains private
     /// process state used for repository permission checks.
     ///
     /// # Errors
     ///
     /// Returns [`ServerError`] if the default lifetime cannot be represented or
     /// session admission is temporarily rate limited.
-    pub fn issue_session_with_github_token(
+    pub fn issue_session_with_github_pat(
         &self,
         user: &RepositoryUser,
         granted_scopes: impl IntoIterator<Item = impl Into<String>>,
-        github_access_token: GitHubOAuthAccessToken,
+        github_personal_access_token: GitHubPersonalAccessToken,
     ) -> ServerResult<IssuedLfsSession> {
         self.issue_session_record(
             user,
             granted_scopes,
             DEFAULT_LFS_SESSION_TTL,
-            Some(github_access_token),
+            Some(github_personal_access_token),
         )
     }
 
@@ -455,7 +461,7 @@ impl LocalLfsSessionStore {
         user: &RepositoryUser,
         granted_scopes: impl IntoIterator<Item = impl Into<String>>,
         ttl: Duration,
-        github_access_token: Option<GitHubOAuthAccessToken>,
+        github_personal_access_token: Option<GitHubPersonalAccessToken>,
     ) -> ServerResult<IssuedLfsSession> {
         if ttl.is_zero() {
             return Err(ServerError::InvalidRequest {
@@ -470,7 +476,10 @@ impl LocalLfsSessionStore {
                 message: "lfs session expiration timestamp overflowed".to_owned(),
             })?;
         let metadata = LfsSessionMetadata::new(user, granted_scopes, issued_at, expires_at);
-        let record = Arc::new(LfsSessionRecord::new(metadata, github_access_token));
+        let record = Arc::new(LfsSessionRecord::new(
+            metadata,
+            github_personal_access_token,
+        ));
         let principal = LfsSessionPrincipal::from_metadata(&record.metadata);
 
         let mut state = self
@@ -830,7 +839,7 @@ impl DurableLfsSessionStore {
             issued_at,
             expires_at,
         );
-        let github_access_token = match (
+        let github_personal_access_token = match (
             stored.provider_access_token_ciphertext,
             stored.provider_access_token_nonce,
         ) {
@@ -848,7 +857,10 @@ impl DurableLfsSessionStore {
 
         Ok((
             token_key,
-            Arc::new(LfsSessionRecord::new(metadata, github_access_token)),
+            Arc::new(LfsSessionRecord::new(
+                metadata,
+                github_personal_access_token,
+            )),
         ))
     }
 
@@ -858,7 +870,7 @@ impl DurableLfsSessionStore {
         record: &LfsSessionRecord,
     ) -> ServerResult<()> {
         let protected_token = record
-            .github_access_token
+            .github_personal_access_token
             .as_ref()
             .map(|token| self.protector.encrypt(token_key, &record.metadata, token))
             .transpose()?;
@@ -912,7 +924,7 @@ impl SessionTokenProtector {
         &self,
         token_key: &LfsSessionTokenKey,
         metadata: &LfsSessionMetadata,
-        access_token: &GitHubOAuthAccessToken,
+        access_token: &GitHubPersonalAccessToken,
     ) -> ServerResult<(Vec<u8>, [u8; SESSION_TOKEN_NONCE_LEN])> {
         let mut nonce_bytes = [0_u8; SESSION_TOKEN_NONCE_LEN];
         self.random
@@ -938,7 +950,7 @@ impl SessionTokenProtector {
         metadata: &LfsSessionMetadata,
         mut ciphertext: Vec<u8>,
         nonce: &[u8],
-    ) -> ServerResult<GitHubOAuthAccessToken> {
+    ) -> ServerResult<GitHubPersonalAccessToken> {
         let nonce_bytes: [u8; SESSION_TOKEN_NONCE_LEN] = nonce.try_into().map_err(|_| {
             invalid_durable_session("stored provider token nonce has invalid length")
         })?;
@@ -957,7 +969,7 @@ impl SessionTokenProtector {
             })?;
         let token = String::from_utf8(plaintext.to_vec())
             .map_err(|_| invalid_durable_session("decrypted provider token is not valid UTF-8"))?;
-        GitHubOAuthAccessToken::from_secret(token)
+        GitHubPersonalAccessToken::from_secret(token)
             .map_err(|_| invalid_durable_session("decrypted provider token is invalid"))
     }
 }
@@ -996,7 +1008,7 @@ mod tests {
         LfsSessionToken, LfsSessionTokenKey, LocalLfsSessionStore, MAX_LFS_SESSION_TOKEN_LEN,
         SessionStoreLimits,
     };
-    use crate::{GitHubOAuthAccessToken, MetadataDatabase, RepositoryUser, ServerError};
+    use crate::{GitHubPersonalAccessToken, MetadataDatabase, RepositoryUser, ServerError};
 
     fn user() -> RepositoryUser {
         RepositoryUser::new("github-main", "octocat", Some("42".to_owned()))
@@ -1079,12 +1091,12 @@ mod tests {
     }
 
     #[test]
-    fn session_store_keeps_github_token_private_for_server_side_authorization() {
+    fn session_store_keeps_github_pat_private_for_server_side_authorization() {
         let store = LocalLfsSessionStore::new();
-        let github_token =
-            GitHubOAuthAccessToken::from_secret("gho_authorization").expect("token should parse");
+        let github_pat = GitHubPersonalAccessToken::from_secret("github_pat_authorization")
+            .expect("token should parse");
         let issued = store
-            .issue_session_with_github_token(&user(), ["read:user", "repo"], github_token)
+            .issue_session_with_github_pat(&user(), ["read:user", "repo"], github_pat)
             .expect("session should be issued");
         let record = store
             .verify_record(&issued.token)
@@ -1093,12 +1105,12 @@ mod tests {
         assert_eq!(record.metadata().login, "octocat");
         assert_eq!(
             record
-                .github_access_token()
+                .github_personal_access_token()
                 .expect("github token should be retained")
                 .as_str(),
-            "gho_authorization"
+            "github_pat_authorization"
         );
-        assert!(!format!("{record:?}").contains("gho_authorization"));
+        assert!(!format!("{record:?}").contains("github_pat_authorization"));
     }
 
     #[test]
@@ -1163,7 +1175,7 @@ mod tests {
             .expect("active record should remain stored");
         assert!(
             Arc::ptr_eq(&verified, stored),
-            "verification should share the OAuth-bearing record"
+            "verification should share the PAT-bearing record"
         );
         drop(state);
 
@@ -1400,18 +1412,18 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir should be created");
         let database_path = directory.path().join("metadata.sqlite3");
         let encryption_secret = b"stable-server-side-session-encryption-secret";
-        let github_token_secret = "gho_restart_authorization";
+        let github_pat_secret = "github_pat_restart_authorization";
 
         let issued = {
             let database =
                 Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should open"));
             let store = LocalLfsSessionStore::open_durable(database, encryption_secret)
                 .expect("durable session store should open");
-            let github_token = GitHubOAuthAccessToken::from_secret(github_token_secret)
-                .expect("GitHub token should parse");
+            let github_pat = GitHubPersonalAccessToken::from_secret(github_pat_secret)
+                .expect("GitHub PAT should parse");
 
             store
-                .issue_session_with_github_token(&user(), ["read:user", "repo"], github_token)
+                .issue_session_with_github_pat(&user(), ["read:user", "repo"], github_pat)
                 .expect("durable session should be issued")
         };
 
@@ -1423,8 +1435,8 @@ mod tests {
         );
         assert!(
             !database_bytes
-                .windows(github_token_secret.len())
-                .any(|window| window == github_token_secret.as_bytes())
+                .windows(github_pat_secret.len())
+                .any(|window| window == github_pat_secret.as_bytes())
         );
 
         let wrong_key_database =
@@ -1436,7 +1448,7 @@ mod tests {
         .expect_err("a different encryption secret must not restore sessions");
         let wrong_key_message = wrong_key_error.to_string();
         assert!(wrong_key_message.contains("could not be authenticated or decrypted"));
-        assert!(!wrong_key_message.contains(github_token_secret));
+        assert!(!wrong_key_message.contains(github_pat_secret));
         assert!(!wrong_key_message.contains(issued.token.as_str()));
 
         let reopened_database =
@@ -1453,10 +1465,10 @@ mod tests {
         assert_eq!(restored.metadata().granted_scopes, ["read:user", "repo"]);
         assert_eq!(
             restored
-                .github_access_token()
-                .expect("restored session should retain the GitHub token")
+                .github_personal_access_token()
+                .expect("restored session should retain the GitHub PAT")
                 .as_str(),
-            github_token_secret
+            github_pat_secret
         );
     }
 
@@ -1470,11 +1482,12 @@ mod tests {
                 Arc::new(MetadataDatabase::open(&database_path).expect("metadata DB should open"));
             let store = LocalLfsSessionStore::open_durable(database, encryption_secret)
                 .expect("durable session store should open");
-            let github_token = GitHubOAuthAccessToken::from_secret("gho_protected_metadata")
-                .expect("GitHub token should parse");
+            let github_pat =
+                GitHubPersonalAccessToken::from_secret("github_pat_protected_metadata")
+                    .expect("GitHub PAT should parse");
 
             store
-                .issue_session_with_github_token(&user(), ["repo"], github_token)
+                .issue_session_with_github_pat(&user(), ["repo"], github_pat)
                 .expect("durable session should be issued")
         };
 
@@ -1492,7 +1505,7 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains("could not be authenticated or decrypted"));
-        assert!(!message.contains("gho_protected_metadata"));
+        assert!(!message.contains("github_pat_protected_metadata"));
         assert!(!message.contains(issued.token.as_str()));
     }
 }

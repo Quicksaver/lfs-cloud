@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use axum::{Json, Router, extract::State, routing::get};
 use lfscloud::{
-    GitHubProviderConfig, GitHubRepositoryPermissionClient, GitHubRepositoryProvider,
-    RepositoryAuthentication, RepositoryIdentity, RepositoryPermission, RepositoryUser,
+    GitHubAuthenticationConfig, GitHubProviderConfig, GitHubRepositoryPermissionClient,
+    GitHubRepositoryProvider, RepositoryAuthentication, RepositoryIdentity, RepositoryPermission,
+    RepositoryUser,
 };
 use serde_json::{Value, json};
 use support::{
@@ -103,8 +104,7 @@ fn github_provider(api_url: String) -> GitHubRepositoryProvider {
         GitHubProviderConfig {
             id: PROVIDER_ID.to_owned(),
             api_url,
-            oauth_client_id: "test-client".to_owned(),
-            oauth_client_secret: "test-secret".to_owned(),
+            authentication: GitHubAuthenticationConfig::new("github-pat"),
             allow_insecure_http: true,
         },
         GitHubRepositoryPermissionClient::new().expect("GitHub API client should build"),
@@ -124,7 +124,7 @@ fn repository_identity(stable_id: &str) -> RepositoryIdentity {
 fn authentication() -> RepositoryAuthentication {
     RepositoryAuthentication::new(
         RepositoryUser::new(PROVIDER_ID, "octocat", Some(USER_ID.to_owned())),
-        "gho_contract_token",
+        "github_pat_contract_token",
     )
 }
 

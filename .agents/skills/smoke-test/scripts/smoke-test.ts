@@ -44,7 +44,7 @@ const pythonCommand = process.platform === 'win32' ? 'python' : 'python3';
 if (configuredBinary !== undefined) process.env.LFS_CLOUD_SMOKE_BINARY = binaryPath;
 const commandOutputLimit = 4 * 1024 * 1024;
 const defaultTimeoutMs = 15 * 60 * 1000;
-const githubCredentialEnv = 'LFS_CLOUD_GITHUB_TOKEN';
+const githubPatEnv = 'LFS_CLOUD_GITHUB_PAT';
 const driveConfigDirEnv = 'LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR';
 
 let sandbox = '';
@@ -272,7 +272,7 @@ async function statusSmoke(): Promise<void> {
     const lfsUrl = `${serverUrl}/github.com/smoke-owner/status.git/info/lfs`;
     await writeFile(
       configPath,
-      `server:\n  host: 127.0.0.1\n  port: ${address.port}\n  public_url: ${serverUrl}\n\nrepository_providers:\n  github-main:\n    type: github\n    api_url: https://api.github.com\n    oauth_client_id: smoke-client\n    oauth_client_secret: smoke-secret\n\nstorage_providers:\n  drive-smoke:\n    type: google_drive\n    credentials:\n      type: gcloud\n      config_dir: ${JSON.stringify(gcloudConfigDir)}\n      executable: ${JSON.stringify(process.execPath)}\n    root_folder_id: smoke-root\n\nrepositories:\n  - id: github-main:smoke-owner/status\n    repo_provider: github-main\n    host: github.com\n    owner: smoke-owner\n    name: status\n    provider_repository_id: "8675309"\n    storage_provider: drive-smoke\n`,
+      `server:\n  host: 127.0.0.1\n  port: ${address.port}\n  public_url: ${serverUrl}\n\nrepository_providers:\n  github-main:\n    type: github\n    api_url: https://api.github.com\n    personal_access_token: smoke-pat\n\nstorage_providers:\n  drive-smoke:\n    type: google_drive\n    credentials:\n      type: gcloud\n      config_dir: ${JSON.stringify(gcloudConfigDir)}\n      executable: ${JSON.stringify(process.execPath)}\n    root_folder_id: smoke-root\n\nrepositories:\n  - id: github-main:smoke-owner/status\n    repo_provider: github-main\n    host: github.com\n    owner: smoke-owner\n    name: status\n    provider_repository_id: "8675309"\n    storage_provider: drive-smoke\n`,
     );
 
     const gitEnv = {
@@ -344,6 +344,10 @@ function enabledFlag(name: string, description: string): () => string | undefine
 
 function hasCredential(name: string): boolean {
   return (process.env[name]?.trim().length ?? 0) > 0;
+}
+
+function hasGitHubPat(): boolean {
+  return hasCredential(githubPatEnv);
 }
 
 function hasDriveCredential(): boolean {
@@ -455,7 +459,7 @@ function tests(): SmokeTest[] {
     },
     {
       name: 'GitHub disposable repository',
-      skip: missingCredential(() => hasCredential(githubCredentialEnv), `requires ${githubCredentialEnv}`),
+      skip: missingCredential(hasGitHubPat, `requires ${githubPatEnv}`),
       run: () =>
         script('verify-github-integration.sh', 30 * 60 * 1000, {
           LFS_CLOUD_RUN_GITHUB_INTEGRATION: '1',
@@ -479,8 +483,8 @@ function tests(): SmokeTest[] {
     {
       name: 'black-box Git LFS live transfer',
       skip: missingCredential(
-        () => hasCredential(githubCredentialEnv) && hasDriveCredential(),
-        `requires ${githubCredentialEnv} and ${driveConfigDirEnv}`,
+        () => hasGitHubPat() && hasDriveCredential(),
+        `requires ${githubPatEnv}, and ${driveConfigDirEnv}`,
       ),
       run: () =>
         script('verify-live-provider-transfer.sh', 45 * 60 * 1000, {

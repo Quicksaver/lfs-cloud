@@ -33,14 +33,10 @@ pub use error::{
 };
 pub use git::{GitLfsConfigChange, GitLfsConfigTarget, GitRemote, GitRepository};
 pub use github_auth::{
-    DEFAULT_GITHUB_OAUTH_SCOPES, GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_CALLBACK_PATH,
-    GITHUB_OAUTH_LOGIN_PATH, GITHUB_OAUTH_TOKEN_URL, GitHubOAuthAccessToken,
-    GitHubOAuthAuthorization, GitHubOAuthCallback, GitHubOAuthCallbackQuery,
-    GitHubOAuthCallbackRouteResponse, GitHubOAuthCallbackRouteState, GitHubOAuthCode,
-    GitHubOAuthState, GitHubOAuthStateRegistry, GitHubOAuthToken, GitHubOAuthTokenExchanger,
-    GitHubRepositoryPermissionClient, GitHubRepositoryProvider, GitHubUserClient,
-    exchange_github_oauth_code, fetch_authenticated_github_user, github_oauth_authorization_url,
-    github_oauth_callback_router, github_oauth_login_router,
+    GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitHubLoginRouteResponse, GitHubPersonalAccessToken,
+    GitHubPersonalAccessTokenLoginRouteState, GitHubRepositoryPermissionClient,
+    GitHubRepositoryProvider, GitHubUserClient, fetch_authenticated_github_user,
+    github_personal_access_token_login_router,
 };
 pub use google_drive::{
     GOOGLE_DRIVE_API_BASE_URL, GOOGLE_DRIVE_FILE_SCOPE, GoogleDriveAccessToken,
@@ -99,9 +95,10 @@ pub use server::{
     lfs_server_router_with_sessions, render_server_startup_message, serve,
 };
 pub use server_config::{
-    DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
-    GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, RepositoryMapping,
-    RepositoryProviderConfig, ServerConfig, ServerSettings, StorageProviderConfig,
+    DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR,
+    GitHubAuthenticationConfig, GitHubProviderConfig, GoogleDriveGcloudCredentialsConfig,
+    GoogleDriveStorageConfig, RepositoryMapping, RepositoryProviderConfig, ServerConfig,
+    ServerSettings, StorageProviderConfig,
 };
 pub use sessions::{
     DEFAULT_LFS_SESSION_TTL, IssuedLfsSession, LfsSessionMetadata, LfsSessionToken,

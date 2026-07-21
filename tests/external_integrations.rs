@@ -18,12 +18,12 @@ use std::{
 };
 
 use lfscloud::{
-    GitHubOAuthAccessToken, GitHubProviderConfig, GitHubRepositoryPermissionClient,
-    GitHubUserClient, GoogleDriveAccessToken, GoogleDriveGcloudCredentialsConfig,
-    GoogleDriveGcloudTokenProvider, GoogleDriveRootValidator, GoogleDriveStorageConfig, LfsObject,
-    LfsObjectSize, LfsOid, LocalLfsSessionStore, MetadataDatabase,
-    MetadataObjectVerificationStatus, RepositoryIdentity, RepositoryPermission, RepositoryUser,
-    ServerConfig,
+    GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitHubAuthenticationConfig, GitHubPersonalAccessToken,
+    GitHubProviderConfig, GitHubRepositoryPermissionClient, GitHubUserClient,
+    GoogleDriveAccessToken, GoogleDriveGcloudCredentialsConfig, GoogleDriveGcloudTokenProvider,
+    GoogleDriveRootValidator, GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid,
+    MetadataDatabase, MetadataObjectVerificationStatus, RepositoryIdentity, RepositoryPermission,
+    RepositoryUser, ServerConfig,
 };
 use reqwest::{
     Client, Method, StatusCode,
@@ -40,15 +40,34 @@ const DRIVE_API_URL: &str = "https://www.googleapis.com/drive/v3";
 const DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 const LIVE_GITHUB_PROVIDER_ID: &str = "github-live";
 const LIVE_DRIVE_PROVIDER_ID: &str = "drive-live";
-const LIVE_OAUTH_CLIENT_SECRET: &str = "live-external-integration-session-key";
+const LIVE_GITHUB_PAT_ENV: &str = "LFS_CLOUD_GITHUB_PAT";
 const LIVE_DRIVE_CONFIG_DIR_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR";
 
+#[derive(Deserialize)]
+struct GitHubPersonalAccessTokenLoginResponse {
+    lfs_token: String,
+}
+
+struct LiveGitHubCredentials {
+    personal_access_token: String,
+}
+
+impl LiveGitHubCredentials {
+    fn authentication(&self) -> GitHubAuthenticationConfig {
+        GitHubAuthenticationConfig::new(self.personal_access_token.clone())
+    }
+
+    fn personal_access_token(&self) -> &str {
+        &self.personal_access_token
+    }
+}
+
 #[tokio::test]
-#[ignore = "requires LFS_CLOUD_RUN_GITHUB_INTEGRATION=1 and a disposable-capable GitHub token"]
+#[ignore = "requires LFS_CLOUD_RUN_GITHUB_INTEGRATION=1 and LFS_CLOUD_GITHUB_PAT"]
 async fn github_disposable_repo_permission_check() {
     require_enabled("LFS_CLOUD_RUN_GITHUB_INTEGRATION");
 
-    let token = required_env("LFS_CLOUD_GITHUB_TOKEN");
+    let credentials = live_github_credentials();
     let repo_owner = env::var("LFS_CLOUD_GITHUB_OWNER").ok();
     let api_url =
         env::var("LFS_CLOUD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_owned());
@@ -58,21 +77,26 @@ async fn github_disposable_repo_permission_check() {
     let provider = GitHubProviderConfig {
         id: "github-main".to_owned(),
         api_url: api_url.clone(),
-        oauth_client_id: "external-integration".to_owned(),
-        oauth_client_secret: "external-integration".to_owned(),
+        authentication: credentials.authentication(),
         allow_insecure_http: false,
     };
-    let oauth_token =
-        GitHubOAuthAccessToken::from_secret(token.clone()).expect("GitHub token should validate");
+    let github_pat =
+        GitHubPersonalAccessToken::from_secret(credentials.personal_access_token().to_owned())
+            .expect("GitHub PAT should validate");
     let http = Client::new();
-    let created_repo =
-        create_github_repo(&http, &api_url, &token, repo_owner.as_deref(), &repo_name)
-            .await
-            .expect("disposable GitHub repository should be created");
+    let created_repo = create_github_repo(
+        &http,
+        &api_url,
+        credentials.personal_access_token(),
+        repo_owner.as_deref(),
+        &repo_name,
+    )
+    .await
+    .expect("disposable GitHub repository should be created");
 
     let check_result = async {
         let user = GitHubUserClient::new()?
-            .fetch_authenticated_user(&provider, &oauth_token)
+            .fetch_authenticated_user(&provider, &github_pat)
             .await?;
         let repository = RepositoryIdentity {
             provider_id: provider.id.clone(),
@@ -84,7 +108,7 @@ async fn github_disposable_repo_permission_check() {
         let authorization = GitHubRepositoryPermissionClient::new()?
             .check_permission(
                 &provider,
-                &oauth_token,
+                &github_pat,
                 &repository,
                 &user,
                 RepositoryPermission::Write,
@@ -95,7 +119,13 @@ async fn github_disposable_repo_permission_check() {
     }
     .await;
 
-    let delete_result = delete_github_repo(&http, &api_url, &token, &created_repo.full_name).await;
+    let delete_result = delete_github_repo(
+        &http,
+        &api_url,
+        credentials.personal_access_token(),
+        &created_repo.full_name,
+    )
+    .await;
     delete_result.expect("disposable GitHub repository should be deleted");
     let authorization = check_result
         .expect("GitHub permission client should authorize disposable repo write access");
@@ -158,7 +188,7 @@ async fn google_drive_disposable_folder_root_validation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION=1 plus disposable GitHub and Drive credentials"]
+#[ignore = "requires LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION=1 plus selected GitHub auth and Drive credentials"]
 async fn black_box_git_lfs_push_fetch_uses_live_github_and_drive() {
     require_enabled("LFS_CLOUD_RUN_LIVE_TRANSFER_INTEGRATION");
 
@@ -188,6 +218,9 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
         config_dir: test_dir.path().join("gcloud-drive"),
         executable: PathBuf::from("gcloud"),
     };
+    let github_credentials = LiveGitHubCredentials {
+        personal_access_token: "github_pat_fixture".to_owned(),
+    };
     let repository_id = format!("{LIVE_GITHUB_PROVIDER_ID}:owner/repo");
     let config = live_server_config_json(LiveServerConfigFixture {
         server_url: "http://127.0.0.1:8080",
@@ -195,6 +228,7 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
         metadata_path: &metadata_path,
         github_api_url: GITHUB_API_URL,
         github_host: "github.com",
+        github_credentials: &github_credentials,
         repository: &repository,
         folder: &folder,
         gcloud_credentials: &gcloud_credentials,
@@ -212,6 +246,9 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
             .repository_providers
             .contains_key(LIVE_GITHUB_PROVIDER_ID)
     );
+    let lfscloud::RepositoryProviderConfig::GitHub(provider) =
+        &config.repository_providers[LIVE_GITHUB_PROVIDER_ID];
+    assert_eq!(provider.authentication, github_credentials.authentication());
     assert!(
         config
             .storage_providers
@@ -232,7 +269,7 @@ async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
         .map_err(|error| format!("Git LFS prerequisite check should start: {error}"))?;
     require_command_success(git_lfs, "Git LFS prerequisite check", &[])?;
 
-    let github_token = required_env("LFS_CLOUD_GITHUB_TOKEN");
+    let github_credentials = live_github_credentials_result()?;
     let github_owner = env::var("LFS_CLOUD_GITHUB_OWNER").ok();
     let github_api_url =
         env::var("LFS_CLOUD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_owned());
@@ -247,7 +284,7 @@ async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
     let repository = create_github_repo(
         &client,
         &github_api_url,
-        &github_token,
+        github_credentials.personal_access_token(),
         github_owner.as_deref(),
         &disposable_name("lfscloud-live-it"),
     )
@@ -267,7 +304,7 @@ async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
             let cleanup = delete_github_repo(
                 &client,
                 &github_api_url,
-                &github_token,
+                github_credentials.personal_access_token(),
                 &repository.full_name,
             )
             .await;
@@ -279,7 +316,7 @@ async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
         &client,
         &github_api_url,
         &github_host,
-        &github_token,
+        &github_credentials,
         &repository,
         LiveDriveFixture {
             gcloud_credentials: &gcloud_credentials,
@@ -292,7 +329,7 @@ async fn run_black_box_git_lfs_transfer_scenario() -> Result<(), String> {
     let github_cleanup = delete_github_repo(
         &client,
         &github_api_url,
-        &github_token,
+        github_credentials.personal_access_token(),
         &repository.full_name,
     )
     .await;
@@ -310,7 +347,7 @@ async fn exercise_black_box_git_lfs_transfer(
     client: &Client,
     github_api_url: &str,
     github_host: &str,
-    github_token: &str,
+    github_credentials: &LiveGitHubCredentials,
     repository: &GitHubCreatedRepo,
     drive: LiveDriveFixture<'_>,
 ) -> Result<(), String> {
@@ -330,6 +367,7 @@ async fn exercise_black_box_git_lfs_transfer(
         metadata_path: &metadata_path,
         github_api_url,
         github_host,
+        github_credentials,
         repository,
         folder: drive.folder,
         gcloud_credentials: drive.gcloud_credentials,
@@ -350,46 +388,49 @@ async fn exercise_black_box_git_lfs_transfer(
     metadata
         .sync_config(&config)
         .map_err(|error| format!("live config should synchronize to metadata: {error}"))?;
-    let github_access_token = GitHubOAuthAccessToken::from_secret(github_token)
-        .map_err(|error| format!("GitHub token should validate: {error}"))?;
+    let github_personal_access_token =
+        GitHubPersonalAccessToken::from_secret(github_credentials.personal_access_token())
+            .map_err(|error| format!("GitHub PAT should validate: {error}"))?;
+    let lfscloud::RepositoryProviderConfig::GitHub(github_provider) =
+        &config.repository_providers[LIVE_GITHUB_PROVIDER_ID];
     let github_user = GitHubUserClient::new()
         .map_err(|error| format!("GitHub user client should build: {error}"))?
-        .fetch_authenticated_user(
-            match &config.repository_providers[LIVE_GITHUB_PROVIDER_ID] {
-                lfscloud::RepositoryProviderConfig::GitHub(provider) => provider,
-            },
-            &github_access_token,
-        )
+        .fetch_authenticated_user(github_provider, &github_personal_access_token)
         .await
-        .map_err(|error| format!("GitHub token should resolve a stable user: {error}"))?;
-    let session = LocalLfsSessionStore::open_durable(
-        Arc::clone(&metadata),
-        LIVE_OAUTH_CLIENT_SECRET.as_bytes(),
-    )
-    .and_then(|sessions| {
-        sessions.issue_session_with_github_token(&github_user, ["repo"], github_access_token)
-    })
-    .map_err(|error| format!("durable live LFS session should be issued: {error}"))?;
-
+        .map_err(|error| format!("GitHub PAT should resolve a stable user: {error}"))?;
     let lfs_url = format!("{server_url}{}", config.repositories[0].route_path());
     let server_stdout = test_dir.path().join("lfscloud.stdout.log");
     let server_stderr = test_dir.path().join("lfscloud.stderr.log");
-    let mut server = LiveServerProcess::spawn(
-        &config_path,
-        &server_stdout,
-        &server_stderr,
-        &[],
-        &[
-            github_token,
-            session.token.as_str(),
-            drive.access_token.as_str(),
-        ],
-    )?;
+    let secrets = vec![
+        github_credentials.personal_access_token(),
+        drive.access_token.as_str(),
+    ];
+    let mut server =
+        LiveServerProcess::spawn(&config_path, &server_stdout, &server_stderr, &[], &secrets)?;
     let scenario = async {
         wait_for_live_server(port, &mut server).await?;
+        let response = client
+            .post(format!(
+                "{server_url}{GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH}"
+            ))
+            .bearer_auth(github_credentials.personal_access_token())
+            .send()
+            .await
+            .map_err(|error| format!("PAT login request should send: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("PAT login should succeed, received HTTP {status}"));
+        }
+        let response = response
+            .json::<GitHubPersonalAccessTokenLoginResponse>()
+            .await
+            .map_err(|error| format!("PAT login response should parse: {error}"))?;
+        let session_token = lfscloud::LfsSessionToken::from_secret(response.lfs_token)
+            .map_err(|error| format!("PAT login local token should validate: {error}"))?;
+        server.add_secret(session_token.as_str());
         let bytes = b"live Git LFS bytes crossing the compiled LFS Cloud process";
         let object = lfs_object_for_bytes(bytes)?;
-        git_lfs_push_fetch_round_trip(test_dir.path(), &lfs_url, session.token.as_str(), bytes)?;
+        git_lfs_push_fetch_round_trip(test_dir.path(), &lfs_url, session_token.as_str(), bytes)?;
         verify_live_object_storage(
             client,
             &repository_id,
@@ -412,6 +453,7 @@ struct LiveServerConfigFixture<'a> {
     metadata_path: &'a Path,
     github_api_url: &'a str,
     github_host: &'a str,
+    github_credentials: &'a LiveGitHubCredentials,
     repository: &'a GitHubCreatedRepo,
     folder: &'a DriveFolder,
     gcloud_credentials: &'a GoogleDriveGcloudCredentialsConfig,
@@ -424,6 +466,7 @@ fn live_server_config_json(fixture: LiveServerConfigFixture<'_>) -> Value {
         metadata_path,
         github_api_url,
         github_host,
+        github_credentials,
         repository,
         folder,
         gcloud_credentials,
@@ -443,8 +486,7 @@ fn live_server_config_json(fixture: LiveServerConfigFixture<'_>) -> Value {
             LIVE_GITHUB_PROVIDER_ID: {
                 "type": "github",
                 "api_url": github_api_url,
-                "oauth_client_id": "live-external-integration",
-                "oauth_client_secret": LIVE_OAUTH_CLIENT_SECRET,
+                "personal_access_token": github_credentials.personal_access_token(),
             }
         },
         "storage_providers": {
@@ -514,6 +556,10 @@ impl LiveServerProcess {
             stderr_path: stderr_path.to_owned(),
             secrets: secrets.iter().map(|secret| (*secret).to_owned()).collect(),
         })
+    }
+
+    fn add_secret(&mut self, secret: &str) {
+        self.secrets.push(secret.to_owned());
     }
 
     fn try_wait(&mut self) -> Result<Option<process::ExitStatus>, String> {
@@ -971,8 +1017,41 @@ fn require_enabled(env_name: &str) {
     );
 }
 
-fn required_env(name: &str) -> String {
-    env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
+fn live_github_credentials() -> LiveGitHubCredentials {
+    live_github_credentials_result().unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn live_github_credentials_result() -> Result<LiveGitHubCredentials, String> {
+    live_github_credentials_from_value(env::var(LIVE_GITHUB_PAT_ENV).ok())
+}
+
+fn live_github_credentials_from_value(
+    personal_access_token: Option<String>,
+) -> Result<LiveGitHubCredentials, String> {
+    let personal_access_token = personal_access_token
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{LIVE_GITHUB_PAT_ENV} must be set"))?;
+    Ok(LiveGitHubCredentials {
+        personal_access_token,
+    })
+}
+
+#[test]
+fn live_github_credentials_require_pat() {
+    let error = match live_github_credentials_from_value(None) {
+        Ok(_) => panic!("missing GitHub PAT should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error, "LFS_CLOUD_GITHUB_PAT must be set");
+}
+
+#[test]
+fn live_github_credentials_load_pat() {
+    let credentials = live_github_credentials_from_value(Some("ghp_personal_token".to_owned()))
+        .expect("PAT smoke credentials should load");
+
+    assert_eq!(credentials.personal_access_token(), "ghp_personal_token");
 }
 
 #[test]

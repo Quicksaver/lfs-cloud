@@ -30,8 +30,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: ${LFS_CLOUD_GITHUB_CLIENT_ID}
-    oauth_client_secret: ${LFS_CLOUD_GITHUB_CLIENT_SECRET}
+    personal_access_token: ${LFS_CLOUD_GITHUB_PAT}
 
 storage_providers:
   drive-personal:
@@ -64,6 +63,11 @@ with `gh api repos/OWNER/REPOSITORY --jq .id`. LFS Cloud verifies this value
 before every permission check so a renamed, transferred, deleted, or reused
 `owner/name` cannot silently switch the mapping to another repository.
 
+`personal_access_token` is the only supported GitHub authentication mode. Prefer a fine-grained PAT
+limited to the listed repositories with repository Metadata read access, and
+run `lfscloud login --server URL` to exchange it for a short-lived local
+LFS token. The PAT is never written to Git's credential helper.
+
 ## LAN Config
 
 Use a LAN bind only on a trusted network:
@@ -83,8 +87,8 @@ lfscloud serve --config ./lfscloud.yml --host 0.0.0.0 --port 8080
 ```
 
 `public_url` is the URL embedded in Git LFS batch action responses. Set it to
-the address clients can actually reach. Plaintext LAN mode exposes OAuth codes,
-LFS credentials, and object bytes to the network, so it requires the explicit
+the address clients can actually reach. Plaintext LAN mode exposes the GitHub
+PAT, LFS credentials, and object bytes to the network, so it requires the explicit
 `allow_insecure_http: true` development opt-in. Prefer HTTPS through trusted TLS
 termination. Client commands using this LAN URL also require
 `--allow-insecure-http`.
@@ -162,14 +166,13 @@ the server from reporting readiness.
 Production `serve` processes persist unexpired local LFS sessions in the
 configured metadata database so Git credentials continue to work across server
 restarts. The database contains only the local token's SHA-256 digest. The
-private GitHub OAuth token and the session identity, scopes, and timestamps are
+private GitHub PAT and the session identity, scopes, and timestamps are
 authenticated together with AES-256-GCM before persistence.
 
-The dedicated encryption key is derived from the configured GitHub
-`oauth_client_secret`; the secret itself is never stored in SQLite. Keep that
-secret stable while sessions are active. Rotating it intentionally makes
-existing rows unreadable, so allow current sessions to expire or intentionally
-remove them before changing it.
+The dedicated encryption key is derived from the configured GitHub PAT; the PAT
+itself is never stored in SQLite. Keep it
+stable while sessions are active. Rotating it intentionally makes existing
+rows unreadable, so allow current sessions to expire or remove them first.
 
 ## Metadata Path
 

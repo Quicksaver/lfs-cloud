@@ -237,8 +237,7 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    oauth_client_id: lan-smoke-client
-    oauth_client_secret: lan-smoke-secret
+    personal_access_token: lan-smoke-pat
 
 storage_providers:
   drive-user-a:
@@ -366,7 +365,7 @@ Manual cross-machine checklist:
 5. Track and push one small Git LFS file from the client, then clone or pull
    from another clean worktree using the same LAN URL.
    Expected: upload and download batch requests succeed, object bytes round-trip
-   through Google Drive storage, and no Drive URL or OAuth token appears in CLI,
+   through Google Drive storage, and no GitHub PAT or Drive token appears in CLI,
    server, or Git LFS output.
 6. Stop the server and remove the disposable GitHub repo, Drive folder contents,
    and local credential-helper entries created for the smoke test.
