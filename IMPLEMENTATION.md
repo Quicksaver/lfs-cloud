@@ -181,12 +181,16 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: google-drive-user-a
+    credentials:
+      type: gcloud
+      config_dir: ${HOME}/.config/lfscloud/gcloud-drive-user-a
     root_folder_id: 012345abcdef
 
   drive-user-b:
     type: google_drive
-    credentials_ref: google-drive-user-b
+    credentials:
+      type: gcloud
+      config_dir: ${HOME}/.config/lfscloud/gcloud-drive-user-b
     root_folder_id: fedcba543210
 
   s3-user-c:
@@ -244,9 +248,9 @@ The server bounds each batch's object-entry count and shares one concurrency
 limit across repository and storage provider calls. Duplicate object
 identities retain duplicate response entries but perform one storage lookup.
 Permission decisions may be cached only briefly and scoped to the exact local
-session, repository, and read/write operation. Google access-token refreshes
-are single-flight and reuse the token only until shortly before its reported
-expiry.
+session, repository, and read/write operation. Google access-token requests to
+`gcloud` are single-flight and reuse the token only until shortly before its
+reported expiry.
 
 The server also admits at most the configured number of active HTTP requests
 across all routes, rejecting overload instead of queueing it. Authenticated
@@ -526,7 +530,7 @@ cannot keep retrying with invalid private provider credentials.
 
 Avoid asking users to paste personal access tokens into the LFS server if possible. That can work for a quick prototype, but it means LFS Cloud receives and handles powerful user repository-host credentials.
 
-Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service can use one Google account's OAuth refresh token to access the backing Drive folder. For a multi-tenant or shared instance, each configured storage provider should have its own credential reference and policy boundary.
+Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service uses one Google account's isolated Google Cloud CLI Application Default Credentials (ADC) directory to access the backing Drive folder; LFS Cloud asks `gcloud` for short-lived access tokens without parsing the generated ADC file. For a multi-tenant or shared instance, each configured storage provider should have its own isolated ADC directory and policy boundary.
 
 ## CLI Initialization Strategy
 
@@ -1095,7 +1099,7 @@ Each configured Google Drive storage provider should include:
 
 ```text
 provider id
-OAuth credential reference / refresh token reference
+isolated Google Cloud CLI ADC directory
 root folder id
 optional display name
 ```
@@ -1122,17 +1126,17 @@ Best MVP storage setup procedure:
 user authorizes Google OAuth
 LFS Cloud creates or records an app-accessible root folder
 LFS Cloud validates root_folder_id with a non-mutating Drive metadata probe
-lfscloud.yml stores the root_folder_id and credential reference
+lfscloud.yml stores the root_folder_id and gcloud ADC directory
 ```
 
 Avoid requiring full-Drive access merely to browse for arbitrary folders. If a manually created folder is used, the setup flow must verify that the app can create, list, read, and delete test objects under that folder before accepting the config.
 
 Server startup validates every configured root folder with a safe `files.get`
-metadata request before binding its listener. The startup check loads and
-refreshes each provider credential, confirms that the ID resolves to a live
-Drive folder, and verifies that the credential can add child objects there.
-The refreshed access token remains cached for transfer use. Resumable upload
-and download paths remain responsible for transfer-level verification.
+metadata request before binding its listener. The startup check asks `gcloud`
+for an ADC access token, confirms that the ID resolves to a live Drive folder,
+and verifies that the credential can add child objects there. The access token
+remains cached for transfer use. Resumable upload and download paths remain
+responsible for transfer-level verification.
 
 New Drive objects are placed in deterministic SHA-256 prefix folders below the
 configured root folder:
@@ -1567,8 +1571,7 @@ Defer:
 
 #### Epic 3.1: Drive Credentials
 
-- [x] [T] Implement Google Drive credential loading from server-side config references.
-- [x] [T] Implement refresh-token based access-token refresh.
+- [x] [T] Implement isolated Google Cloud CLI ADC access-token acquisition and caching.
 - [x] [M] Decide and document MVP Drive scope after validating `drive.file` against the configured root-folder strategy.
 - [x] [M] Validate configured Drive root folder access at server startup or health check.
 

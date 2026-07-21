@@ -36,7 +36,9 @@ repository_providers:
 storage_providers:
   drive-personal:
     type: google_drive
-    credentials_ref: google-drive-personal
+    credentials:
+      type: gcloud
+      config_dir: ${HOME}/.config/lfscloud/gcloud-drive
     root_folder_id: 012345abcdef
     display_name: Personal Drive LFS
 
@@ -100,7 +102,7 @@ Successful repository permission decisions are reused only for the same local
 session, repository, and operation for 15 seconds, which lets a batch action
 complete without an immediate duplicate GitHub check. Google Drive access
 tokens are cached until shortly before their reported expiry, with concurrent
-refreshes collapsed into one token request.
+requests to `gcloud` collapsed into one token request.
 
 `server.max_concurrent_requests` bounds active HTTP request handling across all
 server routes. The default is `64`. Excess requests receive HTTP 503 with a
@@ -120,36 +122,24 @@ capacity until its temporary file is released. The live filesystem check and
 
 ## Google Drive Credentials
 
-`credentials_ref` is not the credential itself. It tells the server which
-environment variable contains a flat OAuth JSON value:
-
-```json
-{
-  "client_id": "google-oauth-client-id",
-  "client_secret": "google-oauth-client-secret",
-  "refresh_token": "google-refresh-token"
-}
-```
-
-For a bare reference such as `google-drive-personal`, the current loader reads:
-
-```text
-LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_GOOGLE_DRIVE_PERSONAL
-```
-
-Bare references are converted by prefixing
-`LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_`, uppercasing ASCII letters, and replacing
-`-` with `_`. They may contain only ASCII letters, digits, `_`, or `-`.
-
-You can name the environment variable explicitly:
+The recommended local configuration uses the Google Cloud CLI to mint
+short-lived tokens from an isolated Application Default Credentials directory:
 
 ```yaml
 storage_providers:
   drive-personal:
     type: google_drive
-    credentials_ref: env:LFS_CLOUD_DRIVE_PERSONAL_JSON
+    credentials:
+      type: gcloud
+      config_dir: ${HOME}/.config/lfscloud/gcloud-drive
+      # executable: /absolute/path/to/gcloud
     root_folder_id: 012345abcdef
 ```
+
+Install `gcloud`, create the directory, and generate the credentials once with
+the browser flow documented in the README. The directory must contain
+`application_default_credentials.json`. LFS Cloud invokes `gcloud` at runtime,
+so the executable must remain installed and accessible to the server user.
 
 The MVP Drive scope is:
 
@@ -161,7 +151,7 @@ The configured `root_folder_id` must be a folder that the app credential can
 access and create children in. Git users never receive Drive tokens or direct
 Drive access.
 
-`lfscloud serve` loads and refreshes the credential for every configured
+`lfscloud serve` asks `gcloud` for an ADC access token for every configured
 Drive provider, then performs a non-mutating metadata probe that confirms the
 root is a live folder with child-write capability. These checks complete before
 the HTTP listener binds; a missing/invalid credential or unusable root prevents
@@ -214,9 +204,8 @@ race has already left multiple otherwise exact object matches.
   `server.max_concurrent_uploads_per_user` must be greater than zero when
   configured. The per-user upload limit cannot exceed the process-wide upload
   limit.
-- Google credential JSON `token_uri` values, and custom Google Drive API base
-  URLs used by embedded runtimes or tests, follow the same URL rules and must
-  use HTTPS except for loopback HTTP endpoints.
+- Custom Google Drive API base URLs used by embedded runtimes or tests must use
+  HTTPS except for loopback HTTP endpoints.
 - Provider IDs and storage IDs must start with an ASCII letter or digit and use
   only ASCII letters, digits, `_`, or `-`.
 - Repository route components must be safe path segments. Repository names must

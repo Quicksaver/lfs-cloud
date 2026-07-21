@@ -58,7 +58,9 @@ server_url="http://127.0.0.1:$port"
 lfs_url="$server_url/github.com/owner/repo.git/info/lfs"
 config_file="$tmp_dir/lfscloud.yml"
 
-mkdir -p "$repo_dir" "$cache_root/objects"
+gcloud_config_dir="$tmp_dir/gcloud-drive"
+mkdir -p "$repo_dir" "$cache_root/objects" "$gcloud_config_dir"
+printf '{}\n' >"$gcloud_config_dir/application_default_credentials.json"
 git -C "$repo_dir" init >/dev/null
 git -C "$repo_dir" remote add origin git@github.com:owner/repo.git
 
@@ -78,7 +80,10 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: drive-user-a
+    credentials:
+      type: gcloud
+      config_dir: $gcloud_config_dir
+      executable: git
     root_folder_id: root-folder
 
 repositories:
@@ -98,18 +103,6 @@ printf 'protocol=http\nhost=127.0.0.1:%s\npath=github.com/owner/repo.git/info/lf
   "$port" "$token" |
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
     git credential approve
-
-restore_xtrace=0
-case "$-" in
-  *x*)
-    restore_xtrace=1
-    set +x
-    ;;
-esac
-export LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_DRIVE_USER_A='{"client_id":"client-id","client_secret":"client-secret","refresh_token":"refresh-token"}'
-if [[ "$restore_xtrace" -eq 1 ]]; then
-  set -x
-fi
 
 (
   cd "$repo_dir"

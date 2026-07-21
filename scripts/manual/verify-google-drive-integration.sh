@@ -15,15 +15,18 @@ if ! is_enabled "${LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION:-}"; then
   exit 0
 fi
 
-for credential_env in \
-  LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID \
-  LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET \
-  LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN; do
-  if [[ -z "${!credential_env:-}" ]]; then
-    echo "$credential_env is required" >&2
-    exit 1
-  fi
-done
+if [[ -z "${LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR:-}" ]]; then
+  echo "LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR is required" >&2
+  exit 1
+fi
+if [[ ! -d "$LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR" ]] || [[ ! -r "$LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR/application_default_credentials.json" ]]; then
+  echo "LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR must point to a readable directory containing application_default_credentials.json" >&2
+  exit 1
+fi
+if ! command -v gcloud >/dev/null 2>&1; then
+  echo "gcloud is required for the Google Drive integration check" >&2
+  exit 1
+fi
 
 cargo test --test external_integrations google_drive_disposable_folder_root_validation -- --ignored --exact
 

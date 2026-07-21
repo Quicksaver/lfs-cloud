@@ -21,15 +21,18 @@ if [[ -z "${LFS_CLOUD_GITHUB_TOKEN:-}" ]]; then
   exit 1
 fi
 
-for credential_env in \
-  LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID \
-  LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET \
-  LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN; do
-  if [[ -z "${!credential_env:-}" ]]; then
-    echo "$credential_env is required" >&2
-    exit 1
-  fi
-done
+if [[ -z "${LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR:-}" ]]; then
+  echo "LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR is required" >&2
+  exit 1
+fi
+if [[ ! -d "$LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR" ]] || [[ ! -r "$LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR/application_default_credentials.json" ]]; then
+  echo "LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR must point to a readable directory containing application_default_credentials.json" >&2
+  exit 1
+fi
+if ! command -v gcloud >/dev/null 2>&1; then
+  echo "gcloud is required for the live provider transfer check" >&2
+  exit 1
+fi
 
 cargo test --test external_integrations black_box_git_lfs_push_fetch_uses_live_github_and_drive -- --ignored --exact
 

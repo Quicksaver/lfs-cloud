@@ -40,9 +40,7 @@ jobs:
       LFS_CLOUD_SMOKE_BINARY: ${{ github.workspace }}/${{ matrix.binary }}
       LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS: "1"
       LFS_CLOUD_GITHUB_TOKEN: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GITHUB_TOKEN || '' }}
-      LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID || '' }}
-      LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET || '' }}
-      LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN || '' }}
+      LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON || '' }}
 
     steps:
       - name: Check out repository
@@ -84,6 +82,10 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Set up Google Cloud CLI
+        if: env.LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON != ''
+        uses: google-github-actions/setup-gcloud@v3
+
       - name: Install repository tooling
         shell: bash
         run: |
@@ -118,6 +120,14 @@ jobs:
           smoke_root="$RUNNER_TEMP/lfscloud-smoke-root"
           echo "LFS_CLOUD_SMOKE_THROWAWAY=$smoke_root" >> "$GITHUB_ENV"
           LFS_CLOUD_SMOKE_THROWAWAY="$smoke_root" node -e "const fs = require('node:fs'); const cp = require('node:child_process'); const root = process.env.LFS_CLOUD_SMOKE_THROWAWAY; fs.mkdirSync(root, { recursive: true }); cp.execFileSync('git', ['init', '--quiet', root], { stdio: 'inherit' });"
+          if [[ -n "$LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON" ]]; then
+            gcloud_config_dir="$RUNNER_TEMP/lfscloud-gcloud-drive"
+            credentials_file="$gcloud_config_dir/application_default_credentials.json"
+            mkdir -p "$gcloud_config_dir"
+            printf '%s' "$LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON" > "$credentials_file"
+            chmod 600 "$credentials_file"
+            echo "LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR=$gcloud_config_dir" >> "$GITHUB_ENV"
+          fi
 
       - name: Run smoke tests against release binary
         shell: bash

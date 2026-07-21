@@ -2,6 +2,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { type AddressInfo, createServer } from 'node:net';
 import { homedir } from 'node:os';
@@ -44,11 +45,7 @@ if (configuredBinary !== undefined) process.env.LFS_CLOUD_SMOKE_BINARY = binaryP
 const commandOutputLimit = 4 * 1024 * 1024;
 const defaultTimeoutMs = 15 * 60 * 1000;
 const githubCredentialEnv = 'LFS_CLOUD_GITHUB_TOKEN';
-const driveCredentialEnvs = [
-  'LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID',
-  'LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET',
-  'LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN',
-] as const;
+const driveConfigDirEnv = 'LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR';
 
 let sandbox = '';
 let currentChild: ChildProcess | undefined;
@@ -253,10 +250,13 @@ async function statusSmoke(): Promise<void> {
   const repo = join(sandbox, 'status-repo');
   const cacheRoot = join(sandbox, 'status-cache');
   const configPath = join(sandbox, 'status.yml');
+  const gcloudConfigDir = join(sandbox, 'status-gcloud-drive');
   const gitConfig = join(sandbox, 'status-gitconfig');
   const credentialStore = join(sandbox, 'status-credentials');
   await mkdir(repo);
   await mkdir(join(cacheRoot, 'objects'), { recursive: true });
+  await mkdir(gcloudConfigDir);
+  await writeFile(join(gcloudConfigDir, 'application_default_credentials.json'), '{}');
   await git(repo, 'init', '--quiet');
   await git(repo, 'remote', 'add', 'origin', 'git@github.com:smoke-owner/status.git');
 
@@ -272,7 +272,7 @@ async function statusSmoke(): Promise<void> {
     const lfsUrl = `${serverUrl}/github.com/smoke-owner/status.git/info/lfs`;
     await writeFile(
       configPath,
-      `server:\n  host: 127.0.0.1\n  port: ${address.port}\n  public_url: ${serverUrl}\n\nrepository_providers:\n  github-main:\n    type: github\n    api_url: https://api.github.com\n    oauth_client_id: smoke-client\n    oauth_client_secret: smoke-secret\n\nstorage_providers:\n  drive-smoke:\n    type: google_drive\n    credentials_ref: drive-smoke\n    root_folder_id: smoke-root\n\nrepositories:\n  - id: github-main:smoke-owner/status\n    repo_provider: github-main\n    host: github.com\n    owner: smoke-owner\n    name: status\n    provider_repository_id: "8675309"\n    storage_provider: drive-smoke\n`,
+      `server:\n  host: 127.0.0.1\n  port: ${address.port}\n  public_url: ${serverUrl}\n\nrepository_providers:\n  github-main:\n    type: github\n    api_url: https://api.github.com\n    oauth_client_id: smoke-client\n    oauth_client_secret: smoke-secret\n\nstorage_providers:\n  drive-smoke:\n    type: google_drive\n    credentials:\n      type: gcloud\n      config_dir: ${JSON.stringify(gcloudConfigDir)}\n      executable: ${JSON.stringify(process.execPath)}\n    root_folder_id: smoke-root\n\nrepositories:\n  - id: github-main:smoke-owner/status\n    repo_provider: github-main\n    host: github.com\n    owner: smoke-owner\n    name: status\n    provider_repository_id: "8675309"\n    storage_provider: drive-smoke\n`,
     );
 
     const gitEnv = {
@@ -295,11 +295,7 @@ async function statusSmoke(): Promise<void> {
 
     const output = await command(binaryPath, ['--config', configPath, 'status', '--cache-root', cacheRoot], {
       cwd: repo,
-      env: {
-        ...gitEnv,
-        LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_DRIVE_SMOKE:
-          '{"client_id":"smoke-client","client_secret":"smoke-secret","refresh_token":"smoke-refresh"}',
-      },
+      env: gitEnv,
     });
     for (const marker of [
       'config     ok',
@@ -351,7 +347,12 @@ function hasCredential(name: string): boolean {
 }
 
 function hasDriveCredential(): boolean {
-  return driveCredentialEnvs.every(hasCredential);
+  const configDir = process.env[driveConfigDirEnv]?.trim();
+  return (
+    configDir !== undefined &&
+    configDir.length > 0 &&
+    existsSync(join(configDir, 'application_default_credentials.json'))
+  );
 }
 
 function missingCredential(available: () => boolean, description: string): () => string | undefined {
@@ -461,8 +462,15 @@ function tests(): SmokeTest[] {
         }),
     },
     {
+      name: 'gcloud CLI prerequisite',
+      skip: missingCredential(hasDriveCredential, `requires ${driveConfigDirEnv}`),
+      run: async () => {
+        await command('gcloud', ['--version']);
+      },
+    },
+    {
       name: 'Google Drive disposable folder',
-      skip: missingCredential(hasDriveCredential, `requires ${driveCredentialEnvs.join(', ')}`),
+      skip: missingCredential(hasDriveCredential, `requires ${driveConfigDirEnv}`),
       run: () =>
         script('verify-google-drive-integration.sh', 30 * 60 * 1000, {
           LFS_CLOUD_RUN_GOOGLE_DRIVE_INTEGRATION: '1',
@@ -472,7 +480,7 @@ function tests(): SmokeTest[] {
       name: 'black-box Git LFS live transfer',
       skip: missingCredential(
         () => hasCredential(githubCredentialEnv) && hasDriveCredential(),
-        `requires ${githubCredentialEnv} and ${driveCredentialEnvs.join(', ')}`,
+        `requires ${githubCredentialEnv} and ${driveConfigDirEnv}`,
       ),
       run: () =>
         script('verify-live-provider-transfer.sh', 45 * 60 * 1000, {

@@ -29,7 +29,7 @@ use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display
 use crate::{
     GITHUB_OAUTH_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup, GitCredentialRejection,
     GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers, GitLfsMigrationDiscovery,
-    GitLfsSourceEndpointSource, GitRemote, GitRepository, GoogleDriveCredentialLoader,
+    GitLfsSourceEndpointSource, GitRemote, GitRepository, GoogleDriveGcloudTokenProvider,
     GoogleDriveStorageConfig, LFS_POINTER_SIZE_CUTOFF, LFS_SESSION_REVOKE_PATH, LfsInitRoute,
     LfsObject, LfsPointer, LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
     LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
@@ -3166,12 +3166,11 @@ fn validate_status_storage(storage: &StorageProviderConfig) -> CliResult<()> {
 }
 
 fn validate_google_drive_status_storage(storage: &GoogleDriveStorageConfig) -> CliResult<()> {
-    GoogleDriveCredentialLoader::new()
-        .load_from_environment(storage)
-        .map(|_| ())
+    GoogleDriveGcloudTokenProvider::new()
+        .validate_local_readiness(&storage.id, &storage.credentials)
         .map_err(|_| CliError::InvalidArguments {
             message: format!(
-                "Google Drive credential for {} is not usable; check the configured credentials_ref environment value",
+                "Google Drive credential for {} is not usable; check the configured gcloud ADC credentials directory",
                 storage.id
             ),
         })
@@ -4507,9 +4506,13 @@ mod tests {
 
     #[test]
     fn status_storage_validation_uses_generic_credential_error() {
+        let directory = TempDir::new().expect("temporary directory should be created");
         let storage = StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig {
             id: "drive-user-a".to_owned(),
-            credential_ref: "definitely-missing-status-test-env".to_owned(),
+            credentials: crate::GoogleDriveGcloudCredentialsConfig {
+                config_dir: directory.path().join("missing-gcloud-drive"),
+                executable: PathBuf::from("gcloud"),
+            },
             root_folder_id: "root-folder".to_owned(),
             display_name: None,
         });
@@ -4520,9 +4523,54 @@ mod tests {
         assert!(matches!(error, CliError::InvalidArguments { .. }));
         let rendered = error.to_string();
         assert!(rendered.contains("drive-user-a"));
-        assert!(rendered.contains("credentials_ref"));
-        assert!(!rendered.contains("LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL"));
-        assert!(!rendered.contains("definitely-missing-status-test-env"));
+        assert!(rendered.contains("gcloud ADC"));
+        assert!(!rendered.contains("missing-gcloud-drive"));
+    }
+
+    #[test]
+    fn status_storage_validation_accepts_generated_gcloud_state() {
+        let directory = TempDir::new().expect("temporary directory should be created");
+        fs::write(
+            directory
+                .path()
+                .join("application_default_credentials.json"),
+            "{}",
+        )
+        .expect("ADC marker file should be written");
+        let storage = StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig {
+            id: "drive-user-a".to_owned(),
+            credentials: crate::GoogleDriveGcloudCredentialsConfig {
+                config_dir: directory.path().to_owned(),
+                executable: PathBuf::from("rustc"),
+            },
+            root_folder_id: "root-folder".to_owned(),
+            display_name: None,
+        });
+
+        validate_status_storage(&storage)
+            .expect("generated gcloud ADC state should pass local status validation");
+    }
+
+    #[test]
+    fn status_storage_validation_reports_missing_gcloud_state_generically() {
+        let directory = TempDir::new().expect("temporary directory should be created");
+        let storage = StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig {
+            id: "drive-user-a".to_owned(),
+            credentials: crate::GoogleDriveGcloudCredentialsConfig {
+                config_dir: directory.path().join("private-gcloud-drive"),
+                executable: PathBuf::from("gcloud"),
+            },
+            root_folder_id: "root-folder".to_owned(),
+            display_name: None,
+        });
+
+        let error = validate_status_storage(&storage)
+            .expect_err("missing gcloud ADC state should fail validation");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("drive-user-a"));
+        assert!(rendered.contains("gcloud"));
+        assert!(!rendered.contains("private-gcloud-drive"));
     }
 
     #[test]
@@ -6613,7 +6661,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: drive-user-a
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: root-folder
 
 repositories:

@@ -21,7 +21,8 @@ yet.
 For real GitHub and Google Drive operation you also need:
 
 - A GitHub OAuth app with callback URL matching the running server.
-- Google OAuth credentials with a refresh token for the Drive account.
+- Google Cloud CLI installed for the account running the server.
+- Google ADC generated with a Desktop OAuth client and Drive scope.
 - A Drive folder accessible to the OAuth client with `drive.file` scope.
 - A Git credential helper configured for local token storage.
 
@@ -57,11 +58,13 @@ coverage, so Windows exercises the same recursive termination boundary as Unix.
 
 Pull requests run the complete local smoke coverage without repository secrets.
 On pushes and manual runs, the GitHub, Google Drive, and black-box Git LFS checks
-also run when `LFS_CLOUD_GITHUB_TOKEN` and the three Google Drive OAuth values
-`LFS_CLOUD_GOOGLE_DRIVE_CLIENT_ID`, `LFS_CLOUD_GOOGLE_DRIVE_CLIENT_SECRET`, and
-`LFS_CLOUD_GOOGLE_DRIVE_REFRESH_TOKEN` are configured as repository secrets.
-The live-test boundary combines those values into the provider credential JSON;
-CI does not require one composite JSON secret.
+also run when `LFS_CLOUD_GITHUB_TOKEN` and
+`LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON` are configured as repository secrets. CI
+writes the ADC JSON to an isolated
+`application_default_credentials.json`, installs `gcloud`, and gives the smoke
+runner only `LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR`, which points to the containing
+isolated gcloud configuration directory. Local smoke runs set the same
+directory-path variable in `.env.local`.
 
 Rotate the local smoke-test values and matching GitHub repository secrets with:
 
@@ -70,9 +73,11 @@ yarn rotate:github
 yarn rotate:google-drive
 ```
 
-The scripts read hidden terminal input, update the existing keys in the ignored
-root `.env.local`, and sync them to the repository resolved from the `origin`
-remote. Leaving a prompt empty retains and re-syncs its current local value.
+The GitHub script reads hidden terminal input. The Google Drive script accepts
+the isolated gcloud configuration directory, updates the ignored root
+`.env.local`, and syncs its generated ADC file contents to the repository's
+`LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON` secret. Both scripts resolve the target
+repository from the `origin` remote.
 
 The separate dependency-audit workflow installs the repository-pinned
 `cargo-audit` version and fails when the locked Rust graph contains an

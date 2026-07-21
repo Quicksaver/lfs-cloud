@@ -43,10 +43,9 @@ pub use github_auth::{
     github_oauth_callback_router, github_oauth_login_router,
 };
 pub use google_drive::{
-    GOOGLE_DRIVE_API_BASE_URL, GOOGLE_DRIVE_FILE_SCOPE, GOOGLE_OAUTH_TOKEN_URL,
-    GoogleDriveAccessToken, GoogleDriveCredential, GoogleDriveCredentialLoader,
-    GoogleDriveDownloadResponse, GoogleDriveObjectKey, GoogleDriveObjectStore,
-    GoogleDriveRootFolder, GoogleDriveRootValidator, GoogleDriveTokenRefresher,
+    GOOGLE_DRIVE_API_BASE_URL, GOOGLE_DRIVE_FILE_SCOPE, GoogleDriveAccessToken,
+    GoogleDriveDownloadResponse, GoogleDriveGcloudTokenProvider, GoogleDriveObjectKey,
+    GoogleDriveObjectStore, GoogleDriveRootFolder, GoogleDriveRootValidator,
 };
 pub use init::LfsInitRoute;
 pub use lfs::{
@@ -101,8 +100,8 @@ pub use server::{
 };
 pub use server_config::{
     DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
-    GoogleDriveStorageConfig, RepositoryMapping, RepositoryProviderConfig, ServerConfig,
-    ServerSettings, StorageProviderConfig,
+    GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, RepositoryMapping,
+    RepositoryProviderConfig, ServerConfig, ServerSettings, StorageProviderConfig,
 };
 pub use sessions::{
     DEFAULT_LFS_SESSION_TTL, IssuedLfsSession, LfsSessionMetadata, LfsSessionToken,

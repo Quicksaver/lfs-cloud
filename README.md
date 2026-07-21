@@ -436,7 +436,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: google-drive-user-a
+    credentials:
+      type: gcloud
+      config_dir: ${HOME}/.config/lfscloud/gcloud-drive
     root_folder_id: 012345abcdef
 
 repositories:
@@ -499,24 +501,85 @@ Cloud uses it as the root secret for a dedicated durable-session encryption
 key; changing it makes existing protected sessions unreadable, so rotate it
 only after those sessions expire or are intentionally removed.
 
-For the current server-side Google Drive credential loader, a bare
-`credentials_ref` such as `google-drive-user-a` maps to an environment variable
-named `LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_GOOGLE_DRIVE_USER_A`. The environment
-value is a JSON object containing `client_id`, `client_secret`, `refresh_token`,
-and optionally `token_uri`. Custom `token_uri` values must use HTTPS, except
-for loopback HTTP endpoints used by local tests and development tools. Use
-`env:NAME` as the `credentials_ref` value when the environment variable name
-must be explicit.
+### Google Drive authentication with `gcloud`
+
+The `gcloud` credential mode avoids copying a client ID, client secret, and
+refresh token into LFS Cloud configuration. It requires the
+[Google Cloud CLI](https://cloud.google.com/sdk/docs/install) on every machine
+that runs `lfscloud serve`; the same operating-system user must be able to run
+`gcloud --version`. For service managers with a restricted `PATH`, set the
+optional `credentials.executable` field to the absolute `gcloud` path.
+
+First create a Desktop app OAuth client in Google Cloud, enable the Google Drive
+API for its project, and download the client JSON. Then create an isolated
+Google Cloud CLI configuration and complete one browser login:
+
+```bash
+mkdir -p "$HOME/.config/lfscloud/gcloud-drive"
+chmod 700 "$HOME/.config/lfscloud/gcloud-drive"
+
+CLOUDSDK_CONFIG="$HOME/.config/lfscloud/gcloud-drive" \
+  gcloud auth application-default login \
+  --client-id-file="$HOME/Downloads/client_secret.json" \
+  --scopes="https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive.file"
+
+chmod 600 "$HOME/.config/lfscloud/gcloud-drive/application_default_credentials.json"
+```
+
+Google Cloud CLI requires `cloud-platform` when explicit ADC scopes are
+provided; `drive.file` is the additional scope LFS Cloud needs. The browser
+flow writes the generated credentials to:
+
+```text
+~/.config/lfscloud/gcloud-drive/application_default_credentials.json
+```
+
+Do not hand-edit or commit that directory. It contains sensitive, long-lived
+ADC state. Point the server configuration at the directory, not at the
+downloaded client JSON:
+
+```yaml
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials:
+      type: gcloud
+      config_dir: ${HOME}/.config/lfscloud/gcloud-drive
+      # executable: /absolute/path/to/gcloud
+    root_folder_id: 012345abcdef
+```
+
+LFS Cloud runs
+`gcloud auth application-default print-access-token --quiet` non-interactively
+with that directory as `CLOUDSDK_CONFIG`, caches the short-lived token, and
+never parses the generated ADC file itself. Rerun the login command with the
+same `CLOUDSDK_CONFIG` when Google revokes the login or you change accounts.
+See Google's
+[ADC login](https://cloud.google.com/sdk/gcloud/reference/auth/application-default/login)
+and
+[access-token](https://cloud.google.com/sdk/gcloud/reference/auth/application-default/print-access-token)
+references for the underlying commands.
+
+The live Google Drive smoke checks use one local variable instead of separate
+OAuth values. Point it at the same isolated directory used by `config_dir`:
+
+```bash
+LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR="$HOME/.config/lfscloud/gcloud-drive"
+```
+
+The smoke runner passes this directory through as the same `config_dir` used by
+server YAML and skips the live Drive checks when the directory or its generated
+ADC file is absent. `gcloud` must remain installed while those checks run.
 
 The MVP Google Drive scope is
 `https://www.googleapis.com/auth/drive.file`. The configured `root_folder_id`
 must be a folder that the app created, opened through the setup flow, or was
 explicitly made accessible to this OAuth client. Current library code can
 validate the folder with a non-mutating Drive metadata probe. On `serve`, LFS
-Cloud loads and refreshes every configured Drive credential and confirms that
-each root is a live folder that can accept children before binding the HTTP
-listener. A failed credential or root probe prevents the server from reporting
-readiness.
+Cloud asks `gcloud` for an ADC access token for every configured Drive provider
+and confirms that each root is a live folder that can accept children before
+binding the HTTP listener. A failed credential or root probe prevents the
+server from reporting readiness.
 
 Google provider connections have a 10-second connect deadline. Large Drive
 uploads and downloads have no total transfer deadline, but must make progress
@@ -530,7 +593,7 @@ stalled fails as retryable without waiting indefinitely.
 The `.lfsconfig` file points only to the LFS Cloud endpoint. It should not contain Google Drive, S3, or other backend credentials.
 
 See [docs/configuration.md](docs/configuration.md) for full `lfscloud.yml`
-examples, credential reference behavior, metadata path defaults, and validation
+examples, Google Cloud CLI ADC setup, metadata path defaults, and validation
 rules.
 
 ## Build And Install
@@ -574,7 +637,7 @@ On APFS and other copy-on-write filesystems, this can allow the cache object and
 
 ## Current State
 
-This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfscloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, `lfscloud login --server` browser handoff and local LFS token credential-helper storage, `lfscloud status` readiness diagnostics for server reachability, repository mapping, local auth, storage credential loading, and local cache directory state, `lfscloud hydrate <path...>` and `lfscloud dehydrate <path...>` local cache operations, `lfscloud gc` registry-based local cache cleanup, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, server-side Google Drive credential loading, Google OAuth refresh-token exchange helpers, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, local cache path helpers for the planned shared object layout under `~/.lfscloud/objects`, verified ingest from existing `.git/lfs/objects` into the shared cache, verified cache-to-worktree materialization with macOS copy-on-write cloning and fallback copying, pointer-file hydration from shared cache without overwriting non-pointer worktree content, clean worktree dehydration back to canonical Git LFS pointers after preserving verified bytes in cache, versioned worktree registrations in `~/.lfscloud/worktrees.json` for local cache garbage collection, migration discovery helpers for existing Git LFS configuration plus current-checkout, selected-ref, and all-fetched-ref pointer enumeration, migration transfer helpers for verified local availability checks, source Git LFS fetches that do not update worktree files, idempotent upload of locally verified migration objects to configured storage providers, and a read-only `lfscloud migrate --dry-run` plan report for migration scope, file/config touch points, object fetch/upload counts, explicitly local readiness checks, and optional GitHub source LFS purge support instructions, plus a minimal `lfscloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through LFS Cloud. Gated external integration tests can create and delete a disposable GitHub repository and a disposable Google Drive folder when explicitly enabled with provider credentials. Full CLI migration execution and release packaging behavior have not been implemented yet.
+This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfscloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, `lfscloud login --server` browser handoff and local LFS token credential-helper storage, `lfscloud status` readiness diagnostics for server reachability, repository mapping, local auth, storage credential loading, and local cache directory state, `lfscloud hydrate <path...>` and `lfscloud dehydrate <path...>` local cache operations, `lfscloud gc` registry-based local cache cleanup, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, GitHub OAuth authorization URL construction, callback state validation and routing, code-to-token exchange helpers, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, Google Cloud CLI ADC access-token acquisition, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, local cache path helpers for the planned shared object layout under `~/.lfscloud/objects`, verified ingest from existing `.git/lfs/objects` into the shared cache, verified cache-to-worktree materialization with macOS copy-on-write cloning and fallback copying, pointer-file hydration from shared cache without overwriting non-pointer worktree content, clean worktree dehydration back to canonical Git LFS pointers after preserving verified bytes in cache, versioned worktree registrations in `~/.lfscloud/worktrees.json` for local cache garbage collection, migration discovery helpers for existing Git LFS configuration plus current-checkout, selected-ref, and all-fetched-ref pointer enumeration, migration transfer helpers for verified local availability checks, source Git LFS fetches that do not update worktree files, idempotent upload of locally verified migration objects to configured storage providers, and a read-only `lfscloud migrate --dry-run` plan report for migration scope, file/config touch points, object fetch/upload counts, explicitly local readiness checks, and optional GitHub source LFS purge support instructions, plus a minimal `lfscloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the GitHub OAuth token server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through LFS Cloud. Gated external integration tests can create and delete a disposable GitHub repository and a disposable Google Drive folder when explicitly enabled with provider credentials. Full CLI migration execution and release packaging behavior have not been implemented yet.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
 

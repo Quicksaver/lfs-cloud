@@ -1,8 +1,8 @@
-//! Google Drive storage-provider authentication helpers.
+//! Google Drive storage-provider authentication and object-transfer helpers.
 //!
-//! This module loads server-owned Google Drive OAuth credentials from
-//! configuration references and exchanges refresh tokens for short-lived
-//! access tokens. It does not expose Drive credentials to Git LFS clients.
+//! Authentication obtains short-lived access tokens from Google Cloud CLI
+//! Application Default Credentials (ADC). It does not expose credentials to
+//! Git LFS clients.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,6 +11,7 @@ use std::{
     io::{self, BufReader, Read, Seek, SeekFrom},
     net::IpAddr,
     path::Path,
+    process::{Command as ProcessCommand, Stdio},
     sync::OnceLock,
     time::Duration,
 };
@@ -30,16 +31,26 @@ use reqwest::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    process::Command,
+};
 use url::Url;
 
 use crate::{
-    GoogleDriveStorageConfig, LfsObject, ProviderFuture, SanitizedMessage, StorageDeleteOutcome,
-    StorageError, StorageProvider, StorageResult, StoredObject,
+    GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, LfsObject, ProviderFuture,
+    SanitizedMessage, StorageDeleteOutcome, StorageError, StorageProvider, StorageResult,
+    StoredObject,
 };
 
-const GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+const GCLOUD_ADC_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
+const GCLOUD_ADC_ACCESS_TOKEN_LIFETIME_SECONDS: u64 = 3_600;
+const MAX_GCLOUD_ADC_TOKEN_BYTES: usize = 4 * 1024;
+const GOOGLE_APPLICATION_CREDENTIALS_ENV: &str = "GOOGLE_APPLICATION_CREDENTIALS";
+const CLOUDSDK_AUTH_ACCESS_TOKEN_ENV: &str = "CLOUDSDK_AUTH_ACCESS_TOKEN";
+const CLOUDSDK_CONFIG_ENV: &str = "CLOUDSDK_CONFIG";
+const CLOUDSDK_CORE_DISABLE_PROMPTS_ENV: &str = "CLOUDSDK_CORE_DISABLE_PROMPTS";
 const GOOGLE_DRIVE_ROOT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_OBJECT_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_DRIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -47,7 +58,6 @@ const GOOGLE_DRIVE_TRANSFER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30
 const GOOGLE_DRIVE_RESUMABLE_UPLOAD_CHUNK_SIZE: usize = 256 * 1024;
 const GOOGLE_DRIVE_RESUMABLE_UPLOAD_MAX_RECOVERY_ATTEMPTS: u32 = 4;
 const GOOGLE_DRIVE_RESUMABLE_UPLOAD_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
-const DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX: &str = "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_";
 const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
 const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
 const MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES: usize = 124;
@@ -64,228 +74,16 @@ const GOOGLE_DRIVE_SHARD_KIND_PROPERTY: &str = "lfsCloudFolderKind";
 const GOOGLE_DRIVE_SHARD_KIND: &str = "objectShard";
 const GOOGLE_DRIVE_SHARD_PREFIX_PROPERTY: &str = "lfsCloudShard";
 
-static DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_OBJECT_METADATA_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_OBJECT_UPLOAD_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_OBJECT_DOWNLOAD_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
-
-/// Google OAuth token endpoint used by Drive refresh-token exchange.
-pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 /// Google Drive API root used for storage-provider metadata and transfer calls.
 pub const GOOGLE_DRIVE_API_BASE_URL: &str = "https://www.googleapis.com";
 
 /// MVP Google Drive OAuth scope for app-accessible LFS object storage.
 pub const GOOGLE_DRIVE_FILE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
-
-/// Loads Google Drive OAuth credentials from server-side references.
-///
-/// Bare credential references are resolved to environment variables by
-/// uppercasing ASCII letters and replacing `-` with `_`, using the prefix
-/// `LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_`. For example, `google-drive-user-a`
-/// resolves to `LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_GOOGLE_DRIVE_USER_A`.
-///
-/// References may also use `env:NAME` to name the environment variable
-/// explicitly.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GoogleDriveCredentialLoader {
-    env_prefix: String,
-}
-
-impl GoogleDriveCredentialLoader {
-    /// Creates a loader using the default LFS Cloud Google Drive env prefix.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use lfscloud::GoogleDriveCredentialLoader;
-    ///
-    /// let loader = GoogleDriveCredentialLoader::new();
-    /// assert!(format!("{loader:?}").contains("GoogleDriveCredentialLoader"));
-    /// ```
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            env_prefix: DEFAULT_GOOGLE_DRIVE_CREDENTIAL_ENV_PREFIX.to_owned(),
-        }
-    }
-
-    /// Creates a loader with an explicit environment-variable prefix.
-    ///
-    /// This is primarily useful for tests and embedded server runtimes that
-    /// need to keep their secret namespace separate.
-    #[must_use]
-    pub fn with_env_prefix(prefix: impl Into<String>) -> Self {
-        Self {
-            env_prefix: prefix.into(),
-        }
-    }
-
-    /// Loads credentials for a configured Google Drive storage provider.
-    ///
-    /// The loaded environment value must be a JSON object containing
-    /// `client_id`, `client_secret`, and `refresh_token`. `token_uri` is
-    /// optional and defaults to Google's OAuth token endpoint.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] when the credential reference cannot be mapped,
-    /// the environment variable is unset, or the JSON credential is invalid.
-    pub fn load_from_environment(
-        &self,
-        storage: &GoogleDriveStorageConfig,
-    ) -> StorageResult<GoogleDriveCredential> {
-        self.load_from_env_with(storage, |name| std::env::var(name).ok())
-    }
-
-    fn load_from_env_with(
-        &self,
-        storage: &GoogleDriveStorageConfig,
-        mut env: impl FnMut(&str) -> Option<String>,
-    ) -> StorageResult<GoogleDriveCredential> {
-        let env_var = self.env_var_for_ref(&storage.id, &storage.credential_ref)?;
-        let contents = env(&env_var).ok_or_else(|| StorageError::CredentialLoad {
-            provider: storage.id.clone(),
-            reference: storage.credential_ref.clone(),
-            message: SanitizedMessage::new(format!("environment variable {env_var} is not set")),
-        })?;
-
-        GoogleDriveCredential::from_json(&storage.id, &storage.credential_ref, &contents)
-    }
-
-    fn env_var_for_ref(&self, provider: &str, reference: &str) -> StorageResult<String> {
-        if let Some(name) = reference.strip_prefix("env:") {
-            validate_env_var_name(provider, reference, name)?;
-            return Ok(name.to_owned());
-        }
-
-        let mut name = String::with_capacity(self.env_prefix.len() + reference.len());
-        name.push_str(&self.env_prefix);
-        for byte in reference.bytes() {
-            match byte {
-                b'a'..=b'z' => name.push((byte as char).to_ascii_uppercase()),
-                b'A'..=b'Z' | b'0'..=b'9' | b'_' => name.push(byte as char),
-                b'-' => name.push('_'),
-                _ => {
-                    return Err(StorageError::CredentialLoad {
-                        provider: provider.to_owned(),
-                        reference: reference.to_owned(),
-                        message: SanitizedMessage::new(
-                            "bare credential references must contain only ASCII letters, digits, '_' or '-'",
-                        ),
-                    });
-                }
-            }
-        }
-        validate_env_var_name(provider, reference, &name)?;
-
-        Ok(name)
-    }
-}
-
-impl Default for GoogleDriveCredentialLoader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Server-owned Google Drive OAuth credential.
-#[derive(Clone, Eq, PartialEq)]
-pub struct GoogleDriveCredential {
-    provider_id: String,
-    credential_ref: String,
-    client_id: String,
-    client_secret: String,
-    refresh_token: String,
-    token_url: Url,
-}
-
-impl GoogleDriveCredential {
-    /// Parses a flat JSON Google Drive OAuth credential.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] when the JSON is malformed, required fields are
-    /// missing, or `token_uri` is not an absolute HTTPS URL. HTTP is accepted
-    /// only for loopback hosts used by local tests and development tools.
-    pub fn from_json(
-        provider_id: impl Into<String>,
-        credential_ref: impl Into<String>,
-        contents: &str,
-    ) -> StorageResult<Self> {
-        let provider_id = provider_id.into();
-        let credential_ref = credential_ref.into();
-        let raw = serde_json::from_str::<RawGoogleDriveCredential>(contents).map_err(|source| {
-            credential_load_error(
-                &provider_id,
-                &credential_ref,
-                format!("credential JSON is invalid: {source}"),
-            )
-        })?;
-
-        let token_uri = raw
-            .token_uri
-            .unwrap_or_else(|| GOOGLE_OAUTH_TOKEN_URL.to_owned());
-        let token_url = validate_token_url(&provider_id, &credential_ref, &token_uri)?;
-
-        Ok(Self {
-            client_id: required_credential_field(
-                &raw.client_id,
-                "client_id",
-                &provider_id,
-                &credential_ref,
-            )?,
-            client_secret: required_credential_field(
-                &raw.client_secret,
-                "client_secret",
-                &provider_id,
-                &credential_ref,
-            )?,
-            refresh_token: required_credential_field(
-                &raw.refresh_token,
-                "refresh_token",
-                &provider_id,
-                &credential_ref,
-            )?,
-            provider_id,
-            credential_ref,
-            token_url,
-        })
-    }
-
-    /// Returns the configured storage provider ID this credential belongs to.
-    #[must_use]
-    pub fn provider_id(&self) -> &str {
-        &self.provider_id
-    }
-
-    /// Returns the non-secret credential reference from server configuration.
-    #[must_use]
-    pub fn credential_ref(&self) -> &str {
-        &self.credential_ref
-    }
-
-    /// Returns the OAuth token endpoint used for refresh-token exchange.
-    #[must_use]
-    pub fn token_url(&self) -> &Url {
-        &self.token_url
-    }
-}
-
-impl fmt::Debug for GoogleDriveCredential {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GoogleDriveCredential")
-            .field("provider_id", &self.provider_id)
-            .field("credential_ref", &self.credential_ref)
-            .field("client_id", &"<redacted>")
-            .field("client_secret", &"<redacted>")
-            .field("refresh_token", &"<redacted>")
-            .field("token_url", &self.token_url)
-            .finish()
-    }
-}
 
 /// Short-lived Google Drive OAuth access token.
 #[derive(Clone, Eq, PartialEq)]
@@ -297,6 +95,17 @@ pub struct GoogleDriveAccessToken {
 }
 
 impl GoogleDriveAccessToken {
+    /// Creates a deterministic bearer token for unit-test provider adapters.
+    #[cfg(test)]
+    pub(crate) fn for_test(access_token: impl Into<String>) -> Self {
+        Self {
+            access_token: access_token.into(),
+            token_type: "Bearer".to_owned(),
+            expires_in_seconds: Some(GCLOUD_ADC_ACCESS_TOKEN_LIFETIME_SECONDS),
+            scope: Vec::new(),
+        }
+    }
+
     /// Returns the raw bearer token secret for provider HTTP requests.
     ///
     /// Callers must not log this value or return it to Git LFS clients.
@@ -348,75 +157,196 @@ impl fmt::Debug for GoogleDriveAccessToken {
     }
 }
 
-/// Exchanges Google Drive refresh tokens for access tokens.
-#[derive(Clone)]
-pub struct GoogleDriveTokenRefresher {
-    client: Client,
-}
+/// Obtains short-lived Google Drive access tokens from Google Cloud CLI ADC.
+///
+/// The provider runs `gcloud auth application-default print-access-token`
+/// against an isolated `CLOUDSDK_CONFIG` directory. It never reads or exposes
+/// the generated ADC file in that directory.
+#[derive(Clone, Debug, Default)]
+pub struct GoogleDriveGcloudTokenProvider;
 
-impl GoogleDriveTokenRefresher {
-    /// Creates a token refresher using the default HTTP client.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] if the default HTTP client cannot be built.
-    pub fn new() -> StorageResult<Self> {
-        Ok(Self {
-            client: default_google_drive_http_client()?,
-        })
-    }
-
-    /// Creates a token refresher with an explicit HTTP client.
+impl GoogleDriveGcloudTokenProvider {
+    /// Creates a Google Cloud CLI ADC token provider.
     #[must_use]
-    pub fn with_client(client: Client) -> Self {
-        Self { client }
+    pub const fn new() -> Self {
+        Self
     }
 
-    /// Exchanges a Google Drive refresh token for a short-lived access token.
+    /// Validates that the configured directory contains generated ADC state.
+    ///
+    /// This check performs no process launch or network request, making it
+    /// suitable for local readiness and migration dry-run diagnostics.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] for transport failures, provider-denied
-    /// credentials, retryable upstream failures, and malformed token responses.
-    pub async fn refresh_access_token(
+    /// Returns [`StorageError`] when the configured directory is missing, is
+    /// not a directory, or lacks `application_default_credentials.json`.
+    pub fn validate_configuration(
         &self,
-        credential: &GoogleDriveCredential,
-    ) -> StorageResult<GoogleDriveAccessToken> {
-        let body = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("client_id", &credential.client_id)
-            .append_pair("client_secret", &credential.client_secret)
-            .append_pair("refresh_token", &credential.refresh_token)
-            .append_pair("grant_type", "refresh_token")
-            .finish();
+        provider_id: &str,
+        credentials: &GoogleDriveGcloudCredentialsConfig,
+    ) -> StorageResult<()> {
+        validate_gcloud_directory(provider_id, &credentials.config_dir)
+    }
 
-        let response = self
-            .client
-            .post(credential.token_url.clone())
-            .header(ACCEPT, "application/json")
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(body)
-            .send()
-            .await
-            .map_err(|source| refresh_transport_error(credential, source))?;
-        let status = response.status();
-        let response_body = read_google_response_body(response)
-            .await
-            .map_err(|source| refresh_transport_error(credential, source))?;
-
-        if status.is_success() {
-            parse_token_success(credential, status, &response_body)
-        } else {
-            Err(parse_token_error(credential, status, &response_body))
+    /// Validates generated ADC state and availability of the configured CLI.
+    ///
+    /// The check runs only `gcloud --version`; it neither mints a token nor
+    /// contacts Google. Ambient credential overrides are removed just as they
+    /// are for token acquisition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when ADC state is incomplete or the configured
+    /// executable cannot run successfully.
+    pub fn validate_local_readiness(
+        &self,
+        provider_id: &str,
+        credentials: &GoogleDriveGcloudCredentialsConfig,
+    ) -> StorageResult<()> {
+        self.validate_configuration(provider_id, credentials)?;
+        let status = ProcessCommand::new(&credentials.executable)
+            .arg("--version")
+            .env(CLOUDSDK_CONFIG_ENV, &credentials.config_dir)
+            .env(CLOUDSDK_CORE_DISABLE_PROMPTS_ENV, "1")
+            .env_remove(GOOGLE_APPLICATION_CREDENTIALS_ENV)
+            .env_remove(CLOUDSDK_AUTH_ACCESS_TOKEN_ENV)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| {
+                gcloud_credential_error(
+                    provider_id,
+                    "configured gcloud CLI could not be executed; install the Google Cloud CLI or correct credentials.executable",
+                )
+            })?;
+        if !status.success() {
+            return Err(gcloud_credential_error(
+                provider_id,
+                "configured gcloud CLI failed its local version check",
+            ));
         }
+        Ok(())
+    }
+
+    /// Requests one short-lived access token from the configured `gcloud` CLI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the ADC directory is incomplete, the
+    /// executable cannot run, the non-interactive command times out or fails,
+    /// or stdout does not contain exactly one valid access token.
+    pub async fn access_token(
+        &self,
+        provider_id: &str,
+        credentials: &GoogleDriveGcloudCredentialsConfig,
+    ) -> StorageResult<GoogleDriveAccessToken> {
+        self.validate_configuration(provider_id, credentials)?;
+
+        let mut command = Command::new(&credentials.executable);
+        command
+            .args([
+                "auth",
+                "application-default",
+                "print-access-token",
+                "--quiet",
+            ])
+            .env(CLOUDSDK_CONFIG_ENV, &credentials.config_dir)
+            .env(CLOUDSDK_CORE_DISABLE_PROMPTS_ENV, "1")
+            .env_remove(GOOGLE_APPLICATION_CREDENTIALS_ENV)
+            .env_remove(CLOUDSDK_AUTH_ACCESS_TOKEN_ENV)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let output = tokio::time::timeout(GCLOUD_ADC_TOKEN_TIMEOUT, command.output())
+            .await
+            .map_err(|_| gcloud_credential_error(provider_id, "gcloud ADC token command timed out"))?
+            .map_err(|_| {
+                gcloud_credential_error(
+                    provider_id,
+                    "configured gcloud CLI could not be executed; install the Google Cloud CLI or correct credentials.executable",
+                )
+            })?;
+
+        if !output.status.success() {
+            let status = output.status.code().map_or_else(
+                || "without an exit code".to_owned(),
+                |code| format!("with exit code {code}"),
+            );
+            return Err(gcloud_credential_error(
+                provider_id,
+                format!(
+                    "gcloud ADC token command failed {status}; rerun gcloud auth application-default login for the configured credentials directory"
+                ),
+            ));
+        }
+
+        parse_gcloud_access_token(provider_id, &output.stdout)
     }
 }
 
-impl fmt::Debug for GoogleDriveTokenRefresher {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GoogleDriveTokenRefresher")
-            .field("client", &"<redacted>")
-            .finish()
+fn validate_gcloud_directory(provider_id: &str, config_dir: &Path) -> StorageResult<()> {
+    let directory = fs::metadata(config_dir).map_err(|_| {
+        gcloud_credential_error(
+            provider_id,
+            "gcloud ADC credentials directory is missing or unreadable; run gcloud auth application-default login with the configured CLOUDSDK_CONFIG",
+        )
+    })?;
+    if !directory.is_dir() {
+        return Err(gcloud_credential_error(
+            provider_id,
+            "configured gcloud ADC credentials path is not a directory",
+        ));
+    }
+
+    let adc_path = config_dir.join("application_default_credentials.json");
+    if !fs::metadata(adc_path).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(gcloud_credential_error(
+            provider_id,
+            "gcloud ADC credentials directory does not contain application_default_credentials.json; run gcloud auth application-default login with the configured CLOUDSDK_CONFIG",
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_gcloud_access_token(
+    provider_id: &str,
+    stdout: &[u8],
+) -> StorageResult<GoogleDriveAccessToken> {
+    if stdout.len() > MAX_GCLOUD_ADC_TOKEN_BYTES {
+        return Err(gcloud_credential_error(
+            provider_id,
+            "gcloud ADC token output exceeded the accepted size",
+        ));
+    }
+    let output = std::str::from_utf8(stdout).map_err(|_| {
+        gcloud_credential_error(provider_id, "gcloud ADC token output was not valid UTF-8")
+    })?;
+    let access_token = output.trim_ascii();
+    if access_token.is_empty() || access_token.chars().any(char::is_whitespace) {
+        return Err(gcloud_credential_error(
+            provider_id,
+            "gcloud ADC token output did not contain one access token",
+        ));
+    }
+
+    Ok(GoogleDriveAccessToken {
+        access_token: access_token.to_owned(),
+        token_type: "Bearer".to_owned(),
+        expires_in_seconds: Some(GCLOUD_ADC_ACCESS_TOKEN_LIFETIME_SECONDS),
+        scope: Vec::new(),
+    })
+}
+
+fn gcloud_credential_error(provider_id: &str, message: impl Into<String>) -> StorageError {
+    StorageError::CredentialLoad {
+        provider: provider_id.to_owned(),
+        reference: "gcloud".to_owned(),
+        message: SanitizedMessage::new(message),
     }
 }
 
@@ -2070,37 +2000,6 @@ impl fmt::Debug for GoogleDriveObjectStore {
 }
 
 #[derive(Deserialize)]
-struct RawGoogleDriveCredential {
-    #[serde(default)]
-    client_id: Option<String>,
-    #[serde(default)]
-    client_secret: Option<String>,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    token_uri: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GoogleDriveTokenSuccess {
-    access_token: Option<String>,
-    #[serde(default)]
-    token_type: Option<String>,
-    #[serde(default)]
-    expires_in: Option<u64>,
-    #[serde(default)]
-    scope: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GoogleDriveTokenError {
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
-}
-
-#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GoogleDriveFileMetadata {
     id: Option<String>,
@@ -2164,66 +2063,6 @@ struct GoogleDriveErrorDetail {
     reason: Option<String>,
 }
 
-fn required_credential_field(
-    value: &Option<String>,
-    field: &str,
-    provider: &str,
-    reference: &str,
-) -> StorageResult<String> {
-    value
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .ok_or_else(|| credential_load_error(provider, reference, format!("{field} is required")))
-}
-
-fn credential_load_error(
-    provider: &str,
-    reference: &str,
-    message: impl Into<String>,
-) -> StorageError {
-    StorageError::CredentialLoad {
-        provider: provider.to_owned(),
-        reference: reference.to_owned(),
-        message: SanitizedMessage::new(message),
-    }
-}
-
-fn validate_token_url(provider: &str, reference: &str, value: &str) -> StorageResult<Url> {
-    let url = Url::parse(value)
-        .map_err(|_| credential_load_error(provider, reference, "token_uri must be a valid URL"))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(credential_load_error(
-            provider,
-            reference,
-            "token_uri must be an absolute http or https URL",
-        ));
-    }
-    if url.scheme() == "http" && !is_loopback_http_url(&url) {
-        return Err(credential_load_error(
-            provider,
-            reference,
-            "token_uri must use https unless it targets a loopback host",
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(credential_load_error(
-            provider,
-            reference,
-            "token_uri must not include credentials",
-        ));
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err(credential_load_error(
-            provider,
-            reference,
-            "token_uri must not include query strings or fragments",
-        ));
-    }
-
-    Ok(url)
-}
-
 fn is_loopback_http_url(url: &Url) -> bool {
     if url.scheme() != "http" {
         return false;
@@ -2236,85 +2075,6 @@ fn is_loopback_http_url(url: &Url) -> bool {
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
-}
-
-fn validate_env_var_name(provider: &str, reference: &str, name: &str) -> StorageResult<()> {
-    let mut bytes = name.bytes();
-    let Some(first) = bytes.next() else {
-        return Err(credential_load_error(
-            provider,
-            reference,
-            "credential environment variable name must not be empty",
-        ));
-    };
-    if !(first.is_ascii_alphabetic() || first == b'_')
-        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err(credential_load_error(
-            provider,
-            reference,
-            "credential environment variable name must contain only ASCII letters, digits, and '_' and must not start with a digit",
-        ));
-    }
-
-    Ok(())
-}
-
-fn parse_token_success(
-    credential: &GoogleDriveCredential,
-    status: StatusCode,
-    body: &str,
-) -> StorageResult<GoogleDriveAccessToken> {
-    let response = serde_json::from_str::<GoogleDriveTokenSuccess>(body).map_err(|_| {
-        StorageError::Upstream {
-            provider: credential.provider_id.clone(),
-            status: Some(status.as_u16()),
-            message: SanitizedMessage::new("Google OAuth token response was invalid JSON"),
-        }
-    })?;
-    let access_token = response
-        .access_token
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| StorageError::Upstream {
-            provider: credential.provider_id.clone(),
-            status: Some(status.as_u16()),
-            message: SanitizedMessage::new(
-                "Google OAuth token response did not include access_token",
-            ),
-        })?;
-    let token_type = response
-        .token_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|token_type| !token_type.is_empty())
-        .unwrap_or("Bearer")
-        .to_owned();
-    if !token_type.eq_ignore_ascii_case("Bearer") {
-        let mut message = sanitize_google_diagnostic(
-            credential,
-            &format!("Google OAuth token response used unsupported token_type {token_type:?}"),
-        );
-        if !access_token.is_empty() {
-            message = message.replace(&access_token, "[redacted]");
-        }
-        return Err(StorageError::Upstream {
-            provider: credential.provider_id.clone(),
-            status: Some(status.as_u16()),
-            message: SanitizedMessage::new(message),
-        });
-    }
-
-    Ok(GoogleDriveAccessToken {
-        access_token,
-        token_type,
-        expires_in_seconds: response.expires_in,
-        scope: response
-            .scope
-            .unwrap_or_default()
-            .split_ascii_whitespace()
-            .map(ToOwned::to_owned)
-            .collect(),
-    })
 }
 
 fn default_google_drive_http_client_from(
@@ -2339,13 +2099,6 @@ fn default_google_drive_http_client_from(
         Ok(()) => Ok(client),
         Err(client) => Ok(client_slot.get().cloned().unwrap_or(client)),
     }
-}
-
-fn default_google_drive_http_client() -> StorageResult<Client> {
-    default_google_drive_http_client_from(
-        &DEFAULT_GOOGLE_DRIVE_HTTP_CLIENT,
-        GOOGLE_DRIVE_TOKEN_REFRESH_TIMEOUT,
-    )
 }
 
 fn default_google_drive_root_validation_http_client() -> StorageResult<Client> {
@@ -3625,94 +3378,6 @@ fn drive_transport_error(
     }
 }
 
-fn parse_token_error(
-    credential: &GoogleDriveCredential,
-    status: StatusCode,
-    body: &str,
-) -> StorageError {
-    let diagnostic = google_token_error_message(credential, body);
-    if matches!(
-        diagnostic.code.as_deref(),
-        Some("invalid_grant" | "invalid_client" | "unauthorized_client")
-    ) || matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-    {
-        return StorageError::AuthenticationRequired {
-            provider: credential.provider_id.clone(),
-        };
-    }
-    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        return StorageError::Retryable {
-            provider: credential.provider_id.clone(),
-            message: diagnostic.message,
-        };
-    }
-
-    StorageError::Upstream {
-        provider: credential.provider_id.clone(),
-        status: Some(status.as_u16()),
-        message: SanitizedMessage::new(diagnostic.message),
-    }
-}
-
-fn google_token_error_message(
-    credential: &GoogleDriveCredential,
-    body: &str,
-) -> GoogleTokenDiagnostic {
-    if let Ok(error) = serde_json::from_str::<GoogleDriveTokenError>(body) {
-        let code = error.error.filter(|value| !value.trim().is_empty());
-        let message = error
-            .error_description
-            .or_else(|| code.clone())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "Google OAuth token refresh failed".to_owned());
-        return GoogleTokenDiagnostic {
-            code,
-            message: sanitize_google_diagnostic(credential, &cap_google_diagnostic(&message)),
-        };
-    }
-
-    GoogleTokenDiagnostic {
-        code: None,
-        message: sanitize_google_diagnostic(credential, &cap_google_diagnostic(body)),
-    }
-}
-
-struct GoogleTokenDiagnostic {
-    code: Option<String>,
-    message: String,
-}
-
-fn sanitize_google_diagnostic(credential: &GoogleDriveCredential, message: &str) -> String {
-    let mut sanitized = message.to_owned();
-    for secret in [
-        &credential.client_id,
-        &credential.client_secret,
-        &credential.refresh_token,
-    ] {
-        sanitized = redact_secret_from_message(&sanitized, secret);
-    }
-    if sanitized.trim().is_empty() {
-        "Google OAuth token refresh failed".to_owned()
-    } else {
-        sanitized
-    }
-}
-
-fn refresh_transport_error(
-    credential: &GoogleDriveCredential,
-    source: reqwest::Error,
-) -> StorageError {
-    let message = sanitize_google_diagnostic(
-        credential,
-        &format!("Google OAuth token refresh request failed: {source}"),
-    );
-
-    StorageError::Retryable {
-        provider: credential.provider_id.clone(),
-        message,
-    }
-}
-
 fn cap_google_diagnostic(message: &str) -> String {
     message.chars().take(MAX_GOOGLE_ERROR_BODY_LEN).collect()
 }
@@ -3770,13 +3435,12 @@ mod tests {
     };
 
     use super::{
-        GOOGLE_OAUTH_TOKEN_URL, GoogleDriveCredential, GoogleDriveCredentialLoader,
-        GoogleDriveObjectKey, GoogleDriveObjectStore, GoogleDriveRootValidator,
-        GoogleDriveTokenRefresher,
+        GoogleDriveGcloudTokenProvider, GoogleDriveObjectKey, GoogleDriveObjectStore,
+        GoogleDriveRootValidator, parse_gcloud_access_token,
     };
     use crate::{
-        GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, StorageDeleteOutcome,
-        StorageError, StorageProvider,
+        GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
+        LfsOid, StorageDeleteOutcome, StorageError, StorageProvider,
     };
     use axum::{
         Json, Router,
@@ -3796,28 +3460,151 @@ mod tests {
     const OBJECT_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
-    fn loader_resolves_bare_credential_refs_to_server_side_env_secret_json() {
-        let storage = storage_config("google-drive-user-a");
-        let loader = GoogleDriveCredentialLoader::new();
+    fn gcloud_token_output_parses_without_exposing_scope_claims() {
+        let token = parse_gcloud_access_token("drive-user-a", b"ya29.test-token\n")
+            .expect("gcloud ADC output should parse");
 
-        let credential = loader
-            .load_from_env_with(&storage, |name| {
-                assert_eq!(
-                    name,
-                    "LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_GOOGLE_DRIVE_USER_A"
-                );
-                Some(credential_json())
-            })
-            .expect("credential should load");
+        assert_eq!(token.as_str(), "ya29.test-token");
+        assert_eq!(token.expires_in_seconds(), Some(3_600));
+        assert!(token.scope().is_empty());
+        assert!(!format!("{token:?}").contains("ya29.test-token"));
+    }
 
-        assert_eq!(credential.provider_id(), "drive-user-a");
-        assert_eq!(credential.credential_ref(), "google-drive-user-a");
-        assert_eq!(credential.token_url().as_str(), GOOGLE_OAUTH_TOKEN_URL);
-        assert_eq!(credential.client_id, "client-id");
-        assert_eq!(credential.client_secret, "client-secret");
-        assert_eq!(credential.refresh_token, "refresh-token");
-        assert!(!format!("{credential:?}").contains("refresh-token"));
-        assert!(!format!("{credential:?}").contains("client-secret"));
+    #[test]
+    fn gcloud_token_output_rejects_multiple_lines() {
+        let error =
+            parse_gcloud_access_token("drive-user-a", b"ya29.first-token\nya29.second-token\n")
+                .expect_err("multiple token lines should be rejected");
+
+        assert!(matches!(error, StorageError::CredentialLoad { .. }));
+        assert!(!error.to_string().contains("ya29.first-token"));
+        assert!(!error.to_string().contains("ya29.second-token"));
+    }
+
+    #[test]
+    fn gcloud_local_readiness_requires_the_configured_executable() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        std::fs::write(
+            directory
+                .path()
+                .join("application_default_credentials.json"),
+            "{}",
+        )
+        .expect("ADC marker file should be written");
+        let credentials = GoogleDriveGcloudCredentialsConfig {
+            config_dir: directory.path().to_owned(),
+            executable: directory.path().join("missing-gcloud"),
+        };
+
+        let error = GoogleDriveGcloudTokenProvider::new()
+            .validate_local_readiness("drive-user-a", &credentials)
+            .expect_err("missing gcloud executable should fail readiness");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("drive-user-a"));
+        assert!(rendered.contains("install the Google Cloud CLI"));
+        assert!(!rendered.contains("missing-gcloud"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gcloud_provider_uses_isolated_noninteractive_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let config_dir = directory.path().join("gcloud-drive");
+        std::fs::create_dir(&config_dir).expect("gcloud config directory should be created");
+        std::fs::write(
+            config_dir.join("application_default_credentials.json"),
+            "{}",
+        )
+        .expect("ADC marker should be written");
+        let invocation_path = directory.path().join("invocation.txt");
+        let executable = directory.path().join("gcloud-test");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$CLOUDSDK_CONFIG\" \"$CLOUDSDK_CORE_DISABLE_PROMPTS\" \"$@\" > '{}'\nprintf 'ya29.gcloud-adc-token\\n'\n",
+                invocation_path.display()
+            ),
+        )
+        .expect("fake gcloud executable should be written");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("fake gcloud metadata should load")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("fake gcloud should become executable");
+
+        let token = GoogleDriveGcloudTokenProvider::new()
+            .access_token(
+                "drive-user-a",
+                &GoogleDriveGcloudCredentialsConfig {
+                    config_dir: config_dir.clone(),
+                    executable,
+                },
+            )
+            .await
+            .expect("fake gcloud should return a token");
+
+        assert_eq!(token.as_str(), "ya29.gcloud-adc-token");
+        let invocation = std::fs::read_to_string(invocation_path)
+            .expect("fake gcloud invocation should be recorded");
+        assert_eq!(
+            invocation
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>(),
+            vec![
+                config_dir.to_string_lossy().into_owned(),
+                "1".to_owned(),
+                "auth".to_owned(),
+                "application-default".to_owned(),
+                "print-access-token".to_owned(),
+                "--quiet".to_owned(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gcloud_provider_redacts_failed_command_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let config_dir = directory.path().join("gcloud-drive");
+        std::fs::create_dir(&config_dir).expect("gcloud config directory should be created");
+        std::fs::write(
+            config_dir.join("application_default_credentials.json"),
+            "{}",
+        )
+        .expect("ADC marker should be written");
+        let executable = directory.path().join("gcloud-test");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'sensitive-credential' >&2\nexit 42\n",
+        )
+        .expect("fake gcloud executable should be written");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("fake gcloud metadata should load")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("fake gcloud should become executable");
+
+        let error = GoogleDriveGcloudTokenProvider::new()
+            .access_token(
+                "drive-user-a",
+                &GoogleDriveGcloudCredentialsConfig {
+                    config_dir,
+                    executable,
+                },
+            )
+            .await
+            .expect_err("failed gcloud command should be reported");
+
+        assert!(error.to_string().contains("exit code 42"));
+        assert!(!error.to_string().contains("sensitive-credential"));
     }
 
     #[test]
@@ -3846,108 +3633,6 @@ mod tests {
             !download_debug.contains("total_timeout"),
             "large downloads must not impose a total request deadline: {download_debug}"
         );
-    }
-
-    #[test]
-    fn loader_supports_explicit_env_var_refs() {
-        let storage = storage_config("env:DRIVE_USER_A_JSON");
-        let loader = GoogleDriveCredentialLoader::new();
-
-        let credential = loader
-            .load_from_env_with(&storage, |name| {
-                assert_eq!(name, "DRIVE_USER_A_JSON");
-                Some(credential_json())
-            })
-            .expect("credential should load");
-
-        assert_eq!(credential.credential_ref(), "env:DRIVE_USER_A_JSON");
-    }
-
-    #[test]
-    fn loader_reports_missing_env_without_secret_material() {
-        let storage = storage_config("google-drive-user-a");
-        let loader = GoogleDriveCredentialLoader::new();
-
-        let error = loader
-            .load_from_env_with(&storage, |_| None)
-            .expect_err("missing credential env should fail");
-
-        assert!(matches!(
-            error,
-            StorageError::CredentialLoad {
-                ref provider,
-                ref reference,
-                ..
-            } if provider == "drive-user-a" && reference == "google-drive-user-a"
-        ));
-        assert!(!error.to_string().contains("client-secret"));
-        assert!(
-            error
-                .to_string()
-                .contains("LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_GOOGLE_DRIVE_USER_A")
-        );
-    }
-
-    #[test]
-    fn credential_json_requires_refresh_token() {
-        let error = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "google-drive-user-a",
-            r#"{"client_id":"client-id","client_secret":"client-secret"}"#,
-        )
-        .expect_err("missing refresh token should fail");
-
-        assert!(matches!(
-            error,
-            StorageError::CredentialLoad {
-                ref provider,
-                ref reference,
-                ..
-            } if provider == "drive-user-a" && reference == "google-drive-user-a"
-        ));
-        assert!(error.to_string().contains("refresh_token is required"));
-        assert!(!error.to_string().contains("client-secret"));
-    }
-
-    #[test]
-    fn credential_json_reports_parse_details_without_secret_material() {
-        let error = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "google-drive-user-a",
-            r#"{"client_id":"client-id","client_secret":"client-secret","refresh_token":"refresh-token""#,
-        )
-        .expect_err("malformed JSON should fail");
-        let display = error.to_string();
-
-        assert!(display.contains("credential JSON is invalid"));
-        assert!(display.contains("line"));
-        assert!(!display.contains("client-secret"));
-        assert!(!display.contains("refresh-token"));
-    }
-
-    #[test]
-    fn credential_json_requires_https_token_uri_except_loopback() {
-        let error = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "google-drive-user-a",
-            r#"{"client_id":"client-id","client_secret":"client-secret","refresh_token":"refresh-token","token_uri":"http://tokens.example.com/token"}"#,
-        )
-        .expect_err("non-loopback HTTP token URI should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("token_uri must use https unless it targets a loopback host")
-        );
-
-        let credential = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "google-drive-user-a",
-            r#"{"client_id":"client-id","client_secret":"client-secret","refresh_token":"refresh-token","token_uri":"http://localhost/token"}"#,
-        )
-        .expect("loopback HTTP token URI should be accepted for local testing");
-
-        assert_eq!(credential.token_url().as_str(), "http://localhost/token");
     }
 
     #[test]
@@ -4292,240 +3977,12 @@ mod tests {
     }
 
     #[test]
-    fn credential_json_rejects_token_uri_query_and_fragment() {
-        for token_uri in [
-            "https://oauth2.googleapis.com/token?client_secret=client-secret",
-            "https://oauth2.googleapis.com/token#client-secret",
-        ] {
-            let error = GoogleDriveCredential::from_json(
-                "drive-user-a",
-                "google-drive-user-a",
-                &format!(
-                    r#"{{
-                        "client_id":"client-id",
-                        "client_secret":"client-secret",
-                        "refresh_token":"refresh-token",
-                        "token_uri":"{token_uri}"
-                    }}"#
-                ),
-            )
-            .expect_err("token_uri query strings and fragments should fail");
-
-            assert!(
-                error
-                    .to_string()
-                    .contains("token_uri must not include query strings or fragments")
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn refresher_exchanges_refresh_token_for_bearer_access_token() {
-        let server = TokenServer::start(
-            StatusCode::OK,
-            r#"{"access_token":"access-token","token_type":"Bearer","expires_in":3599,"scope":"https://www.googleapis.com/auth/drive.file email"}"#,
-        )
-        .await;
-        let credential = credential_with_token_url(&server.url);
-        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
-
-        let token = refresher
-            .refresh_access_token(&credential)
-            .await
-            .expect("refresh should succeed");
-
-        assert_eq!(token.as_str(), "access-token");
-        assert_eq!(token.expires_in_seconds(), Some(3599));
-        assert_eq!(
-            token.scope(),
-            &[
-                "https://www.googleapis.com/auth/drive.file".to_owned(),
-                "email".to_owned()
-            ]
-        );
-        assert_eq!(
-            token
-                .authorization_header_value("drive-user-a")
-                .expect("header should encode"),
-            "Bearer access-token"
-        );
-        assert!(!format!("{token:?}").contains("access-token"));
-
-        let requests = server.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].headers.get(CONTENT_TYPE).unwrap(),
-            "application/x-www-form-urlencoded"
-        );
-        let form = form_pairs(&requests[0].body);
-        assert_eq!(form["grant_type"], "refresh_token");
-        assert_eq!(form["client_id"], "client-id");
-        assert_eq!(form["client_secret"], "client-secret");
-        assert_eq!(form["refresh_token"], "refresh-token");
-    }
-
-    #[tokio::test]
-    async fn refresher_accepts_bearer_token_type_with_surrounding_whitespace() {
-        let server = TokenServer::start(
-            StatusCode::OK,
-            r#"{"access_token":"access-token","token_type":" Bearer \t"}"#,
-        )
-        .await;
-        let credential = credential_with_token_url(&server.url);
-        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
-
-        let token = refresher
-            .refresh_access_token(&credential)
-            .await
-            .expect("whitespace-padded bearer token type should refresh");
-
-        assert_eq!(token.as_str(), "access-token");
-    }
-
-    #[tokio::test]
-    async fn refresher_redacts_credentials_from_unsupported_token_type() {
-        let server = TokenServer::start(
-            StatusCode::OK,
-            r#"{"access_token":"access-token","token_type":"client-secret refresh-token"}"#,
-        )
-        .await;
-        let credential = credential_with_token_url(&server.url);
-        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
-
-        let error = refresher
-            .refresh_access_token(&credential)
-            .await
-            .expect_err("unsupported token type should fail");
-        let display = error.to_string();
-
-        assert!(display.contains("unsupported token_type"));
-        assert!(!display.contains("client-secret"));
-        assert!(!display.contains("refresh-token"));
-        assert!(display.contains("[redacted] [redacted]"));
-    }
-
-    #[tokio::test]
-    async fn refresher_reports_status_for_malformed_success_response() {
-        let server = TokenServer::start(StatusCode::OK, r#"{"token_type":"Bearer"}"#).await;
-        let credential = credential_with_token_url(&server.url);
-        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
-
-        let error = refresher
-            .refresh_access_token(&credential)
-            .await
-            .expect_err("missing access token should fail");
-
-        assert!(matches!(
-            error,
-            StorageError::Upstream {
-                ref provider,
-                status: Some(200),
-                ..
-            } if provider == "drive-user-a"
-        ));
-    }
-
-    #[tokio::test]
-    async fn refresher_maps_invalid_grant_to_authentication_required() {
-        let server = TokenServer::start(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":"invalid_grant","error_description":"refresh token expired"}"#,
-        )
-        .await;
-        let credential = credential_with_token_url(&server.url);
-        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
-
-        let error = refresher
-            .refresh_access_token(&credential)
-            .await
-            .expect_err("invalid grant should require new credentials");
-
-        assert!(matches!(
-            error,
-            StorageError::AuthenticationRequired { provider } if provider == "drive-user-a"
-        ));
-    }
-
-    #[tokio::test]
-    async fn refresher_redacts_credentials_from_upstream_diagnostics() {
-        let server = TokenServer::start(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":"bad_request","error_description":"client-secret refresh-token rejected"}"#,
-        )
-        .await;
-        let credential = credential_with_token_url(&server.url);
-        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
-
-        let error = refresher
-            .refresh_access_token(&credential)
-            .await
-            .expect_err("bad request should fail");
-        let display = error.to_string();
-
-        assert!(!display.contains("client-secret"));
-        assert!(!display.contains("refresh-token"));
-        assert!(display.contains("[redacted] [redacted] rejected"));
-    }
-
-    #[tokio::test]
-    async fn refresher_caps_large_upstream_error_body_before_diagnostics() {
-        let large_body = format!(
-            "{}after-limit client-secret refresh-token",
-            "x".repeat(super::MAX_GOOGLE_ERROR_BODY_LEN)
-        );
-        let server = TokenServer::start(StatusCode::BAD_GATEWAY, large_body).await;
-        let credential = credential_with_token_url(&server.url);
-        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
-
-        let error = refresher
-            .refresh_access_token(&credential)
-            .await
-            .expect_err("large upstream error should fail");
-
-        assert!(matches!(
-            error,
-            StorageError::Retryable {
-                provider,
-                message,
-            } if provider == "drive-user-a"
-                && message.len() == super::MAX_GOOGLE_ERROR_BODY_LEN
-                && !message.contains("after-limit")
-                && !message.contains("client-secret")
-                && !message.contains("refresh-token")
-        ));
-    }
-
-    #[test]
     fn drive_diagnostics_redact_token_fragments_at_truncation_boundary() {
         let body = format!("{}access", "x".repeat(super::MAX_GOOGLE_ERROR_BODY_LEN - 6));
         let diagnostic = super::drive_error_message(&access_token(), &body);
 
         assert!(!diagnostic.message.contains("access"));
         assert!(diagnostic.message.ends_with("[redacted]"));
-    }
-
-    #[tokio::test]
-    async fn refresher_maps_rate_limits_to_retryable_errors() {
-        let server = TokenServer::start(
-            StatusCode::TOO_MANY_REQUESTS,
-            r#"{"error":"rate_limit_exceeded","error_description":"try later"}"#,
-        )
-        .await;
-        let credential = credential_with_token_url(&server.url);
-        let refresher = GoogleDriveTokenRefresher::with_client(reqwest::Client::new());
-
-        let error = refresher
-            .refresh_access_token(&credential)
-            .await
-            .expect_err("rate limit should be retryable");
-
-        assert!(matches!(
-            error,
-            StorageError::Retryable {
-                provider,
-                message,
-            } if provider == "drive-user-a" && message.contains("try later")
-        ));
     }
 
     #[tokio::test]
@@ -6289,33 +5746,16 @@ mod tests {
             .expect_err("download should fail for this provider response")
     }
 
-    fn storage_config(credential_ref: &str) -> GoogleDriveStorageConfig {
+    fn storage_config(_credential_name: &str) -> GoogleDriveStorageConfig {
         GoogleDriveStorageConfig {
             id: "drive-user-a".to_owned(),
-            credential_ref: credential_ref.to_owned(),
+            credentials: GoogleDriveGcloudCredentialsConfig {
+                config_dir: ".gcloud-drive".into(),
+                executable: "gcloud".into(),
+            },
             root_folder_id: "drive-root".to_owned(),
             display_name: None,
         }
-    }
-
-    fn credential_json() -> String {
-        r#"{"client_id":"client-id","client_secret":"client-secret","refresh_token":"refresh-token"}"#.to_owned()
-    }
-
-    fn credential_with_token_url(token_url: &str) -> GoogleDriveCredential {
-        GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "google-drive-user-a",
-            &format!(
-                r#"{{
-                    "client_id":"client-id",
-                    "client_secret":"client-secret",
-                    "refresh_token":"refresh-token",
-                    "token_uri":"{token_url}"
-                }}"#
-            ),
-        )
-        .expect("credential should parse")
     }
 
     fn access_token() -> super::GoogleDriveAccessToken {
@@ -6717,90 +6157,6 @@ mod tests {
         url::form_urlencoded::parse(body.as_bytes())
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect()
-    }
-
-    struct TokenServer {
-        url: String,
-        state: Arc<TokenServerState>,
-        server_task: tokio::task::JoinHandle<()>,
-    }
-
-    impl TokenServer {
-        async fn start(status: StatusCode, body: impl Into<String>) -> Self {
-            let state = Arc::new(TokenServerState {
-                status,
-                body: body.into(),
-                requests: Mutex::new(Vec::new()),
-            });
-            let app = Router::new()
-                .route("/token", post(token_handler))
-                .with_state(state.clone());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("test token server should bind");
-            let address = listener
-                .local_addr()
-                .expect("test token server address should be available");
-            let server_task = tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .await
-                    .expect("test token server should run");
-            });
-
-            Self {
-                url: format!("http://{address}/token"),
-                state,
-                server_task,
-            }
-        }
-
-        fn requests(&self) -> Vec<CapturedTokenRequest> {
-            self.state
-                .requests
-                .lock()
-                .expect("test token requests lock should not poison")
-                .clone()
-        }
-    }
-
-    impl Drop for TokenServer {
-        fn drop(&mut self) {
-            self.server_task.abort();
-        }
-    }
-
-    struct TokenServerState {
-        status: StatusCode,
-        body: String,
-        requests: Mutex<Vec<CapturedTokenRequest>>,
-    }
-
-    #[derive(Clone)]
-    struct CapturedTokenRequest {
-        headers: HeaderMap,
-        body: String,
-    }
-
-    async fn token_handler(
-        State(state): State<Arc<TokenServerState>>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Response {
-        state
-            .requests
-            .lock()
-            .expect("test token requests lock should not poison")
-            .push(CapturedTokenRequest {
-                headers,
-                body: String::from_utf8(body.to_vec()).expect("token request body should be UTF-8"),
-            });
-
-        (
-            state.status,
-            [(CONTENT_TYPE, "application/json")],
-            state.body.clone(),
-        )
-            .into_response()
     }
 
     struct DriveMetadataServer {

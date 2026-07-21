@@ -42,16 +42,15 @@ use url::{Url, form_urlencoded};
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GITHUB_OAUTH_CALLBACK_PATH,
     GitHubOAuthCallbackRouteState, GitHubOAuthStateRegistry, GitHubRepositoryProvider,
-    GoogleDriveAccessToken, GoogleDriveCredential, GoogleDriveCredentialLoader,
-    GoogleDriveObjectStore, GoogleDriveRootValidator, GoogleDriveStorageConfig,
-    GoogleDriveTokenRefresher, LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError,
-    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject,
-    LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase,
-    MetadataObjectVerificationStatus, ProviderFuture, RepositoryAuthentication, RepositoryIdentity,
-    RepositoryMapping, RepositoryPermission, RepositoryProvider, RepositoryProviderConfig,
-    RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerConfig, ServerError,
-    ServerResult, StorageError, StorageProvider, StorageProviderConfig, StorageResult,
-    StoredObject, github_oauth_callback_router, github_oauth_login_router,
+    GoogleDriveAccessToken, GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore,
+    GoogleDriveRootValidator, GoogleDriveStorageConfig, LFS_BASIC_TRANSFER, LfsBatchDownloadObject,
+    LfsBatchObjectError, LfsBatchOperation, LfsBatchRequest, LfsBatchResponse,
+    LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore,
+    MetadataDatabase, MetadataObjectVerificationStatus, ProviderFuture, RepositoryAuthentication,
+    RepositoryIdentity, RepositoryMapping, RepositoryPermission, RepositoryProvider,
+    RepositoryProviderConfig, RepositoryProviderError, RepositoryUser, SanitizedMessage,
+    ServerConfig, ServerError, ServerResult, StorageError, StorageProvider, StorageProviderConfig,
+    StorageResult, StoredObject, github_oauth_callback_router, github_oauth_login_router,
     metadata::{MetadataTransferOperation, MetadataTransferResult},
     parse_lfs_batch_request_json,
     sessions::LfsSessionRecord,
@@ -103,11 +102,11 @@ impl ServeOptions {
 
 /// Starts the configured LFS Cloud HTTP server and runs until shutdown.
 ///
-/// Before binding the listener, the server refreshes credentials for every
-/// configured Google Drive provider and validates that each root is a live,
-/// writable folder. It then serves authenticated Git LFS batch and object
-/// transfer routes. SIGINT and SIGTERM stop new request admission and allow
-/// active transfers up to 30 seconds to finish before process shutdown.
+/// Before binding the listener, the server asks `gcloud` for an ADC access
+/// token for every configured Google Drive provider and validates that each
+/// root is a live, writable folder. It then serves authenticated Git LFS batch
+/// and object transfer routes. SIGINT and SIGTERM stop new request admission
+/// and allow active transfers up to 30 seconds to finish before process shutdown.
 ///
 /// # Errors
 ///
@@ -120,8 +119,7 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
 type ServerShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct ServerCompositionClients {
-    drive_credential_source: Arc<dyn GoogleDriveCredentialSource>,
-    drive_token_refresher: GoogleDriveTokenRefresher,
+    drive_token_source: Arc<dyn GoogleDriveAccessTokenSource>,
     drive_root_validator: GoogleDriveRootValidator,
     github_token_exchanger: crate::GitHubOAuthTokenExchanger,
     github_user_client: crate::GitHubUserClient,
@@ -130,8 +128,7 @@ struct ServerCompositionClients {
 impl ServerCompositionClients {
     fn production() -> ServerResult<Self> {
         Ok(Self {
-            drive_credential_source: Arc::new(GoogleDriveCredentialLoader::new()),
-            drive_token_refresher: GoogleDriveTokenRefresher::new()?,
+            drive_token_source: Arc::new(GoogleDriveGcloudTokenProvider::new()),
             drive_root_validator: GoogleDriveRootValidator::new()?,
             github_token_exchanger: crate::GitHubOAuthTokenExchanger::new()?,
             github_user_client: crate::GitHubUserClient::new()?,
@@ -207,8 +204,7 @@ impl ServerBuilder {
         let transfer_store = GoogleDriveTransferStore::with_dependencies(
             config.clone(),
             metadata_database.clone(),
-            clients.drive_credential_source,
-            clients.drive_token_refresher,
+            clients.drive_token_source,
             clients.drive_root_validator,
         );
         #[cfg(test)]
@@ -1092,21 +1088,26 @@ impl LfsObjectTransferStore for PendingLfsObjectTransferStore {
 struct GoogleDriveTransferStore {
     storage_providers: BTreeMap<String, StorageProviderConfig>,
     metadata_database: Arc<MetadataDatabase>,
-    credential_source: Arc<dyn GoogleDriveCredentialSource>,
-    token_refresher: GoogleDriveTokenRefresher,
+    token_source: Arc<dyn GoogleDriveAccessTokenSource>,
     token_cache: GoogleDriveAccessTokenCache,
     root_validator: GoogleDriveRootValidator,
     #[cfg(test)]
     object_api_base_url: Option<String>,
 }
 
-trait GoogleDriveCredentialSource: Send + Sync {
-    fn load(&self, storage: &GoogleDriveStorageConfig) -> StorageResult<GoogleDriveCredential>;
+trait GoogleDriveAccessTokenSource: Send + Sync {
+    fn access_token<'a>(
+        &'a self,
+        storage: &'a GoogleDriveStorageConfig,
+    ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>>;
 }
 
-impl GoogleDriveCredentialSource for GoogleDriveCredentialLoader {
-    fn load(&self, storage: &GoogleDriveStorageConfig) -> StorageResult<GoogleDriveCredential> {
-        self.load_from_environment(storage)
+impl GoogleDriveAccessTokenSource for GoogleDriveGcloudTokenProvider {
+    fn access_token<'a>(
+        &'a self,
+        storage: &'a GoogleDriveStorageConfig,
+    ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
+        Box::pin(async move { self.access_token(&storage.id, &storage.credentials).await })
     }
 }
 
@@ -1114,15 +1115,13 @@ impl GoogleDriveTransferStore {
     fn with_dependencies(
         config: ServerConfig,
         metadata_database: Arc<MetadataDatabase>,
-        credential_source: Arc<dyn GoogleDriveCredentialSource>,
-        token_refresher: GoogleDriveTokenRefresher,
+        token_source: Arc<dyn GoogleDriveAccessTokenSource>,
         root_validator: GoogleDriveRootValidator,
     ) -> Self {
         Self {
             storage_providers: config.storage_providers,
             metadata_database,
-            credential_source,
-            token_refresher,
+            token_source,
             token_cache: GoogleDriveAccessTokenCache::default(),
             root_validator,
             #[cfg(test)]
@@ -1139,10 +1138,9 @@ impl GoogleDriveTransferStore {
     async fn validate_storage_providers(&self) -> ServerResult<()> {
         for storage in self.storage_providers.values() {
             let StorageProviderConfig::GoogleDrive(storage) = storage;
-            let credential = self.credential_source.load(storage)?;
             let token = self
                 .token_cache
-                .get_or_refresh(&storage.id, &credential, &self.token_refresher)
+                .get_or_refresh(storage, self.token_source.as_ref())
                 .await?;
             self.root_validator
                 .validate_root_folder(storage, &token)
@@ -1167,10 +1165,9 @@ impl GoogleDriveTransferStore {
                 });
             }
         };
-        let credential = self.credential_source.load(&storage)?;
         let token = self
             .token_cache
-            .get_or_refresh(&storage.id, &credential, &self.token_refresher)
+            .get_or_refresh(&storage, self.token_source.as_ref())
             .await?;
 
         #[cfg(test)]
@@ -1264,22 +1261,21 @@ struct CachedGoogleDriveAccessToken {
 impl GoogleDriveAccessTokenCache {
     async fn get_or_refresh(
         &self,
-        provider_id: &str,
-        credential: &GoogleDriveCredential,
-        refresher: &GoogleDriveTokenRefresher,
+        storage: &GoogleDriveStorageConfig,
+        token_source: &dyn GoogleDriveAccessTokenSource,
     ) -> ServerResult<GoogleDriveAccessToken> {
         // Keep the lock through refresh so concurrent misses collapse into one
         // token request. Refreshes happen only near expiry, and the server-wide
         // provider semaphore bounds this path with all other upstream calls.
         let mut tokens = self.tokens.lock().await;
         let now = Instant::now();
-        if let Some(cached) = tokens.get(provider_id)
+        if let Some(cached) = tokens.get(&storage.id)
             && cached.refresh_at > now
         {
             return Ok(cached.token.clone());
         }
 
-        let token = refresher.refresh_access_token(credential).await?;
+        let token = token_source.access_token(storage).await?;
         let refresh_at = token
             .expires_in_seconds()
             .and_then(|seconds| {
@@ -1291,14 +1287,14 @@ impl GoogleDriveAccessTokenCache {
             && refresh_at > now
         {
             tokens.insert(
-                provider_id.to_owned(),
+                storage.id.clone(),
                 CachedGoogleDriveAccessToken {
                     token: token.clone(),
                     refresh_at,
                 },
             );
         } else {
-            tokens.remove(provider_id);
+            tokens.remove(&storage.id);
         }
 
         Ok(token)
@@ -3501,7 +3497,9 @@ impl LfsRouteResolver {
     /// storage_providers:
     ///   drive-user-a:
     ///     type: google_drive
-    ///     credentials_ref: google-drive-user-a
+    ///     credentials:
+    ///       type: gcloud
+    ///       config_dir: .gcloud-drive
     ///     root_folder_id: root
     /// repositories:
     ///   - id: github-main:owner/repo
@@ -3759,7 +3757,7 @@ mod tests {
 
     use super::{
         BASE64_STANDARD, BatchBodyGuardrails, GoogleDriveAccessTokenCache,
-        GoogleDriveCredentialSource, GoogleDriveTransferStore, LFS_AUTH_CHALLENGE,
+        GoogleDriveAccessTokenSource, GoogleDriveTransferStore, LFS_AUTH_CHALLENGE,
         LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore,
         LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES,
         ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients, ServerShutdownOutcome,
@@ -3780,12 +3778,12 @@ mod tests {
 
     use crate::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubOAuthAccessToken, GitHubOAuthTokenExchanger,
-        GitHubUserClient, GoogleDriveCredential, GoogleDriveRootValidator,
-        GoogleDriveStorageConfig, GoogleDriveTokenRefresher, LfsBatchOperation, LfsBatchResponse,
-        LfsObject, LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase,
-        ProviderFuture, RepositoryMapping, RepositoryPermission, RepositoryProviderError,
-        RepositoryUser, SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
-        StorageResult, StoredObject,
+        GitHubUserClient, GoogleDriveAccessToken, GoogleDriveRootValidator,
+        GoogleDriveStorageConfig, LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize,
+        LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture,
+        RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
+        SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
+        StorageProviderConfig, StorageResult, StoredObject,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -3838,7 +3836,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: google-drive-user-a
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: root
 repositories:
   - id: github-main:owner/repo
@@ -3864,16 +3864,39 @@ repositories:
     }
 
     #[derive(Clone)]
-    struct StaticGoogleDriveCredentialSource {
-        credential: GoogleDriveCredential,
+    struct StaticGoogleDriveAccessTokenSource {
+        token: GoogleDriveAccessToken,
     }
 
-    impl GoogleDriveCredentialSource for StaticGoogleDriveCredentialSource {
-        fn load(
-            &self,
-            _storage: &GoogleDriveStorageConfig,
-        ) -> StorageResult<GoogleDriveCredential> {
-            Ok(self.credential.clone())
+    impl GoogleDriveAccessTokenSource for StaticGoogleDriveAccessTokenSource {
+        fn access_token<'a>(
+            &'a self,
+            _storage: &'a GoogleDriveStorageConfig,
+        ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
+            Box::pin(async { Ok(self.token.clone()) })
+        }
+    }
+
+    fn static_drive_token_source() -> Arc<dyn GoogleDriveAccessTokenSource> {
+        Arc::new(StaticGoogleDriveAccessTokenSource {
+            token: GoogleDriveAccessToken::for_test("drive-test-token"),
+        })
+    }
+
+    #[derive(Clone)]
+    struct CountingGoogleDriveAccessTokenSource {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GoogleDriveAccessTokenSource for CountingGoogleDriveAccessTokenSource {
+        fn access_token<'a>(
+            &'a self,
+            _storage: &'a GoogleDriveStorageConfig,
+        ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(GoogleDriveAccessToken::for_test("cached-access-token"))
+            })
         }
     }
 
@@ -3887,17 +3910,6 @@ repositories:
                         "access_token": "gho_composition_test",
                         "token_type": "bearer",
                         "scope": "read:user,repo"
-                    }))
-                }),
-            )
-            .route(
-                "/drive-token",
-                post(|| async {
-                    Json(serde_json::json!({
-                        "access_token": "drive-composition-test",
-                        "token_type": "Bearer",
-                        "expires_in": 3600,
-                        "scope": "https://www.googleapis.com/auth/drive.file"
                     }))
                 }),
             )
@@ -3970,7 +3982,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: composition-drive
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: root
 repositories:
   - id: github-main:owner/repo
@@ -3984,23 +3998,8 @@ repositories:
             ),
         )
         .expect("composition config should be written");
-        let drive_credential = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "composition-drive",
-            &serde_json::json!({
-                "client_id": "drive-client",
-                "client_secret": "drive-secret",
-                "refresh_token": "drive-refresh",
-                "token_uri": format!("{upstream_url}/drive-token")
-            })
-            .to_string(),
-        )
-        .expect("composition Drive credential should parse");
         let clients = ServerCompositionClients {
-            drive_credential_source: Arc::new(StaticGoogleDriveCredentialSource {
-                credential: drive_credential,
-            }),
-            drive_token_refresher: GoogleDriveTokenRefresher::with_client(reqwest::Client::new()),
+            drive_token_source: static_drive_token_source(),
             drive_root_validator: GoogleDriveRootValidator::with_client_and_api_base_url(
                 reqwest::Client::new(),
                 &upstream_url,
@@ -4165,47 +4164,28 @@ repositories:
     }
 
     #[tokio::test]
-    async fn google_drive_startup_validation_refreshes_credentials_and_checks_root() {
+    async fn google_drive_startup_validation_mints_one_token_and_checks_root() {
         let token_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let root_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let app = Router::new()
-            .route(
-                "/token",
-                axum::routing::post({
-                    let token_requests = token_requests.clone();
-                    move || {
-                        let token_requests = token_requests.clone();
-                        async move {
-                            token_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            Json(serde_json::json!({
-                                "access_token": "startup-access-token",
-                                "token_type": "Bearer",
-                                "expires_in": 3600,
-                                "scope": "https://www.googleapis.com/auth/drive.file"
-                            }))
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/drive/v3/files/{file_id}",
-                get({
+        let app = Router::new().route(
+            "/drive/v3/files/{file_id}",
+            get({
+                let root_requests = root_requests.clone();
+                move |Path(file_id): Path<String>| {
                     let root_requests = root_requests.clone();
-                    move |Path(file_id): Path<String>| {
-                        let root_requests = root_requests.clone();
-                        async move {
-                            root_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            Json(serde_json::json!({
-                                "id": file_id,
-                                "name": "LFS Cloud Root",
-                                "mimeType": "application/vnd.google-apps.folder",
-                                "trashed": false,
-                                "capabilities": { "canAddChildren": true }
-                            }))
-                        }
+                    async move {
+                        root_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "id": file_id,
+                            "name": "LFS Cloud Root",
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "trashed": false,
+                            "capabilities": { "canAddChildren": true }
+                        }))
                     }
-                }),
-            );
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Drive startup test server should bind");
@@ -4218,18 +4198,6 @@ repositories:
                 .expect("Drive startup test server should run");
         });
 
-        let credential = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "test-ref",
-            &serde_json::json!({
-                "client_id": "client-id",
-                "client_secret": "client-secret",
-                "refresh_token": "refresh-token",
-                "token_uri": format!("http://{address}/token")
-            })
-            .to_string(),
-        )
-        .expect("test credential should parse");
         let directory = tempfile::tempdir().expect("tempdir should be created");
         let database = Arc::new(
             MetadataDatabase::open(directory.path().join("metadata.sqlite3"))
@@ -4240,8 +4208,9 @@ repositories:
         let store = GoogleDriveTransferStore::with_dependencies(
             config,
             database,
-            Arc::new(StaticGoogleDriveCredentialSource { credential }),
-            GoogleDriveTokenRefresher::with_client(reqwest::Client::new()),
+            Arc::new(CountingGoogleDriveAccessTokenSource {
+                calls: token_requests.clone(),
+            }),
             GoogleDriveRootValidator::with_client_and_api_base_url(
                 reqwest::Client::new(),
                 format!("http://{address}"),
@@ -4264,29 +4233,18 @@ repositories:
 
     #[tokio::test]
     async fn google_drive_startup_validation_rejects_unusable_root() {
-        let app = Router::new()
-            .route(
-                "/token",
-                axum::routing::post(|| async {
-                    Json(serde_json::json!({
-                        "access_token": "startup-access-token",
-                        "token_type": "Bearer",
-                        "expires_in": 3600
-                    }))
-                }),
-            )
-            .route(
-                "/drive/v3/files/{file_id}",
-                get(|| async {
-                    Json(serde_json::json!({
-                        "id": "root",
-                        "name": "Read Only Root",
-                        "mimeType": "application/vnd.google-apps.folder",
-                        "trashed": false,
-                        "capabilities": { "canAddChildren": false }
-                    }))
-                }),
-            );
+        let app = Router::new().route(
+            "/drive/v3/files/{file_id}",
+            get(|| async {
+                Json(serde_json::json!({
+                    "id": "root",
+                    "name": "Read Only Root",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "trashed": false,
+                    "capabilities": { "canAddChildren": false }
+                }))
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Drive startup test server should bind");
@@ -4299,18 +4257,6 @@ repositories:
                 .expect("Drive startup test server should run");
         });
 
-        let credential = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "test-ref",
-            &serde_json::json!({
-                "client_id": "client-id",
-                "client_secret": "client-secret",
-                "refresh_token": "refresh-token",
-                "token_uri": format!("http://{address}/token")
-            })
-            .to_string(),
-        )
-        .expect("test credential should parse");
         let directory = tempfile::tempdir().expect("tempdir should be created");
         let database = Arc::new(
             MetadataDatabase::open(directory.path().join("metadata.sqlite3"))
@@ -4319,8 +4265,7 @@ repositories:
         let store = GoogleDriveTransferStore::with_dependencies(
             test_config(),
             database,
-            Arc::new(StaticGoogleDriveCredentialSource { credential }),
-            GoogleDriveTokenRefresher::with_client(reqwest::Client::new()),
+            static_drive_token_source(),
             GoogleDriveRootValidator::with_client_and_api_base_url(
                 reqwest::Client::new(),
                 format!("http://{address}"),
@@ -4362,16 +4307,6 @@ repositories:
             .expect("Drive metadata test server address should be available");
         let handler_object = object.clone();
         let app = Router::new()
-            .route(
-                "/token",
-                axum::routing::post(|| async {
-                    Json(serde_json::json!({
-                        "access_token": "metadata-access-token",
-                        "token_type": "Bearer",
-                        "expires_in": 3600
-                    }))
-                }),
-            )
             .route(
                 "/drive/v3/files/{file_id}",
                 get({
@@ -4449,18 +4384,6 @@ repositories:
                 .await
                 .expect("Drive metadata test server should run");
         });
-        let credential = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "test-ref",
-            &serde_json::json!({
-                "client_id": "client-id",
-                "client_secret": "client-secret",
-                "refresh_token": "refresh-token",
-                "token_uri": format!("http://{address}/token")
-            })
-            .to_string(),
-        )
-        .expect("test credential should parse");
         let directory = tempfile::tempdir().expect("tempdir should be created");
         let database = Arc::new(
             MetadataDatabase::open(directory.path().join("metadata.sqlite3"))
@@ -4483,8 +4406,7 @@ repositories:
         let store = GoogleDriveTransferStore::with_dependencies(
             config,
             database.clone(),
-            Arc::new(StaticGoogleDriveCredentialSource { credential }),
-            GoogleDriveTokenRefresher::with_client(reqwest::Client::new()),
+            static_drive_token_source(),
             GoogleDriveRootValidator::with_client_and_api_base_url(
                 reqwest::Client::new(),
                 format!("http://{address}"),
@@ -4536,52 +4458,18 @@ repositories:
     #[tokio::test]
     async fn google_drive_access_token_cache_single_flights_refreshes() {
         let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handler_refreshes = refreshes.clone();
-        let app = Router::new().route(
-            "/token",
-            axum::routing::post(move || {
-                let handler_refreshes = handler_refreshes.clone();
-                async move {
-                    handler_refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Json(serde_json::json!({
-                        "access_token": "cached-access-token",
-                        "token_type": "Bearer",
-                        "expires_in": 3600,
-                        "scope": "https://www.googleapis.com/auth/drive.file"
-                    }))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("token server should bind");
-        let address = listener
-            .local_addr()
-            .expect("token server address should be available");
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("token server should run");
-        });
-        let credential = GoogleDriveCredential::from_json(
-            "drive-user-a",
-            "test-ref",
-            &serde_json::json!({
-                "client_id": "client-id",
-                "client_secret": "client-secret",
-                "refresh_token": "refresh-token",
-                "token_uri": format!("http://{address}/token")
-            })
-            .to_string(),
-        )
-        .expect("test credential should parse");
-        let refresher = GoogleDriveTokenRefresher::new().expect("token refresher should build");
         let cache = GoogleDriveAccessTokenCache::default();
+        let storage = match &test_config().storage_providers["drive-user-a"] {
+            StorageProviderConfig::GoogleDrive(storage) => storage.clone(),
+        };
+        let token_source = CountingGoogleDriveAccessTokenSource {
+            calls: refreshes.clone(),
+        };
 
         let (first, second, third) = tokio::join!(
-            cache.get_or_refresh("drive-user-a", &credential, &refresher),
-            cache.get_or_refresh("drive-user-a", &credential, &refresher),
-            cache.get_or_refresh("drive-user-a", &credential, &refresher),
+            cache.get_or_refresh(&storage, &token_source),
+            cache.get_or_refresh(&storage, &token_source),
+            cache.get_or_refresh(&storage, &token_source),
         );
 
         let first = first.expect("first refresh should succeed");
@@ -7722,7 +7610,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: google-drive-user-a
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: root
 repositories:
   - id: github-main:owner/repo

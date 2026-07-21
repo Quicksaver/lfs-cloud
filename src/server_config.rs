@@ -163,7 +163,7 @@ impl ServerConfig {
             .storage_providers
             .into_iter()
             .map(|(id, provider)| {
-                StorageProviderConfig::from_raw(id, provider, &mut env)
+                StorageProviderConfig::from_raw(id, provider, &mut env, metadata_base_dir)
                     .map(|provider| (provider.id().to_owned(), provider))
             })
             .collect::<ServerResult<BTreeMap<_, _>>>()?;
@@ -515,30 +515,35 @@ impl StorageProviderConfig {
         id: String,
         raw: RawStorageProviderConfig,
         env: &mut impl FnMut(&str) -> Option<String>,
+        config_base_dir: &Path,
     ) -> ServerResult<Self> {
         validate_key(&id, format!("storage_providers.{id}"))?;
         let base_path = format!("storage_providers.{id}");
         let provider_type = resolve_required(raw.provider_type, format!("{base_path}.type"), env)?;
 
         match provider_type.as_str() {
-            "google_drive" => Ok(Self::GoogleDrive(GoogleDriveStorageConfig {
-                id,
-                credential_ref: resolve_required(
-                    raw.credential_ref,
-                    format!("{base_path}.credentials_ref"),
+            "google_drive" => {
+                let credentials = GoogleDriveGcloudCredentialsConfig::from_raw(
+                    raw.credentials,
+                    &base_path,
                     env,
-                )?,
-                root_folder_id: resolve_required(
-                    raw.root_folder_id,
-                    format!("{base_path}.root_folder_id"),
-                    env,
-                )?,
-                display_name: resolve_optional(
-                    raw.display_name,
-                    format!("{base_path}.display_name"),
-                    env,
-                )?,
-            })),
+                    config_base_dir,
+                )?;
+                Ok(Self::GoogleDrive(GoogleDriveStorageConfig {
+                    id,
+                    credentials,
+                    root_folder_id: resolve_required(
+                        raw.root_folder_id,
+                        format!("{base_path}.root_folder_id"),
+                        env,
+                    )?,
+                    display_name: resolve_optional(
+                        raw.display_name,
+                        format!("{base_path}.display_name"),
+                        env,
+                    )?,
+                }))
+            }
             unsupported => invalid_config(
                 format!("{base_path}.type"),
                 format!("unsupported storage provider type {unsupported:?}"),
@@ -552,12 +557,64 @@ impl StorageProviderConfig {
 pub struct GoogleDriveStorageConfig {
     /// Configured storage provider ID.
     pub id: String,
-    /// Credential reference used to locate the server-side Drive credential.
-    pub credential_ref: String,
+    /// Google Cloud CLI ADC settings used to obtain short-lived access tokens.
+    pub credentials: GoogleDriveGcloudCredentialsConfig,
     /// Google Drive folder ID that contains this provider's LFS objects.
     pub root_folder_id: String,
     /// Optional operator-facing label for this Drive backend.
     pub display_name: Option<String>,
+}
+
+/// Google Cloud CLI settings for Google Drive Application Default Credentials.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoogleDriveGcloudCredentialsConfig {
+    /// Isolated `CLOUDSDK_CONFIG` directory containing generated ADC state.
+    pub config_dir: PathBuf,
+    /// Google Cloud CLI executable name or path.
+    pub executable: PathBuf,
+}
+
+impl GoogleDriveGcloudCredentialsConfig {
+    fn from_raw(
+        credentials: Option<RawStorageCredentialsConfig>,
+        storage_path: &str,
+        env: &mut impl FnMut(&str) -> Option<String>,
+        config_base_dir: &Path,
+    ) -> ServerResult<Self> {
+        match credentials {
+            Some(credentials) => {
+                let credentials_path = format!("{storage_path}.credentials");
+                let credential_type = resolve_required(
+                    credentials.credential_type,
+                    format!("{credentials_path}.type"),
+                    env,
+                )?;
+                match credential_type.as_str() {
+                    "gcloud" => Ok(Self {
+                        config_dir: resolve_config_directory(
+                            credentials.config_dir,
+                            format!("{credentials_path}.config_dir"),
+                            env,
+                            config_base_dir,
+                        )?,
+                        executable: PathBuf::from(
+                            resolve_optional(
+                                credentials.executable,
+                                format!("{credentials_path}.executable"),
+                                env,
+                            )?
+                            .unwrap_or_else(|| "gcloud".to_owned()),
+                        ),
+                    }),
+                    unsupported => invalid_config(
+                        format!("{credentials_path}.type"),
+                        format!("unsupported Google Drive credential type {unsupported:?}"),
+                    ),
+                }
+            }
+            None => invalid_config(format!("{storage_path}.credentials"), "is required"),
+        }
+    }
 }
 
 /// Explicit repository-to-storage mapping served by this instance.
@@ -733,12 +790,23 @@ impl fmt::Debug for RawRepositoryProviderConfig {
 struct RawStorageProviderConfig {
     #[serde(default, rename = "type")]
     provider_type: Option<String>,
-    #[serde(default, rename = "credentials_ref", alias = "credential_ref")]
-    credential_ref: Option<String>,
+    #[serde(default)]
+    credentials: Option<RawStorageCredentialsConfig>,
     #[serde(default)]
     root_folder_id: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStorageCredentialsConfig {
+    #[serde(default, rename = "type")]
+    credential_type: Option<String>,
+    #[serde(default)]
+    config_dir: Option<String>,
+    #[serde(default)]
+    executable: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -859,6 +927,27 @@ fn resolve_metadata_path(
         Ok(path)
     } else {
         Ok(metadata_base_dir.join(path))
+    }
+}
+
+fn resolve_config_directory(
+    value: Option<String>,
+    path: impl Into<String>,
+    env: &mut impl FnMut(&str) -> Option<String>,
+    config_base_dir: &Path,
+) -> ServerResult<PathBuf> {
+    let path = path.into();
+    let value = resolve_required(value, &path, env)?;
+    validate_no_outer_whitespace(&value, &path)?;
+    let directory = PathBuf::from(value);
+    if directory.as_os_str().is_empty() {
+        return invalid_config(path, "must not be empty");
+    }
+
+    if directory.is_absolute() || config_base_dir.as_os_str().is_empty() {
+        Ok(directory)
+    } else {
+        Ok(config_base_dir.join(directory))
     }
 }
 
@@ -1032,8 +1121,9 @@ mod tests {
 
     use super::{
         DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
-        GoogleDriveStorageConfig, RawRepositoryProviderConfig, RepositoryProviderConfig,
-        ServerConfig, ServerError, StorageProviderConfig, validate_config_http_url,
+        GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, RawRepositoryProviderConfig,
+        RepositoryProviderConfig, ServerConfig, ServerError, StorageProviderConfig,
+        validate_config_http_url,
     };
 
     fn valid_yaml() -> &'static str {
@@ -1053,7 +1143,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: ${DRIVE_CREDENTIAL_REF}
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root-folder
     display_name: Main Drive
 
@@ -1072,7 +1164,6 @@ repositories:
         BTreeMap::from([
             ("GITHUB_CLIENT_ID", "client-id"),
             ("GITHUB_CLIENT_SECRET", "client-secret"),
-            ("DRIVE_CREDENTIAL_REF", "drive-credential"),
         ])
         .get(name)
         .map(ToString::to_string)
@@ -1119,14 +1210,150 @@ repositories:
         }
 
         let StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig {
-            credential_ref,
+            credentials,
             root_folder_id,
             display_name,
             ..
         }) = &config.storage_providers["drive-user-a"];
-        assert_eq!(credential_ref, "drive-credential");
+        assert_eq!(
+            credentials,
+            &GoogleDriveGcloudCredentialsConfig {
+                config_dir: PathBuf::from(".gcloud-drive"),
+                executable: PathBuf::from("gcloud"),
+            }
+        );
         assert_eq!(root_folder_id, "drive-root-folder");
         assert_eq!(display_name.as_deref(), Some("Main Drive"));
+    }
+
+    #[test]
+    fn parses_google_drive_gcloud_credentials() {
+        let config = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials:
+      type: gcloud
+      config_dir: ${GCLOUD_CONFIG_DIR}
+      executable: /opt/google-cloud-sdk/bin/gcloud
+    root_folder_id: drive-root
+"#,
+            "<test>",
+            |name| match name {
+                "GCLOUD_CONFIG_DIR" => Some("/srv/lfscloud/gcloud-drive".to_owned()),
+                _ => test_env(name),
+            },
+        )
+        .expect("gcloud ADC config should load");
+
+        let StorageProviderConfig::GoogleDrive(storage) = &config.storage_providers["drive-user-a"];
+        let credentials = &storage.credentials;
+        assert_eq!(
+            credentials.config_dir,
+            PathBuf::from("/srv/lfscloud/gcloud-drive")
+        );
+        assert_eq!(
+            credentials.executable,
+            PathBuf::from("/opt/google-cloud-sdk/bin/gcloud")
+        );
+    }
+
+    #[test]
+    fn google_drive_gcloud_defaults_to_gcloud_executable() {
+        let config = load_with_test_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
+    root_folder_id: drive-root
+"#,
+        );
+
+        let StorageProviderConfig::GoogleDrive(storage) = &config.storage_providers["drive-user-a"];
+        let credentials = &storage.credentials;
+        assert_eq!(credentials.config_dir, PathBuf::from(".gcloud-drive"));
+        assert_eq!(credentials.executable, PathBuf::from("gcloud"));
+    }
+
+    #[test]
+    fn google_drive_rejects_legacy_credentials_ref() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
+    root_folder_id: drive-root
+"#,
+            "<test>",
+            test_env,
+        )
+        .expect_err("legacy credential references must be rejected");
+
+        assert!(matches!(error, ServerError::ConfigParse { .. }));
+        assert!(error.to_string().contains("credentials_ref"));
+    }
+
+    #[test]
+    fn google_drive_gcloud_requires_config_dir() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials:
+      type: gcloud
+    root_folder_id: drive-root
+"#,
+            "<test>",
+            test_env,
+        )
+        .expect_err("gcloud ADC config directory should be required");
+
+        assert_error_contains(
+            &error,
+            "storage_providers.drive-user-a.credentials.config_dir is required",
+        );
+    }
+
+    #[test]
+    fn google_drive_rejects_old_gcloud_adc_type_name() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials:
+      type: gcloud_adc
+      config_dir: .gcloud-drive
+    root_folder_id: drive-root
+"#,
+            "<test>",
+            test_env,
+        )
+        .expect_err("only the gcloud credential type should be accepted");
+
+        assert_error_contains(
+            &error,
+            "unsupported Google Drive credential type \"gcloud_adc\"",
+        );
     }
 
     #[test]
@@ -1245,7 +1472,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 "#,
         )
@@ -1260,6 +1489,36 @@ storage_providers:
                 .path()
                 .join(DEFAULT_METADATA_DIR)
                 .join(DEFAULT_METADATA_DB_FILE)
+        );
+    }
+
+    #[test]
+    fn relative_gcloud_directory_resolves_from_config_directory() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = directory.path().join("custom-lfscloud.yml");
+        fs::write(
+            &config_path,
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials:
+      type: gcloud
+      config_dir: secrets/gcloud-drive
+    root_folder_id: drive-root
+"#,
+        )
+        .expect("config fixture should be written");
+
+        let config = ServerConfig::load_from_path(&config_path).expect("config should load");
+        let StorageProviderConfig::GoogleDrive(storage) = &config.storage_providers["drive-user-a"];
+        let credentials = &storage.credentials;
+
+        assert_eq!(
+            credentials.config_dir,
+            directory.path().join("secrets/gcloud-drive")
         );
     }
 
@@ -1472,19 +1731,27 @@ server:
     }
 
     #[test]
-    fn required_environment_references_must_not_resolve_to_empty_strings() {
-        let error =
-            ServerConfig::load_from_str_with_env(valid_yaml(), "<test>", |name| match name {
-                "GITHUB_CLIENT_ID" => Some("client-id".to_owned()),
-                "GITHUB_CLIENT_SECRET" => Some("client-secret".to_owned()),
-                "DRIVE_CREDENTIAL_REF" => Some(String::new()),
-                _ => None,
-            })
-            .unwrap_err();
+    fn gcloud_config_directory_environment_reference_must_not_be_empty() {
+        let error = ServerConfig::load_from_str_with_env(
+            r#"
+server:
+  public_url: http://127.0.0.1:8080
+storage_providers:
+  drive-user-a:
+    type: google_drive
+    credentials:
+      type: gcloud
+      config_dir: ${GCLOUD_CONFIG_DIR}
+    root_folder_id: drive-root
+"#,
+            "<test>",
+            |name| (name == "GCLOUD_CONFIG_DIR").then(String::new),
+        )
+        .unwrap_err();
 
         assert_error_contains(
             &error,
-            "storage_providers.drive-user-a.credentials_ref is required",
+            "storage_providers.drive-user-a.credentials.config_dir is required",
         );
     }
 
@@ -1497,7 +1764,9 @@ server:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
     display_name: ${EMPTY_DISPLAY_NAME}
 "#,
@@ -1570,8 +1839,8 @@ server:
     }
 
     #[test]
-    fn accepts_legacy_singular_storage_credential_ref_key() {
-        let config = load_with_test_env(
+    fn rejects_legacy_singular_storage_credential_ref_key() {
+        let error = ServerConfig::load_from_str_with_env(
             r#"
 server:
   public_url: http://127.0.0.1:8080
@@ -1581,11 +1850,13 @@ storage_providers:
     credential_ref: drive-credential
     root_folder_id: drive-root
 "#,
-        );
+            "<test>",
+            test_env,
+        )
+        .expect_err("legacy singular credential reference must be rejected");
 
-        let StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig { credential_ref, .. }) =
-            &config.storage_providers["drive-user-a"];
-        assert_eq!(credential_ref, "drive-credential");
+        assert!(matches!(error, ServerError::ConfigParse { .. }));
+        assert!(error.to_string().contains("credential_ref"));
     }
 
     #[test]
@@ -1626,7 +1897,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 repositories:
   - id: github-main:owner/repo
@@ -1671,7 +1944,9 @@ server:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
 "#,
             "<test>",
             test_env,
@@ -1693,7 +1968,9 @@ server:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 repositories:
   - id: github-main:owner/repo
@@ -1762,7 +2039,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 repositories:
   - id: duplicate
@@ -1806,7 +2085,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 repositories:
   - id: one
@@ -1850,7 +2131,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 repositories:
   - id: one
@@ -1915,11 +2198,15 @@ server:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 "#,
             "<test>",
@@ -2109,7 +2396,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 repositories:
   - id: github-main:owner/repo
@@ -2146,7 +2435,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credential_ref: drive-credential
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: drive-root
 repositories:
   - id: github-main:owner/repo

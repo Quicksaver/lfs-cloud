@@ -488,7 +488,9 @@ repository_providers:
 storage_providers:
   drive-user-a:
     type: google_drive
-    credentials_ref: google-drive-user-a
+    credentials:
+      type: gcloud
+      config_dir: .gcloud-drive
     root_folder_id: root
 repositories:
   - id: github-main:owner/repo
