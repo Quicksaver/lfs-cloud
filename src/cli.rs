@@ -4207,8 +4207,7 @@ mod tests {
             String::from_utf8(output).expect("output should be UTF-8"),
             format!(
                 "configured .lfsconfig\n  path: {}\n  - lfs.url: <unset>\n  + lfs.url: {lfs_url}\n",
-                repo.path()
-                    .canonicalize()
+                dunce::canonicalize(repo.path())
                     .expect("repo path should canonicalize")
                     .join(".lfsconfig")
                     .display()
@@ -4256,8 +4255,7 @@ mod tests {
             String::from_utf8(output).expect("output should be UTF-8"),
             format!(
                 "configured .lfsconfig\n  path: {}\n  - lfs.url: https://old.example/info/lfs\n  + lfs.url: {lfs_url}\n",
-                repo.path()
-                    .canonicalize()
+                dunce::canonicalize(repo.path())
                     .expect("repo path should canonicalize")
                     .join(".lfsconfig")
                     .display()
@@ -4324,8 +4322,7 @@ mod tests {
             String::from_utf8(output).expect("output should be UTF-8"),
             format!(
                 "configured local Git config\n  path: {}\n  - lfs.url: <unset>\n  + lfs.url: {lfs_url}\n",
-                repo.path()
-                    .canonicalize()
+                dunce::canonicalize(repo.path())
                     .expect("repo path should canonicalize")
                     .join(".git/config")
                     .display()
@@ -5112,7 +5109,7 @@ mod tests {
 
         assert_eq!(
             *fetched_root.lock().expect("capture mutex should lock"),
-            Some(repo.canonicalize().expect("repo path should canonicalize"))
+            Some(dunce::canonicalize(&repo).expect("repo path should canonicalize"))
         );
         assert_eq!(
             fs::read(&worktree_file).expect("hydrated file should be readable"),
@@ -5388,8 +5385,7 @@ mod tests {
                 failures: 1,
                 path,
                 ..
-            } if path == missing_file
-                .canonicalize()
+            } if path == dunce::canonicalize(&missing_file)
                 .unwrap_or_else(|_| missing_file.clone())
         ));
         assert_eq!(
@@ -5572,7 +5568,7 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert!(rendered.contains("copied"));
-        assert!(rendered.contains("asset/model.bin"));
+        assert!(rendered.contains(&Path::new("asset/model.bin").display().to_string()));
         assert!(rendered.contains(object.oid.as_hex()));
     }
 
@@ -5613,7 +5609,7 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("dehydrated"));
         assert!(rendered.contains("cached-and-replaced-with-pointer"));
-        assert!(rendered.contains("asset/model.bin"));
+        assert!(rendered.contains(&Path::new("asset/model.bin").display().to_string()));
         assert!(rendered.contains(object.oid.as_hex()));
 
         let mut gc_output = Vec::new();
@@ -5894,7 +5890,7 @@ mod tests {
             error,
             CliError::LocalCache {
                 source: LocalCacheError::PointerParse { path, .. }
-            } if path == worktree_file.canonicalize().unwrap_or(worktree_file)
+            } if path == dunce::canonicalize(&worktree_file).unwrap_or(worktree_file)
         ));
         assert!(output.is_empty());
     }

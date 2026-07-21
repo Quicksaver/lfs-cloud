@@ -5324,10 +5324,12 @@ repositories:
             .send(())
             .expect("shutdown receiver should remain active");
         tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if tokio::net::TcpStream::connect(address).await.is_err() {
-                    break;
-                }
+            while let Ok(Ok(_)) = tokio::time::timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(address),
+            )
+            .await
+            {
                 tokio::task::yield_now().await;
             }
         })

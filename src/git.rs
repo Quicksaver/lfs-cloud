@@ -340,7 +340,9 @@ fn detect_worktree_root(start_dir: &Path) -> CliResult<PathBuf> {
         "git rev-parse --show-toplevel",
     )?;
 
-    Ok(PathBuf::from(output.trim_end()))
+    let path = PathBuf::from(output.trim_end());
+
+    Ok(dunce::canonicalize(&path).unwrap_or(path))
 }
 
 fn git_absolute_path<const N: usize>(
@@ -351,11 +353,13 @@ fn git_absolute_path<const N: usize>(
     let output = git_stdout(current_dir, args, command_name)?;
     let path = PathBuf::from(output.trim_end());
 
-    Ok(if path.is_absolute() {
+    let path = if path.is_absolute() {
         path
     } else {
         current_dir.join(path)
-    })
+    };
+
+    Ok(dunce::canonicalize(&path).unwrap_or(path))
 }
 
 fn git_stdout<const N: usize>(
@@ -886,13 +890,9 @@ mod tests {
         let detected = GitRepository::discover(&nested).expect("repository should be detected");
 
         assert_eq!(
-            detected
-                .worktree_root
-                .canonicalize()
+            dunce::canonicalize(&detected.worktree_root)
                 .expect("detected root should canonicalize"),
-            repo.path()
-                .canonicalize()
-                .expect("repo root should canonicalize")
+            dunce::canonicalize(repo.path()).expect("repo root should canonicalize")
         );
         assert_eq!(detected.remote.host, "github.com");
         assert_eq!(detected.remote.owner, "owner");
@@ -934,9 +934,7 @@ mod tests {
         assert!(path.is_absolute());
         assert_eq!(
             path,
-            repo.path()
-                .join(".git/config")
-                .canonicalize()
+            dunce::canonicalize(repo.path().join(".git/config"))
                 .expect("main config should canonicalize")
         );
     }
@@ -961,9 +959,7 @@ mod tests {
         assert!(common_dir.is_absolute());
         assert_eq!(
             git_dir,
-            repo.path()
-                .join(".git")
-                .canonicalize()
+            dunce::canonicalize(repo.path().join(".git"))
                 .expect("main git dir should canonicalize")
         );
         assert_eq!(common_dir, git_dir);
@@ -1009,9 +1005,7 @@ mod tests {
         assert_ne!(common_dir, git_dir);
         assert_eq!(
             common_dir,
-            repo.path()
-                .join(".git")
-                .canonicalize()
+            dunce::canonicalize(repo.path().join(".git"))
                 .expect("main common dir should canonicalize")
         );
     }

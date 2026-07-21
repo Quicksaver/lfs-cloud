@@ -2114,7 +2114,8 @@ cat > '{}'
             reset_helper.success(),
             "credential helper reset should succeed"
         );
-        let helper = format!("store --file={}", credential_store.display());
+        let helper_path = credential_store.to_string_lossy().replace('\\', "/");
+        let helper = format!("store --file={helper_path}");
         let configure_helper = Command::new("git")
             .args(["config", "--local", "--add", "credential.helper", &helper])
             .current_dir(&repo)

@@ -2511,11 +2511,17 @@ fn sync_verified_cache_object(cache_path: &Path) -> LocalCacheResult<()> {
             "cache object path has no parent directory",
         ),
     })?;
-    let file = File::open(cache_path).map_err(|source| LocalCacheError::Io {
-        context: "failed to open verified cache object for sync",
-        path: cache_path.to_path_buf(),
-        source,
-    })?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    let file = options
+        .open(cache_path)
+        .map_err(|source| LocalCacheError::Io {
+            context: "failed to open verified cache object for sync",
+            path: cache_path.to_path_buf(),
+            source,
+        })?;
     file.sync_all().map_err(|source| LocalCacheError::Io {
         context: "failed to sync verified cache object",
         path: cache_path.to_path_buf(),
@@ -4647,7 +4653,10 @@ mod tests {
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
         let repo = temp.path().join("repo");
         let object = object_for_bytes(b"newline path object");
+        #[cfg(unix)]
         let relative_path = Path::new("asset/line\nbreak.bin");
+        #[cfg(windows)]
+        let relative_path = Path::new("asset/space path.bin");
         initialize_git_worktree(&repo);
         write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(
