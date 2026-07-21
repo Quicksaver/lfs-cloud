@@ -130,6 +130,11 @@ require_file_matches() {
 }
 
 build_lfscloud_binary() {
+  if [[ -n "${LFS_CLOUD_SMOKE_BINARY:-}" ]]; then
+    printf '%s\n' "$LFS_CLOUD_SMOKE_BINARY"
+    return
+  fi
+
   cargo build --quiet --manifest-path "$project_dir/Cargo.toml" --message-format=json |
     "$python_bin" -c '
 import json

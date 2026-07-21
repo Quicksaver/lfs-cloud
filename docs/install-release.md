@@ -16,7 +16,7 @@ yet.
 - `cargo-audit` 0.22.2 for local RustSec scans. Install the same pinned version
   used by CI with
   `cargo install cargo-audit --locked --version 0.22.2`.
-- Node.js/Yarn only for repository formatting checks.
+- Node.js/Yarn for repository formatting checks and the one-shot smoke runner.
 
 For real GitHub and Google Drive operation you also need:
 
@@ -34,13 +34,31 @@ cargo test --doc
 cargo clippy --all-targets -- -D warnings
 cargo audit
 yarn lint:check
+node --no-warnings --experimental-strip-types .agents/skills/smoke-test/scripts/smoke-test.ts
 ```
 
-GitHub Actions runs the Rust formatting, lint, build, unit/integration, and
-documentation-test gates natively on Linux, macOS, and Windows. The test suite
-uses platform-native child processes for timeout and process-tree cleanup
-coverage, so Windows exercises the same recursive termination boundary as Unix
-rather than only compiling it.
+GitHub Actions runs formatting, linting, all Cargo targets, documentation tests,
+release builds, and smoke tests for four native targets:
+
+| Artifact                     | Rust target                  | Runner architecture |
+| ---------------------------- | ---------------------------- | ------------------- |
+| `lfscloud-windows-x86_64`    | `x86_64-pc-windows-msvc`     | Windows 2025 x64    |
+| `lfscloud-macos-arm64`       | `aarch64-apple-darwin`       | macOS 26 ARM64      |
+| `lfscloud-linux-x86_64-musl` | `x86_64-unknown-linux-musl`  | Ubuntu 26.04 x64    |
+| `lfscloud-linux-arm64-musl`  | `aarch64-unknown-linux-musl` | Ubuntu 26.04 ARM64  |
+
+Each matrix job runs the target's Cargo and documentation tests before its
+optimized build. The smoke harness then receives the exact release executable,
+so CLI, local-cache, credential, migration, and eligible live-provider checks
+cannot silently fall back to a separately built debug binary. The opt-in LAN
+check honors the same executable boundary when explicitly enabled. The test
+suite uses platform-native child processes for timeout and process-tree cleanup
+coverage, so Windows exercises the same recursive termination boundary as Unix.
+
+Pull requests run the complete local smoke coverage without repository secrets.
+On pushes and manual runs, the GitHub, Google Drive, and black-box Git LFS checks
+also run when `LFS_CLOUD_GITHUB_TOKEN` and
+`LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON` are configured as repository secrets.
 
 The separate dependency-audit workflow installs the repository-pinned
 `cargo-audit` version and fails when the locked Rust graph contains an
@@ -82,8 +100,9 @@ cargo install --path .
 
 ## Expected Release Artifact
 
-Until packaging is implemented, the expected artifact is the compiled
-`lfscloud` binary plus documentation for:
+Successful CI jobs package the tested executable in a 14-day workflow artifact.
+These archives are CI outputs, not signed or published releases. The expected
+release artifact remains the compiled `lfscloud` binary plus documentation for:
 
 - supported platform and architecture
 - config file schema
@@ -92,9 +111,8 @@ Until packaging is implemented, the expected artifact is the compiled
 - manual verification scripts that were run
 - known MVP limitations
 
-The current repository does not yet define:
+The current repository still does not define:
 
-- packaged archives
 - installer scripts
 - checksums or signatures
 - CI release publishing
@@ -120,10 +138,11 @@ Release automation should run the full verification set before publishing:
 
 ```bash
 cargo fmt --check
-cargo build
 cargo test --all-targets
 cargo test --doc
 cargo clippy --all-targets -- -D warnings
+cargo build --release
+node --no-warnings --experimental-strip-types .agents/skills/smoke-test/scripts/smoke-test.ts
 cargo audit
 yarn lint:check
 ```

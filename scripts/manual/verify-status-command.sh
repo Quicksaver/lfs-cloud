@@ -2,6 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$project_dir/scripts/lib/lfscloud-command.sh"
 tmp_dir="$(mktemp -d)"
 server_pid=""
 trap 'if [[ -n "${server_pid:-}" ]]; then kill "$server_pid" >/dev/null 2>&1 || true; fi; rm -rf "$tmp_dir"' EXIT
@@ -113,8 +114,7 @@ fi
 (
   cd "$repo_dir"
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
-    cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-      --config "$config_file" status --cache-root "$cache_root"
+    run_lfscloud "$project_dir" --config "$config_file" status --cache-root "$cache_root"
 ) >"$tmp_dir/status-output"
 
 grep -F "config     ok" "$tmp_dir/status-output" >/dev/null

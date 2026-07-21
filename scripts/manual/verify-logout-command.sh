@@ -2,6 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$project_dir/scripts/lib/lfscloud-command.sh"
 tmp_dir="$(mktemp -d)"
 server_pid=""
 cleanup() {
@@ -18,12 +19,18 @@ global_config="$tmp_dir/gitconfig"
 port_file="$tmp_dir/port"
 request_file="$tmp_dir/request"
 token="manual-logout-lfs-token"
+python_bin="$(command -v python3 || command -v python || true)"
+
+if [[ -z "$python_bin" ]]; then
+  echo "Python 3 is required to run the logout verifier" >&2
+  exit 1
+fi
 
 mkdir -p "$repo_dir"
 git -C "$repo_dir" init --quiet
 git -C "$repo_dir" remote add origin git@github.com:owner/repo.git
 
-python3 - "$port_file" "$request_file" "$token" <<'PY' &
+"$python_bin" - "$port_file" "$request_file" "$token" <<'PY' &
 import http.server
 import pathlib
 import sys
@@ -76,8 +83,7 @@ printf 'url=%s\nusername=lfscloud\npassword=%s\n\n' "$lfs_url" "$token" |
 (
   cd "$repo_dir"
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
-    cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-      logout --server "$server_url"
+    run_lfscloud "$project_dir" logout --server "$server_url"
 ) >"$tmp_dir/logout-output"
 
 wait "$server_pid"

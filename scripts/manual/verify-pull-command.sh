@@ -2,6 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$project_dir/scripts/lib/lfscloud-command.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -84,8 +85,7 @@ PY
   git add .gitattributes asset/model.bin docs/pointer-example.txt
   PATH="$fake_bin:$PATH" \
     LFS_CLOUD_FAKE_GIT_LFS_FETCH_LOG="$fetch_log" \
-    cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-      pull --cache-root "$cache_root"
+    run_lfscloud "$project_dir" pull --cache-root "$cache_root"
 ) >"$tmp_dir/pull-output"
 
 oid="$(cat "$oid_file")"

@@ -34,7 +34,13 @@ const repoRoot = resolve(dirname(scriptPath), '../../../..');
 dotenv.config({ path: join(repoRoot, '.env.local'), quiet: true });
 const throwawayRoot = resolve(process.env.LFS_CLOUD_SMOKE_THROWAWAY ?? join(homedir(), 'Sites', 'throwaway'));
 const targetDir = join(repoRoot, 'target');
-const binaryPath = join(targetDir, 'debug', 'lfscloud');
+const configuredBinary = process.env.LFS_CLOUD_SMOKE_BINARY?.trim();
+const binaryPath = configuredBinary
+  ? resolve(repoRoot, configuredBinary)
+  : join(targetDir, 'debug', process.platform === 'win32' ? 'lfscloud.exe' : 'lfscloud');
+const pythonCommand = process.platform === 'win32' ? 'python' : 'python3';
+
+if (configuredBinary !== undefined) process.env.LFS_CLOUD_SMOKE_BINARY = binaryPath;
 const commandOutputLimit = 4 * 1024 * 1024;
 const defaultTimeoutMs = 15 * 60 * 1000;
 const githubCredentialEnv = 'LFS_CLOUD_GITHUB_TOKEN';
@@ -351,6 +357,12 @@ function missingCredential(available: () => boolean, description: string): () =>
   return () => (available() ? undefined : description);
 }
 
+function cargoTestsAlreadyRan(): string | undefined {
+  return isEnabled(process.env.LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS)
+    ? 'Cargo tests already ran before the release build'
+    : undefined;
+}
+
 function tests(): SmokeTest[] {
   return [
     {
@@ -360,14 +372,18 @@ function tests(): SmokeTest[] {
         await command('cargo', ['--version']);
         await command('git', ['--version']);
         await command('git', ['lfs', 'version']);
-        await command('python3', ['--version']);
+        await command(pythonCommand, ['--version']);
         await command('curl', ['--version']);
       },
     },
     {
       name: 'build and CLI surface',
       run: async () => {
-        await command('cargo', ['build', '--quiet'], { timeoutMs: 30 * 60 * 1000 });
+        if (configuredBinary === undefined) {
+          await command('cargo', ['build', '--quiet'], { timeoutMs: 30 * 60 * 1000 });
+        } else {
+          assert(await pathExists(binaryPath), `configured smoke binary does not exist: ${binaryPath}`);
+        }
         const help = await command(binaryPath, ['--help']);
         const version = await command(binaryPath, ['--version']);
         for (const subcommand of [
@@ -389,12 +405,14 @@ function tests(): SmokeTest[] {
     },
     {
       name: 'automated Rust targets',
+      skip: cargoTestsAlreadyRan,
       run: async () => {
         await command('cargo', ['test', '--all-targets'], { timeoutMs: 45 * 60 * 1000 });
       },
     },
     {
       name: 'Rust documentation tests',
+      skip: cargoTestsAlreadyRan,
       run: async () => {
         await command('cargo', ['test', '--doc'], { timeoutMs: 30 * 60 * 1000 });
       },

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$project_dir/scripts/lib/lfscloud-command.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -101,8 +102,7 @@ remove_cache_path="$cache_root/objects/${remove_oid:0:2}/${remove_oid:2:2}/$remo
 
 (
   cd "$repo_dir"
-  cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-    gc --cache-root "$cache_root" --dry-run >"$tmp_dir/gc-dry-run-output"
+  run_lfscloud "$project_dir" gc --cache-root "$cache_root" --dry-run >"$tmp_dir/gc-dry-run-output"
 )
 
 test -f "$keep_cache_path"
@@ -113,8 +113,7 @@ grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null
 
 (
   cd "$repo_dir"
-  cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-    gc --cache-root "$cache_root" >"$tmp_dir/gc-output"
+  run_lfscloud "$project_dir" gc --cache-root "$cache_root" >"$tmp_dir/gc-output"
 )
 
 test -f "$keep_cache_path"
@@ -125,8 +124,7 @@ grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null
 
 (
   cd "$repo_dir"
-  cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-    gc --cache-root "$cache_root" --prune-unavailable-worktrees \
+  run_lfscloud "$project_dir" gc --cache-root "$cache_root" --prune-unavailable-worktrees \
     >"$tmp_dir/gc-prune-output"
 )
 

@@ -467,7 +467,10 @@ impl LiveServerProcess {
             .map_err(|error| format!("live server stdout log should be created: {error}"))?;
         let stderr = File::create(stderr_path)
             .map_err(|error| format!("live server stderr log should be created: {error}"))?;
-        let child = Command::new(env!("CARGO_BIN_EXE_lfscloud"))
+        let lfscloud_binary = env::var_os("LFS_CLOUD_SMOKE_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_lfscloud")));
+        let child = Command::new(lfscloud_binary)
             .args(["--config"])
             .arg(config_path)
             .arg("serve")

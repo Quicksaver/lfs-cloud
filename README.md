@@ -538,8 +538,9 @@ rules.
 Local development builds, release builds, and checkout-based installs are
 documented in [docs/install-release.md](docs/install-release.md).
 
-Published packages, signed archives, checksums, and installer scripts are not
-defined yet.
+CI builds and smoke-tests Windows x64, Apple Silicon, Linux x64 musl, and Linux
+ARM64 musl binaries. Published releases, signatures, checksums, and installer
+scripts are not defined yet.
 
 ## License
 

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$project_dir/scripts/lib/lfscloud-command.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -25,8 +26,7 @@ GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
   cd "$repo_dir"
   printf '%s\n' "$token" |
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
-      cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-        login --server https://lfs.example.invalid --no-open
+      run_lfscloud "$project_dir" login --server https://lfs.example.invalid --no-open
 ) >"$tmp_dir/login-output"
 
 grep -F "https://lfs.example.invalid/auth/github/login" "$tmp_dir/login-output" >/dev/null

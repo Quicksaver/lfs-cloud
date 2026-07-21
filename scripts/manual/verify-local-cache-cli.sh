@@ -2,6 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$project_dir/scripts/lib/lfscloud-command.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -74,16 +75,14 @@ rm -rf "$repo_dir/.git/lfs/objects"
 
 (
   cd "$repo_dir"
-  cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-    hydrate --cache-root "$cache_root" asset/model.bin
+  run_lfscloud "$project_dir" hydrate --cache-root "$cache_root" asset/model.bin
 ) >"$tmp_dir/hydrate-output"
 
 cmp "$payload_file" "$repo_dir/asset/model.bin" >/dev/null
 
 (
   cd "$repo_dir"
-  cargo run --quiet --manifest-path "$project_dir/Cargo.toml" -- \
-    dehydrate --cache-root "$cache_root" asset/model.bin
+  run_lfscloud "$project_dir" dehydrate --cache-root "$cache_root" asset/model.bin
 ) >"$tmp_dir/dehydrate-output"
 
 oid="$(cat "$oid_file")"

@@ -22,4 +22,6 @@ Follow these rules:
 - Create linked worktrees only for behavior that specifically depends on multiple worktrees.
 - Enable GitHub and Drive checks when their credentials are present. Enable LAN checks with their explicit flag and config.
 - Use the compiled server and real Git LFS client for the live provider transfer.
+- Set `LFS_CLOUD_SMOKE_BINARY` to smoke an exact prebuilt executable; all CLI verifiers must honor it.
+- Set `LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS=1` only when the same target's Cargo and documentation tests already passed before that executable was built.
 - Report every failure and the final summary. Do not rerun individual tests unless diagnosing a failure.

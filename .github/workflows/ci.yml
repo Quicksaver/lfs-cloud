@@ -3,45 +3,138 @@ name: CI
 on:
   pull_request:
   push:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  rust:
-    name: Rust (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  build-test-smoke:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - artifact: lfscloud-windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/lfscloud.exe
+          - artifact: lfscloud-macos-arm64
+            runner: macos-26
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/lfscloud
+          - artifact: lfscloud-linux-x86_64-musl
+            runner: ubuntu-26.04
+            target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/lfscloud
+          - artifact: lfscloud-linux-arm64-musl
+            runner: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-musl
+            binary: target/aarch64-unknown-linux-musl/release/lfscloud
+
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      CARGO_TERM_COLOR: never
+      LFS_CLOUD_SMOKE_BINARY: ${{ github.workspace }}/${{ matrix.binary }}
+      LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS: "1"
+      LFS_CLOUD_GITHUB_TOKEN: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GITHUB_TOKEN || '' }}
+      LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_CREDENTIAL_JSON || '' }}
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
+        shell: bash
         run: >-
           rustup toolchain install 1.88.0 --profile minimal
           --component clippy --component rustfmt
+          --target "$CARGO_BUILD_TARGET"
 
       - name: Select Rust toolchain
+        shell: bash
         run: rustup default 1.88.0
 
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends git-lfs musl-tools
+
+      - name: Configure musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          target_env="${CARGO_BUILD_TARGET//-/_}"
+          echo "CARGO_TARGET_${target_env^^}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          echo "CC_${target_env}=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install repository tooling
+        shell: bash
+        run: |
+          corepack enable
+          yarn install --immutable
+          git lfs version
+          git lfs install --skip-repo
+
       - name: Check Rust formatting
+        shell: bash
         run: cargo fmt --all -- --check
 
       - name: Check Rust lints
+        shell: bash
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Build
-        run: cargo build
-
-      - name: Run tests
+      - name: Run automated Rust tests
+        shell: bash
         run: cargo test --all-targets -- --test-threads=1
 
-      - name: Run documentation tests
+      - name: Run Rust documentation tests
+        shell: bash
         run: cargo test --doc
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release
+
+      - name: Prepare smoke workspace
+        shell: bash
+        run: |
+          smoke_root="$RUNNER_TEMP/lfscloud-smoke-root"
+          echo "LFS_CLOUD_SMOKE_THROWAWAY=$smoke_root" >> "$GITHUB_ENV"
+          LFS_CLOUD_SMOKE_THROWAWAY="$smoke_root" node -e "const fs = require('node:fs'); const cp = require('node:child_process'); const root = process.env.LFS_CLOUD_SMOKE_THROWAWAY; fs.mkdirSync(root, { recursive: true }); cp.execFileSync('git', ['init', '--quiet', root], { stdio: 'inherit' });"
+
+      - name: Run smoke tests against release binary
+        shell: bash
+        run: >-
+          node --no-warnings --experimental-strip-types
+          .agents/skills/smoke-test/scripts/smoke-test.ts
+
+      - name: Package tested binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.artifact }}.tar.gz" \
+            -C "$(dirname "$LFS_CLOUD_SMOKE_BINARY")" \
+            "$(basename "$LFS_CLOUD_SMOKE_BINARY")"
+
+      - name: Upload tested binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
