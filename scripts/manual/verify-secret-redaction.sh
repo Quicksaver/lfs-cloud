@@ -8,7 +8,6 @@ redaction_tests=(
   "cli::tests::status_redacts_unsafe_server_override_before_route_validation"
   "cli::tests::status_reports_failures_without_leaking_credential_secrets"
   "credentials::tests::command_stderr_redacts_token_before_truncating"
-  "credentials::tests::lookup_failure_suppresses_helper_stderr"
   "credentials::tests::lookup_rejects_invalid_local_lfs_tokens_without_leaking_them"
   "credentials::tests::lookup_rejects_non_utf8_stdout_without_leaking_output"
   "git::tests::debug_redacts_credentialed_url_defensively"
@@ -26,11 +25,16 @@ redaction_tests=(
   "sessions::tests::session_token_validates_restored_secret_and_redacts_debug"
 )
 
-# This regression uses a Unix shell fixture and is not compiled into Windows
-# test binaries. Keep requiring it on every target where cfg(unix) includes it.
+# These regressions use Unix shell fixtures and are not compiled into Windows
+# test binaries. Keep requiring them on every target where cfg(unix) includes them.
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*) ;;
-  *) redaction_tests+=("credentials::tests::approve_failure_redacts_token_from_command_error") ;;
+  *)
+    redaction_tests+=(
+      "credentials::tests::lookup_failure_suppresses_helper_stderr"
+      "credentials::tests::approve_failure_redacts_token_from_command_error"
+    )
+    ;;
 esac
 
 available_tests="$(cargo test --all-targets -- --list)"
