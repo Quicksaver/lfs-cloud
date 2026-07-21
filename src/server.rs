@@ -4064,8 +4064,8 @@ repositories:
         );
         assert!(
             !metadata_bytes
-                .windows(b"github_pat_composition_test".len())
-                .any(|window| window == b"github_pat_composition_test")
+                .windows(b"github-pat-composition".len())
+                .any(|window| window == b"github-pat-composition")
         );
 
         upstream_task.abort();
