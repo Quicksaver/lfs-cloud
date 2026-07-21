@@ -11,7 +11,7 @@ use axum::{
     extract::State,
     http::{
         HeaderMap, StatusCode as AxumStatusCode,
-        header::{AUTHORIZATION, HeaderValue},
+        header::{AUTHORIZATION, HeaderValue, RETRY_AFTER},
     },
     middleware,
     response::{IntoResponse, Response},
@@ -221,16 +221,18 @@ impl From<ServerError> for GitHubPersonalAccessTokenLoginRouteError {
 
 impl IntoResponse for GitHubPersonalAccessTokenLoginRouteError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
-            ServerError::RateLimited { .. } => AxumStatusCode::TOO_MANY_REQUESTS,
+        let (status, retry_after_seconds) = match self.0 {
+            ServerError::RateLimited {
+                retry_after_seconds,
+            } => (AxumStatusCode::TOO_MANY_REQUESTS, Some(retry_after_seconds)),
             ServerError::Unauthorized { .. }
             | ServerError::RepositoryProvider {
                 source:
                     RepositoryProviderError::AuthenticationRequired { .. }
                     | RepositoryProviderError::PermissionDenied { .. }
                     | RepositoryProviderError::SsoRequired { .. },
-            } => AxumStatusCode::UNAUTHORIZED,
-            _ => AxumStatusCode::BAD_GATEWAY,
+            } => (AxumStatusCode::UNAUTHORIZED, None),
+            _ => (AxumStatusCode::BAD_GATEWAY, None),
         };
         let body = GitHubLoginRouteErrorBody {
             error: if status == AxumStatusCode::UNAUTHORIZED {
@@ -240,8 +242,13 @@ impl IntoResponse for GitHubPersonalAccessTokenLoginRouteError {
             },
             message: "GitHub personal-access-token login could not be completed.",
         };
-
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(retry_after_seconds) = retry_after_seconds {
+            let retry_after = HeaderValue::from_str(&retry_after_seconds.to_string())
+                .expect("an integer Retry-After value should be a valid HTTP header");
+            response.headers_mut().insert(RETRY_AFTER, retry_after);
+        }
+        response
     }
 }
 
@@ -1243,7 +1250,11 @@ mod tests {
     use axum::{
         Json, Router,
         body::Body,
-        http::{Request, StatusCode, header::AUTHORIZATION},
+        http::{
+            Request, StatusCode,
+            header::{AUTHORIZATION, RETRY_AFTER},
+        },
+        response::IntoResponse,
         routing::get,
     };
     use tokio::sync::Mutex;
@@ -1251,8 +1262,9 @@ mod tests {
 
     use super::{
         GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitHubPersonalAccessToken,
-        GitHubPersonalAccessTokenLoginRouteState, GitHubRepositoryPermissionClient,
-        GitHubUserClient, github_personal_access_token_login_router,
+        GitHubPersonalAccessTokenLoginRouteError, GitHubPersonalAccessTokenLoginRouteState,
+        GitHubRepositoryPermissionClient, GitHubUserClient,
+        github_personal_access_token_login_router,
     };
     use crate::{
         GitHubAuthenticationConfig, GitHubProviderConfig, LfsSessionToken, LocalLfsSessionStore,
@@ -1283,6 +1295,17 @@ mod tests {
                 "{invalid:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rate_limited_login_response_preserves_retry_after_delay() {
+        let response = GitHubPersonalAccessTokenLoginRouteError(ServerError::RateLimited {
+            retry_after_seconds: 37,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "37");
     }
 
     #[tokio::test]

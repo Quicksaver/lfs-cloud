@@ -32,6 +32,10 @@ const DEFAULT_MAX_PROVIDER_CALLS: usize = 16;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
 const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 8;
 const DEFAULT_MAX_CONCURRENT_UPLOADS_PER_USER: usize = 2;
+#[cfg(not(windows))]
+const DEFAULT_GCLOUD_EXECUTABLE: &str = "gcloud";
+#[cfg(windows)]
+const DEFAULT_GCLOUD_EXECUTABLE: &str = "gcloud.cmd";
 
 /// Loaded and validated server configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -649,7 +653,7 @@ impl GoogleDriveGcloudCredentialsConfig {
                                 format!("{credentials_path}.executable"),
                                 env,
                             )?
-                            .unwrap_or_else(|| "gcloud".to_owned()),
+                            .unwrap_or_else(|| DEFAULT_GCLOUD_EXECUTABLE.to_owned()),
                         ),
                     }),
                     unsupported => invalid_config(
@@ -1354,7 +1358,12 @@ storage_providers:
         let StorageProviderConfig::GoogleDrive(storage) = &config.storage_providers["drive-user-a"];
         let credentials = &storage.credentials;
         assert_eq!(credentials.config_dir, PathBuf::from(".gcloud-drive"));
-        assert_eq!(credentials.executable, PathBuf::from("gcloud"));
+        let expected = if cfg!(windows) {
+            PathBuf::from("gcloud.cmd")
+        } else {
+            PathBuf::from("gcloud")
+        };
+        assert_eq!(credentials.executable, expected);
     }
 
     #[test]

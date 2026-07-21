@@ -499,6 +499,9 @@ Keep the configured PAT stable while issued sessions
 remain active. LFS Cloud uses that secret as the root for a dedicated durable
 session-encryption key; changing it makes existing protected sessions
 unreadable, so rotate it only after those sessions expire or are removed.
+Upgrading from the removed GitHub OAuth mode invalidates its outstanding local
+sessions once during metadata migration, so affected repositories must run
+`lfscloud login` again after the server upgrade.
 
 ### Live GitHub smoke credentials
 
@@ -521,6 +524,8 @@ refresh token into LFS Cloud configuration. It requires the
 that runs `lfscloud serve`; the same operating-system user must be able to run
 `gcloud --version`. For service managers with a restricted `PATH`, set the
 optional `credentials.executable` field to the absolute `gcloud` path.
+When this field is omitted, LFS Cloud defaults to `gcloud.cmd` on Windows and
+`gcloud` on other platforms.
 
 First create a Desktop app OAuth client in Google Cloud, enable the Google Drive
 API for its project, and download the client JSON. Then create an isolated

@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Current metadata schema version installed by the migration runner.
-pub const METADATA_SCHEMA_VERSION: u32 = 4;
+pub const METADATA_SCHEMA_VERSION: u32 = 5;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OBJECT_UPLOAD_LOCK_STRIPES: usize = 64;
@@ -222,6 +222,15 @@ INSERT OR IGNORE INTO schema_migrations(version, name)
 VALUES (4, 'active_repository_mappings');
 
 PRAGMA user_version = 4;
+"#;
+
+const PAT_AUTHENTICATION_SESSION_MIGRATION: &str = r#"
+DELETE FROM sessions;
+
+INSERT OR IGNORE INTO schema_migrations(version, name)
+VALUES (5, 'invalidate_oauth_sessions_for_pat_authentication');
+
+PRAGMA user_version = 5;
 "#;
 
 /// Verification state recorded for a repository-scoped object mapping.
@@ -580,6 +589,17 @@ impl MetadataDatabase {
         if schema_version < 4 {
             transaction
                 .execute_batch(ACTIVE_REPOSITORY_MAPPING_MIGRATION)
+                .map_err(|source| ServerError::MetadataMigration {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        if schema_version < 5 {
+            // OAuth sessions were encrypted from the removed client secret.
+            // They cannot be restored with the PAT-derived key, so invalidate
+            // them once during upgrade rather than aborting every startup.
+            transaction
+                .execute_batch(PAT_AUTHENTICATION_SESSION_MIGRATION)
                 .map_err(|source| ServerError::MetadataMigration {
                     path: self.path.clone(),
                     source,
@@ -1407,9 +1427,10 @@ mod tests {
     };
 
     use super::{
-        INITIAL_SCHEMA, METADATA_SCHEMA_VERSION, MetadataDatabase,
-        MetadataObjectVerificationStatus, MetadataTransferOperation, MetadataTransferResult,
-        NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION, PROTECTED_SESSION_TOKEN_MIGRATION,
+        ACTIVE_REPOSITORY_MAPPING_MIGRATION, INITIAL_SCHEMA, METADATA_SCHEMA_VERSION,
+        MetadataDatabase, MetadataObjectVerificationStatus, MetadataTransferOperation,
+        MetadataTransferResult, NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION,
+        PROTECTED_SESSION_TOKEN_MIGRATION,
     };
 
     const LEGACY_SCHEMA_WITH_NON_NULL_VERIFICATION_TIMESTAMP: &str = r#"
@@ -1518,7 +1539,7 @@ PRAGMA user_version = 1;
                 row.get(0)
             })
             .expect("migration count should load");
-        assert_eq!(migration_count, 4);
+        assert_eq!(migration_count, 5);
         assert_eq!(
             database
                 .schema_version()
@@ -1651,6 +1672,69 @@ PRAGMA user_version = 1;
             )
             .expect("migrated repository activity should load");
         assert!(is_active);
+    }
+
+    #[test]
+    fn migration_invalidates_sessions_from_removed_oauth_authentication() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let db_path = directory.path().join("metadata.sqlite3");
+        let legacy_connection =
+            rusqlite::Connection::open(&db_path).expect("legacy metadata DB should open");
+        legacy_connection
+            .execute_batch(INITIAL_SCHEMA)
+            .expect("initial schema should be created");
+        legacy_connection
+            .execute_batch(NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION)
+            .expect("version 2 migration should apply");
+        legacy_connection
+            .execute_batch(PROTECTED_SESSION_TOKEN_MIGRATION)
+            .expect("version 3 migration should apply");
+        legacy_connection
+            .execute_batch(ACTIVE_REPOSITORY_MAPPING_MIGRATION)
+            .expect("version 4 migration should apply");
+        legacy_connection
+            .execute(
+                "INSERT INTO sessions(
+                    token_sha256,
+                    provider_id,
+                    login,
+                    stable_id,
+                    granted_scopes_json,
+                    issued_at_unix_seconds,
+                    expires_at_unix_seconds,
+                    provider_access_token_ciphertext,
+                    provider_access_token_nonce
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "a".repeat(64),
+                    "github-main",
+                    "octocat",
+                    "42",
+                    "[\"repo\"]",
+                    1_700_000_000_i64,
+                    4_000_000_000_i64,
+                    vec![1_u8, 2, 3],
+                    vec![4_u8, 5, 6],
+                ],
+            )
+            .expect("legacy OAuth session should be inserted");
+        drop(legacy_connection);
+
+        let database = MetadataDatabase::open(&db_path).expect("metadata DB should migrate");
+        let session_count: u32 = database
+            .connection
+            .lock()
+            .expect("metadata connection should lock")
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("session count should load");
+
+        assert_eq!(session_count, 0);
+        assert_eq!(
+            database
+                .schema_version()
+                .expect("schema version should load"),
+            METADATA_SCHEMA_VERSION
+        );
     }
 
     #[test]

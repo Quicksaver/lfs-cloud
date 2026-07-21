@@ -517,6 +517,12 @@ issuances per minute for each stable provider user, plus 1,024 active
 credentials process-wide. Capacity exhaustion returns HTTP 429 with a
 `Retry-After` value rather than evicting an unrelated active credential.
 
+The PAT migration invalidates durable sessions issued by the removed GitHub
+OAuth flow in a one-time metadata migration. Those rows were protected by the
+former OAuth client secret and must be removed before the PAT-derived session
+key loads active rows, so an upgrade requires login again instead of preventing
+server startup.
+
 The authenticated `DELETE /auth/session` endpoint revokes the presented local
 LFS credential. `lfscloud logout` calls that endpoint before erasing the
 repository-scoped Git credential, while an already expired or revoked session
