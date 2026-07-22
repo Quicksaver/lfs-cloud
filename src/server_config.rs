@@ -1167,10 +1167,10 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR, GitHubProviderConfig,
-        GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, RawRepositoryProviderConfig,
-        RepositoryProviderConfig, ServerConfig, ServerError, StorageProviderConfig,
-        validate_config_http_url,
+        DEFAULT_GCLOUD_EXECUTABLE, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR,
+        GitHubProviderConfig, GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig,
+        RawRepositoryProviderConfig, RepositoryProviderConfig, ServerConfig, ServerError,
+        StorageProviderConfig, validate_config_http_url,
     };
 
     fn valid_yaml() -> &'static str {
@@ -1260,7 +1260,7 @@ repositories:
             credentials,
             &GoogleDriveGcloudCredentialsConfig {
                 config_dir: PathBuf::from(".gcloud-drive"),
-                executable: PathBuf::from("gcloud"),
+                executable: PathBuf::from(DEFAULT_GCLOUD_EXECUTABLE),
             }
         );
         assert_eq!(root_folder_id, "drive-root-folder");

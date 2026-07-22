@@ -1430,7 +1430,7 @@ mod tests {
         ACTIVE_REPOSITORY_MAPPING_MIGRATION, INITIAL_SCHEMA, METADATA_SCHEMA_VERSION,
         MetadataDatabase, MetadataObjectVerificationStatus, MetadataTransferOperation,
         MetadataTransferResult, NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION,
-        PROTECTED_SESSION_TOKEN_MIGRATION,
+        PROTECTED_SESSION_TOKEN_MIGRATION, SQLITE_BUSY_TIMEOUT,
     };
 
     const LEGACY_SCHEMA_WITH_NON_NULL_VERIFICATION_TIMESTAMP: &str = r#"
@@ -2231,7 +2231,11 @@ repositories:
         lock_connection
             .execute_batch("COMMIT")
             .expect("exclusive transaction should commit");
-        let record = tokio::time::timeout(Duration::from_secs(1), write)
+        // A connection already inside SQLite's busy handler may take up to the
+        // configured busy timeout to observe the released lock on loaded CI
+        // runners. The earlier timer is the assertion that the runtime worker
+        // itself remains responsive while this blocking work is pending.
+        let record = tokio::time::timeout(SQLITE_BUSY_TIMEOUT + Duration::from_secs(1), write)
             .await
             .expect("metadata write should finish after lock release")
             .expect("metadata write should succeed");
