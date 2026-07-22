@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="64 70 392 392" role="img" aria-labelledby="title description">
+  <title id="title">LFS Cloud solid stacked logo</title>
+  <desc id="description">A blue cloud above a bold geometric LFS wordmark.</desc>
+  <defs>
+    <linearGradient id="solid-cloud" x1="97" y1="83" x2="424" y2="322" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2DD4FF" />
+      <stop offset="1" stop-color="#1677E8" />
+    </linearGradient>
+  </defs>
+  <path
+    fill="url(#solid-cloud)"
+    transform="matrix(1.0623306 0 0 1 -16.736 0)"
+    d="M160 326h207c43 0 78-35 78-78 0-41-31-75-71-79-8-56-56-99-114-99-50 0-94 31-111 77-41 4-73 39-73 81 0 54 33 98 84 98Z"
+  />
+  <g fill="#3182E8">
+    <path d="M110 350h28v84h56v28h-84V350Z" />
+    <path d="M214 350h84v28h-56v14h44v28h-44v42h-28V350Z" />
+    <path d="M318 350h84v28h-84zm0 42h84v28h-84zm0 42h84v28h-84zm0-70h28v42h-28zm56 42h28v42h-28z" />
+  </g>
+</svg>
