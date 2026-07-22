@@ -22,7 +22,7 @@
   "files.insertFinalNewline": true,
   "json.format.enable": true,
   "json.validate.enable": true,
-  "lgtm.contextFiles": ["AGENTS.md", "IMPLEMENTATION.md", "README.md"],
+  "lgtm.contextFiles": ["AGENTS.md", "README.md", "docs/configuration.md"],
   "prettier.configPath": "prettier.config.mjs",
   "prettier.enable": true,
   "prettier.ignorePath": ".prettierignore",

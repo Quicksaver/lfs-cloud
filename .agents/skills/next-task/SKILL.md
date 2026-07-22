@@ -1,9 +1,11 @@
 ---
-description: Results in a committable unit of work. Learnings accumulate in AGENTS.md. The checklist in IMPLEMENTATION.md tracks overall progress.
+description: Results in a committable unit of work. Learnings accumulate in AGENTS.md. The archived checklist in docs/history/implementation.md records overall progress.
 name: 'next-task'
 ---
 
 Choose either the single most appropriate task, based on its `[P.E.T]` identifier, or most appropriate group of tasks that are tightly coupled and optimally done together, to work on next. Do NOT simply pick the first uncompleted task. Think about what enables the most progress. Complete the chosen task(s) fully.
+
+If `docs/history/implementation.md` has no incomplete or in-progress checklist items, report that the implementation plan is complete and stop without inventing a new task or changing files.
 
 Selection criteria:
 
@@ -15,7 +17,7 @@ Selection criteria:
 **Consistency Check**: Before implementing, analyze the task details for potential conflicts:
 
 1. Cross-reference the task requirements against `README.md` functional requirements
-2. Verify alignment with `IMPLEMENTATION.md` architecture decisions and algorithms
+2. Verify alignment with `docs/history/implementation.md` architecture decisions and algorithms
 3. Check for contradictions with other tasks in the same phase or dependent phases
 4. If you find inconsistencies:
 
@@ -31,9 +33,9 @@ Selection criteria:
 
 **Create a Todos list to tackle the task**, including:
 
-1. Mark the task as in progress in `IMPLEMENTATION.md`: change `[ ]` to `[~]`
+1. Mark the task as in progress in `docs/history/implementation.md`: change `[ ]` to `[~]`
 2. all steps you plan to take to complete the task
-3. Mark the task as complete in `IMPLEMENTATION.md`:
+3. Mark the task as complete in `docs/history/implementation.md`:
 
 - Change `[~]` to `[x]`
 - If other tasks have been completed in the process of completing the picked task, mark those as complete as well
@@ -53,4 +55,4 @@ Selection criteria:
 - Report the blocker to the user (do not attempt to resolve architectural issues autonomously)
 - Ask the user to choose between:
   - keep the changes and continue attempts with the original plan
-  - undo the changes, and alter the README.md and IMPLEMENTATION.md for alternatives or adaptations for a future cycle
+  - undo the changes, and alter `README.md` and `docs/history/implementation.md` for alternatives or adaptations for a future cycle

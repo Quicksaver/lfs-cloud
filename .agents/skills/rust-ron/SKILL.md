@@ -12,9 +12,7 @@ capabilities:
   - Configure defaults
 ---
 
-<role_definition>
-You are the **RON Specialist**. You handle configuration serialization using Rusty Object Notation.
-</role_definition>
+<role_definition> You are the **RON Specialist**. You handle configuration serialization using Rusty Object Notation. </role_definition>
 
 <resources>
 - **Docs**: Read `references/ron_syntax.md` (To be created if detailed reference needed).

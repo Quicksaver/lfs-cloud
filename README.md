@@ -1,424 +1,67 @@
 # LFS Cloud
 
-LFS Cloud is an early-stage Git LFS-compatible server and CLI for storing large Git-tracked files outside the Git host's built-in LFS storage.
+LFS Cloud is a self-hosted Git LFS server and companion CLI that stores large files in Google Drive while keeping the Git repository on GitHub.
 
-The initial goal is to keep normal Git version control on GitHub, while routing Git LFS objects through an LFS Cloud server to Google Drive storage you control.
+> LFS Cloud is preparing for its first release. Install it from source for now; published binaries, installers, checksums, and signatures are not available yet.
 
-> Status: early implementation stage. A minimal `serve` command can load config,
-> bind an HTTP listener, print reachable URLs, and resolve configured LFS
-> routes, requiring a local LFS Cloud session token before parsing authenticated
-> requests. The binary now uses a `clap` root command with shared `--config`
-> and `--log-level` flags and dispatches `serve` through the server runtime.
-> CLI support code can detect the current Git worktree and parse
-> GitHub-style HTTPS/SSH remotes, and `lfscloud init --server` can resolve
-> the current repository's intended Git LFS endpoint, write or update
-> `.lfsconfig`, or write only repository-local Git config with `--local`.
-> `lfscloud login --server` exchanges the configured GitHub PAT and stores only the returned
-> local LFS Cloud token in Git's credential helper for the repository-scoped
-> LFS URL.
-> `lfscloud logout --server` revokes that server-side session and erases the
-> matching repository-scoped Git credential.
-> `lfscloud status` can inspect the current repository against server config,
-> check TCP reachability for the configured server URL, verify that a local LFS
-> credential is available, validate the configured Drive credential reference,
-> and report local cache directory readiness.
-> `lfscloud pull` can run a Git LFS fetch for the current checkout, ingest
-> fetched objects from the repository's Git LFS media storage into the shared
-> cache, and hydrate LFS-tracked pointer files with verified cache bytes.
-> Git LFS batch request parsing plus download and upload batch response
-> generation are implemented, with GitHub read/write authorization enforced per
-> batch operation. Upload batches now check configured storage availability,
-> advertise upload actions for missing objects, and accept authenticated object
-> `PUT` uploads through temp-file staging, SHA-256 verification, Google Drive
-> storage, and metadata recording. Download batches check configured storage
-> availability, advertise download actions for existing objects, and proxy
-> authenticated object `GET` downloads directly from Google Drive through
-> LFS Cloud with bounded memory and end-of-stream integrity verification.
-> LFS route, authentication, method, body-size, parse, authorization,
-> upload-integrity, local staging-capacity, idle upload timeout, and storage
-> failures return Git LFS JSON error payloads with matching HTTP statuses.
-> Library helpers can ingest verified objects from existing `.git/lfs/objects`
-> caches into the shared local cache, materialize verified cached objects into
-> worktree paths with copy-on-write cloning where available and fallback
-> copying elsewhere, and hydrate matching Git LFS pointer files from cache
-> without overwriting non-pointer worktree content. Clean hydrated files can be
-> dehydrated back to Git LFS pointers only after their bytes are verified and
-> preserved in the shared cache. `lfscloud hydrate <path...>` and
-> `lfscloud dehydrate <path...>` expose those local cache operations through
-> the CLI. `lfscloud gc` can remove shared local cache objects that are no
-> longer referenced by any registered worktree, with a dry-run mode for review.
-> Migration support code can inspect an existing Git worktree for local Git LFS
-> installation status, LFS filter config, repository LFS endpoint config, and
-> `.gitattributes` patterns that declare `filter=lfs` without mutating local
-> state, and can enumerate Git LFS pointer blobs from the current index for
-> tracked paths whose Git attributes use `filter=lfs`, including hydrated files
-> and files omitted by sparse checkout. It can also enumerate Git LFS pointer
-> blobs reachable from selected refs or all fetched refs by evaluating
-> historical `filter=lfs` attributes without checking out those refs.
-> Migration planning can also check discovered object identities against local
-> Git LFS media storage and an optional shared LFS Cloud cache, verifying
-> SHA-256 and size before treating local bytes as available. Missing migration
-> objects can be fetched from the source Git LFS provider into local media
-> storage without changing checked-out worktree files. Locally available
-> migration objects can also be uploaded idempotently to the configured LFS
-> Cloud storage provider, rechecking source bytes against pointer identities
-> before upload and validating provider-returned object identities afterward.
-> The transfer helper bounds concurrent uploads, synchronizes each completed
-> object to a provider-specific JSON Lines checkpoint, resumes those durable
-> completions after interruption, and returns per-object retry outcomes without
-> discarding independent successes.
-> `lfscloud migrate --dry-run` can report a read-only migration plan for the
-> current checkout, selected refs, or all fetched refs without fetching,
-> uploading, writing Git config, creating cache state, opening metadata, or
-> touching storage. When requested with `--purge-source-lfs`, the dry-run
-> includes GitHub-specific source LFS cleanup guidance but withholds purge
-> input because planning does not prove that any object was uploaded. A future
-> execution path must generate purge input only from a durable,
-> integrity-verified migration receipt.
-> Full non-dry-run migration execution and release packaging are still planned.
+## What It Does
 
-## Why
-
-Git LFS keeps large binaries out of Git history, but hosted LFS storage can be expensive, quota-limited, or hard to clean up. LFS Cloud is intended to provide:
-
-- Google Drive storage for Git LFS objects
-- repo-provider-based authorization, so users can read/write LFS objects only when they have matching repo permissions
-- lower local disk duplication through a shared cache and copy-on-write file materialization where supported
-- migration tooling for existing Git LFS repositories
-
-## Initial Support
-
-The first supported repository provider is:
-
-- GitHub
-
-The first supported storage provider is:
-
-- Google Drive
-
-The architecture is intended to allow future repository providers and storage providers, but those are not part of the initial supported scope.
-
-## How It Works
-
-Git LFS commits small pointer files to the repository:
+LFS Cloud keeps repository history and permissions on GitHub, proxies Git LFS uploads and downloads, and stores the object bytes in a private Google Drive folder:
 
 ```text
-version https://git-lfs.github.com/spec/v1
-oid sha256:<object-hash>
-size <bytes>
+Git LFS client <-> LFS Cloud <-> Google Drive
+                         |
+                         +-> GitHub permission checks
 ```
 
-The actual bytes live in LFS storage. LFS Cloud sits between the Git LFS client and the chosen storage provider:
+It also provides a shared local object cache. On supported filesystems, checked out files can use copy-on-write materialization to reduce duplicate disk usage.
 
-```text
-Git LFS client
-  -> LFS Cloud server
-    -> Google Drive
-```
+## Supported Setup
 
-Repository permissions remain the source of truth:
+| Component           | Initial support                          |
+| ------------------- | ---------------------------------------- |
+| Repository provider | GitHub                                   |
+| Storage provider    | Google Drive                             |
+| Authentication      | One configured GitHub account using PAT  |
+| Server deployment   | Self-hosted process with SQLite metadata |
 
-```text
-repo read access
-  may download LFS objects
+LFS Cloud is best suited to a private, single-operator installation. It is not currently a multi-user identity service.
 
-repo write access
-  may upload LFS objects
-```
+## Quick Start
 
-## Commands
+### 1. Install The Prerequisites
 
-### Run A Local Server
+You need:
 
-The intended MVP deployment is a local server, optionally reachable on the local network:
+- Rust 1.88 or newer
+- Git and Git LFS
+- Google Cloud CLI (`gcloud`)
+- a Git credential helper
+- a GitHub personal access token limited to the repositories you will serve
+- GitHub CLI (`gh`) for the repository ID lookup shown below (optional)
+
+Install LFS Cloud from this checkout:
 
 ```bash
-lfscloud serve --config ./lfscloud.yml --port 8080
+cargo install --locked --path .
+git lfs install
 ```
 
-For LAN exposure:
+### 2. Prepare Google Drive Access
 
-```bash
-lfscloud serve --config ./lfscloud.yml --host 0.0.0.0 --port 8080
-```
+Create a Google Cloud Desktop OAuth client, enable the Google Drive API, and authorize an isolated Application Default Credentials directory with the `cloud-platform` and `drive.file` scopes. The complete setup commands and folder-access requirements are in the [configuration guide](docs/configuration.md#google-drive-credentials).
 
-Use HTTPS through trusted TLS termination for LAN or remote access. Plaintext
-HTTP is accepted automatically only for exact loopback IP addresses. A trusted
-development LAN requires `server.allow_insecure_http: true`, and CLI commands
-that accept `--server` require the matching `--allow-insecure-http` flag. This
-unsafe mode exposes the GitHub PAT, LFS credentials, and object bytes to anyone
-able to observe that network.
+Create or choose the private Drive folder that will hold LFS objects, then keep its folder ID for the server configuration.
 
-The CLI prints addresses like:
+### 3. Create `lfscloud.yml`
 
-```text
-LFS Cloud server running
-  local:   http://127.0.0.1:8080
-  network: http://192.168.1.25:8080
-```
-
-On SIGINT or SIGTERM, the server stops accepting new requests and gives active
-batch and object transfers up to 30 seconds to finish. After that bounded drain
-period, the process exits even if a transfer is still incomplete; clients can
-retry interrupted content-addressed uploads or downloads after restart.
-
-### Initialize A Repository
-
-```bash
-lfscloud init --server http://127.0.0.1:8080
-```
-
-This resolves the current repository's `origin` remote and writes or updates
-`.lfsconfig` with the LFS Cloud endpoint, printing the previous and new
-`lfs.url` values. To avoid creating or modifying a committed `.lfsconfig`,
-write the endpoint only to repository-local Git config:
-
-```bash
-lfscloud init --server http://127.0.0.1:8080 --local
-```
-
-Example `.lfsconfig`:
-
-```ini
-[lfs]
-    url = http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs
-```
-
-### Authenticate A Repository
-
-```bash
-lfscloud login --server http://127.0.0.1:8080
-```
-
-This prompts for the GitHub PAT configured on the server and sends it once over
-protected transport. Interactive terminal entry disables echo while the token
-is read. Piped input remains supported for automation; both input paths accept
-at most 1,024 token bytes and remove only the final LF or CRLF line ending
-before trimming surrounding ASCII whitespace. The server verifies the exact
-PAT, returns a short-lived local LFS token, and the CLI stores only that local
-token in Git's repository-scoped credential helper. The server
-binds the local session to GitHub's immutable numeric user ID and rejects
-repository permission responses for a different account, even if the mutable
-login was reused.
-Unexpired local sessions survive server restarts through the configured SQLite
-metadata database. SQLite stores only a SHA-256 digest of the local bearer
-token; the private GitHub PAT and authenticated session metadata are
-protected with authenticated encryption derived from the configured GitHub PAT.
-Before storing the token, login enables Git credential path matching in the
-repository's local config so another repository on the same LFS host cannot
-reuse it through host-only credential matching.
-Session issuance is bounded to 16 active credentials per stable provider user,
-eight successful issuances per minute per user, and 1,024 active credentials
-per server process. An overloaded login returns HTTP 429 with `Retry-After`;
-it never evicts another active credential to admit the new login.
-
-### Revoke A Repository Session
-
-```bash
-lfscloud logout --server http://127.0.0.1:8080
-```
-
-Logout loads the repository-scoped local LFS credential, authenticates a
-server-side session revocation request with it, and then erases the credential
-through `git credential reject`. If the server reports that the session is
-already expired or revoked, the local credential is still erased. A failed or
-unexpected server response leaves the local credential in place so logout can
-be retried. When GitHub definitively rejects the private PAT retained
-by an active session, the server revokes the corresponding local LFS session
-automatically.
-
-### Check Repository Status
-
-```bash
-lfscloud --config ./lfscloud.yml status
-```
-
-This checks the current Git repository's `origin` remote against the server
-configuration, verifies that the configured server URL is reachable at the TCP
-level, confirms that Git's credential helper can return a local LFS Cloud
-token for the repository LFS URL, validates that the configured Google Drive
-credential reference can be loaded, and reports whether the local cache objects
-directory already exists. Credential lookup is non-interactive: a cache miss
-fails without opening terminal, askpass, or credential-manager prompts. Use
-`--server` to check a different reachable server base URL, or `--cache-root` to
-inspect a non-default local cache root.
-
-### Hydrate Cached Files
-
-```bash
-lfscloud hydrate path/to/file.bin
-```
-
-This replaces matching Git LFS pointer files with verified object bytes from
-the shared local cache. It refuses non-pointer worktree content and fails if the
-referenced object is missing or corrupt in the cache. Same-path cache
-operations are serialized. On macOS and Linux, publication atomically retains
-and verifies the displaced pointer, restoring it if a concurrent edit landed
-after the final check. Hydration accepts only regular files whose resolved
-parent remains inside the current worktree; symbolic links are never followed
-or replaced. Hydration preserves the existing pointer file's mode, including
-its executable bit. On Unix, lower-level cache materialization into a new path
-uses owner-only `0600` permissions rather than making repository content
-readable by other local users. Use `--cache-root` to target a non-default local
-cache root.
-
-### Dehydrate Files To Pointers
-
-```bash
-lfscloud dehydrate path/to/file.bin
-```
-
-This accepts only paths contained in the current worktree that Git tracks with
-`filter=lfs`. It reads the expected object identity from the Git index pointer,
-verifies that the worktree bytes still match, preserves them in the shared
-local cache and the repository's Git LFS media store, and then replaces the
-worktree file with the canonical pointer. Dirty, untracked, non-LFS, and outside
-paths are rejected. Existing matching pointer files are treated as already
-dehydrated. A cache-wide operation lock prevents concurrent garbage collection
-from deleting newly preserved bytes before the pointer becomes visible.
-Same-path cache operations are serialized. On macOS and Linux, pointer
-publication atomically retains and verifies the displaced file, restoring it
-if a concurrent edit landed during publication. When the shared cache is
-missing the object, dehydration verifies it while staging the cache copy rather
-than hashing it in a separate pass. Dehydration rejects symbolic links without
-reading their targets or replacing the links. Use `--cache-root` to target a
-non-default local cache root.
-
-### Garbage-Collect The Local Cache
-
-```bash
-lfscloud gc --dry-run
-```
-
-This asks Git for NUL-delimited tracked paths in every registered worktree,
-keeps cached objects referenced by pointer files whose effective index
-attribute is `filter=lfs`, and removes unreferenced cached objects. Ignored,
-untracked, generated, and tracked non-LFS pointer-shaped files do not pin cache
-objects. Worktree registrations preserve native filesystem path units,
-including non-UTF-8 roots on Unix. If any registered worktree is unavailable,
-such as on a disconnected volume, ordinary garbage collection preserves its
-registry entry and every object that the unavailable worktree might reference.
-Restore the worktree and rerun GC, or use `--prune-unavailable-worktrees` only
-after confirming that every reported unavailable worktree is permanently
-abandoned.
-Garbage collection runs exclusively with respect to cache ingest, hydration,
-materialization, and dehydration so it sees completed object and pointer
-publication. Use `--cache-root` to target a non-default local cache root.
-
-### Pull And Materialize LFS Objects
-
-```bash
-lfscloud pull
-```
-
-This runs `git lfs fetch`, copies verified fetched objects from the repository
-Git LFS media storage into the shared LFS Cloud cache, and replaces
-LFS-tracked pointer files in the current checkout with verified cache bytes. Use
-`--cache-root` to target a non-default local cache root. The fetch has a
-six-hour execution deadline and retains at most 256 KiB from each output stream;
-a timeout or output overflow stops the fetch process tree before `pull` changes
-cache or worktree state.
-
-### Plan Migration From Existing Git LFS
-
-```bash
-lfscloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
-```
-
-The current migration command supports read-only planning with `--dry-run`. The
-dry-run reports tracked LFS patterns, scanned refs, planned local config writes,
-discovered objects, objects that would be fetched from the source Git LFS
-provider, local source-object availability, explicitly unknown target-object
-existence, and object byte totals for each of those groups. The local readiness
-section reports the `git lfs` installation and visible filter settings
-separately from source endpoint, target TCP, local credential, server mapping,
-and storage-credential checks. A dedicated warning section calls out objects
-without a verified local source, unprobed repository permissions, storage
-quota/capacity risk, and unsupported requested purge behavior. A dry run does
-not claim that locally available objects will be uploaded: execution checks the
-destination first and skips objects already present there. The readiness checks
-do not verify source repository access, target server authentication or
-repository permission, Drive root access, or target-object existence. The
-dry-run does not fetch, upload, write Git config, create cache state, open
-metadata storage, or contact the configured storage provider.
-Git discovery also disables partial-clone lazy fetching; if a required Git
-object exists only on a promisor remote, fetch that object explicitly before
-rerunning the plan.
-The source repository remote is explicit and defaults to `origin`; use
-`--source-remote <name>` to select another remote. The target repository
-identity always comes from `origin`, and the plan reports both identities.
-When they differ, migration stops unless `--allow-cross-remote` explicitly
-acknowledges the cross-repository copy. `--all-refs` includes local branches,
-tags, and remote-tracking refs only for the selected source remote, rather than
-silently mixing histories from every configured remote. Selected-ref and
-all-ref planning require a non-shallow repository because a shallow clone
-cannot provide a complete inventory for those history scopes. Run
-`git fetch --unshallow` before using either mode. Current-checkout planning is
-still available in a shallow clone because it inventories only the current
-index. When neither `--ref` nor `--all-refs` is selected, the report prominently
-warns that other refs were not scanned and may reference additional LFS
-objects. Use `--all-refs` for a full provider move.
-Selected-ref and all-ref planning also require Git 2.40.0 or newer because
-historical attribute evaluation uses `git check-attr --source`. LFS Cloud checks
-the installed version before scanning and reports how to upgrade Git or fall
-back to current-checkout planning.
-Migration source fetches explicitly disable Git LFS recent-fetch behavior for
-the command. User, system, or repository settings such as
-`lfs.fetchrecentalways=true` therefore cannot add recent branches or commits to
-the selected migration scope, or make an all-ref fetch fail by implicitly
-combining `--recent` with `--all`.
-Historical scans reuse unchanged Git tree and blob objects across commits and
-cache equivalent historical attribute queries. This keeps large selected-ref
-and all-ref plans proportional to changed tree state plus reported pointer
-occurrences instead of recursively listing the full repository tree for every
-commit.
-Use `--purge-source-lfs` with `--dry-run` to include GitHub Support cleanup
-guidance. The dry-run labels discovered objects as planned candidates and does
-not emit a purge manifest. Planned OIDs and sizes are not proof that the
-destination received verified bytes; purge input must come from a future
-durable, integrity-verified migration receipt.
-
-Full non-dry-run migration execution is not implemented yet. It is expected to:
-
-- read existing Git LFS pointer files
-- fetch missing objects from the current LFS provider
-- upload those same objects to the configured LFS Cloud storage provider
-- update the repo's LFS URL
-- avoid rewriting Git history in the normal case
-
-For GitHub LFS cleanup assistance:
-
-```bash
-lfscloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run --purge-source-lfs
-```
-
-For an intentional fork-to-target migration:
-
-```bash
-lfscloud migrate --server http://127.0.0.1:8080 --source-remote upstream --all-refs --dry-run --allow-cross-remote
-```
-
-For GitHub, automatic purge is not expected to be possible through a normal
-API. The dry-run produces helper text for GitHub Support, but no object list
-that could be mistaken for safe purge input.
-
-## Server Configuration
-
-The server uses private configuration, not committed repo files, to decide which repository maps to which storage provider.
-
-Minimal GitHub plus Google Drive example:
+Create a private server configuration file. Do not commit it.
 
 ```yaml
 server:
   host: 127.0.0.1
   port: 8080
   public_url: http://127.0.0.1:8080
-  max_batch_objects: 100
-  max_provider_calls: 16
-  max_concurrent_requests: 64
-  max_concurrent_uploads: 8
-  max_concurrent_uploads_per_user: 2
-  metadata_path: ./.lfscloud/metadata.sqlite3
 
 repository_providers:
   github-main:
@@ -427,242 +70,98 @@ repository_providers:
     personal_access_token: ${LFS_CLOUD_GITHUB_PAT}
 
 storage_providers:
-  drive-user-a:
+  drive-personal:
     type: google_drive
     credentials:
       type: gcloud
       config_dir: ${HOME}/.config/lfscloud/gcloud-drive
-    root_folder_id: 012345abcdef
+    root_folder_id: YOUR_DRIVE_FOLDER_ID
 
 repositories:
-  - id: github-main:owner/repo
+  - id: github-main:OWNER/REPOSITORY
     repo_provider: github-main
     host: github.com
-    owner: owner
-    name: repo
+    owner: OWNER
+    name: REPOSITORY
     provider_repository_id: '123456789'
-    storage_provider: drive-user-a
+    storage_provider: drive-personal
 ```
 
-`provider_repository_id` is GitHub's immutable numeric repository ID. LFS Cloud
-compares it with the current repository at `owner/name` for every authorization
-decision, preventing a deleted or transferred name from granting access to a
-replacement repository. Retrieve it with
-`gh api repos/OWNER/REPOSITORY --jq .id` and keep it unchanged when renaming the
-same repository.
-
-String values may reference environment variables with `${NAME}`. This keeps
-GitHub and backend credentials out of the YAML file
-while still letting validation report the exact missing key.
-
-GitHub authentication is single-account mode: every local LFS session represents
-the configured GitHub user. Prefer a
-[fine-grained PAT](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
-restricted to the served repositories, with repository Metadata read access.
-`personal_access_token` is the only supported GitHub authentication setting.
-
-`server.metadata_path` is optional. When omitted, the server resolves the
-SQLite metadata database to `.lfscloud/metadata.sqlite3` beside the config
-file, keeping routing, object, session, and transfer-attempt state in
-server-owned local storage. Upload handlers also keep object-keyed lock files in
-an `upload-locks` directory beside that database. Every server process that can
-write to the same Google Drive root must share this metadata location; the
-filesystem locks then serialize the existence check and backend write across
-processes. Exact duplicate Drive objects left by an interrupted historical
-race remain readable because lookup selects the smallest matching Drive file
-ID deterministically after validating every returned match. New uploads use
-one of 256 deterministic `lfscloud-sha256-<first-2>` folders below the root;
-objects written directly under the root by older versions remain readable.
-Normal server lookups use the Drive file ID stored in SQLite with `files.get`
-instead of listing the folder. If that ID is stale, root-and-shard discovery
-repairs the metadata row when it finds the object, or marks the unchanged row
-stale when it does not.
-
-`server.max_batch_objects` defaults to 100 object entries per Git LFS batch,
-`server.max_provider_calls` defaults to 16 concurrent GitHub or storage
-operations, and `server.max_concurrent_requests` defaults to 64 active HTTP
-requests across the process. Upload staging separately defaults to eight
-concurrent uploads process-wide and two per stable provider user through
-`server.max_concurrent_uploads` and
-`server.max_concurrent_uploads_per_user`. Staging reserves each upload's
-declared bytes atomically until its temporary file and backend transfer are
-released, while retaining the live filesystem free-space check and 64 MiB
-headroom. Requests above a concurrency limit receive HTTP 503 with
-`Retry-After` instead of waiting in an unbounded queue. Authenticated batch
-bodies have a 15-second idle timeout and a 60-second total read deadline.
-Duplicate batch identities count toward the batch limit but share one storage
-lookup. Successful permission checks are reused briefly for the same local
-session, repository, and operation so an advertised transfer does not
-immediately repeat the batch's GitHub request.
-
-Keep the configured PAT stable while issued sessions
-remain active. LFS Cloud uses that secret as the root for a dedicated durable
-session-encryption key; changing it makes existing protected sessions
-unreadable, so rotate it only after those sessions expire or are removed.
-Upgrading from the removed GitHub OAuth mode invalidates its outstanding local
-sessions once during metadata migration, so affected repositories must run
-`lfscloud login` again after the server upgrade.
-
-### Live GitHub smoke credentials
-
-The unattended smoke suite uses the same PAT authentication mode as production:
+Get GitHub's stable numeric repository ID with:
 
 ```bash
-LFS_CLOUD_GITHUB_PAT="your-personal-access-token"
+gh api repos/OWNER/REPOSITORY --jq .id
 ```
 
-The runtime supports a fine-grained PAT limited to configured repositories.
-The disposable-repository smoke check creates and deletes a repository, so its
-PAT currently needs classic `repo` and `delete_repo` scopes. Use
-`yarn rotate:github` to store and sync this value.
+See the [configuration guide](docs/configuration.md) for the full schema, security constraints, request limits, metadata paths, and LAN/HTTPS setup.
 
-### Google Drive authentication with `gcloud`
+### 4. Start The Server
 
-The `gcloud` credential mode avoids copying a client ID, client secret, and
-refresh token into LFS Cloud configuration. It requires the
-[Google Cloud CLI](https://cloud.google.com/sdk/docs/install) on every machine
-that runs `lfscloud serve`; the same operating-system user must be able to run
-`gcloud --version`. For service managers with a restricted `PATH`, set the
-optional `credentials.executable` field to the absolute `gcloud` path.
-When this field is omitted, LFS Cloud defaults to `gcloud.cmd` on Windows and
-`gcloud` on other platforms.
-
-First create a Desktop app OAuth client in Google Cloud, enable the Google Drive
-API for its project, and download the client JSON. Then create an isolated
-Google Cloud CLI configuration and complete one browser login:
+Export the same PAT referenced by the configuration and start LFS Cloud:
 
 ```bash
-mkdir -p "$HOME/.config/lfscloud/gcloud-drive"
-chmod 700 "$HOME/.config/lfscloud/gcloud-drive"
-
-CLOUDSDK_CONFIG="$HOME/.config/lfscloud/gcloud-drive" \
-  gcloud auth application-default login \
-  --client-id-file="$HOME/Downloads/client_secret.json" \
-  --scopes="https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive.file"
-
-chmod 600 "$HOME/.config/lfscloud/gcloud-drive/application_default_credentials.json"
+export LFS_CLOUD_GITHUB_PAT="your-personal-access-token"
+lfscloud serve --config ./lfscloud.yml
 ```
 
-Google Cloud CLI requires `cloud-platform` when explicit ADC scopes are
-provided; `drive.file` is the additional scope LFS Cloud needs. The browser
-flow writes the generated credentials to:
+The server validates its configuration, Google Drive credentials, and Drive root before it begins accepting requests.
 
-```text
-~/.config/lfscloud/gcloud-drive/application_default_credentials.json
-```
+### 5. Connect A Repository
 
-Do not hand-edit or commit that directory. It contains sensitive, long-lived
-ADC state. Point the server configuration at the directory, not at the
-downloaded client JSON:
-
-```yaml
-storage_providers:
-  drive-user-a:
-    type: google_drive
-    credentials:
-      type: gcloud
-      config_dir: ${HOME}/.config/lfscloud/gcloud-drive
-      # executable: /absolute/path/to/gcloud
-    root_folder_id: 012345abcdef
-```
-
-LFS Cloud runs
-`gcloud auth application-default print-access-token --quiet` non-interactively
-with that directory as `CLOUDSDK_CONFIG`, caches the short-lived token, and
-never parses the generated ADC file itself. Rerun the login command with the
-same `CLOUDSDK_CONFIG` when Google revokes the login or you change accounts.
-See Google's
-[ADC login](https://cloud.google.com/sdk/gcloud/reference/auth/application-default/login)
-and
-[access-token](https://cloud.google.com/sdk/gcloud/reference/auth/application-default/print-access-token)
-references for the underlying commands.
-
-The live Google Drive smoke checks use one local variable instead of separate
-OAuth values. Point it at the same isolated directory used by `config_dir`:
+From the configured Git repository:
 
 ```bash
-LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR="$HOME/.config/lfscloud/gcloud-drive"
+lfscloud init --server http://127.0.0.1:8080
+lfscloud login --server http://127.0.0.1:8080
+lfscloud --config /path/to/lfscloud.yml status
 ```
 
-The smoke runner passes this directory through as the same `config_dir` used by
-server YAML and skips the live Drive checks when the directory or its generated
-ADC file is absent. `gcloud` must remain installed while those checks run.
+`init` writes the repository-specific endpoint to `.lfsconfig`. Use `--local` to write only repository-local Git config instead. `login` exchanges the configured GitHub PAT for a short-lived LFS Cloud token and stores only that local token through Git's credential helper.
 
-The MVP Google Drive scope is
-`https://www.googleapis.com/auth/drive.file`. The configured `root_folder_id`
-must be a folder that the app created, opened through the setup flow, or was
-explicitly made accessible to this OAuth client. Current library code can
-validate the folder with a non-mutating Drive metadata probe. On `serve`, LFS
-Cloud asks `gcloud` for an ADC access token for every configured Drive provider
-and confirms that each root is a live folder that can accept children before
-binding the HTTP listener. A failed credential or root probe prevents the
-server from reporting readiness.
+After setup, normal Git and Git LFS pushes and fetches use LFS Cloud. For a new LFS pattern, configure Git LFS as usual:
 
-Google provider connections have a 10-second connect deadline. Large Drive
-uploads and downloads have no total transfer deadline, but must make progress
-at least every 30 seconds: upload body progress and response reads reset the
-upload watchdog, while each received download chunk resets the download
-watchdog. Drive uploads use 256 KiB-aligned resumable chunks; after an
-interruption, LFS Cloud probes the existing session and continues from Drive's
-committed offset with bounded exponential backoff. A transfer that remains
-stalled fails as retryable without waiting indefinitely.
+```bash
+git lfs track "*.bin"
+git add .gitattributes .lfsconfig
+```
 
-The `.lfsconfig` file points only to the LFS Cloud endpoint. It should not contain Google Drive, S3, or other backend credentials.
+## Commands
 
-See [docs/configuration.md](docs/configuration.md) for full `lfscloud.yml`
-examples, Google Cloud CLI ADC setup, metadata path defaults, and validation
-rules.
+| Command                        | Purpose                                                         |
+| ------------------------------ | --------------------------------------------------------------- |
+| `lfscloud serve`               | Run the Git LFS-compatible server                               |
+| `lfscloud init`                | Configure the current repository's LFS Cloud endpoint           |
+| `lfscloud login`               | Create and store a repository-scoped local session              |
+| `lfscloud logout`              | Revoke that session and erase its Git credential                |
+| `lfscloud status`              | Check repository, server, auth, storage, and cache readiness    |
+| `lfscloud pull`                | Fetch Git LFS objects and hydrate the current checkout          |
+| `lfscloud hydrate <path...>`   | Replace pointer files with verified bytes from the shared cache |
+| `lfscloud dehydrate <path...>` | Replace clean LFS files with pointers after preserving bytes    |
+| `lfscloud gc --dry-run`        | Preview cleanup of unreferenced shared-cache objects            |
+| `lfscloud migrate --dry-run`   | Plan migration from an existing Git LFS provider                |
 
-## Build And Install
+Run `lfscloud <command> --help` for all options.
 
-Local development builds, release builds, and checkout-based installs are
-documented in [docs/install-release.md](docs/install-release.md).
+## Current Limitations
 
-CI builds and smoke-tests Windows x64, Apple Silicon, Linux x64 musl, and Linux
-ARM64 musl binaries. Published releases, signatures, checksums, and installer
-scripts are not defined yet.
+- Migration is currently planning-only; `lfscloud migrate` requires `--dry-run` and does not transfer or reconfigure a repository.
+- GitHub and Google Drive are the only implemented providers.
+- Authentication represents one configured GitHub account, not independent users.
+- Uploads and downloads are proxied through the LFS Cloud process, so the host must support long-lived large-file transfers.
+- Published and signed release packages are not available yet.
+
+Use HTTPS for every non-loopback deployment. Plaintext LAN mode is an explicit development-only opt-in and exposes credentials and object bytes to network observers.
+
+## Documentation
+
+- [Server configuration](docs/configuration.md)
+- [Install, build, and release details](docs/install-release.md)
+- [Historical implementation notes](docs/history/implementation.md)
+- [Historical implementation review findings](docs/history/findings.md)
+- [Archived pre-release README](docs/history/pre-release-readme.md)
+
+The historical documents preserve design and implementation context; they are not the current user guide and may describe superseded plans.
 
 ## License
 
 LFS Cloud is available under the [MIT License](LICENSE).
-
-## Deployment Notes
-
-For early use, prefer:
-
-- `localhost` for single-machine development
-- HTTPS LAN exposure for trusted local-network machines
-- self-hosted or VPS deployment when remote access is needed
-
-Avoid relying on tunnel services such as ngrok for normal large-file traffic. They are useful for demos or temporary testing, but their bandwidth/request limits are a poor fit for GB-scale LFS usage.
-
-For production, choose hosting where transfer bandwidth is expected, controlled, and affordable. Serverless platforms with small request/response body limits are not a good fit for proxying LFS object bytes.
-
-## Local Disk Usage
-
-Stock Git LFS stores objects in `.git/lfs/objects` and also writes full files into the working tree. LFS Cloud intends to reduce duplication by using:
-
-```text
-~/.lfscloud/objects/<sha256>
-  shared local cache
-
-repo/path/to/file
-  copy-on-write clone where supported
-```
-
-On APFS and other copy-on-write filesystems, this can allow the cache object and checked-out file to share disk blocks until modified.
-
-## Current State
-
-This repository currently contains planning documents, project configuration, a testable `clap` CLI root with shared config-path and log-level flags, Git worktree detection and GitHub-style remote parsing helpers, `lfscloud init --server` Git LFS endpoint resolution plus `.lfsconfig` or local-only Git config writes for the current repository, a PAT-only `lfscloud login` flow with local LFS token credential-helper storage, `lfscloud status` readiness diagnostics for server reachability, repository mapping, local auth, storage credential loading, and local cache directory state, `lfscloud hydrate <path...>` and `lfscloud dehydrate <path...>` local cache operations, `lfscloud gc` registry-based local cache cleanup, typed config loading/validation, SQLite metadata database path resolution and schema migration setup, typed metadata object lookup and verified object upsert helpers, configured-PAT exchange, authenticated GitHub user identity lookup, GitHub repository permission-check helpers, local LFS Cloud session token issuance, Git credential approval and lookup helpers for local LFS tokens, fallback instructions for systems without a configured Git credential helper, Google Cloud CLI ADC access-token acquisition, Google Drive root-folder validation helpers, repository-scoped Google Drive object key helpers, Drive object existence lookup helpers, staged-file verification and resumable Drive upload helpers, Drive media download streaming helpers with classified provider errors, local cache path helpers for the planned shared object layout under `~/.lfscloud/objects`, verified ingest from existing `.git/lfs/objects` into the shared cache, verified cache-to-worktree materialization with macOS copy-on-write cloning and fallback copying, pointer-file hydration from shared cache without overwriting non-pointer worktree content, clean worktree dehydration back to canonical Git LFS pointers after preserving verified bytes in cache, versioned worktree registrations in `~/.lfscloud/worktrees.json` for local cache garbage collection, migration discovery helpers for existing Git LFS configuration plus current-checkout, selected-ref, and all-fetched-ref pointer enumeration, migration transfer helpers for verified local availability checks, source Git LFS fetches that do not update worktree files, idempotent upload of locally verified migration objects to configured storage providers, and a read-only `lfscloud migrate --dry-run` plan report for migration scope, file/config touch points, object fetch/upload counts, explicitly local readiness checks, and optional GitHub source LFS purge support instructions, plus a minimal `lfscloud serve` listener that loads config, initializes metadata storage, syncs configured repository/storage parent rows into metadata, reports local/LAN URLs, resolves configured LFS repository routes, requires valid local LFS token authentication, privately retains the upstream GitHub PAT server-side for repository permission checks, parses authenticated Git LFS batch requests, enforces GitHub read/write authorization per batch operation, returns Git LFS JSON error payloads for LFS route/auth/method/body-size/parse/authorization/upload-integrity/local-staging/storage failures, generates download batch responses with actions for existing objects, generates upload batch actions after storage availability lookup, accepts authenticated object uploads through guarded temp-file staging, SHA-256 verification, Google Drive storage, and metadata recording, and streams authenticated object downloads from Google Drive through LFS Cloud. Gated external integration tests can create and delete disposable GitHub repositories plus a disposable Google Drive folder when explicitly enabled with provider credentials. Full CLI migration execution and release packaging behavior have not been implemented yet.
-
-See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture details, risks, and open questions.
-
-The gated full-provider transfer check goes beyond the standalone permission
-and root-folder probes: it launches the compiled server with disposable GitHub
-and Google Drive resources, pushes from a disposable bare Git remote through
-the real Git LFS pre-push hook, clones pointer-only, pulls the object through
-LFS Cloud, verifies private Drive properties plus SQLite object metadata and
-checkout byte integrity, and cleans up both provider resources. Run it through
-`scripts/manual/verify-live-provider-transfer.sh` with the required provider
-credentials.

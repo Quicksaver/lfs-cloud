@@ -4,7 +4,7 @@ This file provides context for AI agents working in this codebase.
 
 ## Project Overview
 
-**LFS Cloud** is a planned Git LFS-compatible server and CLI for moving Git LFS object storage away from the Git host while keeping normal Git repository hosting unchanged.
+**LFS Cloud** is a Git LFS-compatible server and CLI for moving Git LFS object storage away from the Git host while keeping normal Git repository hosting unchanged.
 
 The initially supported shape is:
 
@@ -16,75 +16,60 @@ The initially supported shape is:
 
 Future repository providers may include GitLab, Bitbucket, and self-hosted Git services. Future storage providers may include local filesystem, S3-compatible storage, R2, B2, and MinIO. Keep the abstraction boundaries in place, but do not present future providers as initially supported.
 
-This repository is currently in planning/early scaffold state. Do not imply that commands are implemented unless corresponding code exists.
+This repository is in pre-release development. Do not imply that a command, provider, or release package exists unless corresponding code or automation exists.
 
 ### Technology Stack
 
-| Component     | Technology                                                      |
-| ------------- | --------------------------------------------------------------- |
-| Core/CLI      | Rust                                                            |
-| CLI parsing   | `clap`                                                          |
-| Errors        | `thiserror` for library errors, `anyhow` for CLI boundaries     |
-| Serialization | `serde`                                                         |
-| Async/runtime | `tokio` when network I/O is needed                              |
-| Logging       | `tracing`                                                       |
-| Config        | YAML or TOML candidate; see `IMPLEMENTATION.md` before choosing |
+| Component     | Technology                                                  |
+| ------------- | ----------------------------------------------------------- |
+| Core/CLI      | Rust                                                        |
+| CLI parsing   | `clap`                                                      |
+| Errors        | `thiserror` for library errors, `anyhow` for CLI boundaries |
+| Serialization | `serde`                                                     |
+| Async/runtime | `tokio` when network I/O is needed                          |
+| Logging       | `tracing`                                                   |
+| Config        | YAML; see `docs/configuration.md`                           |
 
 ### Key Documentation
 
-| Document            | Purpose                                       | Use When                                                               |
-| ------------------- | --------------------------------------------- | ---------------------------------------------------------------------- |
-| `AGENTS.md`         | Agent workflow and repo conventions           | Before any task in this repo                                           |
-| `IMPLEMENTATION.md` | Architecture, tradeoffs, and design decisions | Making implementation, auth, storage, migration, or deployment changes |
-| `README.md`         | End-user overview and intended usage          | Updating user-facing behavior or onboarding                            |
+| Document | Purpose | Use When |
+| --- | --- | --- |
+| `AGENTS.md` | Agent workflow and repo conventions | Before any task in this repo |
+| `README.md` | Current end-user overview | Updating user-facing behavior or onboarding |
+| `docs/configuration.md` | Server configuration reference | Changing config, auth, storage, or routing |
+| `docs/install-release.md` | Build, install, and release shape | Changing packaging, CI, or distribution |
+| `docs/history/implementation.md` | Historical architecture/design record | Researching earlier decisions |
+| `docs/history/findings.md` | Historical implementation review findings | Researching completed review work |
 
 ## Project Structure
 
-Current scaffold:
+Current high-level structure:
 
 ```text
 lfscloud/
   AGENTS.md
   Cargo.lock
   Cargo.toml
-  IMPLEMENTATION.md
   README.md
-  prettier.config.mjs
+  docs/
+    configuration.md
+    install-release.md
+    history/
+      findings.md
+      implementation.md
+      pre-release-readme.md
   src/
-    main.rs
-  .editorconfig
-  .gitattributes
-  .gitignore
-  .markdownlint.yml
-  .prettierignore
-  .vscode/
+  tests/
   .agents/
 ```
 
-Expected future structure may include:
-
-```text
-crates/
-  lfscloud-cli/
-  lfscloud-server/
-  lfscloud-core/
-  lfscloud-providers/
-
-docs/
-  cli/
-  config/
-  deployment/
-
-tests/
-```
-
-Do not create this structure until implementation work needs it.
+The implementation remains a single root Rust package. Do not split it into a workspace until concrete module boundaries justify that change.
 
 ## Development Guidelines
 
 ### Required Context
 
-**Critical before starting any task:** Study `AGENTS.md`, `IMPLEMENTATION.md`, `README.md`.
+**Critical before starting any task:** Study `AGENTS.md`, `README.md`, and the task-relevant current guide under `docs/`. Consult historical documents only when earlier design context is relevant.
 
 **Acceptance criteria:**
 
@@ -122,7 +107,7 @@ Use `cargo` (Cargo.lock present) for Rust code
 **Important rules (high‑impact):**
 
 - Stop and report for any blocker that requires human input.
-- Consult `IMPLEMENTATION.md` and `README.md` before asking clarification.
+- Consult `README.md` and the task-relevant current guide under `docs/` before asking clarification.
 - Always write tests for `[T]` tasks and run verification commands after code changes.
 
 ### Rust Conventions
@@ -196,13 +181,13 @@ You have access to the following specialized protocols. **Activate** a skill by 
 
 ### 🦀 Rust Specialists
 
-| Agent                    | Description                                             | Trigger                                            |
-| :----------------------- | :------------------------------------------------------ | :------------------------------------------------- |
+| Agent | Description | Trigger |
+| :-- | :-- | :-- |
 | **Rust Core Specialist** | Implementing idiomatic, safe, and performant Rust code. | Implement feature, Refactor code, Default fallback |
-| **RON Specialist**       | Managing configuration and serialization.               | Configure settings, Serialize data, .ron files     |
-| **Pest Specialist**      | Generating PEG parsers with pest.                       | Define grammar, Parse input, .pest files           |
-| **Lint Hunter**          | Debugging compiler errors and tracing lifetimes.        | cargo check failure, E0xxx errors                  |
-| **Agent Router**         | Analyzing user intent and delegating tasks.             | New request, Analyze intent                        |
+| **RON Specialist** | Managing configuration and serialization. | Configure settings, Serialize data, .ron files |
+| **Pest Specialist** | Generating PEG parsers with pest. | Define grammar, Parse input, .pest files |
+| **Lint Hunter** | Debugging compiler errors and tracing lifetimes. | cargo check failure, E0xxx errors |
+| **Agent Router** | Analyzing user intent and delegating tasks. | New request, Analyze intent |
 
 ### 🛠️ General Specialists
 
@@ -216,7 +201,7 @@ You have access to the following specialized protocols. **Activate** a skill by 
 
 ## Learnings
 
-> **Purpose**: Capture critical concise (1-3 lines) insights that are NOT obvious from README.md or IMPLEMENTATION.md, and will be helpful for future development and maintenance.
+> **Purpose**: Capture critical concise (1-3 lines) insights that are NOT obvious from current user documentation or the historical implementation notes, and will be helpful for future development and maintenance.
 >
 > **Focus**:
 >
@@ -241,8 +226,7 @@ You have access to the following specialized protocols. **Activate** a skill by 
 > - **[Area] Topic**: Brief insight (target <= 50 words). See \`SymbolName\` in <path/to/file>.
 > ```
 >
-> Use `Area` as a stable keyword describing the part of the system affected.
-> Examples: `build`, `compatibility`, `tests`, `runtime`, `cache`, `providers`, `storage`, `auth`, `migration`, `cli`, `licensing`.
+> Use `Area` as a stable keyword describing the part of the system affected. Examples: `build`, `compatibility`, `tests`, `runtime`, `cache`, `providers`, `storage`, `auth`, `migration`, `cli`, `licensing`.
 >
 > **Example**:
 >

@@ -12,9 +12,7 @@ capabilities:
   - Generate parser
 ---
 
-<role_definition>
-You are the **Pest Specialist**. You generate `pest` grammars and their corresponding Rust parsers.
-</role_definition>
+<role_definition> You are the **Pest Specialist**. You generate `pest` grammars and their corresponding Rust parsers. </role_definition>
 
 <resources>
 - **Syntax Guide**: Read `references/grammar_cheat_sheet.md`.

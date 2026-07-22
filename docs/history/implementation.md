@@ -1,4 +1,6 @@
-# LFS Cloud Implementation Notes
+# LFS Cloud Historical Implementation Notes
+
+> This document preserves the design record and completed implementation checklist from before the first release-oriented documentation rewrite. It may contain superseded plans and is not the current user guide. Start with the [project README](../../README.md) and [configuration guide](../configuration.md).
 
 ## Goal
 
@@ -144,11 +146,7 @@ Bitbucket repo D
 
 This implies a plugin/adapter boundary for both repository providers and storage providers. The LFS protocol surface remains stable while the server dispatches to the configured repo auth adapter and storage adapter.
 
-Repository authorization receives a configured stable repository identity and
-an explicit per-session authentication context containing the provider actor
-and its private access token. The context redacts the token from debug output,
-and production batch handling dispatches through the same provider trait used
-by test adapters rather than calling a concrete provider client directly.
+Repository authorization receives a configured stable repository identity and an explicit per-session authentication context containing the provider actor and its private access token. The context redacts the token from debug output, and production batch handling dispatches through the same provider trait used by test adapters rather than calling a concrete provider client directly.
 
 ## Server Configuration
 
@@ -243,51 +241,19 @@ When a request arrives, the server should:
 
 If a repository is not listed in the server config, the server should deny it by default. This prevents arbitrary repositories from using the instance and makes storage routing explicit.
 
-GitHub providers use one configured `personal_access_token`. This is a
-single-account mode intended for a private operator: the caller presents that
-exact PAT once to the protected login endpoint and receives a short-lived local
-LFS token. The upstream PAT is never put in Git's credential helper.
+GitHub providers use one configured `personal_access_token`. This is a single-account mode intended for a private operator: the caller presents that exact PAT once to the protected login endpoint and receives a short-lived local LFS token. The upstream PAT is never put in Git's credential helper.
 
-The server bounds each batch's object-entry count and shares one concurrency
-limit across repository and storage provider calls. Duplicate object
-identities retain duplicate response entries but perform one storage lookup.
-Permission decisions may be cached only briefly and scoped to the exact local
-session, repository, and read/write operation. Google access-token requests to
-`gcloud` are single-flight and reuse the token only until shortly before its
-reported expiry.
+The server bounds each batch's object-entry count and shares one concurrency limit across repository and storage provider calls. Duplicate object identities retain duplicate response entries but perform one storage lookup. Permission decisions may be cached only briefly and scoped to the exact local session, repository, and read/write operation. Google access-token requests to `gcloud` are single-flight and reuse the token only until shortly before its reported expiry.
 
-The server also admits at most the configured number of active HTTP requests
-across all routes, rejecting overload instead of queueing it. Authenticated
-batch bodies have separate 15-second idle and 60-second total read deadlines,
-so continuing to drip bytes cannot evade the overall bound.
+The server also admits at most the configured number of active HTTP requests across all routes, rejecting overload instead of queueing it. Authenticated batch bodies have separate 15-second idle and 60-second total read deadlines, so continuing to drip bytes cannot evade the overall bound.
 
-Upload staging has dedicated process-wide and stable-provider-user concurrency
-limits because each upload retains a temporary file while backend I/O
-completes. Before reading a body, the server atomically reserves its declared
-size against aggregate staging capacity and keeps that weighted reservation
-with the temporary file. A live filesystem free-space check with reserved
-headroom remains a secondary defense against non-server disk use.
+Upload staging has dedicated process-wide and stable-provider-user concurrency limits because each upload retains a temporary file while backend I/O completes. Before reading a body, the server atomically reserves its declared size against aggregate staging capacity and keeps that weighted reservation with the temporary file. A live filesystem free-space check with reserved headroom remains a secondary defense against non-server disk use.
 
-The metadata directory also owns durable object-keyed upload lock files. Every
-MVP server process writing to the same Google Drive root must share that
-metadata location. The lock spans the final existence check, Drive write, and
-metadata record, so retries and independent processes cannot both create the
-same object during normal operation. If an older race already left multiple
-exact Drive matches, lookup validates each returned candidate and consistently
-uses the lexicographically smallest Drive file ID instead of making the object
-unreadable. Cross-host multi-writer deployment remains outside the MVP.
+The metadata directory also owns durable object-keyed upload lock files. Every MVP server process writing to the same Google Drive root must share that metadata location. The lock spans the final existence check, Drive write, and metadata record, so retries and independent processes cannot both create the same object during normal operation. If an older race already left multiple exact Drive matches, lookup validates each returned candidate and consistently uses the lexicographically smallest Drive file ID instead of making the object unreadable. Cross-host multi-writer deployment remains outside the MVP.
 
-SIGINT and SIGTERM initiate graceful server shutdown: listener admission stops
-immediately, while active batch and object-transfer requests receive a bounded
-30-second drain period. Once the deadline expires, process shutdown proceeds;
-content-addressed clients can safely retry an interrupted transfer after the
-server restarts.
+SIGINT and SIGTERM initiate graceful server shutdown: listener admission stops immediately, while active batch and object-transfer requests receive a bounded 30-second drain period. Once the deadline expires, process shutdown proceeds; content-addressed clients can safely retry an interrupted transfer after the server restarts.
 
-Each mapping also persists the repository provider's stable repository ID.
-Authorization resolves the current repository at the configured owner/name and
-denies access unless that provider ID still matches, preventing repository
-rename or name reuse from changing which repository owns an existing LFS
-storage namespace.
+Each mapping also persists the repository provider's stable repository ID. Authorization resolves the current repository at the configured owner/name and denies access unless that provider ID still matches, preventing repository rename or name reuse from changing which repository owns an existing LFS storage namespace.
 
 ## Deployment Strategy
 
@@ -315,11 +281,7 @@ For example:
 lfscloud serve --config ./lfscloud.yml --port 8080
 ```
 
-By default, the CLI can bind to `127.0.0.1` for safer single-machine use. LAN
-exposure should use HTTPS through trusted TLS termination. Plaintext LAN
-development must be explicitly enabled with `server.allow_insecure_http: true`
-and the matching client `--allow-insecure-http` flag before binding to `0.0.0.0`
-or a selected interface:
+By default, the CLI can bind to `127.0.0.1` for safer single-machine use. LAN exposure should use HTTPS through trusted TLS termination. Plaintext LAN development must be explicitly enabled with `server.allow_insecure_http: true` and the matching client `--allow-insecure-http` flag before binding to `0.0.0.0` or a selected interface:
 
 ```bash
 lfscloud serve --config ./lfscloud.yml --host 0.0.0.0 --port 8080
@@ -493,49 +455,19 @@ PAT login flow:
 5. Git LFS uses that credential for batch/upload/download requests.
 ```
 
-Interactive CLI token entry must disable terminal echo before reading the
-local bearer token and restore the previous terminal mode afterward. Piped
-input remains available for automation. Both paths enforce the local session
-token's 1,024-byte maximum while reading, rather than allocating an unbounded
-line, strip the final LF or CRLF delimiter, and trim only surrounding ASCII
-whitespace before validation.
+Interactive CLI token entry must disable terminal echo before reading the local bearer token and restore the previous terminal mode afterward. Piped input remains available for automation. Both paths enforce the local session token's 1,024-byte maximum while reading, rather than allocating an unbounded line, strip the final LF or CRLF delimiter, and trim only surrounding ASCII whitespace before validation.
 
-GitHub login must return the authenticated account's immutable numeric user ID.
-The local session retains that ID, and repository permission checks compare it
-with the collaborator response's nested user ID before granting access. The
-mutable login remains useful for the API path but is not sufficient identity.
+GitHub login must return the authenticated account's immutable numeric user ID. The local session retains that ID, and repository permission checks compare it with the collaborator response's nested user ID before granting access. The mutable login remains useful for the API path but is not sufficient identity.
 
-Production sessions persist in SQLite until their short-lived expiry so a
-server restart does not invalidate credentials already stored by Git. Persist
-only a SHA-256 digest of the local bearer token. Authenticated-encrypt the
-private GitHub PAT together with the session identity and timestamps using a
-dedicated key derived from the configured PAT; never store either token in
-plaintext.
+Production sessions persist in SQLite until their short-lived expiry so a server restart does not invalidate credentials already stored by Git. Persist only a SHA-256 digest of the local bearer token. Authenticated-encrypt the private GitHub PAT together with the session identity and timestamps using a dedicated key derived from the configured PAT; never store either token in plaintext.
 
-Session admission is bounded to 16 active credentials and eight successful
-issuances per minute for each stable provider user, plus 1,024 active
-credentials process-wide. Capacity exhaustion returns HTTP 429 with a
-`Retry-After` value rather than evicting an unrelated active credential.
+Session admission is bounded to 16 active credentials and eight successful issuances per minute for each stable provider user, plus 1,024 active credentials process-wide. Capacity exhaustion returns HTTP 429 with a `Retry-After` value rather than evicting an unrelated active credential.
 
-The PAT migration invalidates durable sessions issued by the removed GitHub
-OAuth flow in a one-time metadata migration. Those rows were protected by the
-former OAuth client secret and must be removed before the PAT-derived session
-key loads active rows, so an upgrade requires login again instead of preventing
-server startup.
+The PAT migration invalidates durable sessions issued by the removed GitHub OAuth flow in a one-time metadata migration. Those rows were protected by the former OAuth client secret and must be removed before the PAT-derived session key loads active rows, so an upgrade requires login again instead of preventing server startup.
 
-The authenticated `DELETE /auth/session` endpoint revokes the presented local
-LFS credential. `lfscloud logout` calls that endpoint before erasing the
-repository-scoped Git credential, while an already expired or revoked session
-still permits local cleanup. Unexpected server failures preserve the local
-credential for retry. A definitive upstream GitHub authentication rejection
-also revokes the corresponding local session so a stale local bearer token
-cannot keep retrying with invalid private provider credentials.
+The authenticated `DELETE /auth/session` endpoint revokes the presented local LFS credential. `lfscloud logout` calls that endpoint before erasing the repository-scoped Git credential, while an already expired or revoked session still permits local cleanup. Unexpected server failures preserve the local credential for retry. A definitive upstream GitHub authentication rejection also revokes the corresponding local session so a stale local bearer token cannot keep retrying with invalid private provider credentials.
 
-Require the user to present the exact configured GitHub PAT over HTTPS (or
-literal loopback HTTP) before issuing a local LFS session. Prefer a fine-grained
-PAT limited to the configured repositories. This remains inappropriate as a
-multi-user identity model because every session represents the one configured
-account.
+Require the user to present the exact configured GitHub PAT over HTTPS (or literal loopback HTTP) before issuing a local LFS session. Prefer a fine-grained PAT limited to the configured repositories. This remains inappropriate as a multi-user identity model because every session represents the one configured account.
 
 Storage-provider credentials should be backend credentials controlled by the service owner or instance administrator, not by every Git user. For a single-owner prototype, the service uses one Google account's isolated Google Cloud CLI Application Default Credentials (ADC) directory to access the backing Drive folder; LFS Cloud asks `gcloud` for short-lived access tokens without parsing the generated ADC file. For a multi-tenant or shared instance, each configured storage provider should have its own isolated ADC directory and policy boundary.
 
@@ -601,8 +533,7 @@ lfscloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 - LFS pointers discovered
 - objects already present locally
 - objects that would be fetched from the source LFS provider
-- local source-object availability and target-object existence as unknown until
-  execution checks the configured storage provider
+- local source-object availability and target-object existence as unknown until execution checks the configured storage provider
 - local files and config files that would be touched
 - source endpoint configuration and local Git LFS availability
 - target LFS Cloud server TCP reachability
@@ -610,28 +541,11 @@ lfscloud migrate --server http://127.0.0.1:8080 --all-refs --dry-run
 - configured storage credential loading
 - warnings for missing objects, unsupported purge, quota risks, or permission gaps
 
-The dry-run readiness section is intentionally local and must label that scope
-explicitly. It does not verify source repository access, target server
-authentication or repository permission, or Drive root access, because the
-dry-run must not contact remote providers. Live access validation remains a
-server startup/runtime or future execution preflight responsibility. Target
-object counts must therefore remain explicitly unknown during dry-run; do not
-infer uploads from local source availability because execution skips objects
-already present at the destination.
+The dry-run readiness section is intentionally local and must label that scope explicitly. It does not verify source repository access, target server authentication or repository permission, or Drive root access, because the dry-run must not contact remote providers. Live access validation remains a server startup/runtime or future execution preflight responsibility. Target object counts must therefore remain explicitly unknown during dry-run; do not infer uploads from local source availability because execution skips objects already present at the destination.
 
-Migration uses one explicit source Git remote, defaulting to `origin`, for
-remote-scoped LFS endpoint discovery, source fetches, and remote-tracking refs
-included by all-ref scans. The target repository identity comes from `origin`.
-The plan must show both remote names and provider repository identities. If the
-identities differ, require `--allow-cross-remote` before planning or executing
-the cross-repository copy. All-ref scans may include repository-owned local
-branches and tags, but must not admit remote-tracking refs from an unselected
-remote.
+Migration uses one explicit source Git remote, defaulting to `origin`, for remote-scoped LFS endpoint discovery, source fetches, and remote-tracking refs included by all-ref scans. The target repository identity comes from `origin`. The plan must show both remote names and provider repository identities. If the identities differ, require `--allow-cross-remote` before planning or executing the cross-repository copy. All-ref scans may include repository-owned local branches and tags, but must not admit remote-tracking refs from an unselected remote.
 
-Git commands used for dry-run discovery must disable partial-clone lazy
-fetching. A pointer blob that is not stored locally must produce an explicit
-availability error rather than silently transferring data from a promisor
-remote.
+Git commands used for dry-run discovery must disable partial-clone lazy fetching. A pointer blob that is not stored locally must produce an explicit availability error rather than silently transferring data from a promisor remote.
 
 The migration should not need to rewrite Git history in the common case. Existing Git LFS pointer files already contain stable object IDs and sizes:
 
@@ -660,10 +574,7 @@ Suggested flow:
 11. Report source-provider cleanup options.
 ```
 
-Source fetch commands must override all Git LFS recent-fetch settings so the
-reviewed migration mode alone determines which refs and commits are fetched.
-In particular, inherited `lfs.fetchrecentalways=true` must not widen a current
-or selected-ref migration, or implicitly combine recent mode with `--all`.
+Source fetch commands must override all Git LFS recent-fetch settings so the reviewed migration mode alone determines which refs and commits are fetched. In particular, inherited `lfs.fetchrecentalways=true` must not widen a current or selected-ref migration, or implicitly combine recent mode with `--all`.
 
 Migration modes:
 
@@ -683,12 +594,7 @@ all refs
 
 The safest default should be to migrate the current checkout and warn if other refs still reference objects that have not been copied. For a full provider move, the user should choose an explicit all-refs mode. In all-refs mode, the command should fetch refs first, enumerate LFS pointers across those refs, fetch missing object bytes from the source LFS provider, and upload every discovered object to LFS Cloud.
 
-The `--purge-source-lfs` option should be best-effort and provider-dependent.
-It should never claim to guarantee deletion unless the source provider exposes
-a supported object-deletion API and the operation succeeds. A plan is not a
-migration receipt: purge input must include only objects proven uploaded and
-integrity-verified by a durable completion record. Dry-run output may identify
-planned candidates, but must not emit a purge manifest.
+The `--purge-source-lfs` option should be best-effort and provider-dependent. It should never claim to guarantee deletion unless the source provider exposes a supported object-deletion API and the operation succeeds. A plan is not a migration receipt: purge input must include only objects proven uploaded and integrity-verified by a durable completion record. Dry-run output may identify planned candidates, but must not emit a purge manifest.
 
 For GitHub specifically, this is an important limitation:
 
@@ -843,32 +749,9 @@ lfscloud gc
   remove local cached objects not referenced by any registered repo/worktree
 ```
 
-The versioned worktree registry encodes platform-native path units rather than
-requiring UTF-8. This keeps valid non-UTF-8 Unix worktree and Git-directory
-paths eligible for garbage-collection tracking while retaining read
-compatibility with the original UTF-8-only registry schema.
+The versioned worktree registry encodes platform-native path units rather than requiring UTF-8. This keeps valid non-UTF-8 Unix worktree and Git-directory paths eligible for garbage-collection tracking while retaining read compatibility with the original UTF-8-only registry schema.
 
-Hydration and dehydration serialize operations for the same worktree path.
-Their CLI boundary canonicalizes the requested file's parent and proves it
-remains under the discovered worktree. The final path component must be a
-regular file, never a symbolic link; worktree reads use no-follow opens where
-the platform provides them, and displaced-file verification repeats that
-check after atomic publication so a raced symlink is restored rather than
-followed or discarded.
-On macOS and Linux, destructive publication atomically exchanges the proposed
-file with the current path, verifies the displaced bytes, and exchanges them
-back if an edit landed during publication. Dehydration hashes uncached
-worktree bytes while staging the cache copy, then relies on the displaced-byte
-verification as its decisive final identity check. This bounds large
-worktree-file traversal to two reads when populating the cache and one when a
-verified cache object already exists, without weakening concurrent-edit
-rollback. A failed rollback retains the displaced bytes at a reported recovery
-path rather than deleting them. Platforms without exchange-rename support
-retain the path lock and final identity check before atomic replacement.
-On Unix, cache materialization into a path that does not yet exist publishes it
-with owner-only `0600` permissions. Pointer hydration instead preserves the
-existing worktree mode, so Git's executable bit survives without broadening
-access beyond the checked-out file's permissions.
+Hydration and dehydration serialize operations for the same worktree path. Their CLI boundary canonicalizes the requested file's parent and proves it remains under the discovered worktree. The final path component must be a regular file, never a symbolic link; worktree reads use no-follow opens where the platform provides them, and displaced-file verification repeats that check after atomic publication so a raced symlink is restored rather than followed or discarded. On macOS and Linux, destructive publication atomically exchanges the proposed file with the current path, verifies the displaced bytes, and exchanges them back if an edit landed during publication. Dehydration hashes uncached worktree bytes while staging the cache copy, then relies on the displaced-byte verification as its decisive final identity check. This bounds large worktree-file traversal to two reads when populating the cache and one when a verified cache object already exists, without weakening concurrent-edit rollback. A failed rollback retains the displaced bytes at a reported recovery path rather than deleting them. Platforms without exchange-rename support retain the path lock and final identity check before atomic replacement. On Unix, cache materialization into a path that does not yet exist publishes it with owner-only `0600` permissions. Pointer hydration instead preserves the existing worktree mode, so Git's executable bit survives without broadening access beyond the checked-out file's permissions.
 
 There are two likely implementation strategies:
 
@@ -1003,23 +886,15 @@ These decisions define the first working local-network MVP.
 
 ### Project Shape
 
-Use a single root Rust package for the MVP, with a library target for shared
-logic and a small binary target for CLI entry points. The current scaffold
-already follows this shape through `src/lib.rs` and `src/main.rs`.
+Use a single root Rust package for the MVP, with a library target for shared logic and a small binary target for CLI entry points. The current scaffold already follows this shape through `src/lib.rs` and `src/main.rs`.
 
-Do not split into a Cargo workspace until module boundaries become concrete
-enough to justify separate crates. The expected pressure points are the CLI,
-server protocol, provider adapters, storage adapters, migration logic, and local
-cache/materialization code. Keeping those areas as root-package modules first
-avoids creating crate boundaries before their public APIs are proven.
+Do not split into a Cargo workspace until module boundaries become concrete enough to justify separate crates. The expected pressure points are the CLI, server protocol, provider adapters, storage adapters, migration logic, and local cache/materialization code. Keeping those areas as root-package modules first avoids creating crate boundaries before their public APIs are proven.
 
-The root package should preserve clean internal boundaries so a later workspace
-split can move modules into crates without changing user-facing behavior.
+The root package should preserve clean internal boundaries so a later workspace split can move modules into crates without changing user-facing behavior.
 
 ### Baseline Dependency Set
 
-The MVP root package starts with dependencies that match the planned feature
-areas:
+The MVP root package starts with dependencies that match the planned feature areas:
 
 | Area                        | Crate(s)                        | Reason                                        |
 | --------------------------- | ------------------------------- | --------------------------------------------- |
@@ -1036,9 +911,7 @@ areas:
 | Temporary files             | `tempfile`                      | Upload staging before hash/size verification  |
 | Manifest architecture tests | `toml`                          | Parse `Cargo.toml` in project-shape tests     |
 
-Use the `config` crate with only its YAML feature enabled for server
-configuration. Avoid adding a direct dependency on deprecated YAML parsers.
-Use `reqwest` with Rustls and no default TLS features for provider HTTP calls.
+Use the `config` crate with only its YAML feature enabled for server configuration. Avoid adding a direct dependency on deprecated YAML parsers. Use `reqwest` with Rustls and no default TLS features for provider HTTP calls.
 
 ### Supported Providers
 
@@ -1058,10 +931,7 @@ The code should still use repository-provider and storage-provider traits/interf
 
 ### Authentication
 
-Use one configured GitHub PAT for single-account login, then store only the
-resulting LFS Cloud credential through Git's credential helper. Prefer a
-fine-grained PAT restricted to the configured repositories and the minimum
-permissions needed for repository permission checks.
+Use one configured GitHub PAT for single-account login, then store only the resulting LFS Cloud credential through Git's credential helper. Prefer a fine-grained PAT restricted to the configured repositories and the minimum permissions needed for repository permission checks.
 
 Target flow:
 
@@ -1081,10 +951,7 @@ git lfs client
   sends token to LFS Cloud for batch/upload/download requests
 ```
 
-The PAT exchange route must require the caller to present the exact configured
-PAT over protected transport. It must never expose an unauthenticated route
-that mints sessions as the configured account, and its response must contain
-only the local LFS Cloud token and non-secret identity metadata.
+The PAT exchange route must require the caller to present the exact configured PAT over protected transport. It must never expose an unauthenticated route that mints sessions as the configured account, and its response must contain only the local LFS Cloud token and non-secret identity metadata.
 
 For GitHub permission checks, use:
 
@@ -1115,13 +982,7 @@ repo B -> Google Drive storage provider B
 repo C -> Google Drive storage provider A
 ```
 
-Use `https://www.googleapis.com/auth/drive.file` for the MVP Google Drive
-OAuth scope. This keeps Drive access per-file/app-accessible rather than
-requesting the restricted full-Drive scope. The configured `root_folder_id`
-must therefore refer to a folder that the app created, opened through the app's
-setup flow, or was otherwise explicitly made accessible to this OAuth client.
-Do not treat an arbitrary manually copied folder ID as valid merely because it
-exists in the user's Drive.
+Use `https://www.googleapis.com/auth/drive.file` for the MVP Google Drive OAuth scope. This keeps Drive access per-file/app-accessible rather than requesting the restricted full-Drive scope. The configured `root_folder_id` must therefore refer to a folder that the app created, opened through the app's setup flow, or was otherwise explicitly made accessible to this OAuth client. Do not treat an arbitrary manually copied folder ID as valid merely because it exists in the user's Drive.
 
 Best MVP storage setup procedure:
 
@@ -1134,53 +995,21 @@ lfscloud.yml stores the root_folder_id and gcloud ADC directory
 
 Avoid requiring full-Drive access merely to browse for arbitrary folders. If a manually created folder is used, the setup flow must verify that the app can create, list, read, and delete test objects under that folder before accepting the config.
 
-Server startup validates every configured root folder with a safe `files.get`
-metadata request before binding its listener. The startup check asks `gcloud`
-for an ADC access token, confirms that the ID resolves to a live Drive folder,
-and verifies that the credential can add child objects there. The access token
-remains cached for transfer use. Resumable upload and download paths remain
-responsible for transfer-level verification.
+Server startup validates every configured root folder with a safe `files.get` metadata request before binding its listener. The startup check asks `gcloud` for an ADC access token, confirms that the ID resolves to a live Drive folder, and verifies that the credential can add child objects there. The access token remains cached for transfer use. Resumable upload and download paths remain responsible for transfer-level verification.
 
-New Drive objects are placed in deterministic SHA-256 prefix folders below the
-configured root folder:
+New Drive objects are placed in deterministic SHA-256 prefix folders below the configured root folder:
 
 ```text
 lfscloud-sha256-<first-2>/sha256-<oid>-<size>.lfs
 ```
 
-The 256 logical shard names bound each new object's folder population while
-private `appProperties` retain repository namespace, object-key version,
-SHA-256 OID, and byte size identity. Concurrent creators may leave duplicate
-physical folders for one logical shard; discovery checks every matching folder
-and reconciles exact object duplicates by the smallest Drive file ID. Objects
-written by older releases directly under the configured root remain readable.
+The 256 logical shard names bound each new object's folder population while private `appProperties` retain repository namespace, object-key version, SHA-256 OID, and byte size identity. Concurrent creators may leave duplicate physical folders for one logical shard; discovery checks every matching folder and reconciles exact object duplicates by the smallest Drive file ID. Objects written by older releases directly under the configured root remain readable.
 
-Google Drive file IDs remain the backend address and SQLite is the hot-path
-index. Server lookups first issue `files.get` for a stored backend ID and
-verify its private properties plus binary size. A missing or mismatched ID
-falls back to root and shard discovery. If discovery finds a replacement, the
-metadata row is repaired while preserving original creator attribution; if it
-does not, the unchanged mapping is marked stale. Repository namespaces remain
-raw while their UTF-8 value plus the property key fits Drive's 124-byte
-property-string limit. Oversized namespaces use a SHA-256 value plus an
-explicit format property, keeping the backend identity bounded without making
-a digest-shaped raw namespace ambiguous. Discovery follows every Drive list
-page and rejects repeated page tokens rather than looping forever.
+Google Drive file IDs remain the backend address and SQLite is the hot-path index. Server lookups first issue `files.get` for a stored backend ID and verify its private properties plus binary size. A missing or mismatched ID falls back to root and shard discovery. If discovery finds a replacement, the metadata row is repaired while preserving original creator attribution; if it does not, the unchanged mapping is marked stale. Repository namespaces remain raw while their UTF-8 value plus the property key fits Drive's 124-byte property-string limit. Oversized namespaces use a SHA-256 value plus an explicit format property, keeping the backend identity bounded without making a digest-shaped raw namespace ambiguous. Discovery follows every Drive list page and rejects repeated page tokens rather than looping forever.
 
-Use Google Drive resumable uploads for large object writes. Stage uploads to a
-local temp file so SHA-256 and size are verified before opening a Drive session.
-Send the verified file in 256 KiB-aligned chunks, except for the final chunk.
-After an interrupted transfer or retryable provider response, query the same
-session for its committed range and continue from Drive's reported next byte.
-Bound consecutive recovery probes with exponential backoff; an expired session
-returns a retryable failure so the outer idempotent upload path can re-check
-existence before creating a replacement session.
+Use Google Drive resumable uploads for large object writes. Stage uploads to a local temp file so SHA-256 and size are verified before opening a Drive session. Send the verified file in 256 KiB-aligned chunks, except for the final chunk. After an interrupted transfer or retryable provider response, query the same session for its committed range and continue from Drive's reported next byte. Bound consecutive recovery probes with exponential backoff; an expired session returns a retryable failure so the outer idempotent upload path can re-check existence before creating a replacement session.
 
-Google provider clients bound connection establishment to 10 seconds. Object
-transfers intentionally have no total request timeout because healthy large
-uploads and downloads can run for a long time. Instead, a 30-second idle
-watchdog resets on upload body progress, upload response reads, and each Drive
-download read; a stalled operation returns a retryable storage failure.
+Google provider clients bound connection establishment to 10 seconds. Object transfers intentionally have no total request timeout because healthy large uploads and downloads can run for a long time. Instead, a 30-second idle watchdog resets on upload body progress, upload response reads, and each Drive download read; a stalled operation returns a retryable storage failure.
 
 ### Transfer Mode
 
@@ -1196,20 +1025,11 @@ Direct signed URLs are not part of the MVP. They are a future optimization for S
 
 Use SQLite for MVP metadata.
 
-The migration runner reads and validates SQLite's `user_version` before any
-schema statement. A database created by a newer binary is rejected without
-modification so an older binary cannot partially rewrite an unknown schema.
+The migration runner reads and validates SQLite's `user_version` before any schema statement. A database created by a newer binary is rejected without modification so an older binary cannot partially rewrite an unknown schema.
 
-Startup reconciles the current repository configuration transactionally.
-Mappings removed from configuration remain as inactive historical parents for
-object and transfer records, while their route keys are tombstoned before the
-current mappings are upserted so a rename or route reassignment cannot be
-blocked by stale metadata.
+Startup reconciles the current repository configuration transactionally. Mappings removed from configuration remain as inactive historical parents for object and transfer records, while their route keys are tombstoned before the current mappings are upserted so a rename or route reassignment cannot be blocked by stale metadata.
 
-The MVP retains one serialized SQLite connection, but async request handlers
-must dispatch synchronous database operations through Tokio's blocking pool.
-Startup migrations and configuration reconciliation may remain synchronous
-because they complete before the listener admits requests.
+The MVP retains one serialized SQLite connection, but async request handlers must dispatch synchronous database operations through Tokio's blocking pool. Startup migrations and configuration reconciliation may remain synchronous because they complete before the listener admits requests.
 
 Start with repo-scoped object records:
 
@@ -1341,148 +1161,7 @@ Defer:
 
 ### Current Sprint
 
-> **Status**: Phase 6 CLI command work has started. `lfscloud serve`
-> loads validated server config, applies `--host`/`--port` overrides, opens
-> server-owned metadata storage, binds an Axum listener, reports local and
-> best-effort LAN URLs, resolves configured repository LFS paths, and requires
-> a valid local LFS Cloud session token before parsing Git LFS batch requests.
-> Download and upload batch operations now enforce GitHub repository read/write
-> authorization. Upload batches check configured storage availability and return
-> upload actions for missing objects, while authenticated object `PUT` uploads
-> stage bytes to a temp file, verify SHA-256 and size, write to Google Drive,
-> and record verified metadata. Download batches check configured storage
-> availability and return download actions for existing objects, while
-> authenticated object `GET` downloads directly proxy Google Drive bytes with
-> bounded memory and terminate on end-of-stream integrity failure. LFS route,
-> authentication, method, body-size, parse,
-> authorization, upload-integrity, and storage failures now use Git LFS JSON
-> error payloads with matching HTTP statuses. Upload staging now rejects object
-> sizes over the configured server cap, atomically reserves aggregate local
-> temp-directory capacity, bounds process-wide and per-user staging
-> concurrency, and times out idle client body reads.
-> Authenticated batch bodies now have idle and total read deadlines, while a
-> process-wide request admission limit rejects overload without queueing.
-> The binary now uses a testable `clap` root command with shared `--config`
-> and `--log-level` flags, initializes tracing from CLI or `RUST_LOG`, and
-> dispatches `serve` through the server runtime. CLI support code can now
-> detect the current Git worktree and parse GitHub-style HTTPS/SSH remotes
-> into host, owner, and repository name components. `lfscloud init --server`
-> now resolves the current repository's intended Git LFS endpoint, writes or
-> updates `.lfsconfig` with a before/after `lfs.url` summary, and supports
-> `--local` for writing only repository-local Git config. The `lfscloud login`
-> command prompts for the configured single-account PAT, exchanges it through
-> the protected server route, and stores only the returned
-> local token in Git's credential helper for the current repository's LFS URL.
-> The `lfscloud logout` command authenticates session revocation with that
-> local token before erasing the repository-scoped Git credential, and the
-> server also revokes sessions after definitive upstream authentication denial.
-> The `lfscloud status` command now checks the current Git repository against
-> loaded server config, probes configured server TCP reachability, verifies a
-> local LFS credential for the derived repository LFS URL, validates the
-> configured storage credential reference, and reports local cache directory
-> readiness.
-> Local cache path helpers now define the shared content-addressed object layout
-> under `~/.lfscloud/objects`, using two-level SHA-256 sharding. Existing
-> repository-local Git LFS cache objects can now be ingested into that shared
-> cache only after SHA-256 and byte-size verification, and already cached
-> objects are reverified before reuse. Local cache roots now also track
-> registered repository worktrees in a versioned `worktrees.json` registry so
-> future garbage collection can inspect known cache consumers before deleting
-> shared objects. Verified cache objects can now be materialized into worktree
-> paths with confirmed macOS `fclonefileat` copy-on-write cloning where available and
-> fallback copying elsewhere; matching Git LFS pointer files can be hydrated
-> from the shared cache while non-pointer worktree content is left untouched.
-> Clean hydrated worktree files can now be dehydrated back to canonical Git LFS
-> pointer files only when they are contained, Git-tracked `filter=lfs` paths
-> whose index pointers identify the same bytes. Verified bytes are preserved in
-> both the shared cache and repository Git LFS media so a later
-> `git lfs push` remains complete; dirty or unrelated worktree content is left
-> untouched. Cache
-> ingest and worktree materialization operations share a cross-process lock,
-> while garbage collection takes that lock exclusively. Dehydration retains
-> its shared lock from cache publication through pointer publication so GC
-> cannot delete the newly preserved object in between those steps.
-> The `hydrate` and `dehydrate` CLI commands now expose those local cache
-> operations for explicit path lists, including `--cache-root` overrides for
-> tests or non-default local cache locations. The `gc` CLI command now asks Git
-> for NUL-delimited tracked paths in registered worktrees and retains pointer
-> references only when the effective index attribute is `filter=lfs`; ignored,
-> untracked, generated, and tracked non-LFS files cannot pin shared objects. It
-> then removes unreferenced shared cache objects. An unavailable registered root
-> conservatively protects all objects it might reference;
-> `--prune-unavailable-worktrees` is required
-> to declare those roots permanently abandoned before collection proceeds.
-> `gc` also supports `--dry-run` for review before deletion. The `pull` CLI command now runs
-> `git lfs fetch`, ingests fetched current-checkout objects from Git LFS media
-> storage into the shared cache, and hydrates LFS-tracked pointer files with
-> verified cache bytes. Pull fetches drain stdout and stderr concurrently with
-> fixed retention limits, enforce a six-hour execution deadline, and terminate
-> the fetch process tree before returning on timeout or output overflow.
-> Migration discovery support can now inspect an existing Git worktree for
-> local Git LFS installation status, visible LFS filter config, repository LFS
-> endpoint config, and `.gitattributes` patterns that declare `filter=lfs`,
-> without mutating Git config, worktree files, cache state, or storage. Current
-> checkout migration scanning can now ask Git for index paths with `filter=lfs`
-> and parse the corresponding index blobs into object identities. This keeps
-> hydrated files and paths omitted by sparse checkout in scope while excluding
-> non-LFS pointer-shaped fixtures. Selected-ref and all-fetched-ref migration
-> scans can now walk Git history through one persistent batch-object process,
-> reuse unchanged tree and blob summaries across commits, cache historical
-> `filter=lfs` decisions by attribute state and candidate paths, and parse
-> pointer blobs without checking out refs or mutating local state. Read-only
-> migration Git subprocesses disable lazy fetching, and a
-> pointer blob that exists only on a promisor remote produces an explicit local
-> availability error. Migration transfer planning can now check discovered object identities
-> against both repository Git LFS media storage and an optional shared
-> LFS Cloud cache, verifying SHA-256 and size before treating local bytes as
-> available. Missing migration objects can now be fetched from the source Git
-> LFS provider into local media storage without smudging or changing worktree
-> files. Locally available migration objects can now be uploaded idempotently
-> to the configured storage provider, with source bytes rechecked against
-> pointer hashes and sizes before upload and provider-returned identities
-> validated after upload. The upload helper bounds concurrent transfers,
-> synchronizes completed objects into a provider-specific JSON Lines checkpoint,
-> resumes durable completions without repeating provider work, and reports
-> per-object failures while independent transfers finish. The
-> `migrate --dry-run` CLI command can now build a
-> read-only migration plan for the current checkout, selected refs, or all
-> fetched refs, reporting tracked LFS patterns, scanned refs, planned config
-> writes, discovered objects, source fetch/upload counts, byte totals, separate
-> Git LFS/filter readiness, and explicit warnings for missing local sources,
-> unprobed permissions, storage quota/capacity, and unsupported purge behavior.
-> These remain explicitly local readiness results and require no fetching,
-> uploading, Git config writes, cache creation, metadata access, or storage
-> contact. The default current-checkout report labels its
-> index-only scope prominently and warns that unscanned refs may reference
-> additional LFS objects. `migrate --dry-run --purge-source-lfs` now
-> includes GitHub source LFS cleanup helper text and the GitHub Support flow,
-> but withholds purge input because planning has not verified any destination
-> upload. Future purge manifests must come from a durable, integrity-verified
-> migration receipt.
-> Fixture-repository tests now cover hydrated and sparse current checkouts,
-> selected refs, all refs, shallow-history rejection, missing objects, and CLI dry-run no-op migration
-> behavior. A local
-> fake-provider end-to-end test now covers repository init routing, fake GitHub
-> authorization, server-routed fake Drive upload/download actions, and checkout
-> hydration through the shared cache. Security review found and fixed a GitHub
-> OAuth client-secret debug-output leak in loaded server config, and
-> `scripts/manual/verify-secret-redaction.sh` now runs the focused redaction
-> regression checks. `scripts/manual/verify-lan-smoke-test.sh` now verifies
-> local LAN-serving preflight behavior and prints the cross-machine smoke test
-> checklist for disposable GitHub/Google Drive validation. Server
-> configuration docs now include GitHub plus Google Drive `lfscloud.yml`
-> examples, credential-reference behavior, metadata defaults, and validation
-> rules. The README now distinguishes implemented commands from the remaining
-> full migration execution work, and install/build docs define the current
-> local binary and release-artifact expectations. Gated external integration
-> checks now cover disposable GitHub repository permission validation,
-> disposable Google Drive folder root validation, and a GitHub-authorized
-> black-box transfer through the compiled server and real Git LFS client. The
-> full transfer scenario keeps normal Git transport in a disposable bare
-> repository while GitHub authorizes every LFS operation, uploads and downloads
-> LFS bytes through Google Drive, verifies private Drive object properties,
-> durable SQLite metadata, checkout byte integrity, and provider-resource
-> cleanup when explicitly enabled with real credentials.
+> **Status**: Phase 6 CLI command work has started. `lfscloud serve` loads validated server config, applies `--host`/`--port` overrides, opens server-owned metadata storage, binds an Axum listener, reports local and best-effort LAN URLs, resolves configured repository LFS paths, and requires a valid local LFS Cloud session token before parsing Git LFS batch requests. Download and upload batch operations now enforce GitHub repository read/write authorization. Upload batches check configured storage availability and return upload actions for missing objects, while authenticated object `PUT` uploads stage bytes to a temp file, verify SHA-256 and size, write to Google Drive, and record verified metadata. Download batches check configured storage availability and return download actions for existing objects, while authenticated object `GET` downloads directly proxy Google Drive bytes with bounded memory and terminate on end-of-stream integrity failure. LFS route, authentication, method, body-size, parse, authorization, upload-integrity, and storage failures now use Git LFS JSON error payloads with matching HTTP statuses. Upload staging now rejects object sizes over the configured server cap, atomically reserves aggregate local temp-directory capacity, bounds process-wide and per-user staging concurrency, and times out idle client body reads. Authenticated batch bodies now have idle and total read deadlines, while a process-wide request admission limit rejects overload without queueing. The binary now uses a testable `clap` root command with shared `--config` and `--log-level` flags, initializes tracing from CLI or `RUST_LOG`, and dispatches `serve` through the server runtime. CLI support code can now detect the current Git worktree and parse GitHub-style HTTPS/SSH remotes into host, owner, and repository name components. `lfscloud init --server` now resolves the current repository's intended Git LFS endpoint, writes or updates `.lfsconfig` with a before/after `lfs.url` summary, and supports `--local` for writing only repository-local Git config. The `lfscloud login` command prompts for the configured single-account PAT, exchanges it through the protected server route, and stores only the returned local token in Git's credential helper for the current repository's LFS URL. The `lfscloud logout` command authenticates session revocation with that local token before erasing the repository-scoped Git credential, and the server also revokes sessions after definitive upstream authentication denial. The `lfscloud status` command now checks the current Git repository against loaded server config, probes configured server TCP reachability, verifies a local LFS credential for the derived repository LFS URL, validates the configured storage credential reference, and reports local cache directory readiness. Local cache path helpers now define the shared content-addressed object layout under `~/.lfscloud/objects`, using two-level SHA-256 sharding. Existing repository-local Git LFS cache objects can now be ingested into that shared cache only after SHA-256 and byte-size verification, and already cached objects are reverified before reuse. Local cache roots now also track registered repository worktrees in a versioned `worktrees.json` registry so future garbage collection can inspect known cache consumers before deleting shared objects. Verified cache objects can now be materialized into worktree paths with confirmed macOS `fclonefileat` copy-on-write cloning where available and fallback copying elsewhere; matching Git LFS pointer files can be hydrated from the shared cache while non-pointer worktree content is left untouched. Clean hydrated worktree files can now be dehydrated back to canonical Git LFS pointer files only when they are contained, Git-tracked `filter=lfs` paths whose index pointers identify the same bytes. Verified bytes are preserved in both the shared cache and repository Git LFS media so a later `git lfs push` remains complete; dirty or unrelated worktree content is left untouched. Cache ingest and worktree materialization operations share a cross-process lock, while garbage collection takes that lock exclusively. Dehydration retains its shared lock from cache publication through pointer publication so GC cannot delete the newly preserved object in between those steps. The `hydrate` and `dehydrate` CLI commands now expose those local cache operations for explicit path lists, including `--cache-root` overrides for tests or non-default local cache locations. The `gc` CLI command now asks Git for NUL-delimited tracked paths in registered worktrees and retains pointer references only when the effective index attribute is `filter=lfs`; ignored, untracked, generated, and tracked non-LFS files cannot pin shared objects. It then removes unreferenced shared cache objects. An unavailable registered root conservatively protects all objects it might reference; `--prune-unavailable-worktrees` is required to declare those roots permanently abandoned before collection proceeds. `gc` also supports `--dry-run` for review before deletion. The `pull` CLI command now runs `git lfs fetch`, ingests fetched current-checkout objects from Git LFS media storage into the shared cache, and hydrates LFS-tracked pointer files with verified cache bytes. Pull fetches drain stdout and stderr concurrently with fixed retention limits, enforce a six-hour execution deadline, and terminate the fetch process tree before returning on timeout or output overflow. Migration discovery support can now inspect an existing Git worktree for local Git LFS installation status, visible LFS filter config, repository LFS endpoint config, and `.gitattributes` patterns that declare `filter=lfs`, without mutating Git config, worktree files, cache state, or storage. Current checkout migration scanning can now ask Git for index paths with `filter=lfs` and parse the corresponding index blobs into object identities. This keeps hydrated files and paths omitted by sparse checkout in scope while excluding non-LFS pointer-shaped fixtures. Selected-ref and all-fetched-ref migration scans can now walk Git history through one persistent batch-object process, reuse unchanged tree and blob summaries across commits, cache historical `filter=lfs` decisions by attribute state and candidate paths, and parse pointer blobs without checking out refs or mutating local state. Read-only migration Git subprocesses disable lazy fetching, and a pointer blob that exists only on a promisor remote produces an explicit local availability error. Migration transfer planning can now check discovered object identities against both repository Git LFS media storage and an optional shared LFS Cloud cache, verifying SHA-256 and size before treating local bytes as available. Missing migration objects can now be fetched from the source Git LFS provider into local media storage without smudging or changing worktree files. Locally available migration objects can now be uploaded idempotently to the configured storage provider, with source bytes rechecked against pointer hashes and sizes before upload and provider-returned identities validated after upload. The upload helper bounds concurrent transfers, synchronizes completed objects into a provider-specific JSON Lines checkpoint, resumes durable completions without repeating provider work, and reports per-object failures while independent transfers finish. The `migrate --dry-run` CLI command can now build a read-only migration plan for the current checkout, selected refs, or all fetched refs, reporting tracked LFS patterns, scanned refs, planned config writes, discovered objects, source fetch/upload counts, byte totals, separate Git LFS/filter readiness, and explicit warnings for missing local sources, unprobed permissions, storage quota/capacity, and unsupported purge behavior. These remain explicitly local readiness results and require no fetching, uploading, Git config writes, cache creation, metadata access, or storage contact. The default current-checkout report labels its index-only scope prominently and warns that unscanned refs may reference additional LFS objects. `migrate --dry-run --purge-source-lfs` now includes GitHub source LFS cleanup helper text and the GitHub Support flow, but withholds purge input because planning has not verified any destination upload. Future purge manifests must come from a durable, integrity-verified migration receipt. Fixture-repository tests now cover hydrated and sparse current checkouts, selected refs, all refs, shallow-history rejection, missing objects, and CLI dry-run no-op migration behavior. A local fake-provider end-to-end test now covers repository init routing, fake GitHub authorization, server-routed fake Drive upload/download actions, and checkout hydration through the shared cache. Security review found and fixed a GitHub OAuth client-secret debug-output leak in loaded server config, and `scripts/manual/verify-secret-redaction.sh` now runs the focused redaction regression checks. `scripts/manual/verify-lan-smoke-test.sh` now verifies local LAN-serving preflight behavior and prints the cross-machine smoke test checklist for disposable GitHub/Google Drive validation. Server configuration docs now include GitHub plus Google Drive `lfscloud.yml` examples, credential-reference behavior, metadata defaults, and validation rules. The README now distinguishes implemented commands from the remaining full migration execution work, and install/build docs define the current local binary and release-artifact expectations. Gated external integration checks now cover disposable GitHub repository permission validation, disposable Google Drive folder root validation, and a GitHub-authorized black-box transfer through the compiled server and real Git LFS client. The full transfer scenario keeps normal Git transport in a disposable bare repository while GitHub authorizes every LFS operation, uploads and downloads LFS bytes through Google Drive, verifies private Drive object properties, durable SQLite metadata, checkout byte integrity, and provider-resource cleanup when explicitly enabled with real credentials.
 
 ### Progress Summary
 

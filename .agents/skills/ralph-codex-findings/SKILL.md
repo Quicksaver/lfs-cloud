@@ -1,5 +1,5 @@
 ---
-description: 'Ralph, the orchestrator of this project, will study the IMPLEMENTATION and README files, then loop through the implementation and assessment steps until the final body of work is achieved.'
+description: 'Ralph orchestrates the FINDINGS.md remediation loop until every recorded issue is complete.'
 name: 'ralph-codex-findings'
 ---
 
@@ -21,7 +21,7 @@ Spawn a subagent with `fork_turns: "none"`. It is to work in this branch to foll
 
 **Explicitly close the subagent when it completes its work successfully**, then reload this $ralph-codex-findings skill and continue the orchestration loop with a new subagent.
 
-Iterate until all tasks in the implementation plan are marked as complete, or until user interaction is required for any reason.
+Iterate until all tasks in `FINDINGS.md` are marked as complete, or until user interaction is required for any reason.
 
 **PERIODIC CLEANUP**: Every 10 iterations, run `cargo clean` yourself, then proceed to the next iteration.
 
