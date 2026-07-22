@@ -21,9 +21,9 @@ use lfscloud::{
     GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitHubAuthenticationConfig, GitHubPersonalAccessToken,
     GitHubProviderConfig, GitHubRepositoryPermissionClient, GitHubUserClient,
     GoogleDriveAccessToken, GoogleDriveGcloudCredentialsConfig, GoogleDriveGcloudTokenProvider,
-    GoogleDriveRootValidator, GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid,
-    MetadataDatabase, MetadataObjectVerificationStatus, RepositoryIdentity, RepositoryPermission,
-    RepositoryUser, ServerConfig,
+    GoogleDriveObjectStore, GoogleDriveRootValidator, GoogleDriveStorageConfig, LfsObject,
+    LfsObjectSize, LfsOid, MetadataDatabase, MetadataObjectVerificationStatus, RepositoryIdentity,
+    RepositoryPermission, RepositoryUser, ServerConfig,
 };
 use reqwest::{
     Client, Method, StatusCode,
@@ -439,6 +439,18 @@ async fn exercise_black_box_git_lfs_transfer(
             drive.access_token,
             &object,
         )
+        .await?;
+        git_lfs_historical_migration_round_trip(
+            test_dir.path(),
+            &config_path,
+            &server_url,
+            &lfs_url,
+            session_token.as_str(),
+            github_host,
+            repository,
+            &config,
+            drive.access_token,
+        )
         .await
     }
     .await;
@@ -689,8 +701,32 @@ impl IsolatedGit {
         require_command_success(output, context, &self.secrets)
     }
 
+    fn run_program(
+        &self,
+        cwd: Option<&Path>,
+        program: impl AsRef<Path>,
+        context: &str,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<Output, String> {
+        let mut command = Command::new(program.as_ref());
+        self.configure_environment(&mut command);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        configure(&mut command);
+        let output = command
+            .output()
+            .map_err(|error| format!("{context} should start: {error}"))?;
+        require_command_success(output, context, &self.secrets)
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new("git");
+        self.configure_environment(&mut command);
+        command
+    }
+
+    fn configure_environment(&self, command: &mut Command) {
         command
             .env("GIT_CONFIG_GLOBAL", &self.global_config)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -699,7 +735,6 @@ impl IsolatedGit {
             .env("LC_ALL", "C")
             .env("NO_COLOR", "1")
             .env_remove("GIT_CONFIG_COUNT");
-        command
     }
 }
 
@@ -789,6 +824,266 @@ fn git_lfs_push_fetch_round_trip(
     let downloaded = fs::read(checkout.join("assets/model.bin"))
         .map_err(|error| format!("downloaded Git LFS fixture should be readable: {error}"))?;
     require_equal(downloaded.as_slice(), bytes, "downloaded Git LFS bytes")
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the live migration fixture keeps every external resource and secret boundary explicit"
+)]
+async fn git_lfs_historical_migration_round_trip(
+    root: &Path,
+    config_path: &Path,
+    server_url: &str,
+    lfscloud_url: &str,
+    session_token: &str,
+    github_host: &str,
+    repository: &GitHubCreatedRepo,
+    config: &ServerConfig,
+    drive_access_token: &GoogleDriveAccessToken,
+) -> Result<(), String> {
+    let source_remote = root.join("migration-source.git");
+    let source = root.join("migration-source");
+    let checkout = root.join("migration-checkout");
+    let migration_git_root = root.join("migration-git");
+    fs::create_dir_all(&migration_git_root)
+        .map_err(|error| format!("migration Git state directory should be created: {error}"))?;
+    let git = IsolatedGit::initialize(&migration_git_root, &[session_token])?;
+    let github_remote_url = format!(
+        "https://{github_host}/{}/{}.git",
+        repository.owner.login, repository.name
+    );
+    // Keep the raw remote URL on the GitHub identity authorized by the live
+    // LFS Cloud server, but route this fixture's Git transport to a local bare
+    // source. That exercises real Git LFS historical fetches without requiring
+    // the provider PAT to carry repository-contents write permission merely
+    // for smoke-test setup.
+    git.run(None, "migration source bare repository setup", |command| {
+        command
+            .args(["init", "--bare", "--initial-branch", "main"])
+            .arg(&source_remote);
+    })?;
+    let source_lfs_url = Url::from_file_path(&source_remote)
+        .map_err(|()| "migration source path should convert to a file URL".to_owned())?;
+    git.run(None, "migration Git remote rewrite setup", |command| {
+        command.args([
+            "config",
+            "--global",
+            &format!("url.{}.insteadOf", source_lfs_url.as_str()),
+            &github_remote_url,
+        ]);
+    })?;
+    git.approve(lfscloud_url, "lfscloud", session_token)?;
+
+    git.run(
+        None,
+        "migration source repository initialization",
+        |command| {
+            command
+                .args(["init", "--initial-branch", "main"])
+                .arg(&source);
+        },
+    )?;
+    git.run(Some(&source), "migration source remote setup", |command| {
+        command
+            .args(["remote", "add", "origin"])
+            .arg(&github_remote_url);
+    })?;
+    git.run(
+        Some(&source),
+        "migration source LFS endpoint setup",
+        |command| {
+            command.args(["config", "--local", "lfs.url", source_lfs_url.as_str()]);
+        },
+    )?;
+    for (name, value) in [
+        ("user.name", "LFS Cloud Smoke Test"),
+        ("user.email", "smoke@example.invalid"),
+        ("commit.gpgSign", "false"),
+    ] {
+        git.run(Some(&source), "migration Git identity setup", |command| {
+            command.args(["config", name, value]);
+        })?;
+    }
+    git.run(Some(&source), "migration Git LFS installation", |command| {
+        command.args(["lfs", "install", "--local"]);
+    })?;
+    git.run(
+        Some(&source),
+        "migration Git LFS tracking setup",
+        |command| {
+            command.args(["lfs", "track", "assets/*.bin"]);
+        },
+    )?;
+    fs::create_dir_all(source.join("assets"))
+        .map_err(|error| format!("migration LFS fixture directory should be created: {error}"))?;
+
+    let first_bytes = b"historical live migration asset bytes\n";
+    let latest_bytes = b"latest live migration asset bytes with a changed payload\n";
+    let first_object = lfs_object_for_bytes(first_bytes)?;
+    let latest_object = lfs_object_for_bytes(latest_bytes)?;
+    fs::write(source.join("assets/model.bin"), first_bytes)
+        .map_err(|error| format!("first migration asset version should be written: {error}"))?;
+    git.run(Some(&source), "first migration asset staging", |command| {
+        command.args(["add", ".gitattributes", "assets/model.bin"]);
+    })?;
+    git.run(Some(&source), "first migration asset commit", |command| {
+        command.args(["commit", "-m", "Add first historical LFS asset"]);
+    })?;
+    let first_commit = git
+        .run(Some(&source), "first migration commit lookup", |command| {
+            command.args(["rev-parse", "HEAD"]);
+        })?
+        .stdout;
+    let first_commit = String::from_utf8(first_commit)
+        .map_err(|_| "first migration commit should be UTF-8".to_owned())?
+        .trim()
+        .to_owned();
+    git.run(Some(&source), "first source LFS version push", |command| {
+        command.args(["push", "origin", "HEAD:refs/heads/main"]);
+    })?;
+
+    fs::write(source.join("assets/model.bin"), latest_bytes)
+        .map_err(|error| format!("latest migration asset version should be written: {error}"))?;
+    git.run(Some(&source), "latest migration asset staging", |command| {
+        command.args(["add", "assets/model.bin"]);
+    })?;
+    git.run(Some(&source), "latest migration asset commit", |command| {
+        command.args(["commit", "-m", "Change historical LFS asset bytes"]);
+    })?;
+    git.run(Some(&source), "latest source LFS version push", |command| {
+        command.args(["push", "origin", "HEAD:refs/heads/main"]);
+    })?;
+
+    let source_objects = source.join(".git/lfs/objects");
+    fs::remove_dir_all(&source_objects)
+        .map_err(|error| format!("source LFS media should be cleared before migration: {error}"))?;
+    fs::create_dir_all(&source_objects)
+        .map_err(|error| format!("source LFS media should be recreated: {error}"))?;
+
+    let lfscloud_binary = env::var_os("LFS_CLOUD_SMOKE_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_lfscloud")));
+    let migration = git.run_program(
+        Some(&source),
+        &lfscloud_binary,
+        "compiled historical migration",
+        |command| {
+            command.arg("--config").arg(config_path).args([
+                "migrate",
+                "--server",
+                server_url,
+                "--all-refs",
+            ]);
+        },
+    )?;
+    let migration_output = String::from_utf8_lossy(&migration.stdout);
+    for marker in [
+        "lfscloud migrate complete",
+        "mode: all-refs",
+        "objects discovered: 2",
+        "target objects: 2 uploaded",
+        "durable receipt:",
+        "local Git config:",
+    ] {
+        if !migration_output.contains(marker) {
+            return Err(format!("historical migration output omitted {marker:?}"));
+        }
+    }
+    require_equal(
+        fs::read(source.join("assets/model.bin"))
+            .map_err(|error| format!("latest source asset should be readable: {error}"))?,
+        latest_bytes.to_vec(),
+        "latest source worktree bytes after migration",
+    )?;
+
+    let lfscloud::StorageProviderConfig::GoogleDrive(storage) =
+        &config.storage_providers[LIVE_DRIVE_PROVIDER_ID];
+    let store = GoogleDriveObjectStore::new(
+        storage.clone(),
+        &config.repositories[0].id,
+        drive_access_token.clone(),
+    )
+    .map_err(|error| format!("migration Drive object store should build: {error}"))?;
+    for object in [&first_object, &latest_object] {
+        if store
+            .lookup_object(object)
+            .await
+            .map_err(|error| format!("migrated Drive object lookup should succeed: {error}"))?
+            .is_none()
+        {
+            return Err(format!(
+                "migration did not store historical object sha256:{}",
+                object.oid.as_hex()
+            ));
+        }
+    }
+
+    git.run(
+        Some(&source),
+        "migration endpoint commit staging",
+        |command| {
+            command.args(["add", ".lfsconfig"]);
+        },
+    )?;
+    git.run(Some(&source), "migration endpoint commit", |command| {
+        command.args(["commit", "-m", "Route Git LFS through LFS Cloud"]);
+    })?;
+    git.run(Some(&source), "migration endpoint push", |command| {
+        command.args(["push", "origin", "HEAD:refs/heads/main"]);
+    })?;
+
+    git.run(None, "migrated repository pointer-only clone", |command| {
+        command
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .args(["clone", "--branch", "main"])
+            .arg(&github_remote_url)
+            .arg(&checkout);
+    })?;
+    git.run(
+        Some(&checkout),
+        "migrated checkout Git LFS installation",
+        |command| {
+            command.args(["lfs", "install", "--local"]);
+        },
+    )?;
+    git.run(Some(&checkout), "latest migrated LFS pull", |command| {
+        command.args(["lfs", "pull"]);
+    })?;
+    require_equal(
+        fs::read(checkout.join("assets/model.bin"))
+            .map_err(|error| format!("latest migrated asset should be readable: {error}"))?,
+        latest_bytes.to_vec(),
+        "latest migrated checkout bytes",
+    )?;
+
+    git.run_program(
+        Some(&checkout),
+        &lfscloud_binary,
+        "historical checkout local endpoint setup",
+        |command| {
+            command.args(["init", "--server", server_url, "--local"]);
+        },
+    )?;
+    fs::remove_dir_all(checkout.join(".git/lfs/objects"))
+        .map_err(|error| format!("checkout LFS media should be cleared: {error}"))?;
+    git.run(
+        Some(&checkout),
+        "historical pointer-only checkout",
+        |command| {
+            command
+                .env("GIT_LFS_SKIP_SMUDGE", "1")
+                .args(["checkout", "--quiet", &first_commit]);
+        },
+    )?;
+    git.run(Some(&checkout), "historical migrated LFS pull", |command| {
+        command.args(["lfs", "pull"]);
+    })?;
+    require_equal(
+        fs::read(checkout.join("assets/model.bin"))
+            .map_err(|error| format!("historical migrated asset should be readable: {error}"))?,
+        first_bytes.to_vec(),
+        "historical migrated checkout bytes",
+    )
 }
 
 fn require_command_success(

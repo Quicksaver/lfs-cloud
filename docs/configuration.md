@@ -9,6 +9,14 @@ The committed repository-side `.lfsconfig` should contain only the LFS Cloud end
     url = http://127.0.0.1:8080/github.com/octo-org/assets.git/info/lfs
 ```
 
+## Migration Configuration
+
+`lfscloud migrate` uses the repository mapping and Google Drive provider from the private server config supplied through the global `--config` option. The running server, migration command, and any other writer for the same Drive root must use the same `server.metadata_path`; migration shares its object upload locks with the server to prevent duplicate backend files.
+
+Migration obtains its own short-lived Drive token from the configured gcloud ADC directory and validates the root folder before fetching or uploading source LFS objects. It also requires an existing repository-scoped LFS Cloud login so the target endpoint is usable before the source repository is reconfigured.
+
+The completed migration writes the target URL to both `.lfsconfig` and local Git config. `.lfsconfig` is the shareable setting for new clones; the local override preserves target routing while this clone checks out historical commits that predate `.lfsconfig`.
+
 ## Minimal Local Config
 
 ```yaml

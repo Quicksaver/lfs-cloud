@@ -224,23 +224,26 @@ async function migrationDryRunSmoke(): Promise<void> {
   await git(migrationRepo, 'lfs', 'install', '--local');
   await git(migrationRepo, 'lfs', 'track', 'assets/*.bin');
   await mkdir(join(migrationRepo, 'assets'));
-  await writeFile(join(migrationRepo, 'assets', 'fixture.bin'), 'deterministic lfs smoke payload\n');
+  await writeFile(join(migrationRepo, 'assets', 'fixture.bin'), 'historical lfs smoke payload\n');
   await git(migrationRepo, 'add', '.gitattributes', 'assets/fixture.bin');
-  await git(migrationRepo, 'commit', '--quiet', '-m', 'Add existing LFS fixture');
+  await git(migrationRepo, 'commit', '--quiet', '-m', 'Add first LFS fixture version');
+  await writeFile(join(migrationRepo, 'assets', 'fixture.bin'), 'latest lfs smoke payload with changed bytes\n');
+  await git(migrationRepo, 'add', 'assets/fixture.bin');
+  await git(migrationRepo, 'commit', '--quiet', '-m', 'Change LFS fixture bytes');
 
   const statusBefore = await git(migrationRepo, 'status', '--porcelain=v1', '--untracked-files=all');
   const configBefore = await readFile(join(migrationRepo, '.git', 'config'), 'utf8');
   const output = await command(
     binaryPath,
-    ['migrate', '--server', 'https://lfs.example.invalid', '--cache-root', cacheRoot, '--dry-run'],
+    ['migrate', '--server', 'https://lfs.example.invalid', '--cache-root', cacheRoot, '--all-refs', '--dry-run'],
     { cwd: migrationRepo },
   );
   const statusAfter = await git(migrationRepo, 'status', '--porcelain=v1', '--untracked-files=all');
   const configAfter = await readFile(join(migrationRepo, '.git', 'config'), 'utf8');
 
   assert(output.includes('lfscloud migrate dry-run'), 'migration did not render a dry-run report');
-  assert(output.includes('mode: current-checkout'), 'migration did not use current-checkout scope');
-  assert(output.includes('objects discovered: 1'), 'migration did not discover the LFS object');
+  assert(output.includes('mode: all-refs'), 'migration did not use complete-history scope');
+  assert(output.includes('objects discovered: 2'), 'migration did not discover both historical LFS objects');
   assert(statusAfter === statusBefore, 'migration dry-run changed worktree status');
   assert(configAfter === configBefore, 'migration dry-run changed Git config');
   assert(!(await pathExists(cacheRoot)), 'migration dry-run created cache state');
@@ -424,7 +427,7 @@ function tests(): SmokeTest[] {
       },
     },
     { name: 'repository initialization', run: initRepositorySmoke },
-    { name: 'existing Git LFS migration dry-run', run: migrationDryRunSmoke },
+    { name: 'historical Git LFS migration planning', run: migrationDryRunSmoke },
     { name: 'Git credential approval', run: () => script('verify-git-credential-approve.sh') },
     {
       name: 'credential-helper fallback',
@@ -447,6 +450,10 @@ function tests(): SmokeTest[] {
     {
       name: 'migration upload simulation',
       run: () => script('verify-migration-upload-simulation.sh'),
+    },
+    {
+      name: 'historical Git LFS migration execution',
+      run: () => script('verify-migration-history-execution.sh'),
     },
     {
       name: 'secret redaction regressions',

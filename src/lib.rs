@@ -80,8 +80,9 @@ pub use migration::{
     discover_git_lfs_migration, discover_git_lfs_migration_from_remote,
     enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
     enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
-    fetch_missing_migration_objects, fetch_missing_migration_objects_from_remote,
-    upload_migration_objects_to_storage, upload_migration_objects_to_storage_with_options,
+    fetch_migration_git_refs, fetch_missing_migration_objects,
+    fetch_missing_migration_objects_from_remote, upload_migration_objects_to_storage,
+    upload_migration_objects_to_storage_with_options,
 };
 pub use providers::{
     ProviderFuture, RepositoryAuthentication, RepositoryAuthorization, RepositoryIdentity,

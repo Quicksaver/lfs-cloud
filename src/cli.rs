@@ -16,7 +16,7 @@ use std::{
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Component, Path, PathBuf},
     process::{Child, Command as ProcessCommand, ExitStatus, Stdio},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -30,15 +30,20 @@ use crate::{
     GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup,
     GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers,
     GitLfsMigrationDiscovery, GitLfsSourceEndpointSource, GitRemote, GitRepository,
-    GoogleDriveGcloudTokenProvider, GoogleDriveStorageConfig, LFS_POINTER_SIZE_CUTOFF,
-    LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsPointer, LfsSessionToken,
-    LocalCacheDehydration, LocalCacheDehydrationStatus, LocalCacheGarbageCollection,
-    LocalCacheGarbageCollectionObject, LocalCacheIngest, LocalCacheIngestStatus, LocalCacheLayout,
-    LocalCacheMaterialization, LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
-    LocalMigrationObjectAvailability, ServeOptions, ServerConfig, StorageProviderConfig,
-    TracingConfig, check_local_migration_objects, discover_git_lfs_migration_from_remote,
-    enumerate_current_checkout_lfs_pointers, enumerate_fetched_ref_lfs_pointers_for_remote,
-    enumerate_selected_ref_lfs_pointers, init_tracing,
+    GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore, GoogleDriveRootValidator,
+    GoogleDriveStorageConfig, LFS_POINTER_SIZE_CUTOFF, LFS_SESSION_REVOKE_PATH, LfsInitRoute,
+    LfsObject, LfsPointer, LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
+    LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
+    LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
+    LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
+    LocalMigrationObjectAvailability, MetadataDatabase, MigrationError, MigrationFetchMode,
+    MigrationSourceFetch, MigrationStorageUpload, ProviderFuture, RepositoryMapping, ServeOptions,
+    ServerConfig, StorageDeleteOutcome, StorageError, StorageProvider, StorageProviderConfig,
+    StorageResult, StoredObject, TracingConfig, check_local_migration_objects,
+    discover_git_lfs_migration_from_remote, enumerate_current_checkout_lfs_pointers,
+    enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
+    fetch_migration_git_refs, fetch_missing_migration_objects_from_remote, init_tracing,
+    upload_migration_objects_to_storage,
 };
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -92,7 +97,7 @@ enum Command {
     /// refreshed before collection so its Git LFS pointers are considered
     /// reachable.
     Gc(GcCommand),
-    /// Plan migration from an existing Git LFS provider.
+    /// Migrate objects from an existing Git LFS provider.
     Migrate(MigrateCommand),
 }
 
@@ -235,15 +240,15 @@ struct MigrateCommand {
     all_refs: bool,
 
     /// Report the migration plan without fetching, uploading, or writing config.
-    #[arg(long, required = true)]
+    #[arg(long)]
     dry_run: bool,
 
-    /// Include GitHub source-LFS purge guidance in the migration report.
+    /// Include source-LFS purge guidance in the migration report.
     ///
     /// GitHub does not expose a normal self-service API for arbitrary LFS
-    /// object deletion, so this flag reports support-flow instructions instead
-    /// of attempting source-provider mutation or emitting unverified purge
-    /// input from a dry-run plan.
+    /// object deletion, so this flag never mutates the source. Dry runs report
+    /// planning guidance; completed executions point at the durable verified
+    /// receipt for the provider's supported cleanup process.
     #[arg(long)]
     purge_source_lfs: bool,
 }
@@ -321,7 +326,7 @@ where
         Command::Dehydrate(command) => dehydrate(command).context("failed to dehydrate paths"),
         Command::Gc(command) => gc(command).context("failed to garbage collect local cache"),
         Command::Migrate(command) => {
-            migrate(command, cli.config).context("failed to plan lfscloud migration")
+            migrate(command, cli.config).context("failed to complete lfscloud migration")
         }
     }
 }
@@ -450,18 +455,35 @@ fn run_migrate_to_stdout(
     let current_dir = std::env::current_dir().context("failed to determine current directory")?;
     let mut stdout = io::stdout().lock();
 
-    run_migrate_from_dir(
-        command,
-        config_path,
-        &current_dir,
-        &mut stdout,
-        probe_server_reachable,
-        |lfs_url| {
-            GitCredentialLookup::new_with_insecure_http(lfs_url, true)
-                .and_then(|lookup| lookup.lookup().map(|_| ()))
-        },
-        validate_status_storage,
-    )
+    if command.dry_run {
+        return run_migrate_from_dir(
+            command,
+            config_path,
+            &current_dir,
+            &mut stdout,
+            probe_server_reachable,
+            |lfs_url| {
+                GitCredentialLookup::new_with_insecure_http(lfs_url, true)
+                    .and_then(|lookup| lookup.lookup().map(|_| ()))
+            },
+            validate_status_storage,
+        )
+        .map_err(anyhow::Error::from);
+    }
+
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(run_migrate_execution_from_dir(
+            command,
+            config_path,
+            &current_dir,
+            &mut stdout,
+            probe_server_reachable,
+            |lfs_url| {
+                GitCredentialLookup::new_with_insecure_http(lfs_url, true)
+                    .and_then(|lookup| lookup.lookup().map(|_| ()))
+            },
+        ))
+    })
     .map_err(anyhow::Error::from)
 }
 
@@ -1183,7 +1205,7 @@ where
 {
     if !command.dry_run {
         return Err(CliError::InvalidArguments {
-            message: "lfscloud migrate currently supports planning with --dry-run only".to_owned(),
+            message: "the migration planning runner requires --dry-run".to_owned(),
         });
     }
 
@@ -1236,11 +1258,423 @@ where
         route,
         config_path,
         readiness_checks,
-        would_touch_files: migration_dry_run_touched_files(&repository),
+        would_touch_files: migration_dry_run_touched_files(&repository)?,
         source_purge,
     };
 
     write_migration_dry_run_report(output, &report).map_err(output_error)
+}
+
+#[derive(Debug)]
+struct MigrationExecutionContext {
+    repository: GitRepository,
+    source_remote: GitRemote,
+    route: LfsInitRoute,
+    discovery: GitLfsMigrationDiscovery,
+    scan: MigrationPointerScan,
+    cache_layout: LocalCacheLayout,
+    purge_source_lfs: bool,
+}
+
+#[derive(Debug)]
+struct MigrationExecutionResult {
+    source_fetch: MigrationSourceFetch,
+    storage_upload: MigrationStorageUpload,
+    config_changes: Vec<GitLfsConfigChange>,
+}
+
+struct MigrationGoogleDriveStorage {
+    store: GoogleDriveObjectStore,
+    metadata: Arc<MetadataDatabase>,
+}
+
+impl StorageProvider for MigrationGoogleDriveStorage {
+    fn provider_id(&self) -> &str {
+        self.store.provider_id()
+    }
+
+    fn object_exists<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+    ) -> ProviderFuture<'a, StorageResult<bool>> {
+        StorageProvider::object_exists(&self.store, repository_namespace, object)
+    }
+
+    fn upload_object<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+        source: &'a Path,
+    ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+        Box::pin(async move {
+            if repository_namespace != self.store.repository_namespace() {
+                return Err(StorageError::RepositoryNamespaceMismatch {
+                    provider: self.store.provider_id().to_owned(),
+                });
+            }
+            let _upload_lock = self
+                .metadata
+                .acquire_object_upload_lock(
+                    repository_namespace.to_owned(),
+                    self.store.provider_id().to_owned(),
+                    object.clone(),
+                )
+                .await
+                .map_err(|error| StorageError::Retryable {
+                    provider: self.store.provider_id().to_owned(),
+                    message: format!("migration upload lock failed: {error}"),
+                })?;
+
+            // The migration helper performs an optimistic lookup before calling
+            // this method. Repeat it while holding the cross-process lock so a
+            // live server cannot win the race and create a duplicate Drive file.
+            if let Some(stored_object) = self.store.lookup_object(object).await? {
+                return Ok(stored_object);
+            }
+            self.store.upload_object(object, source).await
+        })
+    }
+
+    fn download_object<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+        destination: &'a Path,
+    ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+        StorageProvider::download_object(&self.store, repository_namespace, object, destination)
+    }
+
+    fn delete_or_mark_object<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+    ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
+        StorageProvider::delete_or_mark_object(&self.store, repository_namespace, object)
+    }
+}
+
+async fn run_migrate_execution_from_dir<W, P, A>(
+    command: MigrateCommand,
+    config_path: Option<PathBuf>,
+    start_dir: impl AsRef<Path>,
+    output: &mut W,
+    mut probe_server: P,
+    mut lookup_credential: A,
+) -> CliResult<()>
+where
+    W: Write,
+    P: FnMut(&str) -> CliResult<()>,
+    A: FnMut(&str) -> CliResult<()>,
+{
+    let mut context = prepare_migration_execution(command, start_dir.as_ref())?;
+
+    // Prove the endpoint is usable before fetching source bytes or creating
+    // target storage state. The credential was issued separately by `login`,
+    // so checking it does not require changing the source LFS configuration.
+    probe_server(&context.route.server_url)?;
+    lookup_credential(&context.route.lfs_url)?;
+
+    let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
+    let (mapping, storage) =
+        migration_google_drive_storage(&config_path, &context.repository).await?;
+    fetch_migration_git_refs(
+        &context.repository.worktree_root,
+        &context.source_remote.remote_name,
+    )?;
+    context.scan = history_pointer_scan(
+        MigrationScanMode::AllFetchedRefs,
+        enumerate_fetched_ref_lfs_pointers_for_remote(
+            &context.repository.worktree_root,
+            &context.source_remote.remote_name,
+        )?,
+    );
+    let result = execute_migration_with_storage(&context, &mapping, &storage).await?;
+    write_migration_execution_report(output, &context, &mapping, &result).map_err(output_error)
+}
+
+fn prepare_migration_execution(
+    command: MigrateCommand,
+    start_dir: &Path,
+) -> CliResult<MigrationExecutionContext> {
+    if command.dry_run {
+        return Err(CliError::InvalidArguments {
+            message: "migration execution cannot be prepared from a --dry-run request".to_owned(),
+        });
+    }
+    if !command.all_refs {
+        return Err(CliError::InvalidArguments {
+            message: "migration execution requires --all-refs so reconfiguration cannot strand historical LFS objects; use --dry-run for narrower planning"
+                .to_owned(),
+        });
+    }
+
+    let repository = GitRepository::discover(start_dir)?;
+    let source_repository = GitRepository::discover_with_remote(start_dir, &command.source_remote)?;
+    if !same_repository_identity(&source_repository.remote, &repository.remote)
+        && !command.allow_cross_remote
+    {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "source remote {} identifies {}, but target remote {} identifies {}; rerun with --allow-cross-remote only after confirming this cross-repository migration",
+                source_repository.remote.remote_name,
+                source_repository.remote.repository_label(),
+                repository.remote.remote_name,
+                repository.remote.repository_label(),
+            ),
+        });
+    }
+    let route = LfsInitRoute::resolve_with_insecure_http(
+        &command.server,
+        &repository.remote,
+        command.allow_insecure_http,
+    )?;
+    let discovery = discover_git_lfs_migration_from_remote(start_dir, &command.source_remote)?;
+    if !discovery.installation.installed {
+        return Err(CliError::InvalidArguments {
+            message: "migration execution requires Git LFS; install it and run `git lfs install` before retrying"
+                .to_owned(),
+        });
+    }
+    if discovery
+        .source_endpoint
+        .as_ref()
+        .is_some_and(|source| source.url == route.lfs_url)
+    {
+        return Err(CliError::InvalidArguments {
+            message: "source Git LFS endpoint already points at the requested LFS Cloud target"
+                .to_owned(),
+        });
+    }
+    let scan = migration_pointer_scan(start_dir, &command, &command.source_remote)?;
+    Ok(MigrationExecutionContext {
+        repository,
+        source_remote: source_repository.remote,
+        route,
+        discovery,
+        scan,
+        cache_layout: local_cache_layout(command.cache_root)?,
+        purge_source_lfs: command.purge_source_lfs,
+    })
+}
+
+async fn migration_google_drive_storage(
+    config_path: &Path,
+    repository: &GitRepository,
+) -> CliResult<(RepositoryMapping, MigrationGoogleDriveStorage)> {
+    let config = ServerConfig::load_from_path(config_path)?;
+    let mapping = config
+        .repository_mapping_for_identity(
+            &repository.remote.host,
+            &repository.remote.owner,
+            &repository.remote.name,
+        )
+        .cloned()
+        .ok_or_else(|| CliError::InvalidArguments {
+            message: format!(
+                "server config has no repository mapping for {}",
+                repository.remote.repository_label()
+            ),
+        })?;
+    let storage = config
+        .storage_providers
+        .get(&mapping.storage_provider)
+        .cloned()
+        .ok_or_else(|| CliError::InvalidArguments {
+            message: format!(
+                "repository mapping {} references unknown storage provider {}",
+                mapping.id, mapping.storage_provider
+            ),
+        })?;
+    let StorageProviderConfig::GoogleDrive(storage) = storage;
+    let token = GoogleDriveGcloudTokenProvider::new()
+        .access_token(&storage.id, &storage.credentials)
+        .await
+        .map_err(MigrationError::from)?;
+    GoogleDriveRootValidator::new()
+        .map_err(MigrationError::from)?
+        .validate_root_folder(&storage, &token)
+        .await
+        .map_err(MigrationError::from)?;
+
+    let metadata = Arc::new(MetadataDatabase::open(&config.server.metadata_path)?);
+    metadata.sync_config(&config)?;
+    let store =
+        GoogleDriveObjectStore::new(storage, &mapping.id, token).map_err(MigrationError::from)?;
+
+    Ok((mapping, MigrationGoogleDriveStorage { store, metadata }))
+}
+
+async fn execute_migration_with_storage(
+    context: &MigrationExecutionContext,
+    mapping: &RepositoryMapping,
+    storage: &dyn StorageProvider,
+) -> CliResult<MigrationExecutionResult> {
+    let repository_namespace = storage_namespace_for_context(context, mapping)?;
+    if context.scan.objects.is_empty() {
+        return Err(CliError::InvalidArguments {
+            message: "migration found no non-empty Git LFS objects across the selected history"
+                .to_owned(),
+        });
+    }
+    let source_fetch = fetch_missing_migration_objects_from_remote(
+        &context.repository.worktree_root,
+        context.scan.objects.iter(),
+        Some(&context.cache_layout),
+        &context.source_remote.remote_name,
+        MigrationFetchMode::AllFetchedRefs,
+    )?;
+    if let Some(object) = source_fetch.unavailable_objects.first() {
+        return Err(MigrationError::SourceObjectMissing {
+            oid: object.oid.as_hex().to_owned(),
+            size: object.size.bytes(),
+        }
+        .into());
+    }
+
+    let storage_upload =
+        upload_migration_objects_to_storage(&source_fetch.after, storage, repository_namespace)
+            .await?;
+    if let Some(first) = storage_upload.failed_objects.first() {
+        return Err(CliError::MigrationUploadFailed {
+            failures: storage_upload.failed_objects.len(),
+            oid: first.object.oid.as_hex().to_owned(),
+            message: first.message.clone(),
+        });
+    }
+
+    // Persist both forms after every object has a synchronized successful
+    // checkpoint record. The local override keeps historical commits working
+    // even when they predate the newly committed `.lfsconfig` file.
+    let config_changes = [
+        GitLfsConfigTarget::WorktreeFile,
+        GitLfsConfigTarget::LocalRepository,
+    ]
+    .into_iter()
+    .map(|target| {
+        context
+            .repository
+            .write_lfs_url(target, &context.route.lfs_url)
+    })
+    .collect::<CliResult<Vec<_>>>()?;
+
+    Ok(MigrationExecutionResult {
+        source_fetch,
+        storage_upload,
+        config_changes,
+    })
+}
+
+fn storage_namespace_for_context<'a>(
+    context: &MigrationExecutionContext,
+    mapping: &'a RepositoryMapping,
+) -> CliResult<&'a str> {
+    if mapping
+        .host
+        .eq_ignore_ascii_case(&context.repository.remote.host)
+        && mapping
+            .owner
+            .eq_ignore_ascii_case(&context.repository.remote.owner)
+        && mapping
+            .name
+            .eq_ignore_ascii_case(&context.repository.remote.name)
+    {
+        Ok(&mapping.id)
+    } else {
+        Err(CliError::InvalidArguments {
+            message: format!(
+                "repository mapping {} does not match migration target {}",
+                mapping.id,
+                context.repository.remote.repository_label()
+            ),
+        })
+    }
+}
+
+fn write_migration_execution_report<W>(
+    output: &mut W,
+    context: &MigrationExecutionContext,
+    mapping: &RepositoryMapping,
+    result: &MigrationExecutionResult,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let already_local = result.source_fetch.before.available_objects().len();
+    writeln!(output, "lfscloud migrate complete")?;
+    writeln!(output, "  mode: {}", context.scan.mode.label())?;
+    writeln!(
+        output,
+        "  source remote: {} ({})",
+        context.source_remote.remote_name,
+        context.source_remote.repository_label()
+    )?;
+    writeln!(
+        output,
+        "  source: {}",
+        source_endpoint_display(&context.discovery)
+    )?;
+    writeln!(
+        output,
+        "  target: {}",
+        redacted_url_for_display(&context.route.lfs_url)
+    )?;
+    writeln!(output, "  repository namespace: {}", mapping.id)?;
+    writeln!(
+        output,
+        "  refs scanned: {}",
+        context.scan.refs_scanned.len()
+    )?;
+    writeln!(
+        output,
+        "  objects discovered: {} ({} bytes total)",
+        context.scan.objects.len(),
+        migration_objects_total_bytes(context.scan.objects.iter())
+    )?;
+    writeln!(
+        output,
+        "  source objects: {} already local, {} fetched",
+        already_local,
+        result.source_fetch.fetched_objects.len()
+    )?;
+    writeln!(
+        output,
+        "  target objects: {} uploaded, {} already present",
+        result.storage_upload.uploaded_objects.len(),
+        result.storage_upload.already_present_objects.len()
+    )?;
+    writeln!(
+        output,
+        "  durable receipt: {}",
+        result.storage_upload.checkpoint_path.display()
+    )?;
+    writeln!(output, "  repository configuration:")?;
+    for change in &result.config_changes {
+        writeln!(
+            output,
+            "    {}: {}",
+            change.target.label(),
+            change.path.display()
+        )?;
+    }
+    writeln!(
+        output,
+        "  next step: commit .lfsconfig so new clones use LFS Cloud"
+    )?;
+    if context.purge_source_lfs {
+        writeln!(output, "  source purge:")?;
+        writeln!(output, "    automatic purge: unsupported")?;
+        writeln!(
+            output,
+            "    verified candidates: {}",
+            context.scan.objects.len()
+        )?;
+        writeln!(
+            output,
+            "    use the durable receipt above with the source provider's supported cleanup process"
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1608,8 +2042,11 @@ fn migration_config_readiness_checks<S>(
     });
 }
 
-fn migration_dry_run_touched_files(repository: &GitRepository) -> Vec<PathBuf> {
-    vec![repository.worktree_root.join(".lfsconfig")]
+fn migration_dry_run_touched_files(repository: &GitRepository) -> CliResult<Vec<PathBuf>> {
+    Ok(vec![
+        repository.worktree_root.join(".lfsconfig"),
+        repository.local_git_config_path()?,
+    ])
 }
 
 fn migration_source_purge_report(
@@ -3360,6 +3797,7 @@ mod tests {
     #[cfg(unix)]
     use std::time::{Duration, Instant};
     use std::{
+        collections::BTreeMap,
         fs, io,
         path::{Path, PathBuf},
         process::Command as ProcessCommand,
@@ -3376,20 +3814,129 @@ mod tests {
         Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, LoginTerminal,
         LogoutCommand, MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, PullCommand,
         SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
-        current_checkout_lfs_pointer_scan, dispatch,
+        current_checkout_lfs_pointer_scan, dispatch, execute_migration_with_storage,
         github_personal_access_token_login_url_for_server, is_git_worktree_discovery_error,
-        probe_server_reachable, read_bounded_login_token, read_hidden_login_token,
-        run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
-        run_login_from_dir, run_logout_from_dir, run_migrate_from_dir, run_pull_from_dir,
-        run_status_from_dir, tracing_config, validate_status_storage, write_init_change,
+        prepare_migration_execution, probe_server_reachable, read_bounded_login_token,
+        read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir,
+        run_init_from_dir, run_login_from_dir, run_logout_from_dir, run_migrate_from_dir,
+        run_pull_from_dir, run_status_from_dir, tracing_config, validate_status_storage,
+        write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig,
         LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken, LocalCacheError,
-        LocalCacheLayout, LocalCacheWorktreeRegistration, SanitizedMessage, ServeOptions,
-        StorageProviderConfig,
+        LocalCacheLayout, LocalCacheWorktreeRegistration, ProviderFuture, RepositoryMapping,
+        SanitizedMessage, ServeOptions, StorageDeleteOutcome, StorageError, StorageProvider,
+        StorageProviderConfig, StorageResult, StoredObject,
     };
+
+    struct RecordingMigrationStorage {
+        provider_id: String,
+        objects: Mutex<BTreeMap<LfsObject, Vec<u8>>>,
+        failing_object: Option<LfsObject>,
+    }
+
+    impl RecordingMigrationStorage {
+        fn new(provider_id: impl Into<String>) -> Self {
+            Self {
+                provider_id: provider_id.into(),
+                objects: Mutex::new(BTreeMap::new()),
+                failing_object: None,
+            }
+        }
+
+        fn failing(mut self, object: LfsObject) -> Self {
+            self.failing_object = Some(object);
+            self
+        }
+
+        fn object_bytes(&self, object: &LfsObject) -> Option<Vec<u8>> {
+            self.objects
+                .lock()
+                .expect("recording migration storage lock should not poison")
+                .get(object)
+                .cloned()
+        }
+    }
+
+    impl StorageProvider for RecordingMigrationStorage {
+        fn provider_id(&self) -> &str {
+            &self.provider_id
+        }
+
+        fn object_exists<'a>(
+            &'a self,
+            _repository_namespace: &'a str,
+            object: &'a LfsObject,
+        ) -> ProviderFuture<'a, StorageResult<bool>> {
+            Box::pin(async move {
+                Ok(self
+                    .objects
+                    .lock()
+                    .expect("recording migration storage lock should not poison")
+                    .contains_key(object))
+            })
+        }
+
+        fn upload_object<'a>(
+            &'a self,
+            repository_namespace: &'a str,
+            object: &'a LfsObject,
+            source: &'a Path,
+        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+            Box::pin(async move {
+                if self.failing_object.as_ref() == Some(object) {
+                    return Err(StorageError::Retryable {
+                        provider: self.provider_id.clone(),
+                        message: "simulated migration upload failure".to_owned(),
+                    });
+                }
+                let bytes = fs::read(source).map_err(|error| StorageError::StagedFileRead {
+                    provider: self.provider_id.clone(),
+                    path: source.to_path_buf(),
+                    source: error,
+                })?;
+                self.objects
+                    .lock()
+                    .expect("recording migration storage lock should not poison")
+                    .insert(object.clone(), bytes);
+                Ok(StoredObject::new(
+                    &self.provider_id,
+                    repository_namespace,
+                    object.clone(),
+                    format!("recorded-{}", object.oid.as_hex()),
+                ))
+            })
+        }
+
+        fn download_object<'a>(
+            &'a self,
+            _repository_namespace: &'a str,
+            object: &'a LfsObject,
+            _destination: &'a Path,
+        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+            Box::pin(async move {
+                Err(StorageError::ObjectNotFound {
+                    provider: self.provider_id.clone(),
+                    oid: object.oid.as_hex().to_owned(),
+                    size: object.size.bytes(),
+                })
+            })
+        }
+
+        fn delete_or_mark_object<'a>(
+            &'a self,
+            _repository_namespace: &'a str,
+            _object: &'a LfsObject,
+        ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
+            Box::pin(async {
+                Ok(StorageDeleteOutcome::Retained {
+                    reason: "test storage retains migration objects".to_owned(),
+                })
+            })
+        }
+    }
 
     #[test]
     fn root_command_exposes_shared_global_flags() {
@@ -3656,21 +4203,22 @@ mod tests {
     }
 
     #[test]
-    fn migrate_command_rejects_missing_dry_run_and_conflicting_ref_scopes() {
-        let missing_dry_run =
-            Cli::try_parse_from(["lfscloud", "migrate", "--server", "http://127.0.0.1:8080"])
-                .expect_err("migrate should require explicit dry-run planning");
-        assert!(missing_dry_run.to_string().contains("--dry-run"));
-
-        let purge_without_dry_run = Cli::try_parse_from([
+    fn migrate_command_accepts_execution_and_rejects_conflicting_ref_scopes() {
+        let execution = Cli::try_parse_from([
             "lfscloud",
             "migrate",
             "--server",
             "http://127.0.0.1:8080",
+            "--all-refs",
             "--purge-source-lfs",
         ])
-        .expect_err("purge helper should require explicit dry-run planning");
-        assert!(purge_without_dry_run.to_string().contains("--dry-run"));
+        .expect("migrate should accept non-dry-run execution");
+        let super::Command::Migrate(execution) = execution.command else {
+            panic!("migrate subcommand should parse");
+        };
+        assert!(!execution.dry_run);
+        assert!(execution.all_refs);
+        assert!(execution.purge_source_lfs);
 
         let conflicting_scopes = Cli::try_parse_from([
             "lfscloud",
@@ -4640,8 +5188,9 @@ mod tests {
         assert!(rendered.contains("use --all-refs for a full provider move"));
         assert!(rendered.contains("refs scanned: 1"));
         assert!(rendered.contains("current checkout"));
-        assert!(rendered.contains("files touched: 1 would update"));
+        assert!(rendered.contains("files touched: 2 would update"));
         assert!(rendered.contains(".lfsconfig"));
+        assert!(rendered.contains(".git/config"));
         assert!(rendered.contains("tracked LFS patterns: 1"));
         assert!(rendered.contains("*.bin (.gitattributes; filter=lfs)"));
         assert!(rendered.contains("pointer files: 1"));
@@ -4674,6 +5223,189 @@ mod tests {
         assert!(rendered.contains("repository permissions were not probed"));
         assert!(rendered.contains("storage quota and free capacity were not probed"));
         assert!(rendered.contains(object.oid.as_hex()));
+    }
+
+    #[tokio::test]
+    async fn migrate_execution_uploads_every_historical_asset_version_before_reconfiguring() {
+        require_git();
+        require_git_lfs();
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        run_git(&repo, &["config", "user.name", "LFS Cloud Migration Test"]);
+        run_git(
+            &repo,
+            &["config", "user.email", "migration@example.invalid"],
+        );
+        run_git(&repo, &["config", "commit.gpgSign", "false"]);
+        run_git(&repo, &["lfs", "install", "--local"]);
+
+        let first_bytes = b"historical LFS asset version one\n";
+        let latest_bytes = b"latest LFS asset version two with different bytes\n";
+        let first_object = object_for_bytes(first_bytes);
+        let latest_object = object_for_bytes(latest_bytes);
+        write_file(
+            &repo.join(".gitattributes"),
+            b"assets/*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        );
+        write_file(
+            &repo.join("assets/model.bin"),
+            LfsPointer::new(first_object.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        write_git_lfs_source_object(&repo, &first_object, first_bytes);
+        run_git(&repo, &["add", ".gitattributes", "assets/model.bin"]);
+        run_git(&repo, &["commit", "-m", "Add first LFS asset version"]);
+        let first_commit = read_git_config(&repo, &["rev-parse", "HEAD"]);
+
+        write_file(
+            &repo.join("assets/model.bin"),
+            LfsPointer::new(latest_object.clone())
+                .to_pointer_file()
+                .as_bytes(),
+        );
+        write_git_lfs_source_object(&repo, &latest_object, latest_bytes);
+        run_git(&repo, &["add", "assets/model.bin"]);
+        run_git(&repo, &["commit", "-m", "Change LFS asset bytes"]);
+
+        let command = MigrateCommand {
+            server: "http://127.0.0.1:8080".to_owned(),
+            allow_insecure_http: false,
+            cache_root: Some(temp.path().join("cache")),
+            source_remote: "origin".to_owned(),
+            allow_cross_remote: false,
+            refs: Vec::new(),
+            all_refs: true,
+            dry_run: false,
+            purge_source_lfs: false,
+        };
+        let context = prepare_migration_execution(command, &repo)
+            .expect("historical migration execution should prepare");
+        let mapping = RepositoryMapping {
+            id: "github-main:owner/repo".to_owned(),
+            repo_provider: "github-main".to_owned(),
+            host: "github.com".to_owned(),
+            owner: "owner".to_owned(),
+            name: "repo".to_owned(),
+            provider_repository_id: "8675309".to_owned(),
+            storage_provider: "drive-user-a".to_owned(),
+        };
+        let storage = RecordingMigrationStorage::new("drive-user-a");
+
+        let result = execute_migration_with_storage(&context, &mapping, &storage)
+            .await
+            .expect("historical migration should complete");
+
+        assert_eq!(context.scan.objects.len(), 2);
+        assert_eq!(result.storage_upload.uploaded_objects.len(), 2);
+        assert!(result.storage_upload.failed_objects.is_empty());
+        assert_eq!(
+            storage.object_bytes(&first_object).as_deref(),
+            Some(first_bytes.as_slice())
+        );
+        assert_eq!(
+            storage.object_bytes(&latest_object).as_deref(),
+            Some(latest_bytes.as_slice())
+        );
+        let receipt = fs::read_to_string(&result.storage_upload.checkpoint_path)
+            .expect("durable migration receipt should be readable");
+        assert_eq!(receipt.lines().count(), 2);
+        assert!(receipt.contains(first_object.oid.as_hex()));
+        assert!(receipt.contains(latest_object.oid.as_hex()));
+
+        let target_url = "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs";
+        assert!(
+            fs::read_to_string(repo.join(".lfsconfig"))
+                .expect("migrated .lfsconfig should be readable")
+                .contains(target_url)
+        );
+        assert_eq!(
+            read_git_config(&repo, &["config", "--local", "--get", "lfs.url"]),
+            target_url
+        );
+
+        run_git(&repo, &["checkout", "--quiet", &first_commit]);
+        assert_eq!(
+            read_git_config(&repo, &["config", "--local", "--get", "lfs.url"]),
+            target_url,
+            "the local override must keep pre-.lfsconfig history on LFS Cloud"
+        );
+        assert_eq!(
+            fs::read(repo.join("assets/model.bin"))
+                .expect("historical LFS asset should remain materializable"),
+            first_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_execution_does_not_reconfigure_after_a_partial_upload() {
+        require_git();
+        require_git_lfs();
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        run_git(&repo, &["config", "user.name", "LFS Cloud Migration Test"]);
+        run_git(
+            &repo,
+            &["config", "user.email", "migration@example.invalid"],
+        );
+        run_git(&repo, &["config", "commit.gpgSign", "false"]);
+        run_git(&repo, &["lfs", "install", "--local"]);
+        let bytes = b"migration object that will fail at the target\n";
+        let object = object_for_bytes(bytes);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs -text\n");
+        write_file(
+            &repo.join("asset.bin"),
+            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
+        );
+        write_git_lfs_source_object(&repo, &object, bytes);
+        run_git(&repo, &["add", ".gitattributes", "asset.bin"]);
+        run_git(&repo, &["commit", "-m", "Add LFS asset"]);
+        let context = prepare_migration_execution(
+            MigrateCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
+                cache_root: Some(temp.path().join("cache")),
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
+                refs: Vec::new(),
+                all_refs: true,
+                dry_run: false,
+                purge_source_lfs: false,
+            },
+            &repo,
+        )
+        .expect("migration execution should prepare");
+        let mapping = RepositoryMapping {
+            id: "github-main:owner/repo".to_owned(),
+            repo_provider: "github-main".to_owned(),
+            host: "github.com".to_owned(),
+            owner: "owner".to_owned(),
+            name: "repo".to_owned(),
+            provider_repository_id: "8675309".to_owned(),
+            storage_provider: "drive-user-a".to_owned(),
+        };
+        let storage = RecordingMigrationStorage::new("drive-user-a").failing(object.clone());
+
+        let error = execute_migration_with_storage(&context, &mapping, &storage)
+            .await
+            .expect_err("partial target upload should fail migration execution");
+
+        assert!(
+            matches!(error, CliError::MigrationUploadFailed { failures: 1, oid, .. }
+            if oid == object.oid.as_hex())
+        );
+        assert!(!repo.join(".lfsconfig").exists());
+        let local_url = ProcessCommand::new("git")
+            .args(["config", "--local", "--get", "lfs.url"])
+            .current_dir(&repo)
+            .output()
+            .expect("local Git config lookup should start");
+        assert_eq!(local_url.status.code(), Some(1));
+        assert!(local_url.stdout.is_empty());
     }
 
     #[test]
@@ -5063,15 +5795,15 @@ mod tests {
     }
 
     #[test]
-    fn migrate_without_dry_run_is_rejected_before_writes() {
+    fn migrate_execution_requires_all_refs_before_repository_writes() {
         let temp = TempDir::new().expect("temporary directory should be created");
-        let mut output = Vec::new();
+        let cache_root = temp.path().join("cache");
 
-        let error = run_migrate_from_dir(
+        let error = prepare_migration_execution(
             MigrateCommand {
                 server: "http://127.0.0.1:8080".to_owned(),
                 allow_insecure_http: false,
-                cache_root: Some(temp.path().join("cache")),
+                cache_root: Some(cache_root.clone()),
                 source_remote: "origin".to_owned(),
                 allow_cross_remote: false,
                 refs: Vec::new(),
@@ -5079,19 +5811,13 @@ mod tests {
                 dry_run: false,
                 purge_source_lfs: false,
             },
-            None,
             temp.path(),
-            &mut output,
-            |_| Ok(()),
-            |_| Ok(()),
-            |_| Ok(()),
         )
-        .expect_err("non-dry-run migrate should be rejected");
+        .expect_err("execution without all-ref coverage should be rejected");
 
-        assert!(
-            matches!(error, CliError::InvalidArguments { message } if message.contains("--dry-run"))
-        );
-        assert!(output.is_empty());
+        assert!(matches!(error, CliError::InvalidArguments { message }
+                if message.contains("requires --all-refs") && message.contains("historical")));
+        assert!(!cache_root.exists());
     }
 
     #[test]

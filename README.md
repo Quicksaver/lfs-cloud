@@ -125,6 +125,29 @@ git lfs track "*.bin"
 git add .gitattributes .lfsconfig
 ```
 
+## Migrate An Existing Git LFS Repository
+
+Use a non-shallow clone with all source branches and tags available. Keep the source LFS endpoint configured while planning and transferring:
+
+```bash
+lfscloud login --server http://127.0.0.1:8080
+lfscloud --config /path/to/lfscloud.yml migrate \
+  --server http://127.0.0.1:8080 \
+  --all-refs \
+  --dry-run
+lfscloud --config /path/to/lfscloud.yml migrate \
+  --server http://127.0.0.1:8080 \
+  --all-refs
+git add .lfsconfig
+git commit -m "Route Git LFS through LFS Cloud"
+```
+
+Execution refreshes the selected source remote's branches and tags, inventories every historical LFS pointer, fetches missing bytes from the source provider, and uploads each verified object to the configured Google Drive backend. Every successful destination check is synchronized to a durable JSON Lines receipt, so an interrupted run resumes completed objects. Repository configuration is updated only after the complete object inventory succeeds.
+
+Migration writes both `.lfsconfig` and a repository-local `lfs.url`. The local override keeps this checkout on LFS Cloud when checking out commits older than the new `.lfsconfig`. In a fresh clone, run `lfscloud init --server URL --local` before checking out such older commits. Git history and LFS pointers are not rewritten.
+
+Execution requires `--all-refs`; narrower current-checkout and `--ref` scopes remain available for dry-run investigation only. `--source-remote` defaults to `origin`. Use `--allow-cross-remote` only for an intentional copy between different repository identities. `--purge-source-lfs` reports cleanup guidance and the verified receipt but never automatically deletes source objects.
+
 ## Commands
 
 | Command                        | Purpose                                                         |
@@ -138,13 +161,12 @@ git add .gitattributes .lfsconfig
 | `lfscloud hydrate <path...>`   | Replace pointer files with verified bytes from the shared cache |
 | `lfscloud dehydrate <path...>` | Replace clean LFS files with pointers after preserving bytes    |
 | `lfscloud gc --dry-run`        | Preview cleanup of unreferenced shared-cache objects            |
-| `lfscloud migrate --dry-run`   | Plan migration from an existing Git LFS provider                |
+| `lfscloud migrate`             | Migrate complete Git LFS history into LFS Cloud                 |
 
 Run `lfscloud <command> --help` for all options.
 
 ## Current Limitations
 
-- Migration is currently planning-only; `lfscloud migrate` requires `--dry-run` and does not transfer or reconfigure a repository.
 - GitHub and Google Drive are the only implemented providers.
 - Authentication represents one configured GitHub account, not independent users.
 - Uploads and downloads are proxied through the LFS Cloud process, so the host must support long-lived large-file transfers.

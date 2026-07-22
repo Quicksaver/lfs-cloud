@@ -165,6 +165,26 @@ pub enum CliError {
         source: MigrationError,
     },
 
+    /// A server-owned configuration or metadata prerequisite failed at the CLI boundary.
+    #[error("server prerequisite failed: {source}")]
+    ServerPrerequisite {
+        /// Underlying server configuration or metadata failure.
+        source: Box<ServerError>,
+    },
+
+    /// Migration transferred only part of the selected object inventory.
+    #[error(
+        "migration upload failed for {failures} object(s); first failure at sha256:{oid}: {message}"
+    )]
+    MigrationUploadFailed {
+        /// Number of objects whose terminal upload outcome failed.
+        failures: usize,
+        /// First failed object identifier.
+        oid: String,
+        /// Sanitized first failure diagnostic.
+        message: SanitizedMessage,
+    },
+
     /// One or more `pull` pointer hydrations failed after fetch completed.
     #[error("pull failed for {failures} pointer file(s); first failure at {}: {message}", path.display())]
     PullFailed {
@@ -204,6 +224,14 @@ pub enum CliError {
         /// User-facing recovery instructions that do not contain secrets.
         instructions: SanitizedMessage,
     },
+}
+
+impl From<ServerError> for CliError {
+    fn from(source: ServerError) -> Self {
+        Self::ServerPrerequisite {
+            source: Box::new(source),
+        }
+    }
 }
 
 impl CliError {

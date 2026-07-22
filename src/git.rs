@@ -59,10 +59,28 @@ impl GitRepository {
             ["remote", "get-url", remote_name.as_str()],
             &format!("git remote get-url {remote_name}"),
         )?;
+        let remote_url = remote_url.trim_end();
+        let remote = match GitRemote::parse(remote_name.clone(), remote_url) {
+            Ok(remote) => remote,
+            Err(_) if is_local_transport_url(remote_url) => {
+                // A local mirror selected through `url.*.insteadOf` changes
+                // `git remote get-url` output. Preserve the safe configured
+                // provider identity while Git continues using the rewritten
+                // local transport for its own fetch and push operations.
+                let config_key = format!("remote.{remote_name}.url");
+                let configured_url = git_stdout(
+                    start_dir,
+                    ["config", "--local", "--get", config_key.as_str()],
+                    &format!("git config --local --get {config_key}"),
+                )?;
+                GitRemote::parse(remote_name, configured_url.trim_end())?
+            }
+            Err(error) => return Err(error),
+        };
 
         Ok(Self {
             worktree_root,
-            remote: GitRemote::parse(remote_name, remote_url.trim_end())?,
+            remote,
         })
     }
 
@@ -210,6 +228,10 @@ impl GitRepository {
             ),
         }
     }
+}
+
+fn is_local_transport_url(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| url.scheme() == "file") || Path::new(value).is_absolute()
 }
 
 /// Target config location for `lfscloud init`.
@@ -897,6 +919,57 @@ mod tests {
         assert_eq!(detected.remote.host, "github.com");
         assert_eq!(detected.remote.owner, "owner");
         assert_eq!(detected.remote.name, "repo");
+    }
+
+    #[test]
+    fn discovery_preserves_safe_identity_across_local_transport_rewrite() {
+        let repo = TempGitRepo::new();
+        let mirror = TempDir::new().expect("temporary mirror should be created");
+        let mirror_url = url::Url::from_file_path(mirror.path())
+            .expect("mirror path should convert to a file URL");
+        let rewrite_key = format!("url.{}.insteadOf", mirror_url.as_str());
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+        repo.git([
+            "config",
+            "--local",
+            rewrite_key.as_str(),
+            "https://github.com/owner/repo.git",
+        ]);
+
+        let detected = GitRepository::discover(repo.path())
+            .expect("local transport rewrite should retain the configured identity");
+
+        assert_eq!(detected.remote.host, "github.com");
+        assert_eq!(detected.remote.owner, "owner");
+        assert_eq!(detected.remote.name, "repo");
+        assert_eq!(detected.remote.url(), "https://github.com/owner/repo.git");
+    }
+
+    #[test]
+    fn discovery_does_not_hide_credentialed_transport_rewrites() {
+        let repo = TempGitRepo::new();
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+        repo.git([
+            "config",
+            "--local",
+            "url.https://user:secret@github.com/.insteadOf",
+            "https://github.com/",
+        ]);
+
+        let error = GitRepository::discover(repo.path())
+            .expect_err("credentialed rewritten transport should remain rejected");
+
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
     }
 
     #[test]

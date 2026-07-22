@@ -840,6 +840,58 @@ where
     )
 }
 
+/// Refreshes branches, tags, and remote-tracking refs from the selected source remote.
+///
+/// Full-history migration inventory is only as complete as the Git refs stored
+/// locally. Execution calls this before its final all-ref scan so a stale clone
+/// cannot silently omit a branch or tag that still references LFS objects.
+/// Interactive prompting is disabled, output is bounded, and the owned process
+/// tree is terminated after the same six-hour deadline used for source LFS
+/// transfers.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when the remote name is invalid, the Git fetch
+/// cannot start, times out, or exits unsuccessfully.
+pub fn fetch_migration_git_refs(
+    start_dir: impl AsRef<Path>,
+    source_remote: impl AsRef<str>,
+) -> MigrationResult<()> {
+    let source_remote = validate_source_remote_name(source_remote.as_ref())?;
+    let remote_tracking_refspec = format!("+refs/heads/*:refs/remotes/{source_remote}/*");
+    let args = vec![
+        OsString::from("fetch"),
+        OsString::from("--prune"),
+        OsString::from("--tags"),
+        OsString::from("--no-recurse-submodules"),
+        OsString::from("--"),
+        OsString::from(&source_remote),
+        OsString::from(remote_tracking_refspec),
+    ];
+    let display = display_git_command(&args);
+    let mut process = Command::new("git");
+    process
+        .args(&args)
+        .current_dir(start_dir.as_ref())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    configure_bounded_git_process_tree(&mut process);
+    let mut child = process.spawn().map_err(|source| MigrationError::Io {
+        context: format!("failed to start {display}"),
+        source,
+    })?;
+    let (status, stderr) =
+        wait_for_git_lfs_fetch_command(&mut child, &display, MIGRATION_SOURCE_FETCH_TIMEOUT)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(command_error(&display, status, &stderr))
+    }
+}
+
 /// Uploads locally available migration objects to configured LFS Cloud storage.
 ///
 /// The helper is intentionally idempotent: it checks the destination storage
@@ -4168,9 +4220,9 @@ mod tests {
         discover_git_lfs_migration, discover_git_lfs_migration_from_remote, display_git_command,
         enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
         enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
-        enumerate_selected_ref_lfs_pointers_with_metrics, fetch_missing_migration_objects,
-        fetch_missing_migration_objects_with_runner, git_lfs_object_path,
-        hash_migration_object_file, migration_source_fetch_command,
+        enumerate_selected_ref_lfs_pointers_with_metrics, fetch_migration_git_refs,
+        fetch_missing_migration_objects, fetch_missing_migration_objects_with_runner,
+        git_lfs_object_path, hash_migration_object_file, migration_source_fetch_command,
         parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
         parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
         upload_migration_objects_to_storage, upload_migration_objects_to_storage_with_options,
@@ -5281,6 +5333,75 @@ mod tests {
         assert!(ref_names.contains("refs/tags/v-main"));
         assert!(objects.contains(&main_object));
         assert!(objects.contains(&branch_object));
+    }
+
+    #[test]
+    fn migration_ref_fetch_refreshes_source_branches_and_tags() {
+        let remote_root = tempfile::tempdir().expect("temporary remote root should be created");
+        let remote_path = remote_root.path().join("source.git");
+        let remote = remote_path.to_string_lossy().into_owned();
+        let bare_init = Command::new("git")
+            .args([
+                "init",
+                "--bare",
+                "--initial-branch",
+                "main",
+                remote.as_str(),
+            ])
+            .output()
+            .expect("bare remote initialization should start");
+        assert!(
+            bare_init.status.success(),
+            "bare remote initialization failed: {}",
+            String::from_utf8_lossy(&bare_init.stderr)
+        );
+
+        let source = TempRepo::new();
+        source.write_file("README.md", "initial branch\n");
+        source.commit_all("add main branch");
+        source.git(["remote", "add", "origin", remote.as_str()]);
+        source.git(["push", "-u", "origin", "main"]);
+
+        let clone_path = remote_root.path().join("clone");
+        let clone = clone_path.to_string_lossy().into_owned();
+        let clone_output = Command::new("git")
+            .args(["clone", "--no-local", remote.as_str(), clone.as_str()])
+            .output()
+            .expect("source clone should start");
+        assert!(
+            clone_output.status.success(),
+            "source clone failed: {}",
+            String::from_utf8_lossy(&clone_output.stderr)
+        );
+        let narrow_fetch = Command::new("git")
+            .args([
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ])
+            .current_dir(&clone_path)
+            .output()
+            .expect("narrow fetch configuration should start");
+        assert!(narrow_fetch.status.success());
+
+        source.git(["checkout", "-b", "feature/history"]);
+        source.write_file("historical.txt", "branch-only history\n");
+        source.commit_all("add historical branch");
+        source.git(["tag", "v-history"]);
+        source.git(["push", "origin", "feature/history"]);
+        source.git(["push", "origin", "v-history"]);
+
+        fetch_migration_git_refs(&clone_path, "origin")
+            .expect("migration ref refresh should fetch branches and tags");
+
+        for git_ref in ["refs/remotes/origin/feature/history", "refs/tags/v-history"] {
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", git_ref])
+                .current_dir(&clone_path)
+                .output()
+                .expect("ref verification should start");
+            assert!(output.status.success(), "missing fetched ref {git_ref}");
+        }
     }
 
     #[test]
