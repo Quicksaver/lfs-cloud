@@ -1,0 +1,4 @@
+interface:
+  display_name: "LFS Cloud Slack"
+  short_description: "Read LFS Cloud Actions alerts directly"
+  default_prompt: "Use $read-lfs-cloud-slack to check the latest LFS Cloud Actions alerts."
