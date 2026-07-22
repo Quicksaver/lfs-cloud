@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fix CI"
+  short_description: "Fix LFS Cloud CI failures until green"
+  default_prompt: "Use $fix-ci to fix the latest LFS Cloud CI failure and iterate until the next build is green."
