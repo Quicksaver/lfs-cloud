@@ -142,7 +142,7 @@ git add .lfsconfig
 git commit -m "Route Git LFS through LFS Cloud"
 ```
 
-Execution refreshes the selected source remote's branches and tags, inventories every historical LFS pointer, fetches missing bytes from the source provider, and uploads each verified object to the configured Google Drive backend. Every successful destination check is synchronized to a durable JSON Lines receipt, so an interrupted run resumes completed objects. Repository configuration is updated only after the complete object inventory succeeds.
+Execution authenticates a repository-scoped request to the target, refreshes the selected source remote's branches and tags, inventories every historical LFS pointer, fetches missing bytes from the source provider, and uploads each verified object to the configured Google Drive backend. Every successful destination check is synchronized to a durable JSON Lines receipt; an interrupted run revalidates recorded objects against the active Drive target before resuming them. Repository configuration is updated only after the complete object inventory succeeds.
 
 Migration writes both `.lfsconfig` and a repository-local `lfs.url`. The local override keeps this checkout on LFS Cloud when checking out commits older than the new `.lfsconfig`. In a fresh clone, run `lfscloud init --server URL --local` before checking out such older commits. Git history and LFS pointers are not rewritten.
 

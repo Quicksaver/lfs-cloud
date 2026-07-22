@@ -25,6 +25,7 @@ use clap::{Args, Parser, Subcommand};
 use reqwest::{Client, StatusCode as HttpStatusCode, redirect::Policy};
 use url::Url;
 
+use crate::google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource};
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
     GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup,
@@ -48,6 +49,7 @@ use crate::{
 
 const STATUS_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_REVOCATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MIGRATION_TARGET_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PULL_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_PULL_FETCH_OUTPUT_BYTES: usize = 256 * 1024;
 const CHILD_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
@@ -480,7 +482,7 @@ fn run_migrate_to_stdout(
             probe_server_reachable,
             |lfs_url| {
                 GitCredentialLookup::new_with_insecure_http(lfs_url, true)
-                    .and_then(|lookup| lookup.lookup().map(|_| ()))
+                    .and_then(|lookup| lookup.lookup().map(|credential| credential.token().clone()))
             },
         ))
     })
@@ -1266,6 +1268,37 @@ where
 }
 
 #[derive(Debug)]
+struct MigrationExecutionPreparation {
+    repository: GitRepository,
+    source_remote: GitRemote,
+    route: LfsInitRoute,
+    discovery: GitLfsMigrationDiscovery,
+    cache_layout: LocalCacheLayout,
+    purge_source_lfs: bool,
+}
+
+impl MigrationExecutionPreparation {
+    fn scan_fetched_refs(self) -> CliResult<MigrationExecutionContext> {
+        let scan = history_pointer_scan(
+            MigrationScanMode::AllFetchedRefs,
+            enumerate_fetched_ref_lfs_pointers_for_remote(
+                &self.repository.worktree_root,
+                &self.source_remote.remote_name,
+            )?,
+        );
+        Ok(MigrationExecutionContext {
+            repository: self.repository,
+            source_remote: self.source_remote,
+            route: self.route,
+            discovery: self.discovery,
+            scan,
+            cache_layout: self.cache_layout,
+            purge_source_lfs: self.purge_source_lfs,
+        })
+    }
+}
+
+#[derive(Debug)]
 struct MigrationExecutionContext {
     repository: GitRepository,
     source_remote: GitRemote,
@@ -1284,13 +1317,36 @@ struct MigrationExecutionResult {
 }
 
 struct MigrationGoogleDriveStorage {
-    store: GoogleDriveObjectStore,
+    storage: GoogleDriveStorageConfig,
+    repository_namespace: String,
+    token_source: Arc<dyn GoogleDriveAccessTokenSource>,
+    token_cache: GoogleDriveAccessTokenCache,
     metadata: Arc<MetadataDatabase>,
+}
+
+impl MigrationGoogleDriveStorage {
+    async fn object_store(&self) -> StorageResult<GoogleDriveObjectStore> {
+        let token = self
+            .token_cache
+            .get_or_refresh(&self.storage, self.token_source.as_ref())
+            .await?;
+        GoogleDriveObjectStore::new(self.storage.clone(), &self.repository_namespace, token)
+    }
+
+    fn validate_repository_namespace(&self, repository_namespace: &str) -> StorageResult<()> {
+        if repository_namespace == self.repository_namespace {
+            Ok(())
+        } else {
+            Err(StorageError::RepositoryNamespaceMismatch {
+                provider: self.storage.id.clone(),
+            })
+        }
+    }
 }
 
 impl StorageProvider for MigrationGoogleDriveStorage {
     fn provider_id(&self) -> &str {
-        self.store.provider_id()
+        &self.storage.id
     }
 
     fn object_exists<'a>(
@@ -1298,7 +1354,15 @@ impl StorageProvider for MigrationGoogleDriveStorage {
         repository_namespace: &'a str,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<bool>> {
-        StorageProvider::object_exists(&self.store, repository_namespace, object)
+        Box::pin(async move {
+            self.validate_repository_namespace(repository_namespace)?;
+            Ok(self
+                .object_store()
+                .await?
+                .lookup_object(object)
+                .await?
+                .is_some())
+        })
     }
 
     fn upload_object<'a>(
@@ -1308,31 +1372,28 @@ impl StorageProvider for MigrationGoogleDriveStorage {
         source: &'a Path,
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
         Box::pin(async move {
-            if repository_namespace != self.store.repository_namespace() {
-                return Err(StorageError::RepositoryNamespaceMismatch {
-                    provider: self.store.provider_id().to_owned(),
-                });
-            }
+            self.validate_repository_namespace(repository_namespace)?;
             let _upload_lock = self
                 .metadata
                 .acquire_object_upload_lock(
                     repository_namespace.to_owned(),
-                    self.store.provider_id().to_owned(),
+                    self.storage.id.clone(),
                     object.clone(),
                 )
                 .await
                 .map_err(|error| StorageError::Retryable {
-                    provider: self.store.provider_id().to_owned(),
+                    provider: self.storage.id.clone(),
                     message: format!("migration upload lock failed: {error}"),
                 })?;
 
             // The migration helper performs an optimistic lookup before calling
             // this method. Repeat it while holding the cross-process lock so a
             // live server cannot win the race and create a duplicate Drive file.
-            if let Some(stored_object) = self.store.lookup_object(object).await? {
+            let store = self.object_store().await?;
+            if let Some(stored_object) = store.lookup_object(object).await? {
                 return Ok(stored_object);
             }
-            self.store.upload_object(object, source).await
+            store.upload_object(object, source).await
         })
     }
 
@@ -1342,7 +1403,16 @@ impl StorageProvider for MigrationGoogleDriveStorage {
         object: &'a LfsObject,
         destination: &'a Path,
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
-        StorageProvider::download_object(&self.store, repository_namespace, object, destination)
+        Box::pin(async move {
+            self.validate_repository_namespace(repository_namespace)?;
+            StorageProvider::download_object(
+                &self.object_store().await?,
+                repository_namespace,
+                object,
+                destination,
+            )
+            .await
+        })
     }
 
     fn delete_or_mark_object<'a>(
@@ -1350,7 +1420,15 @@ impl StorageProvider for MigrationGoogleDriveStorage {
         repository_namespace: &'a str,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
-        StorageProvider::delete_or_mark_object(&self.store, repository_namespace, object)
+        Box::pin(async move {
+            self.validate_repository_namespace(repository_namespace)?;
+            StorageProvider::delete_or_mark_object(
+                &self.object_store().await?,
+                repository_namespace,
+                object,
+            )
+            .await
+        })
     }
 }
 
@@ -1365,30 +1443,25 @@ async fn run_migrate_execution_from_dir<W, P, A>(
 where
     W: Write,
     P: FnMut(&str) -> CliResult<()>,
-    A: FnMut(&str) -> CliResult<()>,
+    A: FnMut(&str) -> CliResult<LfsSessionToken>,
 {
-    let mut context = prepare_migration_execution(command, start_dir.as_ref())?;
+    let preparation = prepare_migration_execution(command, start_dir.as_ref())?;
 
     // Prove the endpoint is usable before fetching source bytes or creating
     // target storage state. The credential was issued separately by `login`,
     // so checking it does not require changing the source LFS configuration.
-    probe_server(&context.route.server_url)?;
-    lookup_credential(&context.route.lfs_url)?;
+    probe_server(&preparation.route.server_url)?;
+    let token = lookup_credential(&preparation.route.lfs_url)?;
+    probe_authenticated_migration_target(&preparation.route.lfs_url, &token).await?;
 
     let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
     let (mapping, storage) =
-        migration_google_drive_storage(&config_path, &context.repository).await?;
+        migration_google_drive_storage(&config_path, &preparation.repository).await?;
     fetch_migration_git_refs(
-        &context.repository.worktree_root,
-        &context.source_remote.remote_name,
+        &preparation.repository.worktree_root,
+        &preparation.source_remote.remote_name,
     )?;
-    context.scan = history_pointer_scan(
-        MigrationScanMode::AllFetchedRefs,
-        enumerate_fetched_ref_lfs_pointers_for_remote(
-            &context.repository.worktree_root,
-            &context.source_remote.remote_name,
-        )?,
-    );
+    let context = preparation.scan_fetched_refs()?;
     let result = execute_migration_with_storage(&context, &mapping, &storage).await?;
     write_migration_execution_report(output, &context, &mapping, &result).map_err(output_error)
 }
@@ -1396,7 +1469,7 @@ where
 fn prepare_migration_execution(
     command: MigrateCommand,
     start_dir: &Path,
-) -> CliResult<MigrationExecutionContext> {
+) -> CliResult<MigrationExecutionPreparation> {
     if command.dry_run {
         return Err(CliError::InvalidArguments {
             message: "migration execution cannot be prepared from a --dry-run request".to_owned(),
@@ -1446,13 +1519,11 @@ fn prepare_migration_execution(
                 .to_owned(),
         });
     }
-    let scan = migration_pointer_scan(start_dir, &command, &command.source_remote)?;
-    Ok(MigrationExecutionContext {
+    Ok(MigrationExecutionPreparation {
         repository,
         source_remote: source_repository.remote,
         route,
         discovery,
-        scan,
         cache_layout: local_cache_layout(command.cache_root)?,
         purge_source_lfs: command.purge_source_lfs,
     })
@@ -1487,8 +1558,11 @@ async fn migration_google_drive_storage(
             ),
         })?;
     let StorageProviderConfig::GoogleDrive(storage) = storage;
-    let token = GoogleDriveGcloudTokenProvider::new()
-        .access_token(&storage.id, &storage.credentials)
+    let token_source: Arc<dyn GoogleDriveAccessTokenSource> =
+        Arc::new(GoogleDriveGcloudTokenProvider::new());
+    let token_cache = GoogleDriveAccessTokenCache::default();
+    let token = token_cache
+        .get_or_refresh(&storage, token_source.as_ref())
         .await
         .map_err(MigrationError::from)?;
     GoogleDriveRootValidator::new()
@@ -1499,10 +1573,16 @@ async fn migration_google_drive_storage(
 
     let metadata = Arc::new(MetadataDatabase::open(&config.server.metadata_path)?);
     metadata.sync_config(&config)?;
-    let store =
-        GoogleDriveObjectStore::new(storage, &mapping.id, token).map_err(MigrationError::from)?;
-
-    Ok((mapping, MigrationGoogleDriveStorage { store, metadata }))
+    Ok((
+        mapping.clone(),
+        MigrationGoogleDriveStorage {
+            storage,
+            repository_namespace: mapping.id,
+            token_source,
+            token_cache,
+            metadata,
+        },
+    ))
 }
 
 async fn execute_migration_with_storage(
@@ -3603,6 +3683,57 @@ fn probe_server_reachable(server_url: &str) -> CliResult<()> {
     })
 }
 
+async fn probe_authenticated_migration_target(
+    lfs_url: &str,
+    token: &LfsSessionToken,
+) -> CliResult<()> {
+    let mut batch_url = crate::init::validate_server_url(lfs_url, true)?;
+    let mut segments = batch_url
+        .path_segments_mut()
+        .map_err(|()| CliError::InvalidArguments {
+            message: "LFS URL cannot be used as a repository route".to_owned(),
+        })?;
+    segments.extend(["objects", "batch"]);
+    drop(segments);
+
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .map_err(|source| CliError::Io {
+            context: "failed to create migration target probe client".to_owned(),
+            source: io::Error::other(source),
+        })?;
+    let response = client
+        .post(batch_url)
+        .bearer_auth(token.as_str())
+        .header("Accept", "application/vnd.git-lfs+json")
+        .header("Content-Type", "application/vnd.git-lfs+json")
+        .json(&serde_json::json!({
+            "operation": "upload",
+            "transfers": ["basic"],
+            "objects": [],
+        }))
+        .timeout(MIGRATION_TARGET_PROBE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|source| CliError::Io {
+            context: "failed to authenticate the migration target repository".to_owned(),
+            source: io::Error::other(source),
+        })?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(CliError::ExternalCommandOutput {
+            command: "migration target repository authentication".to_owned(),
+            message: SanitizedMessage::new(format!(
+                "server returned HTTP status {}",
+                response.status().as_u16()
+            )),
+        })
+    }
+}
+
 fn resolve_socket_addresses_with_timeout(host: String, port: u16) -> CliResult<Vec<SocketAddr>> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let thread_host = host.clone();
@@ -3804,6 +3935,11 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use axum::{
+        Json, Router,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
     use clap::{CommandFactory, Parser};
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
@@ -3816,11 +3952,11 @@ mod tests {
         SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
         current_checkout_lfs_pointer_scan, dispatch, execute_migration_with_storage,
         github_personal_access_token_login_url_for_server, is_git_worktree_discovery_error,
-        prepare_migration_execution, probe_server_reachable, read_bounded_login_token,
-        read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir,
-        run_init_from_dir, run_login_from_dir, run_logout_from_dir, run_migrate_from_dir,
-        run_pull_from_dir, run_status_from_dir, tracing_config, validate_status_storage,
-        write_init_change,
+        prepare_migration_execution, probe_authenticated_migration_target, probe_server_reachable,
+        read_bounded_login_token, read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir,
+        run_hydrate_from_dir, run_init_from_dir, run_login_from_dir, run_logout_from_dir,
+        run_migrate_from_dir, run_pull_from_dir, run_status_from_dir, tracing_config,
+        validate_status_storage, write_init_change,
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
@@ -5031,6 +5167,100 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn migration_target_probe_authenticates_the_repository_batch_route() {
+        let observed = Arc::new(Mutex::new(None));
+        let observed_for_route = Arc::clone(&observed);
+        let app = Router::new().route(
+            "/github.com/owner/repo.git/info/lfs/objects/batch",
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let observed = Arc::clone(&observed_for_route);
+                    async move {
+                        *observed
+                            .lock()
+                            .expect("migration target probe record should not poison") = Some((
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                            body,
+                        ));
+                        StatusCode::OK
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("migration target probe listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("migration target probe address should be available");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("migration target probe server should run");
+        });
+        let token = LfsSessionToken::from_secret("migration-session-token")
+            .expect("migration session token should be valid");
+
+        probe_authenticated_migration_target(
+            &format!("http://{address}/github.com/owner/repo.git/info/lfs"),
+            &token,
+        )
+        .await
+        .expect("repository-scoped authenticated probe should succeed");
+        server.abort();
+
+        let observed = observed
+            .lock()
+            .expect("migration target probe record should not poison")
+            .clone()
+            .expect("migration target probe request should be recorded");
+        assert_eq!(
+            observed.0.as_deref(),
+            Some("Bearer migration-session-token")
+        );
+        assert_eq!(observed.1["operation"], "upload");
+        assert_eq!(observed.1["objects"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn migration_target_probe_rejects_an_inactive_session() {
+        let app = Router::new().route(
+            "/github.com/owner/repo.git/info/lfs/objects/batch",
+            post(|| async { StatusCode::UNAUTHORIZED }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("migration target probe listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("migration target probe address should be available");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("migration target probe server should run");
+        });
+        let token = LfsSessionToken::from_secret("expired-migration-session")
+            .expect("migration session token should be valid");
+
+        let error = probe_authenticated_migration_target(
+            &format!("http://{address}/github.com/owner/repo.git/info/lfs"),
+            &token,
+        )
+        .await
+        .expect_err("inactive migration session should fail before migration work");
+        server.abort();
+
+        assert!(
+            matches!(error, CliError::ExternalCommandOutput { command, message }
+            if command == "migration target repository authentication"
+                && message.as_str().contains("401"))
+        );
+    }
+
     #[test]
     fn status_storage_validation_uses_generic_credential_error() {
         let directory = TempDir::new().expect("temporary directory should be created");
@@ -5282,7 +5512,9 @@ mod tests {
             purge_source_lfs: false,
         };
         let context = prepare_migration_execution(command, &repo)
-            .expect("historical migration execution should prepare");
+            .expect("historical migration execution should prepare")
+            .scan_fetched_refs()
+            .expect("historical migration execution should scan fetched refs");
         let mapping = RepositoryMapping {
             id: "github-main:owner/repo".to_owned(),
             repo_provider: "github-main".to_owned(),
@@ -5378,7 +5610,9 @@ mod tests {
             },
             &repo,
         )
-        .expect("migration execution should prepare");
+        .expect("migration execution should prepare")
+        .scan_fetched_refs()
+        .expect("migration execution should scan fetched refs");
         let mapping = RepositoryMapping {
             id: "github-main:owner/repo".to_owned(),
             repo_provider: "github-main".to_owned(),

@@ -899,14 +899,17 @@ pub fn fetch_migration_git_refs(
 /// separately. For objects that do need upload, it re-verifies the selected
 /// local source bytes against the pointer OID and size immediately before
 /// delegating to the storage provider. Every lookup, upload, and durable
-/// checkpoint is bound to `repository_namespace`.
+/// checkpoint is bound to `repository_namespace`. Checkpointed completions are
+/// revalidated against the active storage provider before they are resumed, so
+/// a deleted object or a provider configuration change cannot make stale
+/// durable state look complete.
 ///
 /// Uploads run with [`DEFAULT_MIGRATION_UPLOAD_CONCURRENCY`] simultaneous
 /// transfers. Each success is appended and synchronized to a provider-specific
 /// checkpoint under the repository's Git LFS media directory before it is
-/// reported. A later invocation resumes those completions without contacting
-/// storage, while failed objects are retried. Outcomes retain discovery order
-/// even though provider work completes out of order.
+/// reported. A later invocation resumes those completions after revalidating
+/// them against storage, while missing or failed objects are retried. Outcomes
+/// retain discovery order even though provider work completes out of order.
 ///
 /// # Errors
 ///
@@ -941,7 +944,8 @@ pub async fn upload_migration_objects_to_storage(
 /// are appended as JSON Lines records and synchronized individually, making the
 /// checkpoint safe to reuse after interruption. A partial final line left by a
 /// process crash is ignored; malformed complete records fail closed. The
-/// checkpoint cannot be reused for another repository namespace.
+/// checkpoint cannot be reused for another repository namespace, and every
+/// restored completion is checked against the active storage target.
 ///
 /// # Errors
 ///
@@ -979,25 +983,62 @@ pub async fn upload_migration_objects_to_storage_with_options(
             let storage_provider_id = storage_provider_id.clone();
             let repository_namespace = repository_namespace.clone();
             async move {
-                let outcome = if let Some(completion) = checkpointed {
-                    resumed_migration_upload_outcome(
-                        local_object.object.clone(),
-                        &storage_provider_id,
-                        &repository_namespace,
-                        completion,
-                    )
-                } else {
-                    let status =
-                        upload_one_migration_object(&local_object, storage, &repository_namespace)
-                            .await;
-                    checkpoint_migration_upload_outcome(
-                        &checkpoint_path,
-                        &storage_provider_id,
-                        &repository_namespace,
-                        local_object.object.clone(),
-                        status,
-                    )
-                    .await
+                let outcome = match checkpointed {
+                    Some(completion) => {
+                        match storage
+                            .object_exists(&repository_namespace, &local_object.object)
+                            .await
+                        {
+                            Ok(true) => resumed_migration_upload_outcome(
+                                local_object.object.clone(),
+                                &storage_provider_id,
+                                &repository_namespace,
+                                completion,
+                            ),
+                            Ok(false) => {
+                                let status = upload_missing_migration_object(
+                                    &local_object,
+                                    storage,
+                                    &repository_namespace,
+                                )
+                                .await;
+                                checkpoint_migration_upload_outcome(
+                                    &checkpoint_path,
+                                    &storage_provider_id,
+                                    &repository_namespace,
+                                    local_object.object.clone(),
+                                    status,
+                                )
+                                .await
+                            }
+                            Err(error) => {
+                                checkpoint_migration_upload_outcome(
+                                    &checkpoint_path,
+                                    &storage_provider_id,
+                                    &repository_namespace,
+                                    local_object.object.clone(),
+                                    Err(error.into()),
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    None => {
+                        let status = upload_one_migration_object(
+                            &local_object,
+                            storage,
+                            &repository_namespace,
+                        )
+                        .await;
+                        checkpoint_migration_upload_outcome(
+                            &checkpoint_path,
+                            &storage_provider_id,
+                            &repository_namespace,
+                            local_object.object.clone(),
+                            status,
+                        )
+                        .await
+                    }
                 };
                 (index, outcome)
             }
@@ -1064,6 +1105,15 @@ async fn upload_one_migration_object(
         return Ok(MigrationObjectUploadStatus::AlreadyPresent { resumed: false });
     }
 
+    upload_missing_migration_object(local_object, storage, repository_namespace).await
+}
+
+async fn upload_missing_migration_object(
+    local_object: &LocalMigrationObject,
+    storage: &dyn StorageProvider,
+    repository_namespace: &str,
+) -> MigrationResult<MigrationObjectUploadStatus> {
+    let object = &local_object.object;
     let source = verified_migration_upload_source_path(local_object)?;
     verify_migration_upload_source(source, object).await?;
     let stored_object = storage
@@ -6043,6 +6093,7 @@ mod tests {
         assert!(error.to_string().contains("different repository namespace"));
 
         let resumed_storage = FakeMigrationStorageProvider::new("drive-user-a");
+        resumed_storage.insert_existing(completed.clone());
         let resumed_report = upload_migration_objects_to_storage_with_options(
             &availability,
             &resumed_storage,
@@ -6062,6 +6113,31 @@ mod tests {
             resumed_report.outcomes[1].status,
             MigrationObjectUploadStatus::Uploaded { resumed: false, .. }
         ));
+
+        let replacement_storage = FakeMigrationStorageProvider::new("drive-user-a");
+        let replacement_report = upload_migration_objects_to_storage_with_options(
+            &availability,
+            &replacement_storage,
+            TEST_REPOSITORY_NAMESPACE,
+            &options,
+        )
+        .await
+        .expect("missing checkpointed objects should be uploaded again");
+
+        assert!(replacement_report.failed_objects.is_empty());
+        assert_eq!(
+            replacement_storage
+                .upload_attempts()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            [completed.clone(), failed.clone()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(replacement_report.outcomes.iter().all(|outcome| matches!(
+            outcome.status,
+            MigrationObjectUploadStatus::Uploaded { resumed: false, .. }
+        )));
     }
 
     #[tokio::test]

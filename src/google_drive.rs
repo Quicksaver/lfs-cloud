@@ -5,15 +5,15 @@
 //! Git LFS clients.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
     net::IpAddr,
     path::Path,
     process::{Command as ProcessCommand, Stdio},
-    sync::OnceLock,
-    time::Duration,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -31,7 +31,7 @@ use reqwest::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
@@ -58,6 +58,7 @@ const GOOGLE_DRIVE_TRANSFER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30
 const GOOGLE_DRIVE_RESUMABLE_UPLOAD_CHUNK_SIZE: usize = 256 * 1024;
 const GOOGLE_DRIVE_RESUMABLE_UPLOAD_MAX_RECOVERY_ATTEMPTS: u32 = 4;
 const GOOGLE_DRIVE_RESUMABLE_UPLOAD_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const GOOGLE_ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
 const MAX_GOOGLE_ERROR_BODY_LEN: usize = 16 * 1024;
 const MIN_REDACTED_SECRET_FRAGMENT_LEN: usize = 6;
 const MAX_GOOGLE_DRIVE_CUSTOM_PROPERTY_BYTES: usize = 124;
@@ -154,6 +155,88 @@ impl fmt::Debug for GoogleDriveAccessToken {
             .field("expires_in_seconds", &self.expires_in_seconds)
             .field("scope", &self.scope)
             .finish()
+    }
+}
+
+/// Source of short-lived Google Drive access tokens for runtime storage work.
+pub(crate) trait GoogleDriveAccessTokenSource: Send + Sync {
+    /// Returns a token suitable for the configured Google Drive provider.
+    fn access_token<'a>(
+        &'a self,
+        storage: &'a GoogleDriveStorageConfig,
+    ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>>;
+}
+
+impl GoogleDriveAccessTokenSource for GoogleDriveGcloudTokenProvider {
+    fn access_token<'a>(
+        &'a self,
+        storage: &'a GoogleDriveStorageConfig,
+    ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
+        Box::pin(async move { self.access_token(&storage.id, &storage.credentials).await })
+    }
+}
+
+/// Single-flight cache for short-lived Google Drive access tokens.
+#[derive(Clone, Default)]
+pub(crate) struct GoogleDriveAccessTokenCache {
+    tokens: Arc<AsyncMutex<HashMap<String, CachedGoogleDriveAccessToken>>>,
+}
+
+#[derive(Clone)]
+struct CachedGoogleDriveAccessToken {
+    token: GoogleDriveAccessToken,
+    refresh_at: Instant,
+}
+
+impl GoogleDriveAccessTokenCache {
+    /// Returns a cached token or refreshes it shortly before expiry.
+    pub(crate) async fn get_or_refresh(
+        &self,
+        storage: &GoogleDriveStorageConfig,
+        token_source: &dyn GoogleDriveAccessTokenSource,
+    ) -> StorageResult<GoogleDriveAccessToken> {
+        self.get_or_refresh_at(storage, token_source, Instant::now())
+            .await
+    }
+
+    async fn get_or_refresh_at(
+        &self,
+        storage: &GoogleDriveStorageConfig,
+        token_source: &dyn GoogleDriveAccessTokenSource,
+        now: Instant,
+    ) -> StorageResult<GoogleDriveAccessToken> {
+        // Keep the lock through refresh so concurrent misses collapse into one
+        // token request. Refreshes happen only near expiry.
+        let mut tokens = self.tokens.lock().await;
+        if let Some(cached) = tokens.get(&storage.id)
+            && cached.refresh_at > now
+        {
+            return Ok(cached.token.clone());
+        }
+
+        let token = token_source.access_token(storage).await?;
+        let refresh_at = token
+            .expires_in_seconds()
+            .and_then(|seconds| {
+                Duration::from_secs(seconds).checked_sub(GOOGLE_ACCESS_TOKEN_REFRESH_SKEW)
+            })
+            .and_then(|lifetime| now.checked_add(lifetime));
+
+        if let Some(refresh_at) = refresh_at
+            && refresh_at > now
+        {
+            tokens.insert(
+                storage.id.clone(),
+                CachedGoogleDriveAccessToken {
+                    token: token.clone(),
+                    refresh_at,
+                },
+            );
+        } else {
+            tokens.remove(&storage.id);
+        }
+
+        Ok(token)
     }
 }
 
@@ -3430,17 +3513,21 @@ mod tests {
         collections::BTreeMap,
         io::Cursor,
         str::FromStr,
-        sync::{Arc, Mutex},
-        time::Duration,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
     };
 
     use super::{
+        GoogleDriveAccessToken, GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource,
         GoogleDriveGcloudTokenProvider, GoogleDriveObjectKey, GoogleDriveObjectStore,
         GoogleDriveRootValidator, parse_gcloud_access_token,
     };
     use crate::{
         GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
-        LfsOid, StorageDeleteOutcome, StorageError, StorageProvider,
+        LfsOid, ProviderFuture, StorageDeleteOutcome, StorageError, StorageProvider, StorageResult,
     };
     use axum::{
         Json, Router,
@@ -3458,6 +3545,52 @@ mod tests {
     use tokio_util::io::ReaderStream;
 
     const OBJECT_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    struct CountingAccessTokenSource {
+        calls: AtomicUsize,
+    }
+
+    impl GoogleDriveAccessTokenSource for CountingAccessTokenSource {
+        fn access_token<'a>(
+            &'a self,
+            _storage: &'a GoogleDriveStorageConfig,
+        ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(GoogleDriveAccessToken::for_test(format!(
+                    "access-token-{call}"
+                )))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn access_token_cache_refreshes_before_expiry() {
+        let cache = GoogleDriveAccessTokenCache::default();
+        let source = CountingAccessTokenSource {
+            calls: AtomicUsize::new(0),
+        };
+        let storage = storage_config("google-drive-user-a");
+        let started_at = Instant::now();
+
+        let first = cache
+            .get_or_refresh_at(&storage, &source, started_at)
+            .await
+            .expect("first access token should be minted");
+        let cached = cache
+            .get_or_refresh_at(&storage, &source, started_at + Duration::from_secs(3_000))
+            .await
+            .expect("unexpired access token should be reused");
+        let refreshed = cache
+            .get_or_refresh_at(&storage, &source, started_at + Duration::from_secs(3_540))
+            .await
+            .expect("access token should refresh at the expiry skew");
+
+        assert_eq!(first.as_str(), "access-token-1");
+        assert_eq!(cached.as_str(), first.as_str());
+        assert_eq!(refreshed.as_str(), "access-token-2");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn gcloud_token_output_parses_without_exposing_scope_claims() {

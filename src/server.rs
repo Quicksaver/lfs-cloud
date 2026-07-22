@@ -41,15 +41,16 @@ use url::{Url, form_urlencoded};
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GitHubPersonalAccessTokenLoginRouteState,
-    GitHubRepositoryProvider, GoogleDriveAccessToken, GoogleDriveGcloudTokenProvider,
-    GoogleDriveObjectStore, GoogleDriveRootValidator, GoogleDriveStorageConfig, LFS_BASIC_TRANSFER,
-    LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation, LfsBatchRequest,
-    LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken,
-    LocalLfsSessionStore, MetadataDatabase, MetadataObjectVerificationStatus, ProviderFuture,
-    RepositoryAuthentication, RepositoryIdentity, RepositoryMapping, RepositoryPermission,
-    RepositoryProvider, RepositoryProviderConfig, RepositoryProviderError, RepositoryUser,
-    SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError, StorageProvider,
-    StorageProviderConfig, StorageResult, StoredObject, github_personal_access_token_login_router,
+    GitHubRepositoryProvider, GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore,
+    GoogleDriveRootValidator, LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError,
+    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject,
+    LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase,
+    MetadataObjectVerificationStatus, ProviderFuture, RepositoryAuthentication, RepositoryIdentity,
+    RepositoryMapping, RepositoryPermission, RepositoryProvider, RepositoryProviderConfig,
+    RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerConfig, ServerError,
+    ServerResult, StorageError, StorageProvider, StorageProviderConfig, StoredObject,
+    github_personal_access_token_login_router,
+    google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
     metadata::{MetadataTransferOperation, MetadataTransferResult},
     parse_lfs_batch_request_json,
     sessions::LfsSessionRecord,
@@ -67,7 +68,6 @@ const BATCH_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const BATCH_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const BATCH_STORAGE_LOOKUP_CONCURRENCY: usize = 16;
 const AUTHORIZATION_CACHE_TTL: Duration = Duration::from_secs(15);
-const GOOGLE_ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
 const SERVER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1066,22 +1066,6 @@ struct GoogleDriveTransferStore {
     object_api_base_url: Option<String>,
 }
 
-trait GoogleDriveAccessTokenSource: Send + Sync {
-    fn access_token<'a>(
-        &'a self,
-        storage: &'a GoogleDriveStorageConfig,
-    ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>>;
-}
-
-impl GoogleDriveAccessTokenSource for GoogleDriveGcloudTokenProvider {
-    fn access_token<'a>(
-        &'a self,
-        storage: &'a GoogleDriveStorageConfig,
-    ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
-        Box::pin(async move { self.access_token(&storage.id, &storage.credentials).await })
-    }
-}
-
 impl GoogleDriveTransferStore {
     fn with_dependencies(
         config: ServerConfig,
@@ -1215,60 +1199,6 @@ impl GoogleDriveTransferStore {
         }
 
         Ok(replacement)
-    }
-}
-
-#[derive(Clone, Default)]
-struct GoogleDriveAccessTokenCache {
-    tokens: Arc<AsyncMutex<HashMap<String, CachedGoogleDriveAccessToken>>>,
-}
-
-#[derive(Clone)]
-struct CachedGoogleDriveAccessToken {
-    token: GoogleDriveAccessToken,
-    refresh_at: Instant,
-}
-
-impl GoogleDriveAccessTokenCache {
-    async fn get_or_refresh(
-        &self,
-        storage: &GoogleDriveStorageConfig,
-        token_source: &dyn GoogleDriveAccessTokenSource,
-    ) -> ServerResult<GoogleDriveAccessToken> {
-        // Keep the lock through refresh so concurrent misses collapse into one
-        // token request. Refreshes happen only near expiry, and the server-wide
-        // provider semaphore bounds this path with all other upstream calls.
-        let mut tokens = self.tokens.lock().await;
-        let now = Instant::now();
-        if let Some(cached) = tokens.get(&storage.id)
-            && cached.refresh_at > now
-        {
-            return Ok(cached.token.clone());
-        }
-
-        let token = token_source.access_token(storage).await?;
-        let refresh_at = token
-            .expires_in_seconds()
-            .and_then(|seconds| {
-                Duration::from_secs(seconds).checked_sub(GOOGLE_ACCESS_TOKEN_REFRESH_SKEW)
-            })
-            .and_then(|lifetime| now.checked_add(lifetime));
-
-        if let Some(refresh_at) = refresh_at
-            && refresh_at > now
-        {
-            tokens.insert(
-                storage.id.clone(),
-                CachedGoogleDriveAccessToken {
-                    token: token.clone(),
-                    refresh_at,
-                },
-            );
-        } else {
-            tokens.remove(&storage.id);
-        }
-
-        Ok(token)
     }
 }
 
@@ -3726,8 +3656,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, BatchBodyGuardrails, GoogleDriveAccessTokenCache,
-        GoogleDriveAccessTokenSource, GoogleDriveTransferStore, LFS_AUTH_CHALLENGE,
+        BASE64_STANDARD, BatchBodyGuardrails, GoogleDriveTransferStore, LFS_AUTH_CHALLENGE,
         LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore,
         LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES,
         ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients, ServerShutdownOutcome,
@@ -3754,6 +3683,7 @@ mod tests {
         RepositoryPermission, RepositoryProviderError, RepositoryUser, SanitizedMessage,
         ServerConfig, ServerError, ServerResult, StorageError, StorageProviderConfig,
         StorageResult, StoredObject,
+        google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{

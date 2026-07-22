@@ -13,7 +13,9 @@ The committed repository-side `.lfsconfig` should contain only the LFS Cloud end
 
 `lfscloud migrate` uses the repository mapping and Google Drive provider from the private server config supplied through the global `--config` option. The running server, migration command, and any other writer for the same Drive root must use the same `server.metadata_path`; migration shares its object upload locks with the server to prevent duplicate backend files.
 
-Migration obtains its own short-lived Drive token from the configured gcloud ADC directory and validates the root folder before fetching or uploading source LFS objects. It also requires an existing repository-scoped LFS Cloud login so the target endpoint is usable before the source repository is reconfigured.
+Migration obtains short-lived Drive tokens from the configured gcloud ADC directory, refreshes them shortly before expiry throughout transfer work, and validates the root folder before fetching or uploading source LFS objects. It also requires an existing repository-scoped LFS Cloud login and proves the session plus repository authorization with an authenticated Git LFS batch request before the source repository is reconfigured.
+
+Each completed destination check is synchronized to a durable receipt. A resumed migration revalidates every recorded object against the currently configured Drive target, so changing the root folder or deleting a Drive object causes that object to be uploaded again instead of trusting stale checkpoint state.
 
 The completed migration writes the target URL to both `.lfsconfig` and local Git config. `.lfsconfig` is the shareable setting for new clones; the local override preserves target routing while this clone checks out historical commits that predate `.lfsconfig`.
 
