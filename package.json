@@ -12,7 +12,8 @@
     "lint:prettier": "prettier --log-level=warn --check .",
     "merge": "./scripts/git/merge.sh",
     "rotate:github": "./scripts/keys/github.sh",
-    "rotate:google-drive": "./scripts/keys/google-drive.sh"
+    "rotate:google-drive": "./scripts/keys/google-drive.sh",
+    "rotate:slack": "./scripts/keys/slack.sh"
   },
   "devDependencies": {
     "dotenv": "^17.4.2",

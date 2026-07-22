@@ -1,0 +1,114 @@
+name: Slack workflow failure notifications
+
+on:
+  workflow_run:
+    # GitHub requires workflow_run listeners to enumerate workflow names. Keep
+    # this list aligned with the other workflows in this directory.
+    workflows:
+      - CI
+      - Dependency audit
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  notify-slack:
+    name: Notify Slack
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        github.event.workflow_run.conclusion == 'failure'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      NOTIFICATION_TITLE: >-
+        ${{
+          github.event_name == 'workflow_dispatch' &&
+          'GitHub Actions notification test' ||
+          'GitHub Actions workflow failed'
+        }}
+      WORKFLOW_NAME: ${{ github.event.workflow_run.name || 'Slack workflow failure notifications' }}
+      WORKFLOW_URL: >-
+        ${{
+          github.event.workflow_run.html_url ||
+          format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id)
+        }}
+      SOURCE_RUN_NUMBER: ${{ github.event.workflow_run.run_number || github.run_number }}
+      SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      SOURCE_EVENT: ${{ github.event.workflow_run.event || github.event_name }}
+      SOURCE_ACTOR: ${{ github.event.workflow_run.actor.login || github.actor }}
+      SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - name: Require the channel webhook
+        shell: bash
+        run: |
+          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+            echo "::error::Set SLACK_WEBHOOK_URL to an incoming webhook for Slack channel C0BJY1M2WR4."
+            exit 1
+          fi
+
+      - name: Send failure notification
+        shell: bash
+        run: |
+          short_sha="${SOURCE_SHA:0:7}"
+          payload="$({
+            jq -n \
+              --arg title "$NOTIFICATION_TITLE" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg workflow "$WORKFLOW_NAME" \
+              --arg run "#$SOURCE_RUN_NUMBER" \
+              --arg branch "$SOURCE_BRANCH" \
+              --arg event "$SOURCE_EVENT" \
+              --arg actor "$SOURCE_ACTOR" \
+              --arg commit "$short_sha" \
+              --arg url "$WORKFLOW_URL" \
+              '{
+                text: ($title + " in " + $repository + ": " + $workflow),
+                blocks: [
+                  {
+                    type: "header",
+                    text: {type: "plain_text", text: $title}
+                  },
+                  {
+                    type: "section",
+                    fields: [
+                      {type: "plain_text", text: ("Repository\n" + $repository)},
+                      {type: "plain_text", text: ("Workflow\n" + $workflow)},
+                      {type: "plain_text", text: ("Run\n" + $run)},
+                      {type: "plain_text", text: ("Branch\n" + $branch)},
+                      {type: "plain_text", text: ("Event\n" + $event)},
+                      {type: "plain_text", text: ("Actor\n" + $actor)},
+                      {type: "plain_text", text: ("Commit\n" + $commit)}
+                    ]
+                  },
+                  {
+                    type: "actions",
+                    elements: [
+                      {
+                        type: "button",
+                        text: {type: "plain_text", text: "Open failed run"},
+                        style: "danger",
+                        url: $url
+                      }
+                    ]
+                  }
+                ]
+              }'
+          })"
+
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --header "Content-Type: application/json" \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL"

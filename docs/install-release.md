@@ -71,13 +71,22 @@ Rotate the local smoke-test values and matching GitHub repository secrets with:
 ```bash
 yarn rotate:github
 yarn rotate:google-drive
+yarn rotate:slack
 ```
 
 The GitHub script reads hidden terminal input. The Google Drive script accepts
 the isolated gcloud configuration directory, updates the ignored root
 `.env.local`, and syncs its generated ADC file contents to the repository's
-`LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON` secret. Both scripts resolve the target
-repository from the `origin` remote.
+`LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON` secret. The Slack script reads a hidden,
+channel-bound incoming webhook URL, updates `SLACK_WEBHOOK_URL` in `.env.local`,
+and syncs the matching GitHub Actions repository secret. All three scripts
+resolve the target repository from the `origin` remote.
+
+The `Slack workflow failure notifications` workflow watches the `CI` and
+`Dependency audit` workflows and posts only their failed runs. Its notification
+job maps the `SLACK_WEBHOOK_URL` repository secret into the process environment;
+the webhook value is never committed. A manual workflow dispatch sends a test
+notification without deliberately breaking CI.
 
 The separate dependency-audit workflow installs the repository-pinned
 `cargo-audit` version and fails when the locked Rust graph contains an
