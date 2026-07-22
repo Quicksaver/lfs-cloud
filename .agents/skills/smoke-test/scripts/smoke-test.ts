@@ -163,13 +163,17 @@ async function script(name: string, timeoutMs = defaultTimeoutMs, env: NodeJS.Pr
   await command('bash', [join(repoRoot, 'scripts', 'manual', name)], { env, timeoutMs });
 }
 
+function isolatedGitEnv(): NodeJS.ProcessEnv {
+  return {
+    GIT_CONFIG_GLOBAL: join(sandbox, 'gitconfig'),
+    GIT_CONFIG_NOSYSTEM: '1',
+  };
+}
+
 async function git(cwd: string, ...args: string[]): Promise<string> {
   return command('git', args, {
     cwd,
-    env: {
-      GIT_CONFIG_GLOBAL: join(sandbox, 'gitconfig'),
-      GIT_CONFIG_NOSYSTEM: '1',
-    },
+    env: isolatedGitEnv(),
   });
 }
 
@@ -236,7 +240,7 @@ async function migrationDryRunSmoke(): Promise<void> {
   const output = await command(
     binaryPath,
     ['migrate', '--server', 'https://lfs.example.invalid', '--cache-root', cacheRoot, '--all-refs', '--dry-run'],
-    { cwd: migrationRepo },
+    { cwd: migrationRepo, env: isolatedGitEnv() },
   );
   const statusAfter = await git(migrationRepo, 'status', '--porcelain=v1', '--untracked-files=all');
   const configAfter = await readFile(join(migrationRepo, '.git', 'config'), 'utf8');
