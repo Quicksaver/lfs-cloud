@@ -3968,11 +3968,11 @@ mod tests {
     };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
-        GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GoogleDriveStorageConfig,
-        LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken, LocalCacheError,
-        LocalCacheLayout, LocalCacheWorktreeRegistration, ProviderFuture, RepositoryMapping,
-        SanitizedMessage, ServeOptions, StorageDeleteOutcome, StorageError, StorageProvider,
-        StorageProviderConfig, StorageResult, StoredObject,
+        GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitRepository,
+        GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
+        LocalCacheError, LocalCacheLayout, LocalCacheWorktreeRegistration, ProviderFuture,
+        RepositoryMapping, SanitizedMessage, ServeOptions, StorageDeleteOutcome, StorageError,
+        StorageProvider, StorageProviderConfig, StorageResult, StoredObject,
     };
 
     struct RecordingMigrationStorage {
@@ -5386,6 +5386,10 @@ mod tests {
             &["config", "filter.lfs.process", "git-lfs filter-process"],
         );
         run_git(&repo, &["config", "filter.lfs.required", "true"]);
+        let local_git_config_path = GitRepository::discover(&repo)
+            .expect("temporary repository should be discovered")
+            .local_git_config_path()
+            .expect("local Git config path should resolve");
         let object = object_for_bytes(b"migration object already local");
         write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(
@@ -5446,7 +5450,7 @@ mod tests {
         assert!(rendered.contains("current checkout"));
         assert!(rendered.contains("files touched: 2 would update"));
         assert!(rendered.contains(".lfsconfig"));
-        assert!(rendered.contains(".git/config"));
+        assert!(rendered.contains(&local_git_config_path.display().to_string()));
         assert!(rendered.contains("tracked LFS patterns: 1"));
         assert!(rendered.contains("*.bin (.gitattributes; filter=lfs)"));
         assert!(rendered.contains("pointer files: 1"));
