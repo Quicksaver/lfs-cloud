@@ -884,7 +884,7 @@ pub fn fetch_migration_git_refs(
         source,
     })?;
     let (status, stderr) =
-        wait_for_git_lfs_fetch_command(&mut child, &display, MIGRATION_SOURCE_FETCH_TIMEOUT)?;
+        wait_for_git_command(&mut child, &display, MIGRATION_SOURCE_FETCH_TIMEOUT)?;
     if status.success() {
         Ok(())
     } else {
@@ -1730,11 +1730,8 @@ fn run_git_lfs_fetch_command(
         context: "failed to start git lfs fetch".to_owned(),
         source,
     })?;
-    let (status, stderr) = wait_for_git_lfs_fetch_command(
-        &mut child,
-        &command.display,
-        MIGRATION_SOURCE_FETCH_TIMEOUT,
-    )?;
+    let (status, stderr) =
+        wait_for_git_command(&mut child, &command.display, MIGRATION_SOURCE_FETCH_TIMEOUT)?;
 
     if status.success() {
         Ok(())
@@ -1743,7 +1740,7 @@ fn run_git_lfs_fetch_command(
     }
 }
 
-fn wait_for_git_lfs_fetch_command(
+fn wait_for_git_command(
     child: &mut Child,
     command: &str,
     timeout: Duration,
@@ -1761,13 +1758,13 @@ fn wait_for_git_lfs_fetch_command(
             context: format!("failed to wait for {command}"),
             source,
         })? {
-            let stderr = join_git_lfs_fetch_stderr_reader(stderr_reader)?;
+            let stderr = join_git_stderr_reader(stderr_reader)?;
             return Ok((status, stderr.bytes));
         }
 
         if Instant::now() >= deadline {
-            stop_timed_out_git_lfs_fetch_child(child, command)?;
-            let stderr = join_git_lfs_fetch_stderr_reader(stderr_reader)?;
+            stop_timed_out_git_child(child, command)?;
+            let stderr = join_git_stderr_reader(stderr_reader)?;
             return Err(MigrationError::ExternalCommand {
                 command: command.to_owned(),
                 status: format!("timed out after {} seconds", timeout.as_secs()),
@@ -1779,7 +1776,7 @@ fn wait_for_git_lfs_fetch_command(
     }
 }
 
-fn stop_timed_out_git_lfs_fetch_child(child: &mut Child, command: &str) -> MigrationResult<()> {
+fn stop_timed_out_git_child(child: &mut Child, command: &str) -> MigrationResult<()> {
     stop_bounded_git_process_tree(child);
 
     if child
@@ -1803,7 +1800,7 @@ fn stop_timed_out_git_lfs_fetch_child(child: &mut Child, command: &str) -> Migra
     Ok(())
 }
 
-fn join_git_lfs_fetch_stderr_reader(
+fn join_git_stderr_reader(
     reader: thread::JoinHandle<io::Result<PipeReadResult>>,
 ) -> MigrationResult<PipeReadResult> {
     reader
@@ -4277,7 +4274,7 @@ mod tests {
         parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
         upload_migration_objects_to_storage, upload_migration_objects_to_storage_with_options,
         validate_historical_scan_git_version, validate_history_ref_name,
-        verified_migration_upload_source_path, wait_for_git_lfs_fetch_command,
+        verified_migration_upload_source_path, wait_for_git_command,
     };
 
     const TEST_REPOSITORY_NAMESPACE: &str = "github-main:owner/repo";
@@ -6427,12 +6424,9 @@ mod tests {
         let mut child = command.spawn().expect("test shell should start");
 
         let started_at = Instant::now();
-        let error = wait_for_git_lfs_fetch_command(
-            &mut child,
-            "git lfs fetch test",
-            Duration::from_millis(50),
-        )
-        .expect_err("timed-out command should fail");
+        let error =
+            wait_for_git_command(&mut child, "git lfs fetch test", Duration::from_millis(50))
+                .expect_err("timed-out command should fail");
 
         assert!(
             started_at.elapsed() < Duration::from_secs(5),

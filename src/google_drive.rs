@@ -179,8 +179,10 @@ impl GoogleDriveAccessTokenSource for GoogleDriveGcloudTokenProvider {
 /// Single-flight cache for short-lived Google Drive access tokens.
 #[derive(Clone, Default)]
 pub(crate) struct GoogleDriveAccessTokenCache {
-    tokens: Arc<AsyncMutex<HashMap<String, CachedGoogleDriveAccessToken>>>,
+    tokens: Arc<AsyncMutex<HashMap<String, GoogleDriveAccessTokenSlot>>>,
 }
+
+type GoogleDriveAccessTokenSlot = Arc<AsyncMutex<Option<CachedGoogleDriveAccessToken>>>;
 
 #[derive(Clone)]
 struct CachedGoogleDriveAccessToken {
@@ -205,10 +207,18 @@ impl GoogleDriveAccessTokenCache {
         token_source: &dyn GoogleDriveAccessTokenSource,
         now: Instant,
     ) -> StorageResult<GoogleDriveAccessToken> {
-        // Keep the lock through refresh so concurrent misses collapse into one
-        // token request. Refreshes happen only near expiry.
-        let mut tokens = self.tokens.lock().await;
-        if let Some(cached) = tokens.get(&storage.id)
+        let provider_token = {
+            let mut tokens = self.tokens.lock().await;
+            Arc::clone(
+                tokens
+                    .entry(storage.id.clone())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(None))),
+            )
+        };
+        // Serialize refreshes only for this provider. A slow gcloud process
+        // must not block cached reads or refreshes for unrelated providers.
+        let mut cached_token = provider_token.lock().await;
+        if let Some(cached) = cached_token.as_ref()
             && cached.refresh_at > now
         {
             return Ok(cached.token.clone());
@@ -225,15 +235,14 @@ impl GoogleDriveAccessTokenCache {
         if let Some(refresh_at) = refresh_at
             && refresh_at > now
         {
-            tokens.insert(
-                storage.id.clone(),
-                CachedGoogleDriveAccessToken {
-                    token: token.clone(),
-                    refresh_at,
-                },
-            );
+            *cached_token = Some(CachedGoogleDriveAccessToken {
+                token: token.clone(),
+                refresh_at,
+            });
         } else {
-            tokens.remove(&storage.id);
+            // Tokens already within the refresh skew are deliberately not
+            // cached, preventing reuse of credentials near their expiry.
+            *cached_token = None;
         }
 
         Ok(token)
@@ -3564,6 +3573,29 @@ mod tests {
         }
     }
 
+    struct ConcurrentAccessTokenSource {
+        active_calls: AtomicUsize,
+        max_active_calls: AtomicUsize,
+    }
+
+    impl GoogleDriveAccessTokenSource for ConcurrentAccessTokenSource {
+        fn access_token<'a>(
+            &'a self,
+            storage: &'a GoogleDriveStorageConfig,
+        ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
+            Box::pin(async move {
+                let active = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active_calls.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.active_calls.fetch_sub(1, Ordering::SeqCst);
+                Ok(GoogleDriveAccessToken::for_test(format!(
+                    "access-token-{}",
+                    storage.id
+                )))
+            })
+        }
+    }
+
     #[tokio::test]
     async fn access_token_cache_refreshes_before_expiry() {
         let cache = GoogleDriveAccessTokenCache::default();
@@ -3590,6 +3622,35 @@ mod tests {
         assert_eq!(cached.as_str(), first.as_str());
         assert_eq!(refreshed.as_str(), "access-token-2");
         assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn access_token_cache_refreshes_distinct_providers_concurrently() {
+        let cache = GoogleDriveAccessTokenCache::default();
+        let source = ConcurrentAccessTokenSource {
+            active_calls: AtomicUsize::new(0),
+            max_active_calls: AtomicUsize::new(0),
+        };
+        let first_storage = storage_config("google-drive-user-a");
+        let mut second_storage = storage_config("google-drive-user-b");
+        second_storage.id = "drive-user-b".to_owned();
+
+        let (first, second) = tokio::join!(
+            cache.get_or_refresh(&first_storage, &source),
+            cache.get_or_refresh(&second_storage, &source),
+        );
+
+        assert_eq!(
+            first.expect("first provider token should refresh").as_str(),
+            "access-token-drive-user-a"
+        );
+        assert_eq!(
+            second
+                .expect("second provider token should refresh")
+                .as_str(),
+            "access-token-drive-user-b"
+        );
+        assert_eq!(source.max_active_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

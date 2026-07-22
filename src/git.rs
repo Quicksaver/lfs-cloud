@@ -70,8 +70,8 @@ impl GitRepository {
                 let config_key = format!("remote.{remote_name}.url");
                 let configured_url = git_stdout(
                     start_dir,
-                    ["config", "--local", "--get", config_key.as_str()],
-                    &format!("git config --local --get {config_key}"),
+                    ["config", "--get", config_key.as_str()],
+                    &format!("git config --get {config_key}"),
                 )?;
                 GitRemote::parse(remote_name, configured_url.trim_end())?
             }
@@ -948,6 +948,35 @@ mod tests {
         assert_eq!(detected.remote.owner, "owner");
         assert_eq!(detected.remote.name, "repo");
         assert_eq!(detected.remote.url(), "https://github.com/owner/repo.git");
+    }
+
+    #[test]
+    fn discovery_reads_rewritten_remote_identity_from_worktree_config() {
+        let repo = TempGitRepo::new();
+        let mirror = TempDir::new().expect("temporary mirror should be created");
+        let mirror_url = url::Url::from_file_path(mirror.path())
+            .expect("mirror path should convert to a file URL");
+        let rewrite_key = format!("url.{}.insteadOf", mirror_url.as_str());
+        repo.git(["config", "extensions.worktreeConfig", "true"]);
+        repo.git([
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "https://github.com/owner/repo.git",
+        ]);
+        repo.git([
+            "config",
+            "--local",
+            rewrite_key.as_str(),
+            "https://github.com/owner/repo.git",
+        ]);
+
+        let detected = GitRepository::discover(repo.path())
+            .expect("worktree-scoped remote identity should survive the rewrite");
+
+        assert_eq!(detected.remote.host, "github.com");
+        assert_eq!(detected.remote.owner, "owner");
+        assert_eq!(detected.remote.name, "repo");
     }
 
     #[test]

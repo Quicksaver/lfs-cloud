@@ -1275,6 +1275,7 @@ struct MigrationExecutionPreparation {
     discovery: GitLfsMigrationDiscovery,
     cache_layout: LocalCacheLayout,
     purge_source_lfs: bool,
+    allow_insecure_http: bool,
 }
 
 impl MigrationExecutionPreparation {
@@ -1452,7 +1453,12 @@ where
     // so checking it does not require changing the source LFS configuration.
     probe_server(&preparation.route.server_url)?;
     let token = lookup_credential(&preparation.route.lfs_url)?;
-    probe_authenticated_migration_target(&preparation.route.lfs_url, &token).await?;
+    probe_authenticated_migration_target(
+        &preparation.route.lfs_url,
+        preparation.allow_insecure_http,
+        &token,
+    )
+    .await?;
 
     let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
     let (mapping, storage) =
@@ -1526,6 +1532,7 @@ fn prepare_migration_execution(
         discovery,
         cache_layout: local_cache_layout(command.cache_root)?,
         purge_source_lfs: command.purge_source_lfs,
+        allow_insecure_http: command.allow_insecure_http,
     })
 }
 
@@ -3685,9 +3692,10 @@ fn probe_server_reachable(server_url: &str) -> CliResult<()> {
 
 async fn probe_authenticated_migration_target(
     lfs_url: &str,
+    allow_insecure_http: bool,
     token: &LfsSessionToken,
 ) -> CliResult<()> {
-    let mut batch_url = crate::init::validate_server_url(lfs_url, true)?;
+    let mut batch_url = crate::init::validate_server_url(lfs_url, allow_insecure_http)?;
     let mut segments = batch_url
         .path_segments_mut()
         .map_err(|()| CliError::InvalidArguments {
@@ -5207,6 +5215,7 @@ mod tests {
 
         probe_authenticated_migration_target(
             &format!("http://{address}/github.com/owner/repo.git/info/lfs"),
+            false,
             &token,
         )
         .await
@@ -5248,6 +5257,7 @@ mod tests {
 
         let error = probe_authenticated_migration_target(
             &format!("http://{address}/github.com/owner/repo.git/info/lfs"),
+            false,
             &token,
         )
         .await
@@ -5259,6 +5269,22 @@ mod tests {
             if command == "migration target repository authentication"
                 && message.as_str().contains("401"))
         );
+    }
+
+    #[tokio::test]
+    async fn migration_target_probe_rejects_non_loopback_http_without_opt_in() {
+        let token = LfsSessionToken::from_secret("migration-session-token")
+            .expect("migration session token should be valid");
+
+        let error = probe_authenticated_migration_target(
+            "http://example.com/github.com/owner/repo.git/info/lfs",
+            false,
+            &token,
+        )
+        .await
+        .expect_err("non-loopback HTTP should require explicit opt-in");
+
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
     }
 
     #[test]
