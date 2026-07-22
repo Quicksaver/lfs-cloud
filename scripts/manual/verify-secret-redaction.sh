@@ -11,7 +11,6 @@ redaction_tests=(
   "credentials::tests::lookup_rejects_non_utf8_stdout_without_leaking_output"
   "git::tests::debug_redacts_credentialed_url_defensively"
   "github_auth::tests::personal_access_token_validation_and_debug_are_secret_safe"
-  "google_drive::tests::gcloud_provider_redacts_failed_command_stderr"
   "google_drive::tests::drive_diagnostics_redact_token_fragments_at_truncation_boundary"
   "server_config::tests::raw_repository_provider_debug_redacts_github_personal_access_token"
   "server_config::tests::server_config_debug_redacts_github_personal_access_token"
@@ -28,6 +27,7 @@ case "$(uname -s)" in
       "credentials::tests::lookup_rejects_invalid_local_lfs_tokens_without_leaking_them"
       "credentials::tests::lookup_failure_suppresses_helper_stderr"
       "credentials::tests::approve_failure_redacts_token_from_command_error"
+      "google_drive::tests::gcloud_provider_redacts_failed_command_stderr"
     )
     ;;
 esac
