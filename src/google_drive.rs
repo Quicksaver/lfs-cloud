@@ -4891,7 +4891,9 @@ mod tests {
             &server.base_url,
         )
         .expect("object store should build");
-        store.transfer_read_idle_timeout = Duration::from_millis(50);
+        // Leave enough time for each request to reach the mock server under
+        // emulated ARM64 load while remaining well below its five-second stall.
+        store.transfer_read_idle_timeout = Duration::from_millis(250);
         store.upload_retry_initial_backoff = Duration::ZERO;
 
         let error = store
