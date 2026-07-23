@@ -30,7 +30,15 @@ yarn lint:check
 node --no-warnings --experimental-strip-types .agents/skills/smoke-test/scripts/smoke-test.ts
 ```
 
-GitHub Actions runs formatting, linting, all Cargo targets, documentation tests, release builds, and smoke tests for four native targets:
+After pushing a candidate commit from an ARM64 Mac, run the deterministic local verifier:
+
+```bash
+yarn verify:macos
+```
+
+The verifier requires a clean tracked worktree and proves that the checked-out commit is exactly the current branch on `origin`. It uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. It packages the verified binary, checksum, and commit-bound build manifest under `dist/`, then posts the commit status `local-checks/macos-arm64` through the authenticated GitHub CLI. The status description explicitly identifies the result as a local macOS check.
+
+GitHub Actions `CI` is manual-only and installs the toolchain declared by `package.rust-version` in `Cargo.toml`, including the matrix target and required components. Local verification continues to use the active system Rust toolchain. One workflow dispatch runs formatting, linting, all Cargo targets, documentation tests, release builds, and smoke tests for all four native targets:
 
 | Artifact                     | Rust target                  | Runner architecture |
 | ---------------------------- | ---------------------------- | ------------------- |
@@ -41,7 +49,7 @@ GitHub Actions runs formatting, linting, all Cargo targets, documentation tests,
 
 Each matrix job runs the target's Cargo and documentation tests before its optimized build. The smoke harness then receives the exact release executable, so CLI, local-cache, credential, migration, and eligible live-provider checks cannot silently fall back to a separately built debug binary. The opt-in LAN check honors the same executable boundary when explicitly enabled. The test suite uses platform-native child processes for timeout and process-tree cleanup coverage, so Windows exercises the same recursive termination boundary as Unix.
 
-Pull requests run the complete local smoke coverage without repository secrets. On pushes and manual runs, live GitHub checks run when `LFS_CLOUD_GITHUB_PAT` is configured. The disposable-resource PAT needs classic `repo` and `delete_repo` scopes. CI writes the ADC JSON to an isolated `application_default_credentials.json`, installs `gcloud`, and gives the smoke runner only `LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR`, which points to the containing isolated gcloud configuration directory. Local smoke runs set the same directory-path variable in `.env.local`.
+Manual CI runs live GitHub and Google Drive checks when their repository secrets are configured. The disposable-resource PAT needs classic `repo` and `delete_repo` scopes. CI writes the ADC JSON to an isolated `application_default_credentials.json`, installs `gcloud`, and gives the smoke runner only `LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR`, which points to the containing isolated gcloud configuration directory. Local smoke runs set the same directory-path variable in `.env.local`.
 
 Rotate the local smoke-test values and matching GitHub repository secrets with:
 
@@ -81,9 +89,43 @@ For a local PATH install from this checkout:
 cargo install --path .
 ```
 
+## Local Release
+
+Authenticate `gh` with permission to write commit statuses, tags, and releases, then run the macOS verifier on the current pushed commit:
+
+```bash
+yarn verify:macos
+```
+
+Create the next semantic version with exactly one increment:
+
+```bash
+yarn release:local patch
+# or: yarn release:local minor
+# or: yarn release:local major
+```
+
+The release script:
+
+1. Requires a completely clean worktree and a current commit exactly matching the current branch on `origin`.
+2. Requires the latest `local-checks/macos-arm64` status to be successful and created by the currently authenticated GitHub user.
+3. Updates the matching versions in `Cargo.toml`, `Cargo.lock`, and `package.json`, commits `Release vX.Y.Z`, and pushes that commit without force.
+4. Reruns the deterministic macOS verifier and requires its new commit status to be green.
+5. Verifies that the packaged binary reports the new version and that its SHA-256 checksum and build manifest match the exact commit.
+6. Creates and pushes an annotated `vX.Y.Z` tag for the exact verified commit.
+7. Creates a draft GitHub release, uploads the binary archive, checksum, and build manifest, verifies all assets, and only then publishes the release.
+
+If an interruption occurs after the version commit or tag is pushed, do not increment the version again. Restore the required green local status and artifact if necessary, then continue safely:
+
+```bash
+yarn release:local resume
+```
+
+The required-status list currently contains only macOS. Add future local environment contexts to `release_required_status_contexts` in `scripts/lib/release-common.sh`; the release gate will then require each latest status on the exact commit.
+
 ## Expected Release Artifact
 
-Successful CI jobs package the tested executable in a 14-day workflow artifact. These archives are CI outputs, not signed or published releases. The expected release artifact remains the compiled `lfscloud` binary plus documentation for:
+Successful manual CI jobs package tested executables in 14-day workflow artifacts. The local release path publishes the tested macOS archive, its SHA-256 checksum, and a commit-bound build manifest as GitHub Release assets. The expected release artifact remains the compiled `lfscloud` binary plus documentation for:
 
 - supported platform and architecture
 - config file schema
@@ -95,8 +137,8 @@ Successful CI jobs package the tested executable in a 14-day workflow artifact. 
 The current repository still does not define:
 
 - installer scripts
-- checksums or signatures
-- CI release publishing
+- binary signatures or macOS notarization
+- automated CI release publishing
 - Homebrew, Cargo registry, or OS package distribution
 
 ## Licensing
@@ -105,15 +147,8 @@ LFS Cloud source is licensed under the [MIT License](../LICENSE). The Rust and r
 
 The current locked Rust dependency graph declares only permissive license terms, or multi-license expressions with a permissive option. Prettier, the only JavaScript development dependency, is also MIT-licensed and is not part of the compiled artifact. Before distributing a release, regenerate the dependency inventory from the final lockfiles and preserve any notices required by dependencies whose terms include Apache-2.0, BSD, ISC, Unicode, CDLA-Permissive, or other notice-bearing licenses.
 
-Release automation should run the full verification set before publishing:
+The deterministic macOS verifier runs the complete verification set before publishing:
 
 ```bash
-cargo fmt --check
-cargo test --all-targets
-cargo test --doc
-cargo clippy --all-targets -- -D warnings
-cargo build --release
-node --no-warnings --experimental-strip-types .agents/skills/smoke-test/scripts/smoke-test.ts
-cargo audit
-yarn lint:check
+yarn verify:macos
 ```

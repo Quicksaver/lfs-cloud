@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  pull_request:
-  push:
   workflow_dispatch:
 
 permissions:
@@ -39,23 +37,27 @@ jobs:
       CARGO_TERM_COLOR: never
       LFS_CLOUD_SMOKE_BINARY: ${{ github.workspace }}/${{ matrix.binary }}
       LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS: "1"
-      LFS_CLOUD_GITHUB_PAT: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GITHUB_PAT || '' }}
-      LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON: ${{ github.event_name != 'pull_request' && secrets.LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON || '' }}
+      LFS_CLOUD_GITHUB_PAT: ${{ secrets.LFS_CLOUD_GITHUB_PAT }}
+      LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON: ${{ secrets.LFS_CLOUD_GOOGLE_DRIVE_ADC_JSON }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
+      - name: Install project Rust toolchain
         shell: bash
-        run: >-
-          rustup toolchain install 1.88.0 --profile minimal
-          --component clippy --component rustfmt
-          --target "$CARGO_BUILD_TARGET"
-
-      - name: Select Rust toolchain
-        shell: bash
-        run: rustup default 1.88.0
+        run: |
+          rust_version="$(awk -F'"' '/^rust-version = "/ { print $2; exit }' Cargo.toml)"
+          if [[ ! "$rust_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Invalid or missing package.rust-version in Cargo.toml" >&2
+            exit 1
+          fi
+          rustup toolchain install "$rust_version" \
+            --profile minimal \
+            --component clippy \
+            --component rustfmt \
+            --target "$CARGO_BUILD_TARGET"
+          echo "RUSTUP_TOOLCHAIN=$rust_version" >> "$GITHUB_ENV"
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'

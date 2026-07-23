@@ -11,9 +11,12 @@
     "lint:fix": "yarn lint:prettier --write",
     "lint:prettier": "prettier --log-level=warn --check .",
     "merge": "./scripts/git/merge.sh",
+    "release:local": "./scripts/release.sh",
     "rotate:github": "./scripts/keys/github.sh",
     "rotate:google-drive": "./scripts/keys/google-drive.sh",
-    "rotate:slack": "./scripts/keys/slack.sh"
+    "rotate:slack": "./scripts/keys/slack.sh",
+    "test:release-scripts": "./scripts/tests/release-scripts.sh",
+    "verify:macos": "./scripts/local/verify-macos.sh"
   },
   "devDependencies": {
     "dotenv": "^17.4.2",

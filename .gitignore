@@ -5,6 +5,7 @@
 # Build artifacts
 /target/
 **/target/
+/dist/
 
 # Cargo.lock is committed for binaries, but listed here for reference
 # Cargo.lock
