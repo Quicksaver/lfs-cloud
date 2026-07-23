@@ -6,8 +6,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=release-common.sh
 source "$SCRIPT_DIR/release-common.sh"
 
+VERIFY_LINUX_STATUS_STARTED=0
+VERIFY_LINUX_STATUS_FINALIZED=0
+VERIFY_LINUX_STATUS_CONTEXT=""
+VERIFY_LINUX_ARTIFACT_PLATFORM=""
+
 verify_docker_engine() {
   docker info >/dev/null 2>&1
+}
+
+verify_linux_finalize_status() {
+  local exit_code=$?
+
+  trap - EXIT
+  if ((VERIFY_LINUX_STATUS_STARTED == 1 && VERIFY_LINUX_STATUS_FINALIZED == 0)); then
+    release_post_status \
+      "$RELEASE_SHA" \
+      "$VERIFY_LINUX_STATUS_CONTEXT" \
+      "failure" \
+      "Local Docker $VERIFY_LINUX_ARTIFACT_PLATFORM checks failed" \
+      || release_warn "Failed to record the local Docker failure status"
+  fi
+  release_ui_finalize
+  exit "$exit_code"
 }
 
 verify_linux_docker() {
@@ -39,9 +60,12 @@ verify_linux_docker() {
   local rust_version
   local container_exit
   local start_exit
-  local status_started=0
-  local status_finalized=0
   local -a create_args
+
+  VERIFY_LINUX_STATUS_STARTED=0
+  VERIFY_LINUX_STATUS_FINALIZED=0
+  VERIFY_LINUX_STATUS_CONTEXT="$status_context"
+  VERIFY_LINUX_ARTIFACT_PLATFORM="$artifact_platform"
 
   release_initialize "$SCRIPT_DIR"
   cd "$RELEASE_REPO_ROOT"
@@ -57,22 +81,7 @@ verify_linux_docker() {
   host_uid="$(id -u)"
   host_gid="$(id -g)"
 
-  finalize_linux_status() {
-    local exit_code=$?
-
-    trap - EXIT
-    if ((status_started == 1 && status_finalized == 0)); then
-      release_post_status \
-        "$RELEASE_SHA" \
-        "$status_context" \
-        "failure" \
-        "Local Docker $artifact_platform checks failed" \
-        || release_warn "Failed to record the local Docker failure status"
-    fi
-    release_ui_finalize
-    exit "$exit_code"
-  }
-  trap finalize_linux_status EXIT
+  trap verify_linux_finalize_status EXIT
 
   release_run_step \
     "Record local Docker verification as pending" \
@@ -81,7 +90,7 @@ verify_linux_docker() {
     "$status_context" \
     "pending" \
     "Local Docker $artifact_platform checks are running"
-  status_started=1
+  VERIFY_LINUX_STATUS_STARTED=1
 
   rust_version="$(release_read_rust_version)"
   if [[ ! "$rust_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
@@ -240,7 +249,7 @@ verify_linux_docker() {
     "$status_context" \
     "success" \
     "Local Docker $artifact_platform checks passed"
-  status_finalized=1
+  VERIFY_LINUX_STATUS_FINALIZED=1
 
   release_pass "Local Docker verification passed for $RELEASE_SHA"
   release_info "Image: $image_name"

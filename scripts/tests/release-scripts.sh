@@ -60,6 +60,16 @@ release_info "Test bounded rolling slot output"
   ui_clear_live_state
 ) >/dev/null
 
+release_info "Test Linux verifier finalizer after function scope ends"
+(
+  # shellcheck source=../lib/verify-linux-docker.sh
+  source "$REPO_ROOT/scripts/lib/verify-linux-docker.sh"
+  RELEASE_UI_INITIALIZED=0
+  VERIFY_LINUX_STATUS_STARTED=1
+  VERIFY_LINUX_STATUS_FINALIZED=1
+  trap verify_linux_finalize_status EXIT
+) >/dev/null 2>&1
+
 release_info "Test parallel verifier orchestration and aggregate failures"
 parallel_fixture="$fixture_root/parallel"
 parallel_markers="$parallel_fixture/markers"
