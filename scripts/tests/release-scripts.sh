@@ -39,6 +39,7 @@ cat > "$version_fixture/Cargo.toml" <<'EOF'
 name = "lfscloud"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
 version = "1"
@@ -87,6 +88,9 @@ assert_eq "0.2.0" "$(
   node -e 'process.stdout.write(require(process.argv[1]).version)' "$version_fixture/package.json"
 )" "package.json version update"
 assert_eq "644" "$(stat -f '%Lp' "$version_fixture/Cargo.toml")" "metadata file mode preservation"
+RELEASE_REPO_ROOT="$version_fixture"
+assert_eq "1.88" "$(release_read_rust_version)" "project Rust version lookup"
+RELEASE_REPO_ROOT=""
 
 if node "$REPO_ROOT/scripts/lib/update-version.mjs" "$version_fixture" "0.1.0" "0.3.0" \
   >/dev/null 2>&1; then
@@ -116,6 +120,43 @@ if (
   release_verify_macos_manifest "$manifest_artifact" "$manifest_file" "0.2.0" "different"
 ) >/dev/null 2>&1; then
   fail_test "a build manifest for a different commit should be rejected"
+fi
+
+linux_artifact="$fixture_root/lfscloud-v0.2.0-linux-arm64-musl.tar.gz"
+linux_manifest="$fixture_root/lfscloud-v0.2.0-linux-arm64-musl.build.json"
+printf 'verified Linux artifact\n' > "$linux_artifact"
+linux_digest="$(shasum -a 256 "$linux_artifact" | awk 'NR == 1 { print $1 }')"
+jq -n \
+  --arg artifact "$(basename "$linux_artifact")" \
+  --arg digest "$linux_digest" \
+  '{
+    schema_version: 1,
+    artifact: $artifact,
+    commit: "abc123",
+    version: "0.2.0",
+    target: "aarch64-unknown-linux-musl",
+    container_arch: "aarch64",
+    kernel: "Linux fixture",
+    rustc: "rustc fixture",
+    sha256: $digest
+  }' > "$linux_manifest"
+release_verify_linux_manifest \
+  "$linux_artifact" \
+  "$linux_manifest" \
+  "0.2.0" \
+  "abc123" \
+  "aarch64-unknown-linux-musl" \
+  "aarch64"
+if (
+  release_verify_linux_manifest \
+    "$linux_artifact" \
+    "$linux_manifest" \
+    "0.2.0" \
+    "abc123" \
+    "x86_64-unknown-linux-musl" \
+    "x86_64"
+) >/dev/null 2>&1; then
+  fail_test "a Linux manifest for a different target should be rejected"
 fi
 
 printf '%s\n' "Test exact pushed-commit and status guards"
@@ -183,6 +224,20 @@ cat > "$status_file" <<EOF
     "state": "success",
     "description": "Local macOS checks passed",
     "creator": {"login": "test-user"}
+  },
+  {
+    "id": 3,
+    "context": "$LOCAL_LINUX_X86_64_STATUS_CONTEXT",
+    "state": "success",
+    "description": "Local Docker Linux x86-64 checks passed",
+    "creator": {"login": "test-user"}
+  },
+  {
+    "id": 4,
+    "context": "$LOCAL_LINUX_ARM64_STATUS_CONTEXT",
+    "state": "success",
+    "description": "Local Docker Linux ARM64 checks passed",
+    "creator": {"login": "test-user"}
   }
 ]
 EOF
@@ -233,10 +288,16 @@ fi
 
 printf '%s\n' "Test script syntax and non-destructive help entrypoints"
 bash -n \
+  "$REPO_ROOT/scripts/docker/run-linux-verification.sh" \
   "$REPO_ROOT/scripts/lib/release-common.sh" \
+  "$REPO_ROOT/scripts/lib/verify-linux-docker.sh" \
+  "$REPO_ROOT/scripts/local/verify-linux-arm64.sh" \
+  "$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" \
   "$REPO_ROOT/scripts/local/verify-macos.sh" \
   "$REPO_ROOT/scripts/release.sh" \
   "$REPO_ROOT/scripts/tests/release-scripts.sh"
+"$REPO_ROOT/scripts/local/verify-linux-arm64.sh" --help >/dev/null
+"$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-macos.sh" --help >/dev/null
 "$REPO_ROOT/scripts/release.sh" --help >/dev/null
 

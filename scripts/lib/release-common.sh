@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 LOCAL_MACOS_STATUS_CONTEXT="local-checks/macos-arm64"
+LOCAL_LINUX_X86_64_STATUS_CONTEXT="local-checks/linux-x86_64-docker"
+LOCAL_LINUX_ARM64_STATUS_CONTEXT="local-checks/linux-arm64-docker"
 RELEASE_REPO_ROOT=""
 RELEASE_BRANCH=""
 RELEASE_SHA=""
@@ -155,7 +157,10 @@ release_load_latest_status() {
 }
 
 release_required_status_contexts() {
-  printf '%s\n' "$LOCAL_MACOS_STATUS_CONTEXT"
+  printf '%s\n' \
+    "$LOCAL_MACOS_STATUS_CONTEXT" \
+    "$LOCAL_LINUX_X86_64_STATUS_CONTEXT" \
+    "$LOCAL_LINUX_ARM64_STATUS_CONTEXT"
 }
 
 release_require_local_statuses_green() {
@@ -187,6 +192,20 @@ release_read_cargo_version() {
     in_package && /^version = "[^"]+"$/ {
       value = $0
       sub(/^version = "/, "", value)
+      sub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "$RELEASE_REPO_ROOT/Cargo.toml"
+}
+
+release_read_rust_version() {
+  awk '
+    /^\[package\]$/ { in_package = 1; next }
+    in_package && /^\[/ { exit }
+    in_package && /^rust-version = "[^"]+"$/ {
+      value = $0
+      sub(/^rust-version = "/, "", value)
       sub(/"$/, "", value)
       print value
       exit
@@ -261,6 +280,24 @@ release_macos_manifest_path() {
   printf '%s/dist/lfscloud-v%s-macos-arm64.build.json\n' "$RELEASE_REPO_ROOT" "$version"
 }
 
+release_linux_artifact_path() {
+  local version="$1"
+  local artifact_platform="$2"
+  printf '%s/dist/lfscloud-v%s-%s.tar.gz\n' \
+    "$RELEASE_REPO_ROOT" \
+    "$version" \
+    "$artifact_platform"
+}
+
+release_linux_manifest_path() {
+  local version="$1"
+  local artifact_platform="$2"
+  printf '%s/dist/lfscloud-v%s-%s.build.json\n' \
+    "$RELEASE_REPO_ROOT" \
+    "$version" \
+    "$artifact_platform"
+}
+
 release_verify_checksum() {
   local artifact="$1"
   local checksum="$artifact.sha256"
@@ -306,5 +343,42 @@ release_verify_macos_manifest() {
     ' \
     "$manifest" >/dev/null; then
     release_die "macOS build manifest does not match the verified commit and artifact."
+  fi
+}
+
+release_verify_linux_manifest() {
+  local artifact="$1"
+  local manifest="$2"
+  local version="$3"
+  local sha="$4"
+  local target="$5"
+  local container_arch="$6"
+  local digest
+
+  if [[ ! -s "$manifest" ]]; then
+    release_die "Missing Linux build manifest: $(basename "$manifest")"
+  fi
+
+  digest="$(shasum -a 256 "$artifact" | awk 'NR == 1 { print $1 }')"
+  if ! jq -e \
+    --arg artifact "$(basename "$artifact")" \
+    --arg commit "$sha" \
+    --arg container_arch "$container_arch" \
+    --arg digest "$digest" \
+    --arg target "$target" \
+    --arg version "$version" \
+    '
+      .schema_version == 1 and
+      .artifact == $artifact and
+      .commit == $commit and
+      .sha256 == $digest and
+      .target == $target and
+      .container_arch == $container_arch and
+      .version == $version and
+      (.kernel | type == "string" and length > 0) and
+      (.rustc | type == "string" and length > 0)
+    ' \
+    "$manifest" >/dev/null; then
+    release_die "Linux build manifest does not match the verified commit and artifact."
   fi
 }

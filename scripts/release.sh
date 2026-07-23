@@ -114,18 +114,12 @@ ensure_release_tag() {
 
 publish_release() {
   local tag="$1"
-  local artifact="$2"
-  local checksum="$artifact.sha256"
-  local manifest="$3"
-  local artifact_name
-  local checksum_name
-  local manifest_name
+  shift
+  local assets=("$@")
+  local asset
+  local asset_name
   local release_json
   local release_url
-
-  artifact_name="$(basename "$artifact")"
-  checksum_name="$(basename "$checksum")"
-  manifest_name="$(basename "$manifest")"
 
   if release_json="$(
     gh release view "$tag" \
@@ -138,12 +132,12 @@ publish_release() {
     fi
 
     release_info "Replace assets on the existing draft release $tag"
-    gh release upload "$tag" "$artifact" "$checksum" "$manifest" \
+    gh release upload "$tag" "${assets[@]}" \
       --repo "$RELEASE_GITHUB_REPO" \
       --clobber
   else
     release_info "Create draft release $tag and upload verified assets"
-    gh release create "$tag" "$artifact" "$checksum" "$manifest" \
+    gh release create "$tag" "${assets[@]}" \
       --repo "$RELEASE_GITHUB_REPO" \
       --draft \
       --verify-tag \
@@ -160,24 +154,15 @@ publish_release() {
     release_die "Release $tag must remain a draft until its assets are verified."
   fi
 
-  if ! printf '%s' "$release_json" \
-    | jq -e --arg name "$artifact_name" \
-      '[.assets[] | select(.name == $name and .state == "uploaded" and .size > 0)] | length == 1' \
-      >/dev/null; then
-    release_die "Draft release $tag does not contain the uploaded binary archive."
-  fi
-  if ! printf '%s' "$release_json" \
-    | jq -e --arg name "$checksum_name" \
-      '[.assets[] | select(.name == $name and .state == "uploaded" and .size > 0)] | length == 1' \
-      >/dev/null; then
-    release_die "Draft release $tag does not contain the checksum asset."
-  fi
-  if ! printf '%s' "$release_json" \
-    | jq -e --arg name "$manifest_name" \
-      '[.assets[] | select(.name == $name and .state == "uploaded" and .size > 0)] | length == 1' \
-      >/dev/null; then
-    release_die "Draft release $tag does not contain the build manifest."
-  fi
+  for asset in "${assets[@]}"; do
+    asset_name="$(basename "$asset")"
+    if ! printf '%s' "$release_json" \
+      | jq -e --arg name "$asset_name" \
+        '[.assets[] | select(.name == $name and .state == "uploaded" and .size > 0)] | length == 1' \
+        >/dev/null; then
+      release_die "Draft release $tag does not contain uploaded asset $asset_name."
+    fi
+  done
 
   release_info "Publish release $tag"
   gh release edit "$tag" \
@@ -238,8 +223,10 @@ if [[ "$mode" != "resume" ]]; then
   RELEASE_SHA="$(git rev-parse HEAD)"
   release_require_current_commit_on_origin
 
-  release_info "Rerun deterministic local macOS verification"
+  release_info "Rerun deterministic local verifications"
   "$SCRIPT_DIR/local/verify-macos.sh"
+  "$SCRIPT_DIR/local/verify-linux-arm64.sh"
+  "$SCRIPT_DIR/local/verify-linux-x86-64.sh"
   release_require_local_statuses_green "$RELEASE_SHA"
 
   current_version="$next_version"
@@ -252,6 +239,47 @@ artifact="$(release_macos_artifact_path "$current_version")"
 manifest="$(release_macos_manifest_path "$current_version")"
 release_verify_checksum "$artifact"
 release_verify_macos_manifest "$artifact" "$manifest" "$current_version" "$RELEASE_SHA"
+release_assets=("$artifact" "$artifact.sha256" "$manifest")
+
+linux_x86_artifact="$(
+  release_linux_artifact_path "$current_version" "linux-x86_64-musl"
+)"
+linux_x86_manifest="$(
+  release_linux_manifest_path "$current_version" "linux-x86_64-musl"
+)"
+release_verify_checksum "$linux_x86_artifact"
+release_verify_linux_manifest \
+  "$linux_x86_artifact" \
+  "$linux_x86_manifest" \
+  "$current_version" \
+  "$RELEASE_SHA" \
+  "x86_64-unknown-linux-musl" \
+  "x86_64"
+release_assets+=(
+  "$linux_x86_artifact"
+  "$linux_x86_artifact.sha256"
+  "$linux_x86_manifest"
+)
+
+linux_arm_artifact="$(
+  release_linux_artifact_path "$current_version" "linux-arm64-musl"
+)"
+linux_arm_manifest="$(
+  release_linux_manifest_path "$current_version" "linux-arm64-musl"
+)"
+release_verify_checksum "$linux_arm_artifact"
+release_verify_linux_manifest \
+  "$linux_arm_artifact" \
+  "$linux_arm_manifest" \
+  "$current_version" \
+  "$RELEASE_SHA" \
+  "aarch64-unknown-linux-musl" \
+  "aarch64"
+release_assets+=(
+  "$linux_arm_artifact"
+  "$linux_arm_artifact.sha256"
+  "$linux_arm_manifest"
+)
 
 release_binary="$RELEASE_REPO_ROOT/target/aarch64-apple-darwin/release/lfscloud"
 if [[ ! -x "$release_binary" ]]; then
@@ -263,4 +291,4 @@ fi
 
 release_require_local_statuses_green "$RELEASE_SHA"
 ensure_release_tag "$tag" "$RELEASE_SHA"
-publish_release "$tag" "$artifact" "$manifest"
+publish_release "$tag" "${release_assets[@]}"

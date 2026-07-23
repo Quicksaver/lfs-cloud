@@ -38,6 +38,24 @@ yarn verify:macos
 
 The verifier requires a clean tracked worktree and proves that the checked-out commit is exactly the current branch on `origin`. It uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. It packages the verified binary, checksum, and commit-bound build manifest under `dist/`, then posts the commit status `local-checks/macos-arm64` through the authenticated GitHub CLI. The status description explicitly identifies the result as a local macOS check.
 
+Run the equivalent Linux checks through Docker:
+
+```bash
+yarn verify:linux-arm64
+yarn verify:linux-x86-64
+```
+
+Both scripts require the same clean, pushed commit boundary. They build the exact `package.rust-version` toolchain inside a parameterized Linux image, run formatting, Clippy, all Cargo targets, documentation tests, RustSec, repository formatting, release-binary smoke tests, and package a checksum plus commit-bound manifest under `dist/`. Results use the distinct commit statuses `local-checks/linux-arm64-docker` and `local-checks/linux-x86_64-docker`.
+
+Docker resources are deliberately stable and persist after a check:
+
+| Linux check | Image | Container | Target volume |
+| --- | --- | --- | --- |
+| x86-64 musl | `lfscloud-checks-linux-x86-64:local` | `lfscloud-checks-linux-x86-64` | `lfscloud-checks-linux-x86-64-target` |
+| ARM64 musl | `lfscloud-checks-linux-arm64:local` | `lfscloud-checks-linux-arm64` | `lfscloud-checks-linux-arm64-target` |
+
+Both containers share the architecture-independent `lfscloud-checks-cargo-cache` registry volume. Source is bind-mounted from the current checkout, while compiled targets stay isolated from macOS and the other Linux architecture. Repeated runs rebuild the named image with Docker's cache and restart the matching stopped container rather than creating anonymous images, containers, or volumes. If `.env.local` points at readable Google Drive ADC configuration, the same directory is mounted into the container so eligible live-provider smoke checks remain enabled.
+
 GitHub Actions `CI` is manual-only and installs the toolchain declared by `package.rust-version` in `Cargo.toml`, including the matrix target and required components. Local verification continues to use the active system Rust toolchain. One workflow dispatch runs formatting, linting, all Cargo targets, documentation tests, release builds, and smoke tests for all four native targets:
 
 | Artifact                     | Rust target                  | Runner architecture |
@@ -91,10 +109,12 @@ cargo install --path .
 
 ## Local Release
 
-Authenticate `gh` with permission to write commit statuses, tags, and releases, then run the macOS verifier on the current pushed commit:
+Authenticate `gh` with permission to write commit statuses, tags, and releases, then run all local verifiers on the current pushed commit:
 
 ```bash
 yarn verify:macos
+yarn verify:linux-arm64
+yarn verify:linux-x86-64
 ```
 
 Create the next semantic version with exactly one increment:
@@ -108,12 +128,12 @@ yarn release:local patch
 The release script:
 
 1. Requires a completely clean worktree and a current commit exactly matching the current branch on `origin`.
-2. Requires the latest `local-checks/macos-arm64` status to be successful and created by the currently authenticated GitHub user.
+2. Requires the latest macOS, Linux ARM64 Docker, and Linux x86-64 Docker statuses to be successful and created by the currently authenticated GitHub user.
 3. Updates the matching versions in `Cargo.toml`, `Cargo.lock`, and `package.json`, commits `Release vX.Y.Z`, and pushes that commit without force.
-4. Reruns the deterministic macOS verifier and requires its new commit status to be green.
-5. Verifies that the packaged binary reports the new version and that its SHA-256 checksum and build manifest match the exact commit.
+4. Reruns all three deterministic local verifiers and requires their new commit statuses to be green.
+5. Verifies that the packaged macOS binary reports the new version and that every platform archive's SHA-256 checksum and build manifest match the exact commit.
 6. Creates and pushes an annotated `vX.Y.Z` tag for the exact verified commit.
-7. Creates a draft GitHub release, uploads the binary archive, checksum, and build manifest, verifies all assets, and only then publishes the release.
+7. Creates a draft GitHub release, uploads the three binary archives, checksums, and build manifests, verifies all assets, and only then publishes the release.
 
 If an interruption occurs after the version commit or tag is pushed, do not increment the version again. Restore the required green local status and artifact if necessary, then continue safely:
 
@@ -121,11 +141,9 @@ If an interruption occurs after the version commit or tag is pushed, do not incr
 yarn release:local resume
 ```
 
-The required-status list currently contains only macOS. Add future local environment contexts to `release_required_status_contexts` in `scripts/lib/release-common.sh`; the release gate will then require each latest status on the exact commit.
-
 ## Expected Release Artifact
 
-Successful manual CI jobs package tested executables in 14-day workflow artifacts. The local release path publishes the tested macOS archive, its SHA-256 checksum, and a commit-bound build manifest as GitHub Release assets. The expected release artifact remains the compiled `lfscloud` binary plus documentation for:
+Successful manual CI jobs package tested executables in 14-day workflow artifacts. The local release path publishes tested macOS ARM64, Linux ARM64 musl, and Linux x86-64 musl archives with SHA-256 checksums and commit-bound build manifests as GitHub Release assets. The expected release artifact remains the compiled `lfscloud` binary plus documentation for:
 
 - supported platform and architecture
 - config file schema
@@ -147,8 +165,10 @@ LFS Cloud source is licensed under the [MIT License](../LICENSE). The Rust and r
 
 The current locked Rust dependency graph declares only permissive license terms, or multi-license expressions with a permissive option. Prettier, the only JavaScript development dependency, is also MIT-licensed and is not part of the compiled artifact. Before distributing a release, regenerate the dependency inventory from the final lockfiles and preserve any notices required by dependencies whose terms include Apache-2.0, BSD, ISC, Unicode, CDLA-Permissive, or other notice-bearing licenses.
 
-The deterministic macOS verifier runs the complete verification set before publishing:
+The deterministic local verifiers run the complete verification set before publishing:
 
 ```bash
 yarn verify:macos
+yarn verify:linux-arm64
+yarn verify:linux-x86-64
 ```

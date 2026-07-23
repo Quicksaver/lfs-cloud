@@ -16,6 +16,8 @@
     "rotate:google-drive": "./scripts/keys/google-drive.sh",
     "rotate:slack": "./scripts/keys/slack.sh",
     "test:release-scripts": "./scripts/tests/release-scripts.sh",
+    "verify:linux-arm64": "./scripts/local/verify-linux-arm64.sh",
+    "verify:linux-x86-64": "./scripts/local/verify-linux-x86-64.sh",
     "verify:macos": "./scripts/local/verify-macos.sh"
   },
   "devDependencies": {
