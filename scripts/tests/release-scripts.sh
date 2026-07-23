@@ -4,12 +4,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# shellcheck source=../lib/release-common.sh
-source "$SCRIPT_DIR/../lib/release-common.sh"
+# shellcheck source=../local/verify-all.sh
+source "$SCRIPT_DIR/../local/verify-all.sh"
 
 fail_test() {
-  printf 'FAIL: %s\n' "$1" >&2
-  exit 1
+  release_die "$1"
 }
 
 assert_eq() {
@@ -18,20 +17,103 @@ assert_eq() {
   local message="$3"
 
   if [[ "$expected" != "$actual" ]]; then
-    printf 'Expected: %s\nActual:   %s\n' "$expected" "$actual" >&2
+    release_warn "Expected: $expected"
+    release_warn "Actual:   $actual"
     fail_test "$message"
   fi
 }
 
+release_ui_initialize "[release-tests]" "Test local release automation"
+fixture_root=""
+finalize_release_tests() {
+  if [[ -n "$fixture_root" ]]; then
+    rm -rf -- "$fixture_root"
+  fi
+  release_ui_finalize
+}
+trap finalize_release_tests EXIT
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/lfscloud-release-tests.XXXXXX")"
-trap 'rm -rf -- "$fixture_root"' EXIT
 
-printf '%s\n' "Test semantic-version increments"
+release_info "Test semantic-version increments"
 assert_eq "1.0.0" "$(release_next_version "0.9.4" major)" "major increment"
 assert_eq "0.10.0" "$(release_next_version "0.9.4" minor)" "minor increment"
 assert_eq "0.9.5" "$(release_next_version "0.9.4" patch)" "patch increment"
 
-printf '%s\n' "Test synchronized version metadata updates"
+release_info "Test terminal UI command status propagation"
+set +e
+(release_run_step "Expected command failure" bash -c 'exit 7') >/dev/null 2>&1
+step_exit=$?
+set -e
+assert_eq "7" "$step_exit" "terminal UI command exit status"
+
+release_info "Test bounded rolling slot output"
+(
+  LIVE_REGION_ENABLED=true
+  ui_enable_rolling_slots 1 2
+  ui_set_slot 0 running "fixture"
+  ui_append_rolling_slot_output 0 "first"
+  ui_append_rolling_slot_output 0 "second"
+  ui_append_rolling_slot_output 0 "third"
+  assert_eq "2" "${LIVE_SLOT_OUTPUT_COUNTS[0]}" "rolling output line limit"
+  assert_eq "second" "${LIVE_SLOT_OUTPUT_LINES[0]}" "rolling output oldest retained line"
+  assert_eq "third" "${LIVE_SLOT_OUTPUT_LINES[1]}" "rolling output newest retained line"
+  ui_clear_live_state
+) >/dev/null
+
+release_info "Test parallel verifier orchestration and aggregate failures"
+parallel_fixture="$fixture_root/parallel"
+parallel_markers="$parallel_fixture/markers"
+mkdir -p "$parallel_markers"
+cat > "$parallel_fixture/verifier-template.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+name="$(basename "$0" .sh)"
+touch "$(dirname "$0")/markers/$name"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  marker_count="$(
+    find "$(dirname "$0")/markers" -type f \
+      | wc -l \
+      | tr -d '[:space:]'
+  )"
+  if [[ "$marker_count" == "3" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$marker_count" != "3" ]]; then
+  printf '%s did not overlap the other verifiers\n' "$name"
+  exit 9
+fi
+
+printf '%s unique output\n' "$name"
+if [[ "$name" == "verifier-fail" ]]; then
+  exit 7
+fi
+EOF
+cp "$parallel_fixture/verifier-template.sh" "$parallel_fixture/verifier-one.sh"
+cp "$parallel_fixture/verifier-template.sh" "$parallel_fixture/verifier-two.sh"
+cp "$parallel_fixture/verifier-template.sh" "$parallel_fixture/verifier-fail.sh"
+chmod +x "$parallel_fixture"/verifier-*.sh
+
+VERIFY_ALL_LABELS=("one" "two" "expected failure")
+VERIFY_ALL_COMMANDS=(
+  "$parallel_fixture/verifier-one.sh"
+  "$parallel_fixture/verifier-two.sh"
+  "$parallel_fixture/verifier-fail.sh"
+)
+set +e
+parallel_output="$(verify_all_run_parallel 2>&1)"
+parallel_exit=$?
+set -e
+assert_eq "1" "$parallel_exit" "one failed verifier should produce one aggregate failure"
+for verifier_name in verifier-one verifier-two verifier-fail; do
+  if ! grep -q "$verifier_name unique output" <<< "$parallel_output"; then
+    fail_test "parallel output omitted $verifier_name"
+  fi
+done
+
+release_info "Test synchronized version metadata updates"
 version_fixture="$fixture_root/version"
 mkdir -p "$version_fixture"
 cat > "$version_fixture/Cargo.toml" <<'EOF'
@@ -97,7 +179,7 @@ if node "$REPO_ROOT/scripts/lib/update-version.mjs" "$version_fixture" "0.1.0" "
   fail_test "mismatched old version should be rejected"
 fi
 
-printf '%s\n' "Test commit-bound build manifest verification"
+release_info "Test commit-bound build manifest verification"
 manifest_artifact="$fixture_root/lfscloud-v0.2.0-macos-arm64.tar.gz"
 manifest_file="$fixture_root/lfscloud-v0.2.0-macos-arm64.build.json"
 printf 'verified artifact\n' > "$manifest_artifact"
@@ -159,7 +241,7 @@ if (
   fail_test "a Linux manifest for a different target should be rejected"
 fi
 
-printf '%s\n' "Test exact pushed-commit and status guards"
+release_info "Test exact pushed-commit and status guards"
 bare_repo="$fixture_root/origin.git"
 work_repo="$fixture_root/work"
 fake_bin="$fixture_root/bin"
@@ -286,11 +368,13 @@ if (
   fail_test "a status from a different creator should be rejected"
 fi
 
-printf '%s\n' "Test script syntax and non-destructive help entrypoints"
+release_info "Test script syntax and non-destructive help entrypoints"
 bash -n \
   "$REPO_ROOT/scripts/docker/run-linux-verification.sh" \
   "$REPO_ROOT/scripts/lib/release-common.sh" \
+  "$REPO_ROOT/scripts/lib/terminal-ui.sh" \
   "$REPO_ROOT/scripts/lib/verify-linux-docker.sh" \
+  "$REPO_ROOT/scripts/local/verify-all.sh" \
   "$REPO_ROOT/scripts/local/verify-linux-arm64.sh" \
   "$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" \
   "$REPO_ROOT/scripts/local/verify-macos.sh" \
@@ -299,6 +383,7 @@ bash -n \
 "$REPO_ROOT/scripts/local/verify-linux-arm64.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-macos.sh" --help >/dev/null
+"$REPO_ROOT/scripts/local/verify-all.sh" --help >/dev/null
 "$REPO_ROOT/scripts/release.sh" --help >/dev/null
 
-printf 'PASS: release script tests\n'
+release_pass "Release script tests"

@@ -20,6 +20,9 @@ if (($# != 0)); then
   exit 2
 fi
 
+release_ui_initialize "[verify-linux-x86-64]" "Verify Linux x86-64 release"
+trap 'release_ui_finalize' EXIT
+
 verify_linux_docker \
   "linux/amd64" \
   "x86_64-unknown-linux-musl" \

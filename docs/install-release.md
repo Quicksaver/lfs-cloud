@@ -30,22 +30,23 @@ yarn lint:check
 node --no-warnings --experimental-strip-types .agents/skills/smoke-test/scripts/smoke-test.ts
 ```
 
-After pushing a candidate commit from an ARM64 Mac, run the deterministic local verifier:
+After pushing a candidate commit from an ARM64 Mac, run all deterministic local verifiers in parallel:
+
+```bash
+yarn verify:all
+```
+
+The orchestrator requires a clean tracked worktree and proves that the checked-out commit is exactly the current branch on `origin`, then runs the macOS ARM64, Linux ARM64, and Linux x86-64 verifiers concurrently. Its terminal display keeps a bounded rolling output window for each environment, waits for every verifier even when one fails, and reports their results independently. Each verifier packages its verified binary, checksum, and commit-bound build manifest under `dist/`, then posts its own `local-checks/*` commit status through the authenticated GitHub CLI.
+
+Run one environment independently when needed:
 
 ```bash
 yarn verify:macos
-```
-
-The verifier requires a clean tracked worktree and proves that the checked-out commit is exactly the current branch on `origin`. It uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. It packages the verified binary, checksum, and commit-bound build manifest under `dist/`, then posts the commit status `local-checks/macos-arm64` through the authenticated GitHub CLI. The status description explicitly identifies the result as a local macOS check.
-
-Run the equivalent Linux checks through Docker:
-
-```bash
 yarn verify:linux-arm64
 yarn verify:linux-x86-64
 ```
 
-Both scripts require the same clean, pushed commit boundary. They build the exact `package.rust-version` toolchain inside a parameterized Linux image, run formatting, Clippy, all Cargo targets, documentation tests, RustSec, repository formatting, release-binary smoke tests, and package a checksum plus commit-bound manifest under `dist/`. Results use the distinct commit statuses `local-checks/linux-arm64-docker` and `local-checks/linux-x86_64-docker`.
+The macOS verifier uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. Its status is `local-checks/macos-arm64`. The Linux scripts require the same clean, pushed commit boundary and build the exact `package.rust-version` toolchain inside a parameterized image. Their distinct statuses are `local-checks/linux-arm64-docker` and `local-checks/linux-x86_64-docker`.
 
 Docker resources are deliberately stable and persist after a check:
 
@@ -112,9 +113,7 @@ cargo install --path .
 Authenticate `gh` with permission to write commit statuses, tags, and releases, then run all local verifiers on the current pushed commit:
 
 ```bash
-yarn verify:macos
-yarn verify:linux-arm64
-yarn verify:linux-x86-64
+yarn verify:all
 ```
 
 Create the next semantic version with exactly one increment:
@@ -168,7 +167,5 @@ The current locked Rust dependency graph declares only permissive license terms,
 The deterministic local verifiers run the complete verification set before publishing:
 
 ```bash
-yarn verify:macos
-yarn verify:linux-arm64
-yarn verify:linux-x86-64
+yarn verify:all
 ```

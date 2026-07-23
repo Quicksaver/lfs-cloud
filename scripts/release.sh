@@ -42,6 +42,9 @@ case "$mode" in
     ;;
 esac
 
+release_ui_initialize "[release]" "Publish an LFS Cloud release"
+trap 'release_ui_finalize' EXIT
+
 release_initialize "$SCRIPT_DIR"
 cd "$RELEASE_REPO_ROOT"
 
@@ -55,6 +58,10 @@ release_require_current_commit_on_origin
 release_require_local_statuses_green "$RELEASE_SHA"
 
 current_version="$(release_require_matching_versions)"
+
+validate_locked_cargo_metadata() {
+  cargo metadata --locked --no-deps --format-version 1 >/dev/null
+}
 
 remote_tag_commit() {
   local tag="$1"
@@ -95,14 +102,18 @@ ensure_release_tag() {
 
   if [[ -z "$local_sha" ]]; then
     if [[ -n "$remote_sha" ]]; then
-      git fetch --quiet origin "refs/tags/$tag:refs/tags/$tag"
+      release_run_step \
+        "Fetch existing tag $tag" \
+        git fetch --quiet origin "refs/tags/$tag:refs/tags/$tag"
     else
-      git tag --annotate "$tag" --message "LFS Cloud $tag" "$sha"
+      release_run_step \
+        "Create annotated tag $tag" \
+        git tag --annotate "$tag" --message "LFS Cloud $tag" "$sha"
     fi
   fi
 
   if [[ -z "$remote_sha" ]]; then
-    git push origin "refs/tags/$tag"
+    release_run_step "Push tag $tag" git push origin "refs/tags/$tag"
   fi
 
   remote_sha="$(remote_tag_commit "$tag")"
@@ -131,13 +142,15 @@ publish_release() {
       release_die "Release $tag is already published."
     fi
 
-    release_info "Replace assets on the existing draft release $tag"
-    gh release upload "$tag" "${assets[@]}" \
+    release_run_step \
+      "Replace assets on the existing draft release $tag" \
+      gh release upload "$tag" "${assets[@]}" \
       --repo "$RELEASE_GITHUB_REPO" \
       --clobber
   else
-    release_info "Create draft release $tag and upload verified assets"
-    gh release create "$tag" "${assets[@]}" \
+    release_run_step \
+      "Create draft release $tag and upload verified assets" \
+      gh release create "$tag" "${assets[@]}" \
       --repo "$RELEASE_GITHUB_REPO" \
       --draft \
       --verify-tag \
@@ -164,8 +177,9 @@ publish_release() {
     fi
   done
 
-  release_info "Publish release $tag"
-  gh release edit "$tag" \
+  release_run_step \
+    "Publish release $tag" \
+    gh release edit "$tag" \
     --repo "$RELEASE_GITHUB_REPO" \
     --draft=false \
     --latest
@@ -183,6 +197,22 @@ publish_release() {
   release_pass "Published $release_url"
 }
 
+run_all_local_verifiers() {
+  local verify_exit
+
+  ui_clear_live_state
+  set +e
+  "$SCRIPT_DIR/local/verify-all.sh"
+  verify_exit=$?
+  set -e
+  ui_set_live_section_running "Publish an LFS Cloud release"
+
+  if ((verify_exit != 0)); then
+    release_die "Local release verification failed."
+  fi
+  release_pass "All local release environments passed"
+}
+
 if [[ "$mode" != "resume" ]]; then
   next_version="$(release_next_version "$current_version" "$mode")"
   tag="v$next_version"
@@ -197,36 +227,40 @@ if [[ "$mode" != "resume" ]]; then
     release_die "GitHub release already exists: $tag"
   fi
 
-  release_info "Update version $current_version -> $next_version"
-  node "$SCRIPT_DIR/lib/update-version.mjs" \
+  release_run_step \
+    "Update version $current_version -> $next_version" \
+    node "$SCRIPT_DIR/lib/update-version.mjs" \
     "$RELEASE_REPO_ROOT" \
     "$current_version" \
     "$next_version"
 
-  cargo metadata --locked --no-deps --format-version 1 >/dev/null
-  yarn install --immutable
+  release_run_step \
+    "Validate locked Cargo metadata" \
+    validate_locked_cargo_metadata
+  release_run_step "Validate Yarn install state" yarn install --immutable
 
   changed_files="$(git diff --name-only | LC_ALL=C sort)"
   expected_files="$(printf '%s\n' Cargo.lock Cargo.toml package.json | LC_ALL=C sort)"
   if [[ "$changed_files" != "$expected_files" ]]; then
-    printf 'Changed files:\n%s\n' "$changed_files" >&2
+    ui_log_persistent_raw_batch "Changed files:
+$changed_files" "$YELLOW"
     release_die "Version update changed files outside the expected package metadata."
   fi
 
   git add -- Cargo.toml Cargo.lock package.json
-  git commit --message "Release v$next_version"
+  release_run_step \
+    "Commit release v$next_version" \
+    git commit --message "Release v$next_version"
   release_require_fully_clean
 
-  release_info "Push release commit to origin/$RELEASE_BRANCH"
-  git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+  release_run_step \
+    "Push release commit to origin/$RELEASE_BRANCH" \
+    git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
 
   RELEASE_SHA="$(git rev-parse HEAD)"
   release_require_current_commit_on_origin
 
-  release_info "Rerun deterministic local verifications"
-  "$SCRIPT_DIR/local/verify-macos.sh"
-  "$SCRIPT_DIR/local/verify-linux-arm64.sh"
-  "$SCRIPT_DIR/local/verify-linux-x86-64.sh"
+  run_all_local_verifiers
   release_require_local_statuses_green "$RELEASE_SHA"
 
   current_version="$next_version"

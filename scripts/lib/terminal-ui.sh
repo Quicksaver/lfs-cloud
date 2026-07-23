@@ -11,6 +11,10 @@ LIVE_REGION_LINES=0
 LIVE_SLOT_COUNT=0
 LIVE_SLOT_STATES=()
 LIVE_SLOT_MESSAGES=()
+LIVE_SLOT_OUTPUT_MAX_LINES=3
+LIVE_SLOT_OUTPUT_COUNTS=()
+LIVE_SLOT_OUTPUT_LINES=()
+LIVE_SLOT_OUTPUT_PENDING_LINES=0
 LIVE_STDOUT_MAX_LINES=5
 LIVE_STDOUT_LINE_COUNT=0
 LIVE_STDOUT_LINES=()
@@ -35,7 +39,7 @@ ui_set_prefix() {
 
 ui_set_render_mode() {
     case "$1" in
-        section_task|task_only|slots)
+        section_task|task_only|slots|rolling_slots)
             LIVE_RENDER_MODE="$1"
             ;;
         *)
@@ -257,7 +261,7 @@ ui_render_live_region() {
 
     local lines=0
 
-    if [[ "$LIVE_RENDER_MODE" == "slots" ]]; then
+    if [[ "$LIVE_RENDER_MODE" == "slots" ]] || [[ "$LIVE_RENDER_MODE" == "rolling_slots" ]]; then
         local idx
         for (( idx = 0; idx < LIVE_SLOT_COUNT; idx++ )); do
             local slot_message="${LIVE_SLOT_MESSAGES[$idx]:-}"
@@ -265,6 +269,16 @@ ui_render_live_region() {
                 slot_message="$(ui_fit_live_status_message "$slot_message")"
                 ui_format_line "${LIVE_SLOT_STATES[$idx]:-running}" "$slot_message"
                 lines=$((lines + 1))
+
+                if [[ "$LIVE_RENDER_MODE" == "rolling_slots" ]]; then
+                    local output_count="${LIVE_SLOT_OUTPUT_COUNTS[$idx]:-0}"
+                    local output_idx
+                    for (( output_idx = 0; output_idx < output_count; output_idx++ )); do
+                        local output_offset=$((idx * LIVE_SLOT_OUTPUT_MAX_LINES + output_idx))
+                        ui_print_rolling_slot_output_line "${LIVE_SLOT_OUTPUT_LINES[$output_offset]:-}"
+                        lines=$((lines + 1))
+                    done
+                fi
             fi
         done
     elif [[ "$LIVE_RENDER_MODE" == "task_only" ]]; then
@@ -387,7 +401,7 @@ ui_terminal_columns() {
 }
 
 ui_live_stdout_is_visible() {
-    if [[ "$LIVE_RENDER_MODE" == "slots" ]]; then
+    if [[ "$LIVE_RENDER_MODE" == "slots" ]] || [[ "$LIVE_RENDER_MODE" == "rolling_slots" ]]; then
         return 1
     fi
 
@@ -623,15 +637,107 @@ ui_enable_slots() {
     LIVE_SLOT_COUNT="$count"
     LIVE_SLOT_STATES=()
     LIVE_SLOT_MESSAGES=()
+    LIVE_SLOT_OUTPUT_COUNTS=()
+    LIVE_SLOT_OUTPUT_LINES=()
+    LIVE_SLOT_OUTPUT_PENDING_LINES=0
 
     for (( idx = 0; idx < LIVE_SLOT_COUNT; idx++ )); do
         LIVE_SLOT_STATES[$idx]="running"
         LIVE_SLOT_MESSAGES[$idx]=""
+        LIVE_SLOT_OUTPUT_COUNTS[$idx]=0
     done
 
     LIVE_RENDER_MODE="slots"
     ui_clear_live_region
     ui_render_live_region
+}
+
+ui_enable_rolling_slots() {
+    local count="$1"
+    local max_lines="${2:-3}"
+
+    if ! [[ "$max_lines" =~ ^[0-9]+$ ]] || (( max_lines <= 0 )); then
+        max_lines=3
+    fi
+
+    LIVE_SLOT_OUTPUT_MAX_LINES="$max_lines"
+    ui_enable_slots "$count"
+    LIVE_RENDER_MODE="rolling_slots"
+    ui_clear_live_region
+    ui_render_live_region
+}
+
+ui_print_rolling_slot_output_line() {
+    local output_line="$1"
+
+    if [[ -n "$GRAY" ]]; then
+        printf '%b  │ %s%b\n' "$GRAY" "$output_line" "$RESET"
+    else
+        printf '  | %s\n' "$output_line"
+    fi
+}
+
+_ui_append_rolling_slot_clean_line() {
+    local idx="$1"
+    local line="$2"
+    local count="${LIVE_SLOT_OUTPUT_COUNTS[$idx]:-0}"
+    local output_idx
+    local output_offset
+    local next_output_offset
+
+    if [[ -z "${line//[[:space:]]/}" ]]; then
+        return
+    fi
+
+    if [[ "$LIVE_REGION_ENABLED" != true ]]; then
+        printf '%s\n' "$line"
+        return
+    fi
+
+    line="$(ui_fit_live_stream_line "$line")"
+
+    if (( count < LIVE_SLOT_OUTPUT_MAX_LINES )); then
+        output_offset=$((idx * LIVE_SLOT_OUTPUT_MAX_LINES + count))
+        LIVE_SLOT_OUTPUT_LINES[$output_offset]="$line"
+        LIVE_SLOT_OUTPUT_COUNTS[$idx]=$((count + 1))
+    else
+        for (( output_idx = 0; output_idx < LIVE_SLOT_OUTPUT_MAX_LINES - 1; output_idx++ )); do
+            output_offset=$((idx * LIVE_SLOT_OUTPUT_MAX_LINES + output_idx))
+            next_output_offset=$((output_offset + 1))
+            LIVE_SLOT_OUTPUT_LINES[$output_offset]="${LIVE_SLOT_OUTPUT_LINES[$next_output_offset]:-}"
+        done
+        output_offset=$((idx * LIVE_SLOT_OUTPUT_MAX_LINES + LIVE_SLOT_OUTPUT_MAX_LINES - 1))
+        LIVE_SLOT_OUTPUT_LINES[$output_offset]="$line"
+    fi
+
+    LIVE_SLOT_OUTPUT_PENDING_LINES=$((LIVE_SLOT_OUTPUT_PENDING_LINES + 1))
+}
+
+ui_append_rolling_slot_output() {
+    local idx="$1"
+    local raw_line="$2"
+    local normalized
+    local segment
+
+    if (( idx < 0 )) || (( idx >= LIVE_SLOT_COUNT )); then
+        return 1
+    fi
+
+    normalized="${raw_line//$'\r'/$'\n'}"
+    while IFS= read -r segment; do
+        _ui_append_rolling_slot_clean_line "$idx" "$segment"
+    done <<< "$normalized"
+}
+
+ui_flush_rolling_slots() {
+    if [[ "$LIVE_REGION_ENABLED" != true ]] || (( LIVE_SLOT_OUTPUT_PENDING_LINES == 0 )); then
+        LIVE_SLOT_OUTPUT_PENDING_LINES=0
+        return
+    fi
+
+    ui_clear_live_region
+    ui_render_live_region
+    LIVE_SLOT_OUTPUT_PENDING_LINES=0
 }
 
 ui_slots_all_visible() {
@@ -704,19 +810,30 @@ ui_set_slot() {
 
 ui_clear_slot() {
     local idx="$1"
+    local output_idx
 
     LIVE_SLOT_STATES[$idx]="running"
     LIVE_SLOT_MESSAGES[$idx]=""
+    LIVE_SLOT_OUTPUT_COUNTS[$idx]=0
+    for (( output_idx = 0; output_idx < LIVE_SLOT_OUTPUT_MAX_LINES; output_idx++ )); do
+        LIVE_SLOT_OUTPUT_LINES[$((idx * LIVE_SLOT_OUTPUT_MAX_LINES + output_idx))]=""
+    done
     ui_clear_live_region
     ui_render_live_region
 }
 
 ui_clear_all_slots() {
     local idx
+    local output_idx
     for (( idx = 0; idx < LIVE_SLOT_COUNT; idx++ )); do
         LIVE_SLOT_STATES[$idx]="running"
         LIVE_SLOT_MESSAGES[$idx]=""
+        LIVE_SLOT_OUTPUT_COUNTS[$idx]=0
+        for (( output_idx = 0; output_idx < LIVE_SLOT_OUTPUT_MAX_LINES; output_idx++ )); do
+            LIVE_SLOT_OUTPUT_LINES[$((idx * LIVE_SLOT_OUTPUT_MAX_LINES + output_idx))]=""
+        done
     done
+    LIVE_SLOT_OUTPUT_PENDING_LINES=0
     ui_clear_live_region
     ui_render_live_region
 }
@@ -758,6 +875,9 @@ ui_clear_live_state() {
     LIVE_STDOUT_LINE_COUNT=0
     LIVE_STDOUT_RENDERED_COUNT=0
     LIVE_STDOUT_PENDING_LINES=0
+    LIVE_SLOT_OUTPUT_COUNTS=()
+    LIVE_SLOT_OUTPUT_LINES=()
+    LIVE_SLOT_OUTPUT_PENDING_LINES=0
     ui_clear_live_region
 }
 

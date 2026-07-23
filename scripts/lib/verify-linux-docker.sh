@@ -6,6 +6,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=release-common.sh
 source "$SCRIPT_DIR/release-common.sh"
 
+verify_docker_engine() {
+  docker info >/dev/null 2>&1
+}
+
 verify_linux_docker() {
   if (($# != 8)); then
     release_die "verify_linux_docker requires eight configuration arguments."
@@ -47,7 +51,7 @@ verify_linux_docker() {
   release_require_tracked_clean
   release_require_current_commit_on_origin
 
-  if ! docker info >/dev/null 2>&1; then
+  if ! release_run_step "Verify Docker engine" verify_docker_engine; then
     release_die "Docker is unavailable. Start the Docker engine and retry."
   fi
   host_uid="$(id -u)"
@@ -63,14 +67,16 @@ verify_linux_docker() {
         "$status_context" \
         "failure" \
         "Local Docker $artifact_platform checks failed" \
-        || printf 'warning: failed to record the local failure status\n' >&2
+        || release_warn "Failed to record the local Docker failure status"
     fi
+    release_ui_finalize
     exit "$exit_code"
   }
   trap finalize_linux_status EXIT
 
-  release_info "Record local Docker verification as pending"
-  release_post_status \
+  release_run_step \
+    "Record local Docker verification as pending" \
+    release_post_status \
     "$RELEASE_SHA" \
     "$status_context" \
     "pending" \
@@ -82,8 +88,9 @@ verify_linux_docker() {
     release_die "Cargo.toml package.rust-version is missing or invalid."
   fi
 
-  release_info "Build reusable image $image_name"
-  docker build \
+  release_run_step \
+    "Build reusable image $image_name" \
+    docker build \
     --file "$RELEASE_REPO_ROOT/docker/checks/linux.Dockerfile" \
     --label "com.lfscloud.checks.rust-target=$rust_target" \
     --label "com.lfscloud.checks.rust-version=$rust_version" \
@@ -140,14 +147,17 @@ verify_linux_docker() {
       || [[ "$existing_repo" != "$RELEASE_REPO_ROOT" ]] \
       || [[ "$existing_drive_source" != "$drive_config_dir" ]] \
       || [[ "$existing_user" != "$host_uid:$host_gid" ]]; then
-      release_info "Recreate stale container $container_name"
-      docker container rm "$container_name" >/dev/null
+      release_run_step \
+        "Remove stale container $container_name" \
+        docker container rm "$container_name"
     fi
   fi
 
   docker volume create "$cargo_volume" >/dev/null
   docker volume create "$target_volume" >/dev/null
-  docker run --rm \
+  release_run_step \
+    "Prepare reusable Docker cache volumes" \
+    docker run --rm \
     --platform "$docker_platform" \
     --mount "type=volume,source=$cargo_volume,target=/cargo-cache" \
     --mount "type=volume,source=$target_volume,target=/target" \
@@ -181,19 +191,22 @@ verify_linux_docker() {
         --mount "type=bind,source=$drive_config_dir,target=$container_drive_dir"
       )
     fi
-    release_info "Create reusable container $container_name"
-    docker "${create_args[@]}" \
+    release_run_step \
+      "Create reusable container $container_name" \
+      docker "${create_args[@]}" \
       "$image_name" \
       /workspace/scripts/docker/run-linux-verification.sh \
       "$rust_target" \
       "$artifact_platform" \
-      "$container_arch" >/dev/null
+      "$container_arch"
   else
-    release_info "Reuse container $container_name"
+    release_pass "Reuse container $container_name"
   fi
 
   set +e
-  docker container start --attach "$container_name"
+  release_run_step \
+    "Run verification in $container_name" \
+    docker container start --attach "$container_name"
   start_exit=$?
   set -e
   container_exit="$(
@@ -220,19 +233,19 @@ verify_linux_docker() {
     "$rust_target" \
     "$container_arch"
 
-  release_info "Record local Docker verification as successful"
-  release_post_status \
+  release_run_step \
+    "Record local Docker verification as successful" \
+    release_post_status \
     "$RELEASE_SHA" \
     "$status_context" \
     "success" \
     "Local Docker $artifact_platform checks passed"
   status_finalized=1
-  trap - EXIT
 
   release_pass "Local Docker verification passed for $RELEASE_SHA"
-  printf 'Image: %s\n' "$image_name"
-  printf 'Container: %s\n' "$container_name"
-  printf 'Cargo cache volume: %s\n' "$cargo_volume"
-  printf 'Target cache volume: %s\n' "$target_volume"
-  printf 'Artifact: %s\n' "$artifact"
+  release_info "Image: $image_name"
+  release_info "Container: $container_name"
+  release_info "Cargo cache volume: $cargo_volume"
+  release_info "Target cache volume: $target_volume"
+  release_info "Artifact: $artifact"
 }

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+RELEASE_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=terminal-ui.sh
+source "$RELEASE_COMMON_DIR/terminal-ui.sh"
+
 LOCAL_MACOS_STATUS_CONTEXT="local-checks/macos-arm64"
 LOCAL_LINUX_X86_64_STATUS_CONTEXT="local-checks/linux-x86_64-docker"
 LOCAL_LINUX_ARM64_STATUS_CONTEXT="local-checks/linux-arm64-docker"
@@ -11,18 +15,63 @@ RELEASE_GITHUB_LOGIN=""
 RELEASE_STATUS_STATE=""
 RELEASE_STATUS_CREATOR=""
 RELEASE_STATUS_DESCRIPTION=""
+RELEASE_UI_INITIALIZED=0
+
+release_ui_initialize() {
+  local prefix="$1"
+  local section="$2"
+
+  ui_set_prefix "$prefix"
+  ui_set_render_mode "task_only"
+  ui_init
+  ui_set_live_section_running "$section"
+  RELEASE_UI_INITIALIZED=1
+}
+
+release_ui_finalize() {
+  if ((RELEASE_UI_INITIALIZED == 1)); then
+    ui_finalize
+    RELEASE_UI_INITIALIZED=0
+  fi
+}
+
+release_run_step() {
+  local message="$1"
+  local exit_code
+  shift
+
+  ui_set_live_task_state "running" "$message"
+  if ui_run_with_live_stdout "$@"; then
+    ui_set_live_task_state "pass" "$message"
+    ui_clear_live_task
+    pass "$message"
+    return 0
+  else
+    exit_code=$?
+  fi
+
+  ui_set_live_task_state "fail" "$message"
+  ui_clear_live_task
+  fail "$message"
+  return "$exit_code"
+}
 
 release_die() {
-  printf 'error: %s\n' "$1" >&2
+  ui_clear_live_task
+  fail "$1"
   exit 1
 }
 
 release_info() {
-  printf '==> %s\n' "$1"
+  info "$1"
 }
 
 release_pass() {
-  printf 'PASS: %s\n' "$1"
+  pass "$1"
+}
+
+release_warn() {
+  warn "$1"
 }
 
 release_require_command() {
@@ -91,23 +140,23 @@ release_require_fully_clean() {
 
   status="$(git -C "$RELEASE_REPO_ROOT" status --porcelain=v1 --untracked-files=all)"
   if [[ -n "$status" ]]; then
-    printf '%s\n' "$status" >&2
+    ui_log_persistent_raw_batch "$status" "$YELLOW"
     release_die "The working tree must be completely clean before continuing."
   fi
 }
 
 release_require_current_commit_on_origin() {
-  local remote_ref="refs/remotes/origin/$RELEASE_BRANCH"
   local remote_sha
   local github_sha
 
-  release_info "Refresh origin/$RELEASE_BRANCH"
-  if ! git -C "$RELEASE_REPO_ROOT" fetch --quiet origin \
-    "refs/heads/$RELEASE_BRANCH:$remote_ref"; then
-    release_die "Could not fetch origin/$RELEASE_BRANCH."
+  if ! remote_sha="$(
+    git -C "$RELEASE_REPO_ROOT" ls-remote \
+      --heads origin "refs/heads/$RELEASE_BRANCH" \
+      | awk 'NR == 1 { print $1 }'
+  )"; then
+    release_die "Could not read origin/$RELEASE_BRANCH."
   fi
 
-  remote_sha="$(git -C "$RELEASE_REPO_ROOT" rev-parse --verify "$remote_ref" 2>/dev/null || true)"
   if [[ "$remote_sha" != "$RELEASE_SHA" ]]; then
     release_die "Current commit $RELEASE_SHA is not exactly origin/$RELEASE_BRANCH (${remote_sha:-missing})."
   fi
@@ -308,7 +357,7 @@ release_verify_checksum() {
 
   if ! (
     cd "$(dirname "$artifact")"
-    shasum -a 256 --check "$(basename "$checksum")"
+    shasum -a 256 --check "$(basename "$checksum")" >/dev/null
   ); then
     release_die "Release artifact checksum validation failed."
   fi
