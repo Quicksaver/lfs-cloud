@@ -7,6 +7,7 @@ LFS Cloud is currently a single Rust package with a library target and a small C
 - Rust toolchain compatible with the crate's `rust-version`.
 - Git. Historical migration scans with `lfscloud migrate --ref ...` or `--all-refs` require Git 2.40.0 or newer because they evaluate attributes with `git check-attr --source`. Current-checkout dry-run planning does not use that option.
 - Git LFS for `lfscloud pull` and migration source-fetch steps. Read-only migration planning can still report repository config without fetching, but fetching missing source objects depends on `git lfs fetch`.
+- Python 3 for the manual and aggregate smoke verifiers.
 - PowerShell 7 (`pwsh`) for the native Windows verifier.
 - `cargo-audit` 0.22.2 for local RustSec scans. Install the same pinned version used by CI with `cargo install cargo-audit --locked --version 0.22.2`.
 - Node.js/Yarn for repository formatting checks and the one-shot smoke runner.
@@ -30,6 +31,8 @@ cargo audit
 yarn lint:check
 node --no-warnings --experimental-strip-types .agents/skills/smoke-test/scripts/smoke-test.ts
 ```
+
+The local smoke runner creates an isolated child repository under `~/Sites/throwaway` on macOS and `~/Projects/throwaway` on Windows. The selected parent must already be a Git repository and remains unchanged; set `LFS_CLOUD_SMOKE_THROWAWAY` to use another prepared parent.
 
 On a Windows x86-64 machine, test the native verification automation with:
 

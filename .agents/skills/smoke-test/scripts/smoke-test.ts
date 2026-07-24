@@ -33,7 +33,15 @@ type SmokeTest = {
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = resolve(dirname(scriptPath), '../../../..');
 dotenv.config({ path: join(repoRoot, '.env.local'), quiet: true });
-const throwawayRoot = resolve(process.env.LFS_CLOUD_SMOKE_THROWAWAY ?? join(homedir(), 'Sites', 'throwaway'));
+
+function defaultThrowawayRoot(homeDirectory: string, platform: NodeJS.Platform): string {
+  const projectsDirectory = platform === 'win32' ? 'Projects' : 'Sites';
+  return join(homeDirectory, projectsDirectory, 'throwaway');
+}
+
+const throwawayRoot = resolve(
+  process.env.LFS_CLOUD_SMOKE_THROWAWAY ?? defaultThrowawayRoot(homedir(), process.platform),
+);
 const targetDir = join(repoRoot, 'target');
 const configuredBinary = process.env.LFS_CLOUD_SMOKE_BINARY?.trim();
 const binaryPath = configuredBinary
@@ -378,6 +386,19 @@ function cargoTestsAlreadyRan(): string | undefined {
 
 function tests(): SmokeTest[] {
   return [
+    {
+      name: 'smoke workspace platform defaults',
+      run: async () => {
+        assert(
+          defaultThrowawayRoot('C:\\Users\\smoke', 'win32') === join('C:\\Users\\smoke', 'Projects', 'throwaway'),
+          'Windows throwaway root did not use the Projects directory',
+        );
+        assert(
+          defaultThrowawayRoot('/Users/smoke', 'darwin') === join('/Users/smoke', 'Sites', 'throwaway'),
+          'macOS throwaway root did not preserve the Sites directory',
+        );
+      },
+    },
     {
       name: 'toolchain prerequisites',
       run: async () => {

@@ -3,18 +3,15 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$project_dir/scripts/lib/lfscloud-command.sh"
+# shellcheck source=../lib/python.sh
+source "$project_dir/scripts/lib/python.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 # Python 3 is used only to create deterministic binary fixtures and registry JSON.
-python_bin="$(command -v python3 || command -v python || true)"
+python_bin="$(lfscloud_find_python3 || true)"
 
-if [[ -z "$python_bin" ]] || ! "$python_bin" - <<'PY'
-import sys
-
-sys.exit(0 if sys.version_info[0] >= 3 else 1)
-PY
-then
+if [[ -z "$python_bin" ]]; then
   echo "Python 3 is required to run the manual local-cache GC verifier" >&2
   exit 1
 fi

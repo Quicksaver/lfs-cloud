@@ -3,6 +3,8 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$project_dir/scripts/lib/lfscloud-command.sh"
+# shellcheck source=../lib/python.sh
+source "$project_dir/scripts/lib/python.sh"
 tmp_dir="$(mktemp -d)"
 server_pid=""
 trap 'if [[ -n "${server_pid:-}" ]]; then kill "$server_pid" >/dev/null 2>&1 || true; fi; rm -rf "$tmp_dir"' EXIT
@@ -13,14 +15,9 @@ store_file="$tmp_dir/credentials"
 global_config="$tmp_dir/gitconfig"
 port_file="$tmp_dir/server.port"
 token="manual-status-lfs-token"
-python_bin="$(command -v python3 || command -v python || true)"
+python_bin="$(lfscloud_find_python3 || true)"
 
-if [[ -z "$python_bin" ]] || ! "$python_bin" - <<'PY'
-import sys
-
-sys.exit(0 if sys.version_info[0] >= 3 else 1)
-PY
-then
+if [[ -z "$python_bin" ]]; then
   echo "Python 3 is required to run the manual status verifier" >&2
   exit 1
 fi
@@ -61,6 +58,10 @@ config_file="$tmp_dir/lfscloud.yml"
 gcloud_config_dir="$tmp_dir/gcloud-drive"
 mkdir -p "$repo_dir" "$cache_root/objects" "$gcloud_config_dir"
 printf '{}\n' >"$gcloud_config_dir/application_default_credentials.json"
+gcloud_config_path="$gcloud_config_dir"
+if command -v cygpath >/dev/null 2>&1; then
+  gcloud_config_path="$(cygpath -m "$gcloud_config_dir")"
+fi
 git -C "$repo_dir" init >/dev/null
 git -C "$repo_dir" remote add origin git@github.com:owner/repo.git
 
@@ -81,7 +82,7 @@ storage_providers:
     type: google_drive
     credentials:
       type: gcloud
-      config_dir: $gcloud_config_dir
+      config_dir: $gcloud_config_path
       executable: git
     root_folder_id: root-folder
 
@@ -104,11 +105,14 @@ printf 'protocol=http\nhost=127.0.0.1:%s\npath=github.com/owner/repo.git/info/lf
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
     git credential approve
 
-(
+if ! (
   cd "$repo_dir"
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$global_config" \
     run_lfscloud "$project_dir" --config "$config_file" status --cache-root "$cache_root"
-) >"$tmp_dir/status-output"
+) >"$tmp_dir/status-output" 2>&1; then
+  cat "$tmp_dir/status-output" >&2
+  exit 1
+fi
 
 grep -F "config     ok" "$tmp_dir/status-output" >/dev/null
 grep -F "repository ok" "$tmp_dir/status-output" >/dev/null

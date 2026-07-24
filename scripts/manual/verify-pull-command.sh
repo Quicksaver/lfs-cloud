@@ -3,17 +3,14 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$project_dir/scripts/lib/lfscloud-command.sh"
+# shellcheck source=../lib/python.sh
+source "$project_dir/scripts/lib/python.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-python_bin="$(command -v python3 || command -v python || true)"
+python_bin="$(lfscloud_find_python3 || true)"
 
-if [[ -z "$python_bin" ]] || ! "$python_bin" - <<'PY'
-import sys
-
-sys.exit(0 if sys.version_info[0] >= 3 else 1)
-PY
-then
+if [[ -z "$python_bin" ]]; then
   echo "Python 3 is required to run the pull verifier" >&2
   exit 1
 fi
@@ -22,29 +19,20 @@ repo_dir="$tmp_dir/repo"
 cache_root="$tmp_dir/cache"
 payload_file="$tmp_dir/payload.bin"
 oid_file="$tmp_dir/oid"
-fake_bin="$tmp_dir/bin"
-fetch_log="$tmp_dir/git-lfs-fetch"
+remote_dir="$tmp_dir/lfs-remote.git"
 
-mkdir -p "$repo_dir" "$fake_bin"
-
-cat >"$fake_bin/git-lfs" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ "${1:-}" == "fetch" || "${2:-}" == "fetch" ]]; then
-  printf 'fetch\n' >"${LFS_CLOUD_FAKE_GIT_LFS_FETCH_LOG:?}"
-  exit 0
-fi
-
-echo "unexpected git-lfs invocation: $*" >&2
-exit 2
-SH
-chmod +x "$fake_bin/git-lfs"
+mkdir -p "$repo_dir"
+git -C "$tmp_dir" init --quiet --bare "$(basename "$remote_dir")"
 
 (
   cd "$repo_dir"
   git init >/dev/null
+  git config user.name "LFS Cloud Pull Verifier"
+  git config user.email "lfscloud-pull@example.invalid"
+  git config commit.gpgSign false
   git remote add origin git@github.com:owner/repo.git
+  git config remote.origin.lfsurl "$remote_dir"
+  git config remote.origin.lfspushurl "$remote_dir"
 )
 
 "$python_bin" - "$repo_dir" "$payload_file" "$oid_file" <<'PY'
@@ -83,15 +71,17 @@ PY
 (
   cd "$repo_dir"
   git add .gitattributes asset/model.bin docs/pointer-example.txt
-  PATH="$fake_bin:$PATH" \
-    LFS_CLOUD_FAKE_GIT_LFS_FETCH_LOG="$fetch_log" \
-    run_lfscloud "$project_dir" pull --cache-root "$cache_root"
+  git commit --quiet -m "Add Git LFS pull fixture"
+  git lfs push origin HEAD
+  rm -rf .git/lfs/objects
+  run_lfscloud "$project_dir" pull --cache-root "$cache_root"
 ) >"$tmp_dir/pull-output"
 
 oid="$(cat "$oid_file")"
 cmp "$payload_file" "$repo_dir/asset/model.bin" >/dev/null
 cmp "$payload_file" "$cache_root/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
-grep -F "fetch" "$fetch_log" >/dev/null
+cmp "$payload_file" "$repo_dir/.git/lfs/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
+cmp "$payload_file" "$remote_dir/lfs/objects/${oid:0:2}/${oid:2:2}/$oid" >/dev/null
 grep -F "lfscloud pull" "$tmp_dir/pull-output" >/dev/null
 grep -F "tracked paths: 1" "$tmp_dir/pull-output" >/dev/null
 grep -F "pointers: 1" "$tmp_dir/pull-output" >/dev/null

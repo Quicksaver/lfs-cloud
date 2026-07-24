@@ -3,6 +3,8 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$project_dir/scripts/lib/lfscloud-command.sh"
+# shellcheck source=../lib/python.sh
+source "$project_dir/scripts/lib/python.sh"
 tmp_dir="$(mktemp -d)"
 server_pid=""
 cleanup() {
@@ -19,7 +21,7 @@ global_config="$tmp_dir/gitconfig"
 port_file="$tmp_dir/port"
 request_file="$tmp_dir/request"
 token="manual-logout-lfs-token"
-python_bin="$(command -v python3 || command -v python || true)"
+python_bin="$(lfscloud_find_python3 || true)"
 
 if [[ -z "$python_bin" ]]; then
   echo "Python 3 is required to run the logout verifier" >&2
