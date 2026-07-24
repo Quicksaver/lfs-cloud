@@ -27,13 +27,13 @@ fi
 release_ui_initialize "[verify-macos]" "Verify macOS ARM64 release"
 trap 'release_ui_finalize' EXIT
 
-release_initialize "$SCRIPT_DIR"
-cd "$RELEASE_REPO_ROOT"
-
 if [[ "$(uname -s)" != "Darwin" ]] || [[ "$(uname -m)" != "arm64" ]]; then
   release_die "Local macOS verification requires an arm64 Mac."
 fi
 macos_version="$(sw_vers -productVersion)"
+
+release_initialize "$SCRIPT_DIR"
+cd "$RELEASE_REPO_ROOT"
 
 release_require_tracked_clean
 release_require_current_commit_on_origin

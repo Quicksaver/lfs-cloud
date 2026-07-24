@@ -70,6 +70,113 @@ release_info "Test Linux verifier finalizer after function scope ends"
   trap verify_linux_finalize_status EXIT
 ) >/dev/null 2>&1
 
+release_info "Test local verifier platform preflights"
+preflight_bin="$fixture_root/preflight-bin"
+preflight_gh_marker="$fixture_root/preflight-gh-called"
+mkdir -p "$preflight_bin"
+cat > "$preflight_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  -s)
+    printf '%s\n' "${PREFLIGHT_UNAME_SYSTEM:-Darwin}"
+    ;;
+  -m)
+    printf '%s\n' "${PREFLIGHT_UNAME_MACHINE:-arm64}"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+cat > "$preflight_bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+touch "${PREFLIGHT_GH_MARKER:?}"
+exit 99
+EOF
+cat > "$preflight_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  info)
+    printf '%s\n' "${PREFLIGHT_DOCKER_ENGINE_OS:-linux}"
+    ;;
+  buildx)
+    if [[ "${2:-}" == "inspect" ]] && [[ "${3:-}" == "--bootstrap" ]]; then
+      printf 'Name: fixture\n'
+      printf 'Platforms: %s\n' "${PREFLIGHT_DOCKER_PLATFORMS:-linux/amd64, linux/arm64}"
+    else
+      exit 2
+    fi
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+chmod +x "$preflight_bin/uname" "$preflight_bin/gh" "$preflight_bin/docker"
+
+set +e
+macos_preflight_output="$(
+  PATH="$preflight_bin:$PATH" \
+    PREFLIGHT_GH_MARKER="$preflight_gh_marker" \
+    PREFLIGHT_UNAME_MACHINE="x86_64" \
+    PREFLIGHT_UNAME_SYSTEM="Linux" \
+    "$REPO_ROOT/scripts/local/verify-macos.sh" 2>&1
+)"
+macos_preflight_exit=$?
+set -e
+assert_eq "1" "$macos_preflight_exit" "wrong macOS host preflight exit status"
+if ! grep -q "requires an arm64 Mac" <<< "$macos_preflight_output"; then
+  fail_test "wrong macOS host did not report the platform requirement"
+fi
+if [[ -e "$preflight_gh_marker" ]]; then
+  fail_test "macOS platform preflight contacted GitHub"
+fi
+
+(
+  # shellcheck source=../lib/verify-linux-docker.sh
+  source "$REPO_ROOT/scripts/lib/verify-linux-docker.sh"
+  export PATH="$preflight_bin:$PATH"
+  export PREFLIGHT_DOCKER_PLATFORMS="linux/amd64, linux/arm64"
+  verify_docker_engine
+  verify_docker_platform "linux/arm64"
+) >/dev/null
+
+set +e
+docker_preflight_output="$(
+  (
+    # shellcheck source=../lib/verify-linux-docker.sh
+    source "$REPO_ROOT/scripts/lib/verify-linux-docker.sh"
+    release_ui_initialize "[preflight-test]" "Test Docker platform preflight"
+    export PATH="$preflight_bin:$PATH"
+    export PREFLIGHT_DOCKER_PLATFORMS="linux/amd64"
+    export PREFLIGHT_GH_MARKER="$preflight_gh_marker"
+    verify_linux_docker \
+      "linux/arm64" \
+      "aarch64-unknown-linux-musl" \
+      "linux-arm64-musl" \
+      "aarch64" \
+      "$LOCAL_LINUX_ARM64_STATUS_CONTEXT" \
+      "fixture:local" \
+      "fixture" \
+      "fixture-target"
+  ) 2>&1
+)"
+docker_preflight_exit=$?
+set -e
+assert_eq "1" "$docker_preflight_exit" "unsupported Docker platform preflight exit status"
+if ! grep -q "does not support requested platform linux/arm64" <<< "$docker_preflight_output"; then
+  fail_test "unsupported Docker platform did not report the requested platform"
+fi
+if [[ -e "$preflight_gh_marker" ]]; then
+  fail_test "Docker platform preflight contacted GitHub"
+fi
+
 release_info "Test parallel verifier orchestration and aggregate failures"
 parallel_fixture="$fixture_root/parallel"
 parallel_markers="$parallel_fixture/markers"

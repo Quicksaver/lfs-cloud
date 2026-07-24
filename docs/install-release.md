@@ -46,7 +46,7 @@ yarn verify:linux-arm64
 yarn verify:linux-x86-64
 ```
 
-The macOS verifier uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. Its status is `local-checks/macos-arm64`. The Linux scripts require the same clean, pushed commit boundary and build the exact `package.rust-version` toolchain inside a parameterized image. Their distinct statuses are `local-checks/linux-arm64-docker` and `local-checks/linux-x86_64-docker`.
+The macOS verifier first requires a Darwin ARM64 host, then uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. Its status is `local-checks/macos-arm64`. The Linux scripts first require a responsive Docker Linux engine whose active Buildx builder advertises the requested platform, then enforce the same clean, pushed commit boundary and build the exact `package.rust-version` toolchain inside a parameterized image. Their distinct statuses are `local-checks/linux-arm64-docker` and `local-checks/linux-x86_64-docker`. Platform preflights run before GitHub authentication, origin checks, commit-status writes, image builds, or verification commands.
 
 Docker resources are deliberately stable and persist after a check:
 

@@ -12,7 +12,31 @@ VERIFY_LINUX_STATUS_CONTEXT=""
 VERIFY_LINUX_ARTIFACT_PLATFORM=""
 
 verify_docker_engine() {
-  docker info >/dev/null 2>&1
+  local engine_os
+
+  engine_os="$(docker info --format '{{.OSType}}' 2>/dev/null)" || return 1
+  [[ "$engine_os" == "linux" ]]
+}
+
+verify_docker_platform() {
+  local requested_platform="$1"
+  local advertised_platform
+  local builder_details
+
+  builder_details="$(docker buildx inspect --bootstrap 2>/dev/null)" || return 1
+  while IFS= read -r advertised_platform; do
+    if [[ "$advertised_platform" == "$requested_platform" ]] \
+      || [[ "$advertised_platform" == "$requested_platform/"* ]]; then
+      return 0
+    fi
+  done < <(
+    printf '%s\n' "$builder_details" \
+      | sed -n 's/^[[:space:]]*Platforms:[[:space:]]*//p' \
+      | tr ',' '\n' \
+      | sed -E 's/^[[:space:]]+//; s/[[:space:]*]+$//'
+  )
+
+  return 1
 }
 
 verify_linux_finalize_status() {
@@ -67,17 +91,24 @@ verify_linux_docker() {
   VERIFY_LINUX_STATUS_CONTEXT="$status_context"
   VERIFY_LINUX_ARTIFACT_PLATFORM="$artifact_platform"
 
+  release_require_command docker
+  if ! release_run_step "Verify Docker Linux engine" verify_docker_engine; then
+    release_die "Docker is unavailable, not running, or not configured for Linux containers."
+  fi
+  if ! release_run_step \
+    "Verify Docker platform $docker_platform" \
+    verify_docker_platform \
+    "$docker_platform"; then
+    release_die "Docker builder is unavailable or does not support requested platform $docker_platform."
+  fi
+
   release_initialize "$SCRIPT_DIR"
   cd "$RELEASE_REPO_ROOT"
-  release_require_command docker
   release_require_command node
   release_require_command shasum
   release_require_tracked_clean
   release_require_current_commit_on_origin
 
-  if ! release_run_step "Verify Docker engine" verify_docker_engine; then
-    release_die "Docker is unavailable. Start the Docker engine and retry."
-  fi
   host_uid="$(id -u)"
   host_gid="$(id -g)"
 
