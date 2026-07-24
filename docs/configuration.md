@@ -115,6 +115,16 @@ storage_providers:
 
 Install `gcloud`, create the directory, and generate the credentials once with the browser flow documented in the README. The directory must contain `application_default_credentials.json`. LFS Cloud invokes `gcloud` at runtime, so the executable must remain installed and accessible to the server user. When `credentials.executable` is omitted, LFS Cloud defaults to `gcloud.cmd` on Windows and `gcloud` on other platforms.
 
+On Windows, if `gcloud.cmd` cannot find an otherwise available Python installation, point the Google Cloud CLI at the global interpreter and open a new terminal:
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+    'CLOUDSDK_PYTHON',
+    (Get-Command python).Source,
+    'User'
+)
+```
+
 The MVP Drive scope is:
 
 ```text

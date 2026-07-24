@@ -3700,6 +3700,60 @@ mod tests {
         assert!(!rendered.contains("missing-gcloud"));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn gcloud_provider_launches_windows_command_scripts() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let config_dir = directory.path().join("gcloud-drive");
+        std::fs::create_dir(&config_dir).expect("gcloud config directory should be created");
+        std::fs::write(
+            config_dir.join("application_default_credentials.json"),
+            "{}",
+        )
+        .expect("ADC marker should be written");
+        let invocation_path = directory.path().join("invocation.txt");
+        let executable = directory.path().join("gcloud-test.cmd");
+        std::fs::write(
+            &executable,
+            format!(
+                "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo Google Cloud SDK test\r\n  exit /b 0\r\n)\r\n> \"{}\" (\r\n  echo %CLOUDSDK_CONFIG%\r\n  echo %CLOUDSDK_CORE_DISABLE_PROMPTS%\r\n  echo %~1\r\n  echo %~2\r\n  echo %~3\r\n  echo %~4\r\n)\r\necho ya29.gcloud-adc-token\r\n",
+                invocation_path.display()
+            ),
+        )
+        .expect("fake gcloud command script should be written");
+        let credentials = GoogleDriveGcloudCredentialsConfig {
+            config_dir: config_dir.clone(),
+            executable,
+        };
+        let provider = GoogleDriveGcloudTokenProvider::new();
+
+        provider
+            .validate_local_readiness("drive-user-a", &credentials)
+            .expect("Windows gcloud command script should pass readiness");
+        let token = provider
+            .access_token("drive-user-a", &credentials)
+            .await
+            .expect("Windows gcloud command script should return a token");
+
+        assert_eq!(token.as_str(), "ya29.gcloud-adc-token");
+        let invocation = std::fs::read_to_string(invocation_path)
+            .expect("fake gcloud invocation should be recorded");
+        assert_eq!(
+            invocation
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>(),
+            vec![
+                config_dir.to_string_lossy().into_owned(),
+                "1".to_owned(),
+                "auth".to_owned(),
+                "application-default".to_owned(),
+                "print-access-token".to_owned(),
+                "--quiet".to_owned(),
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn gcloud_provider_uses_isolated_noninteractive_command() {

@@ -42,6 +42,10 @@ const LIVE_GITHUB_PROVIDER_ID: &str = "github-live";
 const LIVE_DRIVE_PROVIDER_ID: &str = "drive-live";
 const LIVE_GITHUB_PAT_ENV: &str = "LFS_CLOUD_GITHUB_PAT";
 const LIVE_DRIVE_CONFIG_DIR_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR";
+#[cfg(not(windows))]
+const LIVE_GCLOUD_EXECUTABLE: &str = "gcloud";
+#[cfg(windows)]
+const LIVE_GCLOUD_EXECUTABLE: &str = "gcloud.cmd";
 
 #[derive(Deserialize)]
 struct GitHubPersonalAccessTokenLoginResponse {
@@ -216,7 +220,7 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
     };
     let gcloud_credentials = GoogleDriveGcloudCredentialsConfig {
         config_dir: test_dir.path().join("gcloud-drive"),
-        executable: PathBuf::from("gcloud"),
+        executable: PathBuf::from(LIVE_GCLOUD_EXECUTABLE),
     };
     let github_credentials = LiveGitHubCredentials {
         personal_access_token: "github_pat_fixture".to_owned(),
@@ -1367,7 +1371,10 @@ fn live_drive_config_directory_is_used_directly() {
         credentials.config_dir,
         fs::canonicalize(directory.path()).expect("temporary directory should canonicalize")
     );
-    assert_eq!(credentials.executable, PathBuf::from("gcloud"));
+    assert_eq!(
+        credentials.executable,
+        PathBuf::from(LIVE_GCLOUD_EXECUTABLE)
+    );
 }
 
 #[test]
@@ -1426,7 +1433,7 @@ fn google_drive_gcloud_credentials_from_directory(
 
     Ok(GoogleDriveGcloudCredentialsConfig {
         config_dir,
-        executable: PathBuf::from("gcloud"),
+        executable: PathBuf::from(LIVE_GCLOUD_EXECUTABLE),
     })
 }
 

@@ -30,6 +30,11 @@ type SmokeTest = {
   skip?: () => string | undefined;
 };
 
+type CommandInvocation = {
+  executable: string;
+  args: string[];
+};
+
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = resolve(dirname(scriptPath), '../../../..');
 dotenv.config({ path: join(repoRoot, '.env.local'), quiet: true });
@@ -37,6 +42,22 @@ dotenv.config({ path: join(repoRoot, '.env.local'), quiet: true });
 function defaultThrowawayRoot(homeDirectory: string, platform: NodeJS.Platform): string {
   const projectsDirectory = platform === 'win32' ? 'Projects' : 'Sites';
   return join(homeDirectory, projectsDirectory, 'throwaway');
+}
+
+function gcloudInvocation(
+  args: string[],
+  platform: NodeJS.Platform,
+  commandShell = process.env.ComSpec?.trim() || 'cmd.exe',
+): CommandInvocation {
+  return platform === 'win32'
+    ? {
+        executable: commandShell,
+        args: ['/d', '/s', '/c', 'gcloud.cmd', ...args],
+      }
+    : {
+        executable: 'gcloud',
+        args,
+      };
 }
 
 const throwawayRoot = resolve(
@@ -152,6 +173,11 @@ async function command(executable: string, args: string[], options: CommandOptio
   }
 
   return result.output;
+}
+
+async function gcloud(args: string[]): Promise<string> {
+  const invocation = gcloudInvocation(args, process.platform);
+  return command(invocation.executable, invocation.args);
 }
 
 function baseEnv(): NodeJS.ProcessEnv {
@@ -397,6 +423,17 @@ function tests(): SmokeTest[] {
           defaultThrowawayRoot('/Users/smoke', 'darwin') === join('/Users/smoke', 'Sites', 'throwaway'),
           'macOS throwaway root did not preserve the Sites directory',
         );
+        const windowsGcloud = gcloudInvocation(['--version'], 'win32', 'C:\\Windows\\System32\\cmd.exe');
+        assert(
+          windowsGcloud.executable === 'C:\\Windows\\System32\\cmd.exe' &&
+            windowsGcloud.args.join(' ') === '/d /s /c gcloud.cmd --version',
+          'Windows gcloud invocation did not use the command launcher',
+        );
+        const macosGcloud = gcloudInvocation(['--version'], 'darwin');
+        assert(
+          macosGcloud.executable === 'gcloud' && macosGcloud.args.join(' ') === '--version',
+          'macOS gcloud invocation unexpectedly changed',
+        );
       },
     },
     {
@@ -501,7 +538,7 @@ function tests(): SmokeTest[] {
       name: 'gcloud CLI prerequisite',
       skip: missingCredential(hasDriveCredential, `requires ${driveConfigDirEnv}`),
       run: async () => {
-        await command('gcloud', ['--version']);
+        await gcloud(['--version']);
       },
     },
     {
