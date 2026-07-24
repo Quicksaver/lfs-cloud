@@ -7,6 +7,7 @@ LFS Cloud is currently a single Rust package with a library target and a small C
 - Rust toolchain compatible with the crate's `rust-version`.
 - Git. Historical migration scans with `lfscloud migrate --ref ...` or `--all-refs` require Git 2.40.0 or newer because they evaluate attributes with `git check-attr --source`. Current-checkout dry-run planning does not use that option.
 - Git LFS for `lfscloud pull` and migration source-fetch steps. Read-only migration planning can still report repository config without fetching, but fetching missing source objects depends on `git lfs fetch`.
+- PowerShell 7 (`pwsh`) for the native Windows verifier.
 - `cargo-audit` 0.22.2 for local RustSec scans. Install the same pinned version used by CI with `cargo install cargo-audit --locked --version 0.22.2`.
 - Node.js/Yarn for repository formatting checks and the one-shot smoke runner.
 
@@ -30,6 +31,12 @@ yarn lint:check
 node --no-warnings --experimental-strip-types .agents/skills/smoke-test/scripts/smoke-test.ts
 ```
 
+On a Windows x86-64 machine, test the native verification automation with:
+
+```powershell
+yarn test:verify-windows
+```
+
 After pushing a candidate commit from an ARM64 Mac, run all deterministic local verifiers in parallel:
 
 ```bash
@@ -46,7 +53,15 @@ yarn verify:linux-arm64
 yarn verify:linux-x86-64
 ```
 
-The macOS verifier first requires a Darwin ARM64 host, then uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. Its status is `local-checks/macos-arm64`. The Linux scripts first require a responsive Docker Linux engine whose active Buildx builder advertises the requested platform, then enforce the same clean, pushed commit boundary and build the exact `package.rust-version` toolchain inside a parameterized image. Their distinct statuses are `local-checks/linux-arm64-docker` and `local-checks/linux-x86_64-docker`. Platform preflights run before GitHub authentication, origin checks, commit-status writes, image builds, or verification commands.
+Run the equivalent native Windows verification independently from a Windows x86-64 checkout:
+
+```powershell
+yarn verify:windows
+```
+
+The macOS verifier first requires a Darwin ARM64 host, then uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. Its status is `local-checks/macos-arm64`. The Windows verifier requires a Windows x86-64 host and enforces the same active-toolchain checks, clean pushed-commit boundary, exact release-binary smoke tests, and artifact integrity checks. It writes a Windows archive, checksum, and commit-bound build manifest under `dist/`; its status is `local-checks/windows-x86_64`. The Linux scripts first require a responsive Docker Linux engine whose active Buildx builder advertises the requested platform, then enforce the same clean, pushed commit boundary and build the exact `package.rust-version` toolchain inside a parameterized image. Their distinct statuses are `local-checks/linux-arm64-docker` and `local-checks/linux-x86_64-docker`. Platform preflights run before GitHub authentication, origin checks, commit-status writes, image builds, or verification commands.
+
+`yarn verify:all` remains the ARM64 Mac orchestrator for the macOS and two Docker environments. Run `yarn verify:windows` on the Windows machine for the separate native status and artifact.
 
 Docker resources are deliberately stable and persist after a check:
 

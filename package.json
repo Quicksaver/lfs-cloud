@@ -16,10 +16,12 @@
     "rotate:google-drive": "./scripts/keys/google-drive.sh",
     "rotate:slack": "./scripts/keys/slack.sh",
     "test:release-scripts": "./scripts/tests/release-scripts.sh",
+    "test:verify-windows": "pwsh -NoProfile -File ./scripts/tests/verify-windows.ps1",
     "verify:all": "./scripts/local/verify-all.sh",
     "verify:linux-arm64": "./scripts/local/verify-linux-arm64.sh",
     "verify:linux-x86-64": "./scripts/local/verify-linux-x86-64.sh",
-    "verify:macos": "./scripts/local/verify-macos.sh"
+    "verify:macos": "./scripts/local/verify-macos.sh",
+    "verify:windows": "pwsh -NoProfile -File ./scripts/local/verify-windows.ps1"
   },
   "devDependencies": {
     "dotenv": "^17.4.2",
