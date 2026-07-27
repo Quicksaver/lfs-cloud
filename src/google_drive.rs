@@ -782,6 +782,25 @@ impl GoogleDriveObjectStore {
         )
     }
 
+    /// Creates an object store with production HTTP clients and a test API URL.
+    #[cfg(test)]
+    pub(crate) fn with_api_base_url(
+        storage: GoogleDriveStorageConfig,
+        repo_namespace: impl AsRef<str>,
+        token: GoogleDriveAccessToken,
+        api_base_url: impl AsRef<str>,
+    ) -> StorageResult<Self> {
+        Self::with_clients_and_api_base_url(
+            storage,
+            repo_namespace,
+            token,
+            default_google_drive_object_metadata_http_client()?,
+            default_google_drive_object_upload_http_client()?,
+            default_google_drive_object_download_http_client()?,
+            api_base_url,
+        )
+    }
+
     /// Creates an object store with an explicit HTTP client and API base URL.
     ///
     /// This is primarily useful for tests that replace Google Drive with a
@@ -1219,9 +1238,9 @@ impl GoogleDriveObjectStore {
         source: impl AsRef<Path>,
     ) -> StorageResult<StoredObject> {
         let source = source.as_ref().to_path_buf();
-        let verified_file =
-            open_verified_staged_upload_file_on_blocking_thread(&self.storage, object, &source)
-                .await?;
+        let verified_file = self
+            .open_verified_staged_upload_file(object, &source)
+            .await?;
         self.upload_verified_object(object, &source, verified_file)
             .await
     }
@@ -1230,19 +1249,43 @@ impl GoogleDriveObjectStore {
     ///
     /// Source verification happens before the existence lookup so callers
     /// cannot use idempotency to bypass the staged-file integrity contract.
+    /// That deliberately re-reads the full staged file even when Drive already
+    /// contains the object. The lookup and upload are only sequentially
+    /// idempotent; concurrent writers to one Drive root must hold the shared
+    /// object upload lock across this operation.
     pub(crate) async fn upload_object_idempotent(
         &self,
         object: &LfsObject,
         source: impl AsRef<Path>,
     ) -> StorageResult<StoredObject> {
         let source = source.as_ref().to_path_buf();
-        let verified_file =
-            open_verified_staged_upload_file_on_blocking_thread(&self.storage, object, &source)
-                .await?;
+        let verified_file = self
+            .open_verified_staged_upload_file(object, &source)
+            .await?;
+        self.upload_verified_object_idempotent(object, &source, verified_file)
+            .await
+    }
+
+    /// Opens and verifies a staged upload before entering a cross-process lock.
+    pub(crate) async fn open_verified_staged_upload_file(
+        &self,
+        object: &LfsObject,
+        source: &Path,
+    ) -> StorageResult<File> {
+        open_verified_staged_upload_file_on_blocking_thread(&self.storage, object, source).await
+    }
+
+    /// Performs the idempotent lookup and upload using an already-verified file.
+    pub(crate) async fn upload_verified_object_idempotent(
+        &self,
+        object: &LfsObject,
+        source: &Path,
+        verified_file: File,
+    ) -> StorageResult<StoredObject> {
         if let Some(stored_object) = self.lookup_object(object).await? {
             return Ok(stored_object);
         }
-        self.upload_verified_object(object, &source, verified_file)
+        self.upload_verified_object(object, source, verified_file)
             .await
     }
 
@@ -6679,7 +6722,15 @@ mod tests {
     async fn drive_upload_shard_list_handler(uri: Uri) -> Response {
         let query = uri.query().unwrap_or_default();
         let Some(shard_prefix) = shard_prefix_from_query(query) else {
-            return Json(serde_json::json!({ "files": [] })).into_response();
+            if is_object_lookup_query(query) {
+                return Json(serde_json::json!({ "files": [] })).into_response();
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                [(CONTENT_TYPE, "application/json")],
+                r#"{"error":{"message":"missing shard or object query"}}"#.to_owned(),
+            )
+                .into_response();
         };
         (
             StatusCode::OK,
@@ -6705,6 +6756,12 @@ mod tests {
         form_pairs(query)
             .get("q")
             .is_some_and(|query| query.contains("lfsCloudFolderKind"))
+    }
+
+    fn is_object_lookup_query(query: &str) -> bool {
+        form_pairs(query)
+            .get("q")
+            .is_some_and(|query| query.contains("lfsCloudOid"))
     }
 
     fn shard_prefix_from_query(query: &str) -> Option<String> {

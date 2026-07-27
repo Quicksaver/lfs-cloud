@@ -12,7 +12,7 @@ use axum::{Json, Router, extract::State, routing::get};
 use lfscloud::{
     GitHubAuthenticationConfig, GitHubProviderConfig, GitHubRepositoryPermissionClient,
     GitHubRepositoryProvider, RepositoryAuthentication, RepositoryIdentity, RepositoryPermission,
-    RepositoryUser,
+    RepositoryUser, StorageDeleteOutcome,
 };
 use serde_json::{Value, json};
 use support::storage_provider_contract::assert_storage_provider_contract;
@@ -84,17 +84,24 @@ async fn github_repository_provider_satisfies_shared_isolation_contract() {
 async fn fake_storage_provider_satisfies_shared_contract() {
     let provider = FakeStorageProvider::new("drive-user-a");
 
-    assert_storage_provider_contract(
+    let report = assert_storage_provider_contract(
         &provider,
         "github.com/owner/repo",
         "github.com/owner/isolated",
     )
     .await;
 
+    assert!(report.isolated_object_was_created);
+    assert_eq!(report.deletion, StorageDeleteOutcome::Deleted);
     assert_eq!(
-        provider.object_count(),
+        provider.object_count_for_namespace("github.com/owner/repo"),
+        0,
+        "fake deletion must remove the primary namespaced object"
+    );
+    assert_eq!(
+        provider.object_count_for_namespace("github.com/owner/isolated"),
         1,
-        "primary deletion must leave only the isolated backend object"
+        "fake deletion must preserve the isolated namespaced object"
     );
 }
 

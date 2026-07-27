@@ -483,13 +483,15 @@ impl FakeStorageProvider {
             .map(|stored| stored.bytes.clone())
     }
 
-    /// Returns the number of distinct backend objects retained by the fake.
+    /// Returns the number of backend objects retained in one repository namespace.
     #[must_use]
-    pub fn object_count(&self) -> usize {
+    pub fn object_count_for_namespace(&self, repository_namespace: &str) -> usize {
         self.objects
             .lock()
             .expect("fake storage lock should not poison")
-            .len()
+            .keys()
+            .filter(|(namespace, _)| namespace == repository_namespace)
+            .count()
     }
 }
 

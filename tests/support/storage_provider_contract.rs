@@ -1,3 +1,20 @@
+// This file is both a normal integration-test module and included by
+// `src/cli.rs` unit tests. Keep parent-provided imports compatible with both
+// contexts; the `include!` also means this file must ship with crate sources.
+use super::{
+    LfsObject, StorageDeleteOutcome, StorageError, StorageProvider, StoredObject, fs,
+    lfs_object_for_bytes,
+};
+
+/// Adapter-specific outcomes observed by the shared storage-provider contract.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StorageProviderContractReport {
+    /// Whether the adapter accepted and isolated a second repository namespace.
+    pub isolated_object_was_created: bool,
+    /// The cleanup behavior reported for the primary repository object.
+    pub deletion: StorageDeleteOutcome,
+}
+
 /// Asserts the object lifecycle and namespace-isolation semantics required of
 /// every storage-provider adapter.
 ///
@@ -8,14 +25,16 @@ pub async fn assert_storage_provider_contract(
     provider: &dyn StorageProvider,
     repository_namespace: &str,
     isolated_repository_namespace: &str,
-) {
-    let object_bytes = b"shared storage provider contract bytes";
-    let object = lfs_object_for_bytes(object_bytes);
+) -> StorageProviderContractReport {
+    // Cross the Drive chunk boundary so production adapters exercise resumable
+    // continuation rather than only their one-request upload path.
+    let object_bytes = vec![b'x'; 256 * 1024 + 17];
+    let object = lfs_object_for_bytes(&object_bytes);
     let missing_bytes = b"missing storage provider contract bytes";
     let missing_object = lfs_object_for_bytes(missing_bytes);
     let source_root = tempfile::tempdir().expect("contract source root should be created");
     let source = source_root.path().join("object.bin");
-    fs::write(&source, object_bytes).expect("contract source should be written");
+    fs::write(&source, &object_bytes).expect("contract source should be written");
     let destination = source_root.path().join("downloads/object.bin");
 
     let missing_error = provider
@@ -35,6 +54,16 @@ pub async fn assert_storage_provider_contract(
         ),
         "missing objects must report ObjectNotFound"
     );
+    assert!(
+        !destination.exists(),
+        "a failed download must not leave a partial destination file"
+    );
+    fs::create_dir_all(
+        destination
+            .parent()
+            .expect("contract destination should have a parent"),
+    )
+    .expect("contract destination parent should be created");
 
     let invalid_source = source_root.path().join("invalid.bin");
     fs::write(
@@ -67,7 +96,8 @@ pub async fn assert_storage_provider_contract(
         provider
             .object_exists(repository_namespace, &object)
             .await
-            .expect("uploaded object existence check should succeed")
+            .expect("uploaded object existence check should succeed"),
+        "a successful upload must be discoverable"
     );
 
     let downloaded = provider
@@ -75,6 +105,10 @@ pub async fn assert_storage_provider_contract(
         .await
         .expect("uploaded object should download");
     assert_stored_object_identity(provider, repository_namespace, &object, &downloaded);
+    assert_eq!(
+        downloaded.backend_id, uploaded.backend_id,
+        "download must return the uploaded backend object identity"
+    );
     assert_eq!(
         fs::read(&destination).expect("contract download should be readable"),
         object_bytes,
@@ -113,6 +147,10 @@ pub async fn assert_storage_provider_contract(
                 &object,
                 &stored,
             );
+            assert_ne!(
+                stored.backend_id, uploaded.backend_id,
+                "isolated namespaces must use distinct backend object identities"
+            );
             true
         }
         Err(StorageError::RepositoryNamespaceMismatch {
@@ -130,7 +168,7 @@ pub async fn assert_storage_provider_contract(
         .delete_or_mark_object(repository_namespace, &object)
         .await
         .expect("cleanup should return a documented outcome");
-    match deletion {
+    match &deletion {
         StorageDeleteOutcome::Deleted => assert!(
             !provider
                 .object_exists(repository_namespace, &object)
@@ -138,16 +176,23 @@ pub async fn assert_storage_provider_contract(
                 .expect("deleted object existence check should succeed"),
             "Deleted must remove the requested namespaced object"
         ),
-        StorageDeleteOutcome::Marked { ref marker } => {
+        StorageDeleteOutcome::Marked { marker } => {
             assert!(
                 !marker.trim().is_empty(),
                 "cleanup marker must be meaningful"
             );
         }
-        StorageDeleteOutcome::Retained { ref reason } => {
+        StorageDeleteOutcome::Retained { reason } => {
             assert!(
                 !reason.trim().is_empty(),
                 "retention reason must be meaningful"
+            );
+            assert!(
+                provider
+                    .object_exists(repository_namespace, &object)
+                    .await
+                    .expect("retained object existence check should succeed"),
+                "Retained must keep the requested namespaced object accessible"
             );
         }
     }
@@ -172,6 +217,11 @@ pub async fn assert_storage_provider_contract(
             "repository-bound provider must keep rejecting the isolated namespace"
         );
     }
+
+    StorageProviderContractReport {
+        isolated_object_was_created,
+        deletion,
+    }
 }
 
 fn assert_stored_object_identity(
@@ -188,7 +238,3 @@ fn assert_stored_object_identity(
         "stored backend identity must not be blank"
     );
 }
-use super::{
-    LfsObject, StorageDeleteOutcome, StorageError, StorageProvider, StoredObject, fs,
-    lfs_object_for_bytes,
-};

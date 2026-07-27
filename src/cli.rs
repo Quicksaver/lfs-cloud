@@ -1335,11 +1335,10 @@ impl MigrationGoogleDriveStorage {
             .await?;
         #[cfg(test)]
         if let Some(api_base_url) = &self.api_base_url {
-            return GoogleDriveObjectStore::with_client_and_api_base_url(
+            return GoogleDriveObjectStore::with_api_base_url(
                 self.storage.clone(),
                 &self.repository_namespace,
                 token,
-                Client::new(),
                 api_base_url,
             );
         }
@@ -1386,6 +1385,10 @@ impl StorageProvider for MigrationGoogleDriveStorage {
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
         Box::pin(async move {
             self.validate_repository_namespace(repository_namespace)?;
+            let store = self.object_store().await?;
+            let verified_file = store
+                .open_verified_staged_upload_file(object, source)
+                .await?;
             let _upload_lock = self
                 .metadata
                 .acquire_object_upload_lock(
@@ -1399,11 +1402,13 @@ impl StorageProvider for MigrationGoogleDriveStorage {
                     message: format!("migration upload lock failed: {error}"),
                 })?;
 
-            // The migration helper performs an optimistic lookup before calling
-            // this method. Repeat it while holding the cross-process lock so a
-            // live server cannot win the race and create a duplicate Drive file.
-            let store = self.object_store().await?;
-            store.upload_object_idempotent(object, source).await
+            // Perform the lookup and possible upload while holding the
+            // cross-process lock so a live server cannot win the race and
+            // create a duplicate Drive file. File verification stays outside
+            // the lock so cache-hit retries do not serialize large-file reads.
+            store
+                .upload_verified_object_idempotent(object, source, verified_file)
+                .await
         })
     }
 
@@ -3963,7 +3968,7 @@ mod tests {
         extract::{Path as AxumPath, State},
         http::{
             HeaderMap, HeaderValue, StatusCode, Uri,
-            header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
+            header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
         },
         response::{IntoResponse, Response},
         routing::{get, post, put},
@@ -3998,6 +4003,10 @@ mod tests {
         SanitizedMessage, ServeOptions, StorageDeleteOutcome, StorageError, StorageProvider,
         StorageProviderConfig, StorageResult, StoredObject,
     };
+
+    // The shared contract expects this parent-level fixture name in both its
+    // integration-test and unit-test inclusion contexts.
+    use object_for_bytes as lfs_object_for_bytes;
 
     mod storage_provider_contract {
         include!(concat!(
@@ -4153,7 +4162,8 @@ mod tests {
             let state = Arc::new(DriveStorageContractState {
                 base_url: base_url.clone(),
                 objects: Mutex::new(BTreeMap::new()),
-                pending_upload: Mutex::new(None),
+                pending_uploads: Mutex::new(BTreeMap::new()),
+                next_upload_session_id: AtomicUsize::new(1),
                 next_backend_id: AtomicUsize::new(1),
                 upload_count: AtomicUsize::new(0),
             });
@@ -4196,15 +4206,21 @@ mod tests {
     struct DriveStorageContractState {
         base_url: String,
         objects: Mutex<BTreeMap<(String, String, u64), DriveContractObject>>,
-        pending_upload: Mutex<Option<serde_json::Value>>,
+        pending_uploads: Mutex<BTreeMap<String, DriveContractUploadSession>>,
+        next_upload_session_id: AtomicUsize,
         next_backend_id: AtomicUsize,
         upload_count: AtomicUsize,
+    }
+
+    struct DriveContractUploadSession {
+        metadata: serde_json::Value,
+        bytes: Vec<u8>,
     }
 
     async fn drive_contract_list(
         State(state): State<Arc<DriveStorageContractState>>,
         uri: Uri,
-    ) -> Json<serde_json::Value> {
+    ) -> Response {
         let query = drive_contract_query(&uri);
         if query.contains("lfsCloudFolderKind") {
             let shard =
@@ -4221,15 +4237,18 @@ mod tests {
                         "lfsCloudShard": shard
                     }
                 }]
-            }));
+            }))
+            .into_response();
         }
 
-        let repository_namespace =
-            drive_contract_property(&query, "lfsCloudRepoNamespace").unwrap_or_default();
-        let oid = drive_contract_property(&query, "lfsCloudOid").unwrap_or_default();
+        let repository_namespace = drive_contract_property(&query, "lfsCloudRepoNamespace")
+            .expect("Drive contract object query must include lfsCloudRepoNamespace");
+        let oid = drive_contract_property(&query, "lfsCloudOid")
+            .expect("Drive contract object query must include lfsCloudOid");
         let size = drive_contract_property(&query, "lfsCloudSize")
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or_default();
+            .expect("Drive contract object query must include lfsCloudSize")
+            .parse::<u64>()
+            .expect("Drive contract object query size must parse");
         let objects = state
             .objects
             .lock()
@@ -4237,7 +4256,7 @@ mod tests {
         let files = objects
             .get(&(repository_namespace, oid, size))
             .map_or_else(Vec::new, |object| vec![drive_contract_object_json(object)]);
-        Json(serde_json::json!({ "files": files }))
+        Json(serde_json::json!({ "files": files })).into_response()
     }
 
     async fn drive_contract_initiate_upload(
@@ -4246,32 +4265,49 @@ mod tests {
     ) -> Response {
         let metadata: serde_json::Value =
             serde_json::from_slice(&body).expect("Drive contract upload metadata should be JSON");
-        *state
-            .pending_upload
+        let session_id = format!(
+            "session-{}",
+            state.next_upload_session_id.fetch_add(1, Ordering::SeqCst)
+        );
+        state
+            .pending_uploads
             .lock()
-            .expect("Drive contract pending upload lock should not poison") = Some(metadata);
+            .expect("Drive contract pending uploads lock should not poison")
+            .insert(
+                session_id.clone(),
+                DriveContractUploadSession {
+                    metadata,
+                    bytes: Vec::new(),
+                },
+            );
 
         let mut response = StatusCode::OK.into_response();
         response.headers_mut().insert(
             LOCATION,
-            HeaderValue::from_str(&format!("{}/upload_session/session-1", state.base_url))
+            HeaderValue::from_str(&format!("{}/upload_session/{session_id}", state.base_url))
                 .expect("Drive contract upload location should be a valid header"),
         );
         response
     }
 
     async fn drive_contract_complete_upload(
-        AxumPath(_session_id): AxumPath<String>,
+        AxumPath(session_id): AxumPath<String>,
         State(state): State<Arc<DriveStorageContractState>>,
+        headers: HeaderMap,
         body: Bytes,
     ) -> Response {
-        let metadata = state
-            .pending_upload
+        let content_range = headers
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .expect("Drive contract upload must include a valid Content-Range");
+        let mut pending_uploads = state
+            .pending_uploads
             .lock()
-            .expect("Drive contract pending upload lock should not poison")
-            .take()
-            .expect("Drive contract upload should have metadata");
-        let properties = &metadata["appProperties"];
+            .expect("Drive contract pending uploads lock should not poison");
+        let session = pending_uploads
+            .get_mut(&session_id)
+            .expect("Drive contract upload session should have metadata");
+        let properties = &session.metadata["appProperties"];
         let repository_namespace = properties["lfsCloudRepoNamespace"]
             .as_str()
             .expect("Drive contract namespace should be present")
@@ -4285,6 +4321,38 @@ mod tests {
             .expect("Drive contract size should be present")
             .parse::<u64>()
             .expect("Drive contract size should parse");
+        if content_range == format!("bytes */{size}") {
+            return drive_contract_incomplete_upload_response(session.bytes.len());
+        }
+        let (start, end, total) = drive_contract_upload_range(content_range);
+        assert_eq!(
+            total, size,
+            "Drive contract upload total must match metadata"
+        );
+        assert_eq!(
+            start,
+            u64::try_from(session.bytes.len()).expect("session byte count should fit u64"),
+            "Drive contract upload chunks must be contiguous"
+        );
+        assert_eq!(
+            end - start + 1,
+            u64::try_from(body.len()).expect("chunk length should fit u64"),
+            "Drive contract Content-Range must match the chunk body"
+        );
+        session.bytes.extend_from_slice(&body);
+        let committed_size =
+            u64::try_from(session.bytes.len()).expect("session byte count should fit u64");
+        assert!(
+            committed_size <= size,
+            "Drive contract upload must not exceed its declared size"
+        );
+        if committed_size < size {
+            return drive_contract_incomplete_upload_response(session.bytes.len());
+        }
+        let completed = pending_uploads
+            .remove(&session_id)
+            .expect("completed Drive contract session should still exist");
+        drop(pending_uploads);
         let backend_id = format!(
             "drive-contract-{}",
             state.next_backend_id.fetch_add(1, Ordering::SeqCst)
@@ -4294,7 +4362,7 @@ mod tests {
             repository_namespace: repository_namespace.clone(),
             oid: oid.clone(),
             size,
-            bytes: body.to_vec(),
+            bytes: completed.bytes,
         };
         state
             .objects
@@ -4309,6 +4377,40 @@ mod tests {
             Json(drive_contract_object_json(&object)),
         )
             .into_response()
+    }
+
+    fn drive_contract_upload_range(value: &str) -> (u64, u64, u64) {
+        let (range, total) = value
+            .strip_prefix("bytes ")
+            .and_then(|value| value.split_once('/'))
+            .expect("Drive contract Content-Range must use bytes start-end/total");
+        let (start, end) = range
+            .split_once('-')
+            .expect("Drive contract Content-Range must include a byte range");
+        (
+            start
+                .parse::<u64>()
+                .expect("Drive contract range start should parse"),
+            end.parse::<u64>()
+                .expect("Drive contract range end should parse"),
+            total
+                .parse::<u64>()
+                .expect("Drive contract range total should parse"),
+        )
+    }
+
+    fn drive_contract_incomplete_upload_response(committed_size: usize) -> Response {
+        let mut response = StatusCode::from_u16(308)
+            .expect("308 should be a valid status")
+            .into_response();
+        if committed_size > 0 {
+            response.headers_mut().insert(
+                RANGE,
+                HeaderValue::from_str(&format!("bytes=0-{}", committed_size - 1))
+                    .expect("Drive contract committed range should be a valid header"),
+            );
+        }
+        response
     }
 
     async fn drive_contract_download(
@@ -4364,11 +4466,15 @@ mod tests {
     }
 
     fn drive_contract_object_json(object: &DriveContractObject) -> serde_json::Value {
+        let oid_prefix = object
+            .oid
+            .get(..2)
+            .expect("Drive contract OID must contain a two-character shard prefix");
         serde_json::json!({
             "id": object.backend_id,
             "name": format!("sha256-{}-{}.lfs", object.oid, object.size),
             "size": object.size.to_string(),
-            "parents": [format!("drive-shard-{}", &object.oid[..2])],
+            "parents": [format!("drive-shard-{oid_prefix}")],
             "trashed": false,
             "appProperties": {
                 "lfsCloudVersion": "1",
@@ -4382,26 +4488,30 @@ mod tests {
     #[tokio::test]
     async fn google_drive_object_store_satisfies_shared_storage_contract() {
         let server = DriveStorageContractServer::start().await;
-        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+        let store = GoogleDriveObjectStore::with_api_base_url(
             drive_contract_storage_config(),
             "github.com/owner/repo",
             GoogleDriveAccessToken::for_test("contract-access-token"),
-            reqwest::Client::new(),
             &server.base_url,
         )
         .expect("Drive contract store should build");
 
-        assert_storage_provider_contract(
+        let report = assert_storage_provider_contract(
             &store,
             "github.com/owner/repo",
             "github.com/owner/isolated",
         )
         .await;
 
+        assert!(!report.isolated_object_was_created);
+        assert!(matches!(
+            report.deletion,
+            StorageDeleteOutcome::Retained { .. }
+        ));
         assert_eq!(
             server.upload_count(),
             1,
-            "idempotent re-upload must not create another Drive object"
+            "verified idempotent re-upload must not create another Drive object"
         );
     }
 
@@ -4419,17 +4529,22 @@ mod tests {
             api_base_url: Some(server.base_url.clone()),
         };
 
-        assert_storage_provider_contract(
+        let report = assert_storage_provider_contract(
             &storage,
             "github.com/owner/repo",
             "github.com/owner/isolated",
         )
         .await;
 
+        assert!(!report.isolated_object_was_created);
+        assert!(matches!(
+            report.deletion,
+            StorageDeleteOutcome::Retained { .. }
+        ));
         assert_eq!(
             server.upload_count(),
             1,
-            "migration idempotency lock must not create another Drive object"
+            "migration's locked idempotent re-upload must reuse the Drive object"
         );
     }
 
@@ -7958,10 +8073,6 @@ repositories:
             oid,
             LfsObjectSize::new(u64::try_from(bytes.len()).expect("test bytes should fit u64")),
         )
-    }
-
-    fn lfs_object_for_bytes(bytes: &[u8]) -> LfsObject {
-        object_for_bytes(bytes)
     }
 
     fn write_file(path: &Path, contents: &[u8]) {
