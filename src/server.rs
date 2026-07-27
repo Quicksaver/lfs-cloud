@@ -211,13 +211,10 @@ impl ServerBuilder {
             storage_providers,
             metadata_database.clone(),
         ));
-        let router = server_router_with_sessions_and_transfer_store(
-            config,
-            session_store,
-            transfer_store,
-            metadata_database,
-            clients.github_user_client,
-        )?;
+        let router = LfsRouterBuilder::new(config, session_store)
+            .with_transfer_store(transfer_store)
+            .with_metadata_database(metadata_database)
+            .build_server(clients.github_user_client)?;
         let listener = tokio::net::TcpListener::bind((bind.host.as_str(), bind.port))
             .await
             .map_err(|source| ServerError::Bind {
@@ -350,59 +347,7 @@ pub fn server_router_with_sessions(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
 ) -> ServerResult<Router> {
-    let max_concurrent_requests = config.server.max_concurrent_requests;
-    let lfs_router = build_lfs_server_router(
-        config.clone(),
-        session_store.clone(),
-        Arc::new(ProviderBatchAuthorizer::from_config(&config)),
-        Arc::new(PendingLfsObjectTransferStore),
-        BatchBodyGuardrails::default(),
-        None,
-    );
-    let session_router = lfs_session_revoke_router(session_store.clone());
-    let Some(auth_router) = github_auth_router(config, session_store)? else {
-        return Ok(with_http_request_limit(
-            session_router.merge(lfs_router),
-            max_concurrent_requests,
-        ));
-    };
-
-    Ok(with_http_request_limit(
-        auth_router.merge(session_router).merge(lfs_router),
-        max_concurrent_requests,
-    ))
-}
-
-fn server_router_with_sessions_and_transfer_store(
-    config: ServerConfig,
-    session_store: LocalLfsSessionStore,
-    transfer_store: Arc<dyn LfsObjectTransferStore>,
-    metadata_database: Arc<MetadataDatabase>,
-    github_user_client: crate::GitHubUserClient,
-) -> ServerResult<Router> {
-    let max_concurrent_requests = config.server.max_concurrent_requests;
-    let lfs_router = build_lfs_server_router(
-        config.clone(),
-        session_store.clone(),
-        Arc::new(ProviderBatchAuthorizer::from_config(&config)),
-        transfer_store,
-        BatchBodyGuardrails::default(),
-        Some(metadata_database),
-    );
-    let session_router = lfs_session_revoke_router(session_store.clone());
-    let Some(auth_router) =
-        github_auth_router_with_client(config, session_store, github_user_client)?
-    else {
-        return Ok(with_http_request_limit(
-            session_router.merge(lfs_router),
-            max_concurrent_requests,
-        ));
-    };
-
-    Ok(with_http_request_limit(
-        auth_router.merge(session_router).merge(lfs_router),
-        max_concurrent_requests,
-    ))
+    LfsRouterBuilder::new(config, session_store).build_server(crate::GitHubUserClient::new()?)
 }
 
 fn lfs_session_revoke_router(session_store: LocalLfsSessionStore) -> Router {
@@ -456,11 +401,7 @@ pub fn lfs_server_router_with_sessions(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
 ) -> Router {
-    lfs_server_router_with_sessions_and_authorizer(
-        config.clone(),
-        session_store,
-        Arc::new(ProviderBatchAuthorizer::from_config(&config)),
-    )
+    LfsRouterBuilder::new(config, session_store).build_lfs()
 }
 
 /// Builds the Git LFS router with explicit provider-trait adapters.
@@ -494,16 +435,11 @@ pub fn lfs_server_router_with_provider_adapters(
         storage_providers,
         metadata_database.clone(),
     ));
-    Ok(
-        lfs_server_router_with_sessions_authorizer_transfer_store_guardrails_and_metadata(
-            config,
-            session_store,
-            Arc::new(ProviderBatchAuthorizer::new(repository_provider)),
-            transfer_store,
-            BatchBodyGuardrails::default(),
-            Some(metadata_database),
-        ),
-    )
+    Ok(LfsRouterBuilder::new(config, session_store)
+        .with_authorizer(Arc::new(ProviderBatchAuthorizer::new(repository_provider)))
+        .with_transfer_store(transfer_store)
+        .with_metadata_database(metadata_database)
+        .build_lfs())
 }
 
 fn validate_provider_adapter_config(
@@ -533,91 +469,87 @@ fn validate_provider_adapter_config(
     Ok(())
 }
 
-fn lfs_server_router_with_sessions_and_authorizer(
-    config: ServerConfig,
-    session_store: LocalLfsSessionStore,
-    authorizer: Arc<dyn LfsBatchAuthorizer>,
-) -> Router {
-    lfs_server_router_with_sessions_authorizer_and_transfer_store(
-        config,
-        session_store,
-        authorizer,
-        Arc::new(PendingLfsObjectTransferStore),
-    )
-}
-
-fn lfs_server_router_with_sessions_authorizer_and_transfer_store(
-    config: ServerConfig,
-    session_store: LocalLfsSessionStore,
-    authorizer: Arc<dyn LfsBatchAuthorizer>,
-    transfer_store: Arc<dyn LfsObjectTransferStore>,
-) -> Router {
-    lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails(
-        config,
-        session_store,
-        authorizer,
-        transfer_store,
-        BatchBodyGuardrails::default(),
-    )
-}
-
-fn lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails(
-    config: ServerConfig,
-    session_store: LocalLfsSessionStore,
-    authorizer: Arc<dyn LfsBatchAuthorizer>,
-    transfer_store: Arc<dyn LfsObjectTransferStore>,
-    batch_body_guardrails: BatchBodyGuardrails,
-) -> Router {
-    lfs_server_router_with_sessions_authorizer_transfer_store_guardrails_and_metadata(
-        config,
-        session_store,
-        authorizer,
-        transfer_store,
-        batch_body_guardrails,
-        None,
-    )
-}
-
-fn lfs_server_router_with_sessions_authorizer_transfer_store_guardrails_and_metadata(
+struct LfsRouterBuilder {
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
     authorizer: Arc<dyn LfsBatchAuthorizer>,
     transfer_store: Arc<dyn LfsObjectTransferStore>,
     batch_body_guardrails: BatchBodyGuardrails,
     metadata_database: Option<Arc<MetadataDatabase>>,
-) -> Router {
-    let max_concurrent_requests = config.server.max_concurrent_requests;
-    with_http_request_limit(
-        build_lfs_server_router(
+}
+
+impl LfsRouterBuilder {
+    fn new(config: ServerConfig, session_store: LocalLfsSessionStore) -> Self {
+        let authorizer = Arc::new(ProviderBatchAuthorizer::from_config(&config));
+        Self {
             config,
             session_store,
             authorizer,
-            transfer_store,
-            batch_body_guardrails,
-            metadata_database,
-        ),
-        max_concurrent_requests,
-    )
-}
+            transfer_store: Arc::new(PendingLfsObjectTransferStore),
+            batch_body_guardrails: BatchBodyGuardrails::default(),
+            metadata_database: None,
+        }
+    }
 
-fn build_lfs_server_router(
-    config: ServerConfig,
-    session_store: LocalLfsSessionStore,
-    authorizer: Arc<dyn LfsBatchAuthorizer>,
-    transfer_store: Arc<dyn LfsObjectTransferStore>,
-    batch_body_guardrails: BatchBodyGuardrails,
-    metadata_database: Option<Arc<MetadataDatabase>>,
-) -> Router {
-    let state = Arc::new(LfsServerState::new(
-        config,
-        session_store,
-        authorizer,
-        transfer_store,
-        batch_body_guardrails,
-        metadata_database,
-    ));
+    fn with_authorizer(mut self, authorizer: Arc<dyn LfsBatchAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
 
-    Router::new().fallback(handle_lfs_request).with_state(state)
+    fn with_transfer_store(mut self, transfer_store: Arc<dyn LfsObjectTransferStore>) -> Self {
+        self.transfer_store = transfer_store;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_batch_body_guardrails(mut self, batch_body_guardrails: BatchBodyGuardrails) -> Self {
+        self.batch_body_guardrails = batch_body_guardrails;
+        self
+    }
+
+    fn with_metadata_database(mut self, metadata_database: Arc<MetadataDatabase>) -> Self {
+        self.metadata_database = Some(metadata_database);
+        self
+    }
+
+    fn build_lfs(self) -> Router {
+        let max_concurrent_requests = self.config.server.max_concurrent_requests;
+        with_http_request_limit(self.build_lfs_routes(), max_concurrent_requests)
+    }
+
+    fn build_server(self, github_user_client: crate::GitHubUserClient) -> ServerResult<Router> {
+        let max_concurrent_requests = self.config.server.max_concurrent_requests;
+        let config = self.config.clone();
+        let session_store = self.session_store.clone();
+        let lfs_router = self.build_lfs_routes();
+        let session_router = lfs_session_revoke_router(session_store.clone());
+        let Some(auth_router) =
+            github_auth_router_with_client(config, session_store, github_user_client)?
+        else {
+            return Ok(with_http_request_limit(
+                session_router.merge(lfs_router),
+                max_concurrent_requests,
+            ));
+        };
+
+        Ok(with_http_request_limit(
+            auth_router.merge(session_router).merge(lfs_router),
+            max_concurrent_requests,
+        ))
+    }
+
+    fn build_lfs_routes(self) -> Router {
+        let state = Arc::new(LfsServerState::new(
+            self.config,
+            self.session_store,
+            self.authorizer,
+            self.transfer_store,
+            self.batch_body_guardrails,
+            self.metadata_database,
+        ));
+
+        Router::new().fallback(handle_lfs_request).with_state(state)
+    }
 }
 
 #[derive(Clone)]
@@ -652,13 +584,6 @@ async fn enforce_http_request_limit(
     };
 
     next.run(request).await
-}
-
-fn github_auth_router(
-    config: ServerConfig,
-    session_store: LocalLfsSessionStore,
-) -> ServerResult<Option<Router>> {
-    github_auth_router_with_client(config, session_store, crate::GitHubUserClient::new()?)
 }
 
 fn github_auth_router_with_client(
@@ -3592,16 +3517,15 @@ mod tests {
     use super::{
         BASE64_STANDARD, BatchBodyGuardrails, ConfiguredStorageProviders, LFS_AUTH_CHALLENGE,
         LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsObjectTransferStore, LfsRouteEndpoint,
-        LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ProviderBatchAuthorizer,
-        ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients, ServerShutdownOutcome,
-        StorageProviderTransferStore, UploadStagingCoordinator, UploadStagingGuardrails,
-        advertised_server_urls, authenticate_lfs_session, lfs_server_router_with_sessions,
-        lfs_server_router_with_sessions_authorizer_and_transfer_store,
-        lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails,
-        production_session_store, render_server_startup_message, serve_with_graceful_shutdown,
-        server_router_with_sessions, stage_upload_request_body,
-        stage_upload_request_body_with_guardrails, stage_upload_request_body_with_limit,
-        upload_staging_file_io_error, upload_staging_preflight_size,
+        LfsRouteResolver, LfsRouterBuilder, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES,
+        ProviderBatchAuthorizer, ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients,
+        ServerShutdownOutcome, StorageProviderTransferStore, UploadStagingCoordinator,
+        UploadStagingGuardrails, advertised_server_urls, authenticate_lfs_session,
+        lfs_server_router, lfs_server_router_with_sessions, production_session_store,
+        render_server_startup_message, serve_with_graceful_shutdown, server_router_with_sessions,
+        stage_upload_request_body, stage_upload_request_body_with_guardrails,
+        stage_upload_request_body_with_limit, upload_staging_file_io_error,
+        upload_staging_preflight_size,
     };
     use base64::Engine as _;
     use futures_util::stream;
@@ -5106,12 +5030,10 @@ repositories:
         authorizer: RecordingBatchAuthorizer,
         transfer_store: RecordingTransferStore,
     ) -> Router {
-        lfs_server_router_with_sessions_authorizer_and_transfer_store(
-            config,
-            store,
-            Arc::new(authorizer),
-            Arc::new(transfer_store),
-        )
+        LfsRouterBuilder::new(config, store)
+            .with_authorizer(Arc::new(authorizer))
+            .with_transfer_store(Arc::new(transfer_store))
+            .build_lfs()
     }
 
     fn test_router_with_transfer_metadata(
@@ -5121,14 +5043,11 @@ repositories:
         transfer_store: RecordingTransferStore,
         metadata_database: Arc<MetadataDatabase>,
     ) -> Router {
-        super::build_lfs_server_router(
-            config,
-            store,
-            Arc::new(authorizer),
-            Arc::new(transfer_store),
-            super::BatchBodyGuardrails::default(),
-            Some(metadata_database),
-        )
+        LfsRouterBuilder::new(config, store)
+            .with_authorizer(Arc::new(authorizer))
+            .with_transfer_store(Arc::new(transfer_store))
+            .with_metadata_database(metadata_database)
+            .build_lfs_routes()
     }
 
     #[test]
@@ -5530,6 +5449,30 @@ repositories:
     }
 
     #[tokio::test]
+    async fn public_lfs_router_entry_point_mounts_configured_routes() {
+        let router = lfs_server_router(test_config());
+
+        let configured_route = router
+            .clone()
+            .oneshot(lfs_request(
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                None,
+            ))
+            .await
+            .expect("router should respond");
+        let unknown_route = router
+            .oneshot(lfs_request(
+                "/github.com/owner/other.git/info/lfs/objects/batch",
+                None,
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(configured_route.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(unknown_route.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn configured_lfs_routes_require_valid_session_tokens() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
         let router = lfs_server_router_with_sessions(test_config(), store);
@@ -5635,14 +5578,12 @@ repositories:
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
             let (store, token) = issued_session_token(Duration::from_secs(60));
-            let router = lfs_server_router_with_sessions_authorizer_and_transfer_store(
-                test_config(),
-                store,
-                Arc::new(SecretBearingBatchAuthorizer {
+            let router = LfsRouterBuilder::new(test_config(), store)
+                .with_authorizer(Arc::new(SecretBearingBatchAuthorizer {
                     message: format!("provider diagnostic {PROVIDER_SECRET} {HELPER_SECRET}"),
-                }),
-                Arc::new(RecordingTransferStore::missing()),
-            );
+                }))
+                .with_transfer_store(Arc::new(RecordingTransferStore::missing()))
+                .build_lfs();
             let response = router
                 .oneshot(lfs_request_with_method_and_body(
                     Method::POST,
@@ -5655,14 +5596,12 @@ repositories:
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
             let (store, token) = issued_session_token(Duration::from_secs(60));
-            let router = lfs_server_router_with_sessions_authorizer_and_transfer_store(
-                test_config(),
-                store,
-                Arc::new(RecordingBatchAuthorizer::allow()),
-                Arc::new(SecretBearingTransferStore {
+            let router = LfsRouterBuilder::new(test_config(), store)
+                .with_authorizer(Arc::new(RecordingBatchAuthorizer::allow()))
+                .with_transfer_store(Arc::new(SecretBearingTransferStore {
                     message: format!("Drive diagnostic {DRIVE_SECRET}"),
-                }),
-            );
+                }))
+                .build_lfs();
             let response = router
                 .oneshot(lfs_request_with_method_and_body(
                     Method::GET,
@@ -5740,12 +5679,10 @@ repositories:
     #[tokio::test]
     async fn definitive_upstream_authentication_failure_revokes_local_session() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
-        let router = lfs_server_router_with_sessions_authorizer_and_transfer_store(
-            test_config(),
-            store.clone(),
-            Arc::new(AuthenticationRequiredBatchAuthorizer),
-            Arc::new(RecordingTransferStore::missing()),
-        );
+        let router = LfsRouterBuilder::new(test_config(), store.clone())
+            .with_authorizer(Arc::new(AuthenticationRequiredBatchAuthorizer))
+            .with_transfer_store(Arc::new(RecordingTransferStore::missing()))
+            .build_lfs();
 
         let response = router
             .oneshot(lfs_request_with_method_and_body(
@@ -7702,17 +7639,15 @@ repositories:
     #[tokio::test]
     async fn authenticated_batch_route_times_out_an_idle_body() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
-        let router = lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails(
-            test_config(),
-            store,
-            Arc::new(RecordingBatchAuthorizer::allow()),
-            Arc::new(RecordingTransferStore::default()),
-            BatchBodyGuardrails {
+        let router = LfsRouterBuilder::new(test_config(), store)
+            .with_authorizer(Arc::new(RecordingBatchAuthorizer::allow()))
+            .with_transfer_store(Arc::new(RecordingTransferStore::default()))
+            .with_batch_body_guardrails(BatchBodyGuardrails {
                 idle_timeout: Duration::from_millis(10),
                 total_timeout: Duration::from_secs(1),
                 ..BatchBodyGuardrails::default()
-            },
-        );
+            })
+            .build_lfs();
         let request = Request::builder()
             .method(Method::POST)
             .uri("/github.com/owner/repo.git/info/lfs/objects/batch")
@@ -7738,17 +7673,15 @@ repositories:
     #[tokio::test]
     async fn authenticated_batch_route_enforces_a_total_body_deadline() {
         let (store, token) = issued_session_token(Duration::from_secs(60));
-        let router = lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails(
-            test_config(),
-            store,
-            Arc::new(RecordingBatchAuthorizer::allow()),
-            Arc::new(RecordingTransferStore::default()),
-            BatchBodyGuardrails {
+        let router = LfsRouterBuilder::new(test_config(), store)
+            .with_authorizer(Arc::new(RecordingBatchAuthorizer::allow()))
+            .with_transfer_store(Arc::new(RecordingTransferStore::default()))
+            .with_batch_body_guardrails(BatchBodyGuardrails {
                 idle_timeout: Duration::from_millis(20),
                 total_timeout: Duration::from_millis(45),
                 ..BatchBodyGuardrails::default()
-            },
-        );
+            })
+            .build_lfs();
         let slow_drip = stream::unfold((), |_| async {
             tokio::time::sleep(Duration::from_millis(5)).await;
             Some((Ok::<_, std::io::Error>(Bytes::from_static(b" ")), ()))
