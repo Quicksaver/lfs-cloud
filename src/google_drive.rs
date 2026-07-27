@@ -1238,9 +1238,8 @@ impl GoogleDriveObjectStore {
         source: impl AsRef<Path>,
     ) -> StorageResult<StoredObject> {
         let source = source.as_ref().to_path_buf();
-        let verified_file = self
-            .open_verified_staged_upload_file(object, &source)
-            .await?;
+        let verified_file =
+            Self::open_verified_staged_upload_file(&self.storage, object, &source).await?;
         self.upload_verified_object(object, &source, verified_file)
             .await
     }
@@ -1259,20 +1258,19 @@ impl GoogleDriveObjectStore {
         source: impl AsRef<Path>,
     ) -> StorageResult<StoredObject> {
         let source = source.as_ref().to_path_buf();
-        let verified_file = self
-            .open_verified_staged_upload_file(object, &source)
-            .await?;
+        let verified_file =
+            Self::open_verified_staged_upload_file(&self.storage, object, &source).await?;
         self.upload_verified_object_idempotent(object, &source, verified_file)
             .await
     }
 
-    /// Opens and verifies a staged upload before entering a cross-process lock.
+    /// Opens and verifies a staged upload without requiring a Drive token.
     pub(crate) async fn open_verified_staged_upload_file(
-        &self,
+        storage: &GoogleDriveStorageConfig,
         object: &LfsObject,
         source: &Path,
     ) -> StorageResult<File> {
-        open_verified_staged_upload_file_on_blocking_thread(&self.storage, object, source).await
+        open_verified_staged_upload_file_on_blocking_thread(storage, object, source).await
     }
 
     /// Performs the idempotent lookup and upload using an already-verified file.

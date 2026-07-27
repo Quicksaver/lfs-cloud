@@ -1385,10 +1385,12 @@ impl StorageProvider for MigrationGoogleDriveStorage {
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
         Box::pin(async move {
             self.validate_repository_namespace(repository_namespace)?;
-            let store = self.object_store().await?;
-            let verified_file = store
-                .open_verified_staged_upload_file(object, source)
-                .await?;
+            let verified_file = GoogleDriveObjectStore::open_verified_staged_upload_file(
+                &self.storage,
+                object,
+                source,
+            )
+            .await?;
             let _upload_lock = self
                 .metadata
                 .acquire_object_upload_lock(
@@ -1406,6 +1408,7 @@ impl StorageProvider for MigrationGoogleDriveStorage {
             // cross-process lock so a live server cannot win the race and
             // create a duplicate Drive file. File verification stays outside
             // the lock so cache-hit retries do not serialize large-file reads.
+            let store = self.object_store().await?;
             store
                 .upload_verified_object_idempotent(object, source, verified_file)
                 .await
@@ -3950,7 +3953,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
     #[cfg(unix)]
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     use std::{
         collections::BTreeMap,
         fs, io,
@@ -3960,6 +3963,7 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use axum::{
@@ -4132,6 +4136,24 @@ mod tests {
             _storage: &'a GoogleDriveStorageConfig,
         ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
             Box::pin(async { Ok(GoogleDriveAccessToken::for_test("contract-access-token")) })
+        }
+    }
+
+    struct CountingDriveTokenSource {
+        calls: AtomicUsize,
+    }
+
+    impl GoogleDriveAccessTokenSource for CountingDriveTokenSource {
+        fn access_token<'a>(
+            &'a self,
+            _storage: &'a GoogleDriveStorageConfig,
+        ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(GoogleDriveAccessToken::for_test(format!(
+                    "contract-access-token-{call}"
+                )))
+            })
         }
     }
 
@@ -4545,6 +4567,64 @@ mod tests {
             server.upload_count(),
             1,
             "migration's locked idempotent re-upload must reuse the Drive object"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_upload_acquires_drive_token_after_upload_lock() {
+        let server = DriveStorageContractServer::start().await;
+        let source_root = tempfile::tempdir().expect("migration source root should be created");
+        let source = source_root.path().join("object.bin");
+        let object_bytes = b"migration upload lock token refresh";
+        fs::write(&source, object_bytes).expect("migration source should be written");
+        let object = lfs_object_for_bytes(object_bytes);
+        let repository_namespace = "github.com/owner/repo";
+        let storage_config = drive_contract_storage_config();
+        let metadata = Arc::new(
+            MetadataDatabase::open(source_root.path().join("metadata.sqlite3"))
+                .expect("migration metadata should open"),
+        );
+        let held_lock = metadata
+            .acquire_object_upload_lock(
+                repository_namespace.to_owned(),
+                storage_config.id.clone(),
+                object.clone(),
+            )
+            .await
+            .expect("migration upload lock should be acquired")
+            .expect("file-backed metadata should return an upload lock");
+        let token_source = Arc::new(CountingDriveTokenSource {
+            calls: AtomicUsize::new(0),
+        });
+        let storage = MigrationGoogleDriveStorage {
+            storage: storage_config,
+            repository_namespace: repository_namespace.to_owned(),
+            token_source: token_source.clone(),
+            token_cache: GoogleDriveAccessTokenCache::default(),
+            metadata,
+            api_base_url: Some(server.base_url.clone()),
+        };
+
+        let upload = tokio::spawn(async move {
+            StorageProvider::upload_object(&storage, repository_namespace, &object, &source).await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            token_source.calls.load(Ordering::SeqCst),
+            0,
+            "migration must not capture a Drive token before the upload lock is available"
+        );
+
+        drop(held_lock);
+        tokio::time::timeout(Duration::from_secs(10), upload)
+            .await
+            .expect("migration upload should complete after the lock is released")
+            .expect("migration upload task should join")
+            .expect("migration upload should succeed");
+        assert_eq!(
+            token_source.calls.load(Ordering::SeqCst),
+            1,
+            "migration should acquire a current Drive token after the upload lock"
         );
     }
 
