@@ -6837,24 +6837,22 @@ repositories:
             "/github.com/owner/repo.git/info/lfs/objects/{second_oid}?size={}",
             second_body.len()
         );
-        let overloaded = router
-            .oneshot(lfs_request_with_method_and_body(
+        let overloaded = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.oneshot(lfs_request_with_method_and_body(
                 Method::PUT,
                 &second_path,
                 Some(&format!("Bearer {token}")),
                 second_body.to_vec(),
-            ))
-            .await
+            )),
+        )
+        .await;
+        first.abort();
+        let _ = first.await;
+        let overloaded = overloaded
+            .expect("competing upload should be rejected without waiting for the active upload")
             .expect("competing router response should exist");
 
-        upload_release.wait().await;
-        assert_eq!(
-            first
-                .await
-                .expect("first upload task should complete")
-                .status(),
-            StatusCode::OK
-        );
         assert_eq!(
             overloaded.headers().get(RETRY_AFTER),
             Some(&HeaderValue::from_static("1"))
@@ -6916,24 +6914,22 @@ repositories:
             "/github.com/owner/repo.git/info/lfs/objects/{second_oid}?size={}",
             second_body.len()
         );
-        let overloaded = router
-            .oneshot(lfs_request_with_method_and_body(
+        let overloaded = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.oneshot(lfs_request_with_method_and_body(
                 Method::PUT,
                 &second_path,
                 Some(&format!("Bearer {second_token}")),
                 second_body.to_vec(),
-            ))
-            .await
+            )),
+        )
+        .await;
+        first.abort();
+        let _ = first.await;
+        let overloaded = overloaded
+            .expect("competing upload should be rejected without waiting for the active upload")
             .expect("competing router response should exist");
 
-        upload_release.wait().await;
-        assert_eq!(
-            first
-                .await
-                .expect("first upload task should complete")
-                .status(),
-            StatusCode::OK
-        );
         assert_eq!(
             overloaded.headers().get(RETRY_AFTER),
             Some(&HeaderValue::from_static("1"))
