@@ -28,7 +28,7 @@ Two project constraints were applied and materially changed several conclusions:
 | 6.5 | **[DONE / REVIEWED]** Three copies of the `check-attr` pipeline | Deduplication | Shared contract | Medium | Completed |
 | 7 | **[DONE / REVIEWED]** Mechanical duplication across modules | Deduplication | Shared contracts | Low | Completed |
 | 6.1 | **[DONE / REVIEWED]** `dispatch` test boilerplate | Test restructure | Same coverage | Low | Completed |
-| 8 | Dead public API | Removal | ~80 lines | Low | Before launch |
+| 8 | **[DONE / REVIEWED]** Dead public API | Public-surface cleanup | 24 lines removed | Low | Completed |
 | 1 | No provider factory; 8 concrete-variant matches | Design | Extensibility | Medium | Scoped separately |
 | 2 | Server transfer path bypasses the plugin trait | Design | Extensibility | High | Scoped separately |
 | 9 | Deferred items | Design | Readability | High | After launch |
@@ -237,15 +237,21 @@ The coverage argument is the strongest reason to do this. `AGENTS.md` records th
 
 **Reviewer quality:** The original reviewer was high quality: all six groups identified real consolidation opportunities, correctly required a neutral provider boundary, and explicitly preserved query, upload-path, migration, error-message, and batch-readability distinctions. Its §7.4 status-text claim became partly stale after §6 because credentials now intentionally render signal termination differently, but the remaining items were current. Initial CodeRabbit was precise (one valid finding out of one). Both Codex passes were clean and relevant. Blast was productive: Claude Opus feedback was fully relevant, Grok supplied four valid comments out of five, and the unavailable Sonnet and Gemini passes cannot be assessed.
 
-## 8. Dead public API
+## 8. **[DONE / REVIEWED]** Dead public API
 
-| Item | Status | Action |
+| Item | Review status | Validity and outcome |
 | --- | --- | --- |
-| `fetch_authenticated_github_user` (`src/github_auth.rs:707`) | Zero callers; only re-exported at `src/lib.rs:38` | Remove — GitHub-specific convenience, not a seam |
-| `GoogleDriveRootValidator::with_client` (`src/google_drive.rs:492`) | Zero callers; every test uses `with_client_and_api_base_url` | Remove — strict subset of the used constructor |
-| `lfs_server_router` (`src/server.rs:347`) | Zero callers; only re-exported at `src/lib.rs:95` | Keep — plausible embedder entry point; fold into §9.2 |
+| `fetch_authenticated_github_user` (formerly `src/github_auth.rs:708`) | **[DONE / REVIEWED] Removed** | Valid and actionable. It had no callers, merely selected `GitHubUserClient::new`, and exposed GitHub-specific convenience rather than a provider extension seam. The function and root re-export were removed before the first release; `GitHubUserClient` remains public for explicit client use. |
+| `GoogleDriveRootValidator::with_client` (formerly `src/google_drive.rs:489`) | **[DONE / REVIEWED] Removed** | Valid and actionable. It had no callers and only supplied `GOOGLE_DRIVE_API_BASE_URL` to `with_client_and_api_base_url`. The strict-subset constructor was removed; `new` retains the production default and the full constructor retains client and endpoint injection. Assessment clarified that the full constructor accepts the public production constant or a validated loopback test URL. |
+| `lfs_server_router` (`src/server.rs:347`) | **[DONE / REVIEWED] Retained intentionally** | Valid recommendation to keep. Although it has no in-tree caller beyond its root re-export, it is the public zero-setup Axum router constructor for embedders. It is an extension-facing composition entry point, unlike the removed provider-specific conveniences, and remains part of the §9.2 router-builder design rather than this cleanup. |
 
-**Note on scope:** because providers may eventually become separate crates, the `src/lib.rs` re-export block is the plugin surface. Do not trim it wholesale. Remove only items verified as both unused and not an extension point.
+**Public-surface reasoning:** The root re-export block remains the prospective plugin/public surface and was not trimmed wholesale. Removing two unused public conveniences is an intentional pre-release API break that narrows redundant choices before SemVer stability; the underlying public clients and configurable constructors remain available. The embedder-facing router entry point remains exported because absence of an in-tree caller does not make an extension seam dead.
+
+**Assessment and commits:** The two removals were committed in `586805f64889bb69f23a37a0e586d49ce598911f` against `929779e1ce29a4983d72b072fbafecdd286b35c9`. Initial CodeRabbit and Codex reviews found no actionable defects. Blast found one valid documentation ambiguity in the surviving Drive constructor and committed the clarification in `f7c3525c51f16ab8374e99dce6223c8583f30c30`; its removed-reference check found no stale references in doctests, tests, README, or current guides. Claude Sonnet and Gemini Blast passes were quota-limited no-ops. Final CodeRabbit and final Codex found no actionable defects.
+
+**Verification:** The implementation and assessment commits passed `cargo fmt --all`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all 627 automated test-target tests (12 expected helper/live-provider tests ignored), and all 29 doc tests. Direct current-tree searches confirmed that only `lfs_server_router` remains in source and the root re-export; the removed names remain only here as historical reviewed items.
+
+**Reviewer quality:** The original reviewer was high quality: all three API classifications were current and correctly distinguished redundant provider conveniences from an intentional embedder seam (three valid conclusions out of three). CodeRabbit and Codex were clean and relevant in both passes. Blast's available Claude Opus feedback was precise: it found one useful documentation improvement and correctly requested stale-reference verification; the quota-limited Sonnet and Gemini passes cannot be assessed.
 
 ## 9. Deferred until after launch
 
