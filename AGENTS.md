@@ -92,7 +92,7 @@ The implementation remains a single root Rust package. Do not split it into a wo
 
 Use `cargo` (Cargo.lock present) for Rust code
 
-**Add any learnings to `§ Learnings`** that fit the requirements for that section.
+**Add any learnings to `§ Learnings`** that fit the requirements for that section. **Update or remove any stale entries.**
 
 **Update user documentation if the changes affect user-facing features:**
 
