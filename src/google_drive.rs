@@ -9,7 +9,6 @@ use std::{
     fmt,
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
-    net::IpAddr,
     path::Path,
     process::{Command as ProcessCommand, Stdio},
     sync::{Arc, OnceLock},
@@ -41,7 +40,8 @@ use url::Url;
 use crate::{
     GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, LfsObject, ProviderFuture,
     SanitizedMessage, StorageDeleteOutcome, StorageError, StorageProvider, StorageResult,
-    StoredObject, http_transport::read_bounded_lossy_response_body,
+    StoredObject,
+    http_transport::{has_exact_loopback_host, read_bounded_lossy_response_body},
 };
 
 const GCLOUD_ADC_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2213,20 +2213,6 @@ struct GoogleDriveErrorDetail {
     reason: Option<String>,
 }
 
-fn is_loopback_http_url(url: &Url) -> bool {
-    if url.scheme() != "http" {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
-}
-
 fn default_google_drive_http_client_from(
     client_slot: &'static OnceLock<Client>,
     timeout: Duration,
@@ -2344,7 +2330,7 @@ fn validate_drive_url(
             format!("{label} must be an absolute http or https URL"),
         ));
     }
-    if url.scheme() == "http" && !is_loopback_http_url(&url) {
+    if url.scheme() == "http" && !has_exact_loopback_host(&url) {
         return Err(drive_upstream_error(
             provider,
             format!("{label} must use https unless it targets a loopback host"),
@@ -3773,13 +3759,23 @@ mod tests {
             "Google Drive API base URL must use https unless it targets a loopback host"
         ));
 
-        let validator = GoogleDriveRootValidator::with_client_and_api_base_url(
+        let error = GoogleDriveRootValidator::with_client_and_api_base_url(
             reqwest::Client::new(),
             "http://localhost/drive/v3",
         )
-        .expect("loopback HTTP API base should be accepted for local testing");
+        .expect_err("localhost HTTP API base should fail");
 
-        assert_eq!(validator.api_base_url.as_str(), "http://localhost/drive/v3");
+        assert!(error.to_string().contains(
+            "Google Drive API base URL must use https unless it targets a loopback host"
+        ));
+
+        let validator = GoogleDriveRootValidator::with_client_and_api_base_url(
+            reqwest::Client::new(),
+            "http://127.0.0.1/drive/v3",
+        )
+        .expect("literal loopback HTTP API base should be accepted for local testing");
+
+        assert_eq!(validator.api_base_url.as_str(), "http://127.0.0.1/drive/v3");
     }
 
     #[test]
@@ -4040,15 +4036,26 @@ mod tests {
 
         let url = super::validate_drive_resumable_upload_session_url(
             &storage,
-            &url::Url::parse("http://localhost").expect("API base should parse"),
-            "http://localhost/upload/session-1?upload_id=123",
+            &url::Url::parse("http://127.0.0.1").expect("API base should parse"),
+            "http://127.0.0.1/upload/session-1?upload_id=123",
         )
-        .expect("loopback HTTP session URL should be accepted for local testing");
+        .expect("literal loopback HTTP session URL should be accepted for local testing");
 
         assert_eq!(
             url.as_str(),
-            "http://localhost/upload/session-1?upload_id=123"
+            "http://127.0.0.1/upload/session-1?upload_id=123"
         );
+
+        let error = super::validate_drive_resumable_upload_session_url(
+            &storage,
+            &url::Url::parse("http://localhost").expect("API base should parse"),
+            "http://localhost/upload/session-1?upload_id=123",
+        )
+        .expect_err("localhost HTTP session URL should fail");
+
+        assert!(error.to_string().contains(
+            "Google Drive resumable upload session URL must use https unless it targets a loopback host"
+        ));
     }
 
     #[test]
