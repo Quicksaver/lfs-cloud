@@ -1033,10 +1033,16 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
                 })?;
             let runtime = self.providers.provider_for(repository)?;
             if let Some(streaming_download) = runtime.streaming_download() {
-                return streaming_download
+                let download = streaming_download
                     .download_object_response(&repository.id, object, stored_object)
                     .await
-                    .map_err(ServerError::from);
+                    .map_err(ServerError::from)?;
+                Self::ensure_stored_object_namespace(
+                    runtime.provider(),
+                    repository,
+                    download.stored_object().clone(),
+                )?;
+                return Ok(download);
             }
             self.staged_download_response(repository, object).await
         })
