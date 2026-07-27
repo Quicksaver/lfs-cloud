@@ -30,22 +30,22 @@ Two project constraints were applied and materially changed several conclusions:
 | 6.1 | **[DONE / REVIEWED]** `dispatch` test boilerplate | Test restructure | Same coverage | Low | Completed |
 | 8 | **[DONE / REVIEWED]** Dead public API | Public-surface cleanup | 24 lines removed | Low | Completed |
 | 1 | **[DONE / REVIEWED]** Provider registration and construction | Design | Extensibility | Medium | Completed |
-| 2 | Server transfer path bypasses the plugin trait | Design | Extensibility | High | Scoped separately |
+| 2 | **[DONE / REVIEWED]** Server transfer path bypasses the plugin trait | Design | Extensibility | High | Completed |
 | 9 | Deferred items | Design | Readability | High | After launch |
 
 ---
 
 ## 1. **[DONE / REVIEWED]** Provider registration and construction
 
-**Validity:** Valid design finding, but the eight-site inventory combined provider construction with two sites owned by the separately scoped production transfer-store design in §2. Six sites were current and actionable here; the two `GoogleDriveTransferStore` sites remain intentionally concrete until §2 can preserve indexed-ID repair, streaming downloads, metadata recording, and Drive startup token reuse through a generic production transfer abstraction.
+**Validity:** Valid design finding, but the eight-site inventory combined provider construction with two sites owned by the separately scoped production transfer-store design in §2. Six sites were current and actionable here; the two `GoogleDriveTransferStore` sites were intentionally deferred until §2 could preserve indexed-ID repair, streaming downloads, metadata recording, and Drive startup token reuse through a generic production transfer abstraction. That follow-up is now complete.
 
 | Original site | Current assessment and outcome |
 | --- | --- |
 | `production_session_store` | **Valid and addressed.** Uses centralized single-GitHub-PAT selection while retaining durable-session-specific diagnostics and the existing PAT-derived encryption secret. |
 | `github_auth_router_with_client` | **Valid and addressed.** Shares the same selection helper while retaining PAT-router-specific diagnostics and the single-account login contract. |
 | `ProviderBatchAuthorizer::from_config` | **Valid and addressed.** Builds trait-object adapters through `RepositoryProviderConfig::build_provider`; assessment restored the authoritative config-map key instead of trusting an embedded ID. |
-| `GoogleDriveTransferStore::validate_storage_providers` | **Valid coupling, deferred with §2.** Blast review proved that pushing Drive token-cache and root-validator types through the provider-neutral registration trait merely disguised the concrete production transfer boundary. |
-| `GoogleDriveTransferStore::object_store_for_repository` | **Valid coupling, deferred with §2.** Its return type and backend-ID/download methods are Drive-specific; changing it here would implement §2 rather than the provider factory. |
+| `GoogleDriveTransferStore::validate_storage_providers` | **Valid coupling, addressed in §2.** `ServerStorageProviderFactory` now owns Drive readiness dependencies and exposes only a provider-neutral registry plus optional server capabilities. |
+| `GoogleDriveTransferStore::object_store_for_repository` | **Valid coupling, addressed in §2.** Repository-scoped runtime resolution now returns the generic storage contract with independent optional backend-ID and streaming capabilities. |
 | `migration_google_drive_storage` | **Valid and addressed.** Renamed to provider-neutral `migration_storage_provider`, constructs `dyn StorageProvider` through the storage registration, and maps readiness failures into the migration error domain. |
 | `validate_status_storage` | **Valid and addressed.** Delegates readiness validation and the safe operator diagnostic through the storage registration. |
 | `upsert_storage_provider` | **Valid and addressed.** Uses config accessors for ID, type, backend root, and display name rather than matching Drive fields. |
@@ -54,7 +54,7 @@ Two project constraints were applied and materially changed several conclusions:
 
 **Authentication couplings:** The duplicate provider collection is removed, but the current product still composes at most one configured GitHub PAT account. `production_session_store` continues to derive the durable-session encryption key from `GitHubAuthenticationConfig::session_encryption_secret`; neither that secret nor `PAT_AUTHENTICATION_SESSION_MIGRATION` changed. A provider-neutral durable-session key remains a separately scoped blocker before a non-PAT repository provider can work, and changing it must include explicit session invalidation/migration semantics.
 
-**Preserved boundaries:** GitHub and Google Drive remain the only implemented providers. The single-root package, public provider traits, single-account PAT login, durable-session behavior, Drive upload locking, root readiness, and §2/§9 scopes are unchanged. The registration boundary removes the six valid concrete call-site matches without claiming that future providers or the generic production transfer store already exist.
+**Preserved boundaries:** GitHub and Google Drive remain the only implemented providers. The single-root package, public provider traits, single-account PAT login, durable-session behavior, Drive upload locking, root readiness, and §9 scope are unchanged. This registration work removed the six factory-owned concrete call-site matches; §2 subsequently completed the generic production transfer store without implementing another provider.
 
 **Assessment and commits:** The implementation was committed as `12f14e9668d3d75f1bf0510b792739a6158c09a6` against `a85325453053758d1de71e50ee07230a2a845c7d`. Initial CodeRabbit found no issues. Initial Codex found one valid P2: storage readiness failures had crossed from migration into the server error category; `ca4c0ec55e40b7c44e350a639d7ecd7517dbdb0f` restored `MigrationError::Storage` and added a regression. Blast then committed `5fc2681caad810c77047c421472933ce6c413ccb`, removing Drive runtime dependencies from the neutral registration trait, restoring config-map identity and subsystem-specific authentication diagnostics, tightening readiness assertions, restoring upload-lock rationale, and colocating provider tests. Claude Sonnet and Gemini Blast passes were quota-limited no-ops. Final CodeRabbit and final Codex found no actionable regressions.
 
@@ -62,17 +62,31 @@ Two project constraints were applied and materially changed several conclusions:
 
 **Reviewer quality:** The original review was high quality on six sites and correctly identified the CLI placement and authentication couplings, but it overcounted the two §2 production transfer sites as factory-only work and its universal fallible-factory claim was stale after lazy GitHub client construction. Initial CodeRabbit was clean and relevant. Initial Codex found one valid boundary regression. Blast was high value: Claude Opus 5 and Grok found real abstraction, identity, diagnostic, documentation, and test-placement issues; one ambient-credential concern was invalid and one documentation requirement was overstated. Final CodeRabbit and Codex were clean.
 
-## 2. The server transfer path bypasses the generic storage trait
+## 2. **[DONE / REVIEWED]** The server transfer path bypasses the generic storage trait
 
-`providers.rs:190` defines a clean `StorageProvider` trait, and `StorageProviderTransferStore` (`src/server.rs:831`) adapts it to the server's `LfsObjectTransferStore`. Production serving does not use that adapter. It uses `GoogleDriveTransferStore` (`src/server.rs:1059`), a provider-named implementation. The generic adapter is reachable only through `lfs_server_router_with_provider_adapters`, which is `#[doc(hidden)]`, documented as "a narrow test seam," and used only by `tests/local_end_to_end.rs`.
+**Validity:** Valid and current at the review base. Production serving used the provider-named `GoogleDriveTransferStore`, while `StorageProviderTransferStore` was a metadata-free test seam. A future storage backend therefore would have needed both a `StorageProvider` and a second server transfer implementation, and the local end-to-end test exercised a materially different composition from production.
 
-This is deliberate and recorded in `AGENTS.md`: _"`GoogleDriveObjectStore` implements the generic storage-provider trait for migration/direct storage flows; server LFS transfers still wrap it separately to record verified-object metadata."_
+**Chosen architecture:** `StorageProvider` now exposes a real, stable-identity `lookup_object` operation, and its default `object_exists` implementation delegates to that lookup so existence cannot silently diverge from backend identity. The production `StorageProviderTransferStore` owns the configured provider registry plus `MetadataDatabase`; it performs provider-neutral lookup, stale-ID repair, verified-object recording, upload metadata updates, and download composition. `ServerStorageProviderFactory` performs readiness-checked config registration and builds repository-scoped `ConfiguredStorageProviders` without leaking Drive clients into the server.
 
-The consequence for plugin extensibility is that adding S3 requires a second `LfsObjectTransferStore`, not just a second `StorageProvider`. However, the divergence is one method deep, not architectural: the metadata recording and stale-ID repair in `lookup_and_repair_object` (`src/server.rs:1143`) is provider-generic. Only `lookup_object_by_backend_id` and the object-store construction are Drive-specific.
+The proposed generic type parameter was not used because runtime YAML configuration produces multiple mappings and trait-object providers. A registry of runtime providers is the natural production shape. Drive's non-portable optimizations are instead independent optional capabilities: `BackendIdLookup` verifies a known backend ID without a namespace scan, while `StreamingStorageProvider` returns a verified streaming response. Providers implementing neither remain fully usable through the core trait and a verified temporary-file download fallback; a provider may also implement either capability without being forced to implement the other.
 
-Likely shape: a generic `MetadataRecordingTransferStore<P: StorageProvider>` owning the metadata and repair logic, plus a small optional trait (for example `BackendIdLookup`) that Drive implements for the indexed fast path and other providers leave defaulted.
+**Production and test composition:** Production and `lfs_server_router_with_provider_adapters` now construct the same generic metadata-recording transfer store. The injected local end-to-end path supplies its provider through the same registry and uses an in-memory metadata database rather than a synthetic metadata-free adapter. The shared storage contract now asserts lookup identity and namespace behavior, while server tests cover generic providers with and without each optional capability, stale and missing metadata, mismatched provider identities, and download fallback reconciliation.
 
-**Gain:** The plugin boundary becomes the path production actually runs through, so `tests/local_end_to_end.rs` stops covering a path production does not take. **Drawback:** Genuine design work on the upload and download hot path. The Drive sharding, lookup, and repair behavior is covered by four separate `Learnings` entries and must survive the move intact. This is the largest item in this document.
+**Preserved Drive and metadata invariants:** Drive still uses deterministic first-byte shards, private app properties, exact OID/size validation, smallest-ID duplicate selection, indexed `files.get` verification, stale-ID fallback and repair, resumable upload integrity, startup token-cache reuse, and direct hash-verified streaming. Returned provider ID and repository namespace are validated before metadata is trusted or bytes are exposed. Metadata repairs preserve the original creator, missing backend objects become stale, and successful uploads and transfer-attempt lifecycles remain recorded at the same server boundaries.
+
+Drive migration continues to acquire the provider's durable metadata upload lock after local byte verification and before token minting. The server adapter disables that inner lock because `handle_lfs_upload_request` already owns the same durable lock across its final lookup and upload; a regression test proves server uploads do not self-deadlock. Existing process-wide provider concurrency limits, per-object single-flight locks, staging admission, and bounded graceful shutdown remain server-owned and unchanged.
+
+**Genuinely deferred boundary:** `StorageDownloadResponse` and `StreamingStorageProvider` currently use an Axum response because this remains a single package and the capability exists specifically at its HTTP edge. Extracting a framework-neutral verified byte stream is deferred until a package split or a concrete second server framework justifies it. This does not block another storage provider: the core `StorageProvider` path and staged verified-download fallback require no Axum-specific implementation. No S3 or other future provider was added or implied.
+
+**Assessment and commits:** The implementation was committed as `90d1392b8a34d3eeb93e6f3e5974afef12125615` against `e22a6cf1fb4315eaeae3c9e2596718e65fe95b9a`. Initial CodeRabbit found one valid Major issue: the streaming path accepted returned metadata without validating its provider and namespace; `0ac2f428852322de572501bf4908d33b9b5a5c4e` added the transfer-store validation. Initial Codex found one valid P2: the Drive streaming adapter should reject a foreign namespace before opening the media request; `4c0a3da0105d4ea939f1b829aeb50290e23d93bf` moved that rejection to the provider edge.
+
+Blast remediation in `d79301d53102ae402503d6574ecc8b3fe883ba5c` separated the optional capabilities, removed compatibility aliases, consolidated test composition, removed a duplicate fallback lookup, documented the upload-lock and Axum boundaries, corrected the factory error domain, tightened identity/reference validation, and expanded capability/fallback regressions. Claims that migration used inconsistent fake backend IDs, token-cache clones were unshared, the server lacked the durable lock, upload metadata was recorded twice, or the shared lifecycle contract should discover server-only capabilities were invalid against the enclosing code and contract scope. Claude Sonnet and Gemini Blast passes were quota-limited no-ops.
+
+Final CodeRabbit found no issues. Final Codex found one valid P2 introduced by the fallback optimization: staged downloads no longer reconciled durable metadata from the returned backend identity. `334f15b0e4b526e8d604ccb2cf13844c145d392e` repairs changed backend IDs, non-verified records, and missing-object stale state without repeating provider discovery. No assessment comments remain unaddressed.
+
+**Verification:** The final tree passed `yarn lint:fix`, `cargo fmt --all`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all-target tests (615 library tests with expected helper/live-provider ignores, plus every integration target including the real local Git LFS end-to-end path), and all 29 doc tests.
+
+**Reviewer quality:** The original review was high quality: its diagnosis, risk ranking, and optional indexed-lookup direction were correct, although the final runtime registry and independent streaming capability were necessary refinements. Initial CodeRabbit and Codex each found a distinct valid trust-boundary regression. Blast was high value overall: Claude Opus produced 12 actionable findings out of 14 and Grok produced 7 unique actionable findings out of 10, while the invalid comments mainly missed enclosing lock ownership or intentional test seams. Final CodeRabbit was clean; final Codex caught a subtle metadata regression introduced during assessment.
 
 ## 3. **[DONE / REVIEWED] `StorageProvider` lacked a shared contract test**
 
@@ -292,7 +306,7 @@ A small `LfsRouterBuilder` collapses six functions to one and makes the roughly 
 **Deliberate design work, scoped separately from cleanup**
 
 8. §1 provider factory.
-9. §2 generic metadata-recording transfer store.
+9. §2 generic metadata-recording transfer store. **Completed.**
 10. Provider-neutral session encryption key (blocks a second repository provider outright).
 
 **After launch**
