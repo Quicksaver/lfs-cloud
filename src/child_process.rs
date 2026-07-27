@@ -196,8 +196,8 @@ pub(crate) fn wait_for_child(
                     OUTPUT_DRAIN_AFTER_STOP,
                     command_name,
                 );
-                join_reader(&mut stdout_reader, "stdout", command_name)?;
-                join_reader(&mut stderr_reader, "stderr", command_name)?;
+                join_completed_reader(&mut stdout_reader, stdout.as_ref(), "stdout", command_name)?;
+                join_completed_reader(&mut stderr_reader, stderr.as_ref(), "stderr", command_name)?;
                 return Err(error);
             }
         }
@@ -230,8 +230,8 @@ pub(crate) fn wait_for_child(
                 OUTPUT_DRAIN_AFTER_STOP,
                 command_name,
             );
-            join_reader(&mut stdout_reader, "stdout", command_name)?;
-            join_reader(&mut stderr_reader, "stderr", command_name)?;
+            join_completed_reader(&mut stdout_reader, stdout.as_ref(), "stdout", command_name)?;
+            join_completed_reader(&mut stderr_reader, stderr.as_ref(), "stderr", command_name)?;
             return Err(ChildProcessError::TimedOut {
                 timeout: options
                     .timeout
@@ -280,16 +280,18 @@ fn accept_pipe_event(
     let output = match result {
         Ok(output) => output,
         Err(source) => {
+            *destination = Some(Vec::new());
             return Err(ChildProcessError::io(
                 format!("failed to read {stream} from {command_name}"),
                 source,
             ));
         }
     };
-    if let Some(limit) = output.exceeded_limit {
+    let exceeded_limit = output.exceeded_limit;
+    *destination = Some(output.bytes);
+    if let Some(limit) = exceeded_limit {
         return Err(ChildProcessError::OutputLimit { stream, limit });
     }
-    *destination = Some(output.bytes);
     Ok(())
 }
 
@@ -636,6 +638,36 @@ mod tests {
         assert!(!debug.contains("stderr-secret"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn timeout_remains_bounded_when_escaped_descendant_holds_pipes() {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MODE_ENV, "escaped-timeout")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().expect("helper should start");
+        let started = Instant::now();
+
+        let error = wait_for_child(
+            &mut child,
+            "test helper",
+            ChildProcessOptions {
+                timeout: Some(Duration::from_millis(100)),
+                stdout: PipeCapture::Unlimited,
+                stderr: PipeCapture::Unlimited,
+                inherited_pipe_is_error: true,
+            },
+        )
+        .expect_err("helper should time out");
+
+        assert!(matches!(error, ChildProcessError::TimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
     #[test]
     fn inherited_pipe_policy_distinguishes_recovered_output() {
         for inherited_pipe_is_error in [false, true] {
@@ -708,6 +740,42 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hard_limit_remains_bounded_when_escaped_descendant_holds_pipes() {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MODE_ENV, "escaped-hard-limit")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().expect("helper should start");
+        let started = Instant::now();
+
+        let error = wait_for_child(
+            &mut child,
+            "test helper",
+            ChildProcessOptions {
+                timeout: Some(Duration::from_secs(5)),
+                stdout: PipeCapture::HardLimit { limit: 3 },
+                stderr: PipeCapture::Unlimited,
+                inherited_pipe_is_error: true,
+            },
+        )
+        .expect_err("stdout should exceed the hard limit");
+
+        assert!(matches!(
+            error,
+            ChildProcessError::OutputLimit {
+                stream: "stdout",
+                limit: 3
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
     #[test]
     #[ignore = "invoked as a platform-native child-process helper"]
     #[allow(
@@ -718,13 +786,25 @@ mod tests {
         use std::io::Write as _;
 
         let mode = std::env::var(PROCESS_TREE_MODE_ENV).unwrap_or_default();
+        #[cfg(unix)]
+        if matches!(mode.as_str(), "escaped-timeout" | "escaped-hard-limit") {
+            use std::os::unix::process::CommandExt as _;
+
+            let mut descendant = Command::new(std::env::current_exe().expect("test executable"));
+            descendant
+                .args(["--ignored", "--exact", PROCESS_TREE_DESCENDANT_TEST])
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            descendant.process_group(0);
+            descendant.spawn().expect("escaped descendant should start");
+        }
         std::io::stdout()
             .write_all(b"stdout-secret\n")
             .expect("stdout should be writable");
         std::io::stderr()
             .write_all(b"stderr-secret\n")
             .expect("stderr should be writable");
-        if mode == "timeout" {
+        if matches!(mode.as_str(), "timeout" | "escaped-timeout") {
             std::thread::sleep(Duration::from_secs(30));
         } else if mode == "descendant" {
             Command::new(std::env::current_exe().expect("test executable"))
@@ -739,6 +819,12 @@ mod tests {
     #[test]
     #[ignore = "invoked as a platform-native child-process descendant"]
     fn process_tree_pipe_holding_descendant() {
-        std::thread::sleep(Duration::from_secs(30));
+        let mode = std::env::var(PROCESS_TREE_MODE_ENV).unwrap_or_default();
+        let duration = if mode.starts_with("escaped-") {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(30)
+        };
+        std::thread::sleep(duration);
     }
 }
