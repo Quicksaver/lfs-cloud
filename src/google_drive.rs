@@ -483,8 +483,9 @@ impl GoogleDriveRootValidator {
 
     /// Creates a validator with an explicit HTTP client and API base URL.
     ///
-    /// This is primarily useful for tests that replace Google Drive with a
-    /// local HTTP server.
+    /// Callers targeting the real Google Drive endpoint should pass
+    /// [`GOOGLE_DRIVE_API_BASE_URL`]. Tests and development tools can instead
+    /// provide a validated loopback URL for a local HTTP server.
     ///
     /// # Errors
     ///
