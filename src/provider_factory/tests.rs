@@ -28,7 +28,7 @@ use crate::google_drive::{
 use crate::{
     GoogleDriveObjectStore, GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid,
     MetadataDatabase, ProviderFuture, StorageDeleteOutcome, StorageError, StorageProvider,
-    StorageResult, StoredObject,
+    StorageResult, StoredObject, StreamingStorageProvider,
 };
 
 mod storage_provider_contract {
@@ -487,6 +487,43 @@ async fn configured_google_drive_storage_satisfies_shared_storage_contract() {
         1,
         "configured provider's locked idempotent re-upload must reuse the Drive object"
     );
+}
+
+#[tokio::test]
+async fn configured_google_drive_streaming_rejects_another_repository_namespace() {
+    let object = lfs_object_for_bytes(b"configured provider namespace isolation");
+    let storage = GoogleDriveStorageProvider::with_test_dependencies(
+        drive_contract_storage_config(),
+        "github.com/owner/repo-a",
+        Arc::new(FixedDriveTokenSource),
+        GoogleDriveAccessTokenCache::default(),
+        Arc::new(MetadataDatabase::open_in_memory().expect("Drive metadata should open")),
+        Some("http://127.0.0.1:1".to_owned()),
+    );
+    let stored_object = StoredObject::new(
+        "drive-user-a",
+        "github.com/owner/repo-b",
+        object.clone(),
+        "foreign-drive-file",
+    );
+
+    let error = match StreamingStorageProvider::download_object_response(
+        &storage,
+        "github.com/owner/repo-b",
+        &object,
+        stored_object,
+    )
+    .await
+    {
+        Ok(_) => panic!("configured provider should reject another repository namespace"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        StorageError::RepositoryNamespaceMismatch { ref provider }
+            if provider == "drive-user-a"
+    ));
 }
 
 #[tokio::test]

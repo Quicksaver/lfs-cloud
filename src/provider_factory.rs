@@ -148,17 +148,6 @@ pub(crate) struct ServerStorageProvider {
 }
 
 impl ServerStorageProvider {
-    fn with_capabilities<T>(provider: Arc<T>) -> Self
-    where
-        T: StorageProvider + BackendIdLookup + StreamingStorageProvider + Send + Sync + 'static,
-    {
-        Self {
-            provider: provider.clone(),
-            backend_id_lookup: Some(provider.clone()),
-            streaming_download: Some(provider),
-        }
-    }
-
     /// Builds the default server adapter for a provider without optional capabilities.
     pub(crate) fn from_provider(provider: Arc<dyn StorageProvider + Send + Sync>) -> Self {
         Self {
@@ -166,6 +155,21 @@ impl ServerStorageProvider {
             backend_id_lookup: None,
             streaming_download: None,
         }
+    }
+
+    /// Attaches indexed backend-ID lookup when the provider supports it.
+    fn with_backend_id_lookup(mut self, backend_id_lookup: Arc<dyn BackendIdLookup>) -> Self {
+        self.backend_id_lookup = Some(backend_id_lookup);
+        self
+    }
+
+    /// Attaches direct streaming when the provider supports it.
+    fn with_streaming_download(
+        mut self,
+        streaming_download: Arc<dyn StreamingStorageProvider>,
+    ) -> Self {
+        self.streaming_download = Some(streaming_download);
+        self
     }
 
     /// Returns the provider's generic storage contract.
@@ -259,7 +263,7 @@ pub(crate) struct ServerStorageProviderFactory {
 
 impl ServerStorageProviderFactory {
     /// Builds production provider dependencies.
-    pub(crate) fn production() -> StorageResult<Self> {
+    pub(crate) fn production() -> ServerResult<Self> {
         Ok(Self {
             drive_token_source: Arc::new(GoogleDriveGcloudTokenProvider::new()),
             drive_token_cache: GoogleDriveAccessTokenCache::default(),
@@ -454,7 +458,10 @@ impl StorageProviderRegistration for GoogleDriveStorageConfig {
             Some(api_base_url) => provider.with_object_api_base_url(api_base_url.clone()),
             None => provider,
         };
-        ServerStorageProvider::with_capabilities(Arc::new(provider))
+        let provider = Arc::new(provider);
+        ServerStorageProvider::from_provider(provider.clone())
+            .with_backend_id_lookup(provider.clone())
+            .with_streaming_download(provider)
     }
 }
 
@@ -515,6 +522,9 @@ pub(crate) struct GoogleDriveStorageProvider {
     token_source: Arc<dyn GoogleDriveAccessTokenSource>,
     token_cache: GoogleDriveAccessTokenCache,
     metadata: Arc<MetadataDatabase>,
+    // Migration uses this provider directly and therefore keeps provider-level
+    // locking enabled. The server disables it because its upload handler holds
+    // the same durable lock across both the final lookup and the upload.
     acquire_upload_lock: bool,
     #[cfg(test)]
     api_base_url: Option<String>,
@@ -568,6 +578,11 @@ impl GoogleDriveStorageProvider {
         self
     }
 
+    /// Disables provider-level locking for the server-owned upload path.
+    ///
+    /// Callers must already hold the metadata upload lock across the final
+    /// object lookup and this provider call. Keeping both layers enabled would
+    /// attempt to acquire the same process-shared file lock twice.
     fn without_provider_upload_lock(mut self) -> Self {
         self.acquire_upload_lock = false;
         self
@@ -648,10 +663,10 @@ impl StorageProvider for GoogleDriveStorageProvider {
             };
 
             // Verify before waiting so cache-hit retries do not serialize
-            // large-file reads. Keep lookup and possible upload under the
-            // cross-process lock so a live server cannot create a duplicate
-            // Drive file, and mint the token after admission so long waits
-            // cannot age the credential.
+            // large-file reads. Migration keeps lookup and upload under the
+            // provider-acquired lock; the server caller already holds that
+            // lock across its final lookup and this upload. In both paths the
+            // token is minted after lock admission so waits cannot age it.
             self.object_store()
                 .await?
                 .upload_verified_object_idempotent(object, source, verified_file)

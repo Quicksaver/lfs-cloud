@@ -50,7 +50,9 @@ use crate::{
     StorageError, StorageProvider, StoredObject, github_personal_access_token_login_router,
     metadata::{MetadataTransferOperation, MetadataTransferResult},
     parse_lfs_batch_request_json,
-    provider_factory::{ConfiguredStorageProviders, ServerStorageProviderFactory},
+    provider_factory::{
+        ConfiguredStorageProviders, ServerStorageProvider, ServerStorageProviderFactory,
+    },
     sessions::LfsSessionRecord,
 };
 
@@ -492,10 +494,8 @@ pub fn lfs_server_router_with_provider_adapters(
         storage_providers,
         metadata_database.clone(),
     ));
-    let max_concurrent_requests = config.server.max_concurrent_requests;
-
-    Ok(with_http_request_limit(
-        build_lfs_server_router(
+    Ok(
+        lfs_server_router_with_sessions_authorizer_transfer_store_guardrails_and_metadata(
             config,
             session_store,
             Arc::new(ProviderBatchAuthorizer::new(repository_provider)),
@@ -503,8 +503,7 @@ pub fn lfs_server_router_with_provider_adapters(
             BatchBodyGuardrails::default(),
             Some(metadata_database),
         ),
-        max_concurrent_requests,
-    ))
+    )
 }
 
 fn validate_provider_adapter_config(
@@ -569,6 +568,24 @@ fn lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrail
     transfer_store: Arc<dyn LfsObjectTransferStore>,
     batch_body_guardrails: BatchBodyGuardrails,
 ) -> Router {
+    lfs_server_router_with_sessions_authorizer_transfer_store_guardrails_and_metadata(
+        config,
+        session_store,
+        authorizer,
+        transfer_store,
+        batch_body_guardrails,
+        None,
+    )
+}
+
+fn lfs_server_router_with_sessions_authorizer_transfer_store_guardrails_and_metadata(
+    config: ServerConfig,
+    session_store: LocalLfsSessionStore,
+    authorizer: Arc<dyn LfsBatchAuthorizer>,
+    transfer_store: Arc<dyn LfsObjectTransferStore>,
+    batch_body_guardrails: BatchBodyGuardrails,
+    metadata_database: Option<Arc<MetadataDatabase>>,
+) -> Router {
     let max_concurrent_requests = config.server.max_concurrent_requests;
     with_http_request_limit(
         build_lfs_server_router(
@@ -577,7 +594,7 @@ fn lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrail
             authorizer,
             transfer_store,
             batch_body_guardrails,
-            None,
+            metadata_database,
         ),
         max_concurrent_requests,
     )
@@ -689,7 +706,7 @@ trait LfsObjectTransferStore: Send + Sync {
         &'a self,
         repository: &'a RepositoryMapping,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>>;
+    ) -> ProviderFuture<'a, ServerResult<StorageDownloadResponse>>;
 
     fn record_verified_object<'a>(
         &'a self,
@@ -699,8 +716,6 @@ trait LfsObjectTransferStore: Send + Sync {
         created_by: &'a RepositoryUser,
     ) -> ProviderFuture<'a, ServerResult<()>>;
 }
-
-type LfsDownloadResponse = StorageDownloadResponse;
 
 #[derive(Clone)]
 struct ProviderBatchAuthorizer {
@@ -800,22 +815,29 @@ impl StorageProviderTransferStore {
         }
     }
 
-    fn ensure_stored_object_namespace(
-        provider: &(dyn StorageProvider + Send + Sync),
+    fn validate_stored_object_namespace(
         repository: &RepositoryMapping,
-        stored_object: StoredObject,
-    ) -> ServerResult<StoredObject> {
+        stored_object: &StoredObject,
+    ) -> ServerResult<()> {
         if stored_object.provider_id == repository.storage_provider
             && stored_object.repository_namespace == repository.id
         {
-            Ok(stored_object)
+            Ok(())
         } else {
             Err(ServerError::Storage {
                 source: StorageError::RepositoryNamespaceMismatch {
-                    provider: provider.provider_id().to_owned(),
+                    provider: repository.storage_provider.clone(),
                 },
             })
         }
+    }
+
+    fn ensure_stored_object_namespace(
+        repository: &RepositoryMapping,
+        stored_object: StoredObject,
+    ) -> ServerResult<StoredObject> {
+        Self::validate_stored_object_namespace(repository, &stored_object)?;
+        Ok(stored_object)
     }
 
     async fn record_verified_object_metadata(
@@ -843,6 +865,16 @@ impl StorageProviderTransferStore {
         object: &LfsObject,
     ) -> ServerResult<Option<StoredObject>> {
         let runtime = self.providers.provider_for(repository)?;
+        self.lookup_and_repair_object_with_runtime(repository, object, runtime)
+            .await
+    }
+
+    async fn lookup_and_repair_object_with_runtime(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+        runtime: &ServerStorageProvider,
+    ) -> ServerResult<Option<StoredObject>> {
         let provider = runtime.provider();
         let metadata = self
             .metadata_database
@@ -857,7 +889,7 @@ impl StorageProviderTransferStore {
                 .lookup_object(&repository.id, object)
                 .await?
                 .map(|stored_object| {
-                    Self::ensure_stored_object_namespace(provider, repository, stored_object)
+                    Self::ensure_stored_object_namespace(repository, stored_object)
                 })
                 .transpose();
         };
@@ -867,8 +899,7 @@ impl StorageProviderTransferStore {
                 .lookup_object_by_backend_id(&repository.id, object, &metadata.backend_id)
                 .await?
         {
-            let stored_object =
-                Self::ensure_stored_object_namespace(provider, repository, stored_object)?;
+            let stored_object = Self::ensure_stored_object_namespace(repository, stored_object)?;
             if metadata.verification_status != MetadataObjectVerificationStatus::Verified {
                 self.record_verified_object_metadata(
                     repository,
@@ -884,9 +915,7 @@ impl StorageProviderTransferStore {
         let replacement = provider
             .lookup_object(&repository.id, object)
             .await?
-            .map(|stored_object| {
-                Self::ensure_stored_object_namespace(provider, repository, stored_object)
-            })
+            .map(|stored_object| Self::ensure_stored_object_namespace(repository, stored_object))
             .transpose()?;
         if let Some(stored_object) = &replacement {
             if stored_object.backend_id != metadata.backend_id
@@ -918,8 +947,8 @@ impl StorageProviderTransferStore {
         &self,
         repository: &RepositoryMapping,
         object: &LfsObject,
+        runtime: &ServerStorageProvider,
     ) -> ServerResult<StorageDownloadResponse> {
-        let runtime = self.providers.provider_for(repository)?;
         let provider = runtime.provider();
         let provider_id = provider.provider_id().to_owned();
         let temp_file = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
@@ -939,8 +968,7 @@ impl StorageProviderTransferStore {
         let stored_object = provider
             .download_object(&repository.id, object, temp_file.path())
             .await?;
-        let stored_object =
-            Self::ensure_stored_object_namespace(provider, repository, stored_object)?;
+        let stored_object = Self::ensure_stored_object_namespace(repository, stored_object)?;
         let file = tokio::fs::File::open(temp_file.path())
             .await
             .map_err(|source| ServerError::Storage {
@@ -1002,8 +1030,7 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
             let stored_object = provider
                 .upload_object(&repository.id, object, source)
                 .await?;
-            let stored_object =
-                Self::ensure_stored_object_namespace(provider, repository, stored_object)?;
+            let stored_object = Self::ensure_stored_object_namespace(repository, stored_object)?;
             self.record_verified_object_metadata(
                 repository,
                 object,
@@ -1019,32 +1046,30 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
         &'a self,
         repository: &'a RepositoryMapping,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
+    ) -> ProviderFuture<'a, ServerResult<StorageDownloadResponse>> {
         Box::pin(async move {
-            let stored_object = self
-                .lookup_and_repair_object(repository, object)
-                .await?
-                .ok_or_else(|| ServerError::Storage {
-                    source: StorageError::ObjectNotFound {
-                        provider: repository.storage_provider.clone(),
-                        oid: object.oid.as_hex().to_owned(),
-                        size: object.size.bytes(),
-                    },
-                })?;
             let runtime = self.providers.provider_for(repository)?;
             if let Some(streaming_download) = runtime.streaming_download() {
+                let stored_object = self
+                    .lookup_and_repair_object_with_runtime(repository, object, runtime)
+                    .await?
+                    .ok_or_else(|| ServerError::Storage {
+                        source: StorageError::ObjectNotFound {
+                            provider: repository.storage_provider.clone(),
+                            oid: object.oid.as_hex().to_owned(),
+                            size: object.size.bytes(),
+                        },
+                    })?;
+                Self::validate_stored_object_namespace(repository, &stored_object)?;
                 let download = streaming_download
                     .download_object_response(&repository.id, object, stored_object)
                     .await
                     .map_err(ServerError::from)?;
-                Self::ensure_stored_object_namespace(
-                    runtime.provider(),
-                    repository,
-                    download.stored_object().clone(),
-                )?;
+                Self::validate_stored_object_namespace(repository, download.stored_object())?;
                 return Ok(download);
             }
-            self.staged_download_response(repository, object).await
+            self.staged_download_response(repository, object, runtime)
+                .await
         })
     }
 
@@ -1105,7 +1130,7 @@ impl LfsObjectTransferStore for PendingLfsObjectTransferStore {
         &'a self,
         _repository: &'a RepositoryMapping,
         _object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
+    ) -> ProviderFuture<'a, ServerResult<StorageDownloadResponse>> {
         Box::pin(async {
             Err(ServerError::Storage {
                 source: StorageError::Unsupported {
@@ -1344,7 +1369,7 @@ impl LfsServerState {
         &self,
         repository: &RepositoryMapping,
         object: &LfsObject,
-    ) -> ServerResult<LfsDownloadResponse> {
+    ) -> ServerResult<StorageDownloadResponse> {
         let _provider_permit = self.provider_call_permit().await?;
         self.transfer_store
             .download_object_response(repository, object)
@@ -3501,7 +3526,10 @@ mod tests {
         io::{self, ErrorKind, Write},
         net::TcpListener as StdTcpListener,
         path::Path as FsPath,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -3522,8 +3550,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, BatchBodyGuardrails, LFS_AUTH_CHALLENGE, LFS_SESSION_REVOKE_PATH,
-        LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore, LfsRouteEndpoint,
+        BASE64_STANDARD, BatchBodyGuardrails, ConfiguredStorageProviders, LFS_AUTH_CHALLENGE,
+        LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsObjectTransferStore, LfsRouteEndpoint,
         LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ProviderBatchAuthorizer,
         ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients, ServerShutdownOutcome,
         StorageProviderTransferStore, UploadStagingCoordinator, UploadStagingGuardrails,
@@ -3546,7 +3574,8 @@ mod tests {
         GoogleDriveStorageConfig, LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize,
         LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture,
         RepositoryMapping, RepositoryPermission, RepositoryProviderConfig, RepositoryProviderError,
-        RepositoryUser, SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
+        RepositoryUser, SanitizedMessage, ServerConfig, ServerError, ServerResult,
+        StorageDeleteOutcome, StorageDownloadResponse, StorageError, StorageProvider,
         StorageProviderConfig, StorageResult, StoredObject,
         google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
         provider_factory::ServerStorageProviderFactory,
@@ -3626,6 +3655,148 @@ repositories:
         config.server.max_batch_objects = max_batch_objects;
         config.server.max_provider_calls = max_provider_calls;
         config
+    }
+
+    #[test]
+    fn stored_object_validation_rejects_foreign_storage_provider() {
+        let config = test_config();
+        let repository = &config.repositories[0];
+        let object = LfsObject::new(
+            LfsOid::new("a".repeat(64)).expect("test OID should parse"),
+            LfsObjectSize::new(42),
+        );
+        let stored_object = StoredObject::new(
+            "drive-user-b",
+            repository.id.clone(),
+            object,
+            "foreign-provider-object",
+        );
+
+        let error = StorageProviderTransferStore::validate_stored_object_namespace(
+            repository,
+            &stored_object,
+        )
+        .expect_err("foreign provider metadata should be rejected");
+
+        assert!(matches!(
+            error,
+            ServerError::Storage {
+                source: StorageError::RepositoryNamespaceMismatch { ref provider }
+            } if provider == "drive-user-a"
+        ));
+    }
+
+    struct CountingFallbackStorageProvider {
+        object: LfsObject,
+        bytes: Vec<u8>,
+        lookup_calls: AtomicUsize,
+    }
+
+    impl StorageProvider for CountingFallbackStorageProvider {
+        fn provider_id(&self) -> &str {
+            "drive-user-a"
+        }
+
+        fn lookup_object<'a>(
+            &'a self,
+            repository_namespace: &'a str,
+            object: &'a LfsObject,
+        ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>> {
+            Box::pin(async move {
+                self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+                Ok((object == &self.object).then(|| {
+                    StoredObject::new(
+                        self.provider_id(),
+                        repository_namespace,
+                        object.clone(),
+                        "fallback-object",
+                    )
+                }))
+            })
+        }
+
+        fn upload_object<'a>(
+            &'a self,
+            _repository_namespace: &'a str,
+            _object: &'a LfsObject,
+            _source: &'a FsPath,
+        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+            Box::pin(async {
+                Err(StorageError::Unsupported {
+                    provider_type: "test fallback storage".to_owned(),
+                })
+            })
+        }
+
+        fn download_object<'a>(
+            &'a self,
+            repository_namespace: &'a str,
+            object: &'a LfsObject,
+            destination: &'a FsPath,
+        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
+            Box::pin(async move {
+                let stored_object = self
+                    .lookup_object(repository_namespace, object)
+                    .await?
+                    .ok_or_else(|| StorageError::ObjectNotFound {
+                        provider: self.provider_id().to_owned(),
+                        oid: object.oid.as_hex().to_owned(),
+                        size: object.size.bytes(),
+                    })?;
+                fs::write(destination, &self.bytes).map_err(|source| StorageError::Retryable {
+                    provider: self.provider_id().to_owned(),
+                    message: format!("test fallback download could not be staged: {source}"),
+                })?;
+                Ok(stored_object)
+            })
+        }
+
+        fn delete_or_mark_object<'a>(
+            &'a self,
+            _repository_namespace: &'a str,
+            _object: &'a LfsObject,
+        ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
+            Box::pin(async {
+                Ok(StorageDeleteOutcome::Retained {
+                    reason: "test fallback storage retains objects".to_owned(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_download_resolves_fallback_provider_object_once() {
+        let bytes = b"single fallback lookup".to_vec();
+        let object = LfsObject::new(
+            LfsOid::new(format!("{:x}", Sha256::digest(&bytes)))
+                .expect("test object OID should parse"),
+            LfsObjectSize::new(u64::try_from(bytes.len()).expect("test bytes should fit u64")),
+        );
+        let provider = Arc::new(CountingFallbackStorageProvider {
+            object: object.clone(),
+            bytes,
+            lookup_calls: AtomicUsize::new(0),
+        });
+        let config = test_config();
+        let repository = &config.repositories[0];
+        let providers = ConfiguredStorageProviders::from_provider(&config, provider.clone())
+            .expect("fallback provider should compose");
+        let store = StorageProviderTransferStore::new(
+            providers,
+            Arc::new(MetadataDatabase::open_in_memory().expect("metadata should open")),
+        );
+
+        let response = store
+            .download_object_response(repository, &object)
+            .await
+            .expect("fallback download should succeed");
+
+        assert_eq!(response.stored_object().backend_id, "fallback-object");
+        assert_eq!(
+            provider.lookup_calls.load(Ordering::SeqCst),
+            1,
+            "fallback download should not repeat object discovery"
+        );
     }
 
     #[derive(Clone)]
@@ -4376,7 +4547,7 @@ repositories:
             &'a self,
             repository: &'a RepositoryMapping,
             _object: &'a LfsObject,
-        ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
+        ) -> ProviderFuture<'a, ServerResult<StorageDownloadResponse>> {
             Box::pin(async move {
                 Err(ServerError::Storage {
                     source: StorageError::Upstream {
@@ -4693,7 +4864,7 @@ repositories:
             &'a self,
             repository: &'a RepositoryMapping,
             object: &'a LfsObject,
-        ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
+        ) -> ProviderFuture<'a, ServerResult<StorageDownloadResponse>> {
             Box::pin(async move {
                 let Some(stored_object) = self.lookup_object(repository, object).await? else {
                     return Err(ServerError::Storage {
@@ -4746,7 +4917,7 @@ repositories:
                         message: format!("test download response could not be built: {source}"),
                     })?;
 
-                Ok(LfsDownloadResponse::new(stored_object, response))
+                Ok(StorageDownloadResponse::new(stored_object, response))
             })
         }
 

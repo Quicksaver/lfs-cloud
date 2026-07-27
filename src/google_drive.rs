@@ -699,9 +699,6 @@ enum DriveUploadPhase {
     Transfer,
 }
 
-/// Backwards-compatible name for a verified Google Drive streaming response.
-pub type GoogleDriveDownloadResponse = StorageDownloadResponse;
-
 /// Looks up repository-scoped LFS objects in Google Drive.
 #[derive(Clone)]
 pub struct GoogleDriveObjectStore {
@@ -1449,7 +1446,7 @@ impl GoogleDriveObjectStore {
     pub async fn download_object_response(
         &self,
         object: &LfsObject,
-    ) -> StorageResult<GoogleDriveDownloadResponse> {
+    ) -> StorageResult<StorageDownloadResponse> {
         let stored_object =
             self.lookup_object(object)
                 .await?
@@ -1467,7 +1464,7 @@ impl GoogleDriveObjectStore {
         &self,
         object: &LfsObject,
         stored_object: StoredObject,
-    ) -> StorageResult<GoogleDriveDownloadResponse> {
+    ) -> StorageResult<StorageDownloadResponse> {
         self.ensure_repository_namespace(&stored_object.repository_namespace)?;
         if stored_object.provider_id != self.storage.id || stored_object.object != *object {
             return Err(StorageError::Conflict {

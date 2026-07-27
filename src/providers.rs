@@ -172,6 +172,11 @@ impl StoredObject {
 /// The response body may stream backend bytes while the provider verifies
 /// their LFS object hash and size. Provider implementations must not expose
 /// backend credentials or private object locations through the response.
+///
+/// This optional capability is currently coupled to Axum at the HTTP server
+/// boundary. If the package is split into provider and server crates, move
+/// this wrapper behind the server boundary or replace the body with a
+/// framework-neutral verified byte stream.
 pub struct StorageDownloadResponse {
     stored_object: StoredObject,
     response: Response,
@@ -247,6 +252,11 @@ pub trait StorageProvider: Send + Sync {
     ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>>;
 
     /// Checks whether an object exists in one repository namespace.
+    ///
+    /// The default is intentionally a thin wrapper around [`Self::lookup_object`]
+    /// so existence and stable backend identity cannot diverge. Providers with
+    /// a materially cheaper existence primitive may override this method while
+    /// preserving the same namespace and object-validation contract.
     fn object_exists<'a>(
         &'a self,
         repository_namespace: &'a str,

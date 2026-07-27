@@ -43,8 +43,8 @@ pub use github_auth::{
 };
 pub use google_drive::{
     GOOGLE_DRIVE_API_BASE_URL, GOOGLE_DRIVE_FILE_SCOPE, GoogleDriveAccessToken,
-    GoogleDriveDownloadResponse, GoogleDriveGcloudTokenProvider, GoogleDriveObjectKey,
-    GoogleDriveObjectStore, GoogleDriveRootFolder, GoogleDriveRootValidator,
+    GoogleDriveGcloudTokenProvider, GoogleDriveObjectKey, GoogleDriveObjectStore,
+    GoogleDriveRootFolder, GoogleDriveRootValidator,
 };
 pub use init::LfsInitRoute;
 pub use lfs::{
