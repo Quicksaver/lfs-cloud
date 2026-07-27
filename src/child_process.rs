@@ -7,11 +7,14 @@
 use std::{
     fmt,
     io::{self, Read},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+use std::process::Stdio;
 
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const OUTPUT_DRAIN_AFTER_STOP: Duration = Duration::from_secs(1);
@@ -37,8 +40,8 @@ pub(crate) struct ChildProcessOptions {
     pub(crate) stdout: PipeCapture,
     /// Standard-error capture policy.
     pub(crate) stderr: PipeCapture,
-    /// Whether successfully stopping descendants that retain output pipes
-    /// after the direct child exits must still fail the command.
+    /// Whether output pipes recovered only after descendant cleanup must still
+    /// fail the command. Pipes that remain open after cleanup always fail.
     pub(crate) inherited_pipe_is_error: bool,
 }
 
@@ -184,9 +187,12 @@ pub(crate) fn wait_for_child(
     let mut drain_deadline = None;
     let mut stdout = stdout_reader.is_none().then(Vec::new);
     let mut stderr = stderr_reader.is_none().then(Vec::new);
+    let mut pending_event = None;
+    let mut pipe_channel_connected = true;
 
     loop {
-        while let Ok(event) = receiver.try_recv() {
+        let mut next_event = pending_event.take().or_else(|| receiver.try_recv().ok());
+        while let Some(event) = next_event {
             if let Err(error) = accept_pipe_event(event, command_name, &mut stdout, &mut stderr) {
                 terminate_process_tree(child, command_name)?;
                 let _ = collect_pipe_events(
@@ -200,6 +206,7 @@ pub(crate) fn wait_for_child(
                 join_completed_reader(&mut stderr_reader, stderr.as_ref(), "stderr", command_name)?;
                 return Err(error);
             }
+            next_event = receiver.try_recv().ok();
         }
 
         if status.is_none() {
@@ -263,7 +270,19 @@ pub(crate) fn wait_for_child(
             }
         }
 
-        thread::sleep(PROCESS_POLL_INTERVAL);
+        if pipe_channel_connected {
+            match receiver.recv_timeout(PROCESS_POLL_INTERVAL) {
+                Ok(event) => pending_event = Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    pipe_channel_connected = false;
+                }
+            }
+        } else {
+            // Once every pipe reader has completed there is no event source to
+            // block on, but the direct child may still need periodic polling.
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        }
     }
 }
 
@@ -441,20 +460,20 @@ pub(crate) fn terminate_process_tree(
 
 #[cfg(unix)]
 fn stop_process_tree(child: &Child) {
-    signal_process_group("TERM", child.id());
+    signal_process_group(rustix::process::Signal::TERM, child.id());
     thread::sleep(Duration::from_millis(50));
-    signal_process_group("KILL", child.id());
+    signal_process_group(rustix::process::Signal::KILL, child.id());
 }
 
 #[cfg(unix)]
-fn signal_process_group(signal: &str, process_group_id: u32) {
-    let _ = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(format!("-{process_group_id}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+fn signal_process_group(signal: rustix::process::Signal, process_group_id: u32) {
+    let Some(process_group_id) = i32::try_from(process_group_id)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return;
+    };
+    let _ = rustix::process::kill_process_group(process_group_id, signal);
 }
 
 #[cfg(windows)]
@@ -488,6 +507,7 @@ mod tests {
     const PROCESS_TREE_DESCENDANT_TEST: &str =
         "child_process::tests::process_tree_pipe_holding_descendant";
     const PROCESS_TREE_MODE_ENV: &str = "LFSCLOUD_CHILD_PROCESS_TEST_MODE";
+    const PROCESS_TREE_READY_PATH_ENV: &str = "LFSCLOUD_CHILD_PROCESS_TEST_READY_PATH";
 
     #[test]
     fn truncated_pipe_keeps_draining_but_retains_only_the_limit() {
@@ -570,27 +590,20 @@ mod tests {
 
     #[test]
     fn output_debug_reports_lengths_without_exposing_captured_bytes() {
-        let mut command = Command::new(std::env::current_exe().expect("test executable"));
-        command
+        let output = Command::new(std::env::current_exe().expect("test executable"))
             .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
             .env(PROCESS_TREE_MODE_ENV, "complete")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_process_tree(&mut command);
-        let mut child = command.spawn().expect("helper should start");
+            .stderr(Stdio::piped())
+            .output()
+            .expect("helper should complete");
 
-        let output = wait_for_child(
-            &mut child,
-            "test helper",
-            ChildProcessOptions {
-                timeout: Some(Duration::from_secs(5)),
-                stdout: PipeCapture::Unlimited,
-                stderr: PipeCapture::Unlimited,
-                inherited_pipe_is_error: true,
-            },
-        )
-        .expect("helper should complete");
+        let output = super::ChildProcessOutput {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        };
         let debug = format!("{output:?}");
 
         assert!(debug.contains("stdout_len"));
@@ -600,15 +613,26 @@ mod tests {
 
     #[test]
     fn timeout_retains_output_without_exposing_it_through_debug() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let ready_path = temp.path().join("ready");
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
             .env(PROCESS_TREE_MODE_ENV, "timeout")
+            .env(PROCESS_TREE_READY_PATH_ENV, &ready_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure_process_tree(&mut command);
         let mut child = command.spawn().expect("helper should start");
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready_path.exists(),
+            "helper should report readiness before the timeout starts"
+        );
 
         let error = wait_for_child(
             &mut child,
@@ -668,6 +692,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
+    #[cfg(unix)]
     #[test]
     fn inherited_pipe_policy_distinguishes_recovered_output() {
         for inherited_pipe_is_error in [false, true] {
@@ -804,6 +829,9 @@ mod tests {
         std::io::stderr()
             .write_all(b"stderr-secret\n")
             .expect("stderr should be writable");
+        if let Some(ready_path) = std::env::var_os(PROCESS_TREE_READY_PATH_ENV) {
+            std::fs::write(ready_path, b"ready").expect("readiness marker should be writable");
+        }
         if matches!(mode.as_str(), "timeout" | "escaped-timeout") {
             std::thread::sleep(Duration::from_secs(30));
         } else if mode == "descendant" {

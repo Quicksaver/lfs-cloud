@@ -1083,7 +1083,13 @@ fn wait_for_git_command_timeout(
     token: &str,
     timeout: Duration,
 ) -> CliResult<(ExitStatus, Vec<u8>)> {
-    let output = wait_for_git_command_capture(child, command_name, token, timeout, None)?;
+    let output = wait_for_git_command_capture(
+        child,
+        command_name,
+        token,
+        timeout,
+        PipeCapture::Truncate { limit: 0 },
+    )?;
     Ok((output.status, output.stderr))
 }
 
@@ -1098,7 +1104,9 @@ fn wait_for_git_command_output(
         command_name,
         stderr_secret,
         timeout,
-        Some(MAX_CREDENTIAL_OUTPUT_LEN + 1),
+        PipeCapture::Truncate {
+            limit: MAX_CREDENTIAL_OUTPUT_LEN + 1,
+        },
     )?;
     Ok((output.status, output.stdout, output.stderr))
 }
@@ -1108,16 +1116,14 @@ fn wait_for_git_command_capture(
     command_name: &str,
     stderr_secret: &str,
     timeout: Duration,
-    stdout_limit: Option<usize>,
+    stdout: PipeCapture,
 ) -> CliResult<crate::child_process::ChildProcessOutput> {
     wait_for_child(
         child,
         command_name,
         ChildProcessOptions {
             timeout: Some(timeout),
-            stdout: PipeCapture::Truncate {
-                limit: stdout_limit.unwrap_or(0),
-            },
+            stdout,
             stderr: PipeCapture::Truncate {
                 limit: MAX_RETAINED_COMMAND_STDERR_LEN,
             },
@@ -1141,11 +1147,11 @@ fn credential_child_process_error(
             status: format!("timed out after {} seconds", timeout.as_secs()),
             stderr: sanitize_command_stderr(&stderr, stderr_secret),
         },
-        ChildProcessError::OutputLimit { stream, limit } => CliError::ExternalCommandOutput {
-            command: command_name.to_owned(),
-            message: SanitizedMessage::new(format!(
-                "{stream} exceeded the {limit}-byte credential output limit"
-            )),
+        ChildProcessError::OutputLimit { .. } => CliError::Io {
+            context: format!("{command_name} unexpectedly exceeded a hard output limit"),
+            source: std::io::Error::other(
+                "credential commands configure truncation, not hard output limits",
+            ),
         },
         ChildProcessError::InheritedPipe => CliError::Io {
             context: format!("timed out draining pipe output from {command_name}"),
@@ -1182,14 +1188,12 @@ mod tests {
     #[cfg(unix)]
     use std::{path::Path, time::Instant};
 
-    #[cfg(unix)]
-    use super::wait_for_git_command_output;
     use super::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, GitCredentialLookup,
         GitCredentialRejection, MAX_COMMAND_STDERR_LEN, MAX_CREDENTIAL_OUTPUT_LEN,
         MAX_RETAINED_COMMAND_STDERR_LEN, git_command, git_config_output_has_helper,
         git_credential_helper_fallback_instructions, parse_git_credential_fill_output,
-        sanitize_command_stderr, wait_for_git_command_timeout,
+        sanitize_command_stderr, wait_for_git_command_output, wait_for_git_command_timeout,
     };
     use crate::{CliError, LfsSessionToken};
 
@@ -1197,6 +1201,8 @@ mod tests {
     const PROCESS_TREE_DESCENDANT_TEST: &str =
         "credentials::tests::credential_process_tree_descendant";
     const PROCESS_TREE_MARKER_ENV: &str = "LFS_CLOUD_CREDENTIAL_TEST_MARKER";
+    const CAPTURE_HELPER_TEST: &str = "credentials::tests::credential_capture_helper";
+    const CAPTURE_MODE_ENV: &str = "LFS_CLOUD_CREDENTIAL_CAPTURE_MODE";
 
     fn token() -> LfsSessionToken {
         LfsSessionToken::from_secret("local-lfs-token").expect("test token should be valid")
@@ -2247,6 +2253,85 @@ exit 0
         assert!(sanitized.as_str().len() <= MAX_COMMAND_STDERR_LEN + "...".len());
         assert!(!sanitized.as_str().contains("split"));
         assert!(!sanitized.as_str().contains("split-token-secret"));
+    }
+
+    #[test]
+    fn credential_stdout_capture_retains_the_oversize_sentinel() {
+        let test_executable = std::env::current_exe().expect("test executable should resolve");
+        let mut command = git_command(&test_executable);
+        command
+            .args(["--ignored", "--exact", CAPTURE_HELPER_TEST])
+            .env(CAPTURE_MODE_ENV, "oversized-stdout")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("capture helper should start");
+
+        let (status, stdout, stderr) =
+            wait_for_git_command_output(&mut child, "capture helper", "", Duration::from_secs(5))
+                .expect("capture helper should complete");
+
+        assert!(status.success());
+        assert_eq!(stdout.len(), MAX_CREDENTIAL_OUTPUT_LEN + 1);
+        assert!(stderr.is_empty());
+        let lfs_url = url::Url::parse("https://lfs.example.com/repo.git/info/lfs")
+            .expect("test URL should parse");
+        let error =
+            parse_git_credential_fill_output(&lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME, &stdout)
+                .expect_err("retained oversized output should be rejected");
+        assert!(matches!(error, CliError::ExternalCommandOutput { .. }));
+        assert!(error.to_string().contains("too much output"));
+    }
+
+    #[test]
+    fn credential_stderr_capture_keeps_a_boundary_secret_for_redaction() {
+        let token = "split-token-secret";
+        let test_executable = std::env::current_exe().expect("test executable should resolve");
+        let mut command = git_command(&test_executable);
+        command
+            .args(["--ignored", "--exact", CAPTURE_HELPER_TEST])
+            .env(CAPTURE_MODE_ENV, "boundary-stderr")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("capture helper should start");
+
+        let (status, stderr) = wait_for_git_command_timeout(
+            &mut child,
+            "capture helper",
+            token,
+            Duration::from_secs(5),
+        )
+        .expect("capture helper should complete");
+        let sanitized = sanitize_command_stderr(&stderr, token);
+
+        assert!(status.success());
+        assert_eq!(stderr.len(), MAX_RETAINED_COMMAND_STDERR_LEN);
+        assert!(!sanitized.as_str().contains("split"));
+        assert!(!sanitized.as_str().contains(token));
+    }
+
+    #[test]
+    #[ignore = "invoked as a platform-native credential capture helper"]
+    fn credential_capture_helper() {
+        use std::io::Write as _;
+
+        match std::env::var(CAPTURE_MODE_ENV).as_deref() {
+            Ok("oversized-stdout") => {
+                std::io::stdout()
+                    .write_all(&vec![b'x'; MAX_CREDENTIAL_OUTPUT_LEN * 2])
+                    .expect("oversized stdout should be writable");
+            }
+            Ok("boundary-stderr") => {
+                let token = "split-token-secret";
+                let prefix = "x".repeat(MAX_COMMAND_STDERR_LEN - 5);
+                let noisy_tail = "y".repeat(MAX_RETAINED_COMMAND_STDERR_LEN * 2);
+                std::io::stderr()
+                    .write_all(format!("{prefix}{token}{noisy_tail}").as_bytes())
+                    .expect("boundary stderr should be writable");
+            }
+            _ => {}
+        }
     }
 
     #[test]

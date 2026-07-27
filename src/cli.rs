@@ -3183,12 +3183,13 @@ where
     )?;
     writeln!(
         output,
-        "  objects: {} retained, {} protected, {} {}, {} skipped",
+        "  objects: {} retained, {} protected, {} {}, {} cache paths skipped, {} worktree pointers skipped",
         report.retained_objects.len(),
         report.protected_objects.len(),
         report.unreferenced_objects.len(),
         action,
-        report.skipped_cache_paths.len()
+        report.skipped_cache_paths.len(),
+        report.skipped_worktree_pointer_paths.len()
     )?;
 
     for object in &report.unreferenced_objects {
@@ -3219,7 +3220,14 @@ where
         )?;
     }
     for path in &report.skipped_cache_paths {
-        writeln!(output, "skipped {}", path.display())?;
+        writeln!(output, "skipped cache path {}", path.display())?;
+    }
+    for path in &report.skipped_worktree_pointer_paths {
+        writeln!(
+            output,
+            "skipped non-regular worktree pointer {}",
+            path.display()
+        )?;
     }
 
     Ok(())
@@ -7229,7 +7237,9 @@ mod tests {
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("lfscloud gc"));
         assert!(rendered.contains("worktrees: 1 active, 0 unavailable, 0 pruned"));
-        assert!(rendered.contains("objects: 1 retained, 0 protected, 1 removed, 0 skipped"));
+        assert!(rendered.contains(
+            "objects: 1 retained, 0 protected, 1 removed, 0 cache paths skipped, 0 worktree pointers skipped"
+        ));
         assert!(rendered.contains(remove_object.oid.as_hex()));
     }
 
@@ -7260,7 +7270,9 @@ mod tests {
 
         assert!(layout.object_path(&object).exists());
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("objects: 0 retained, 0 protected, 1 would remove, 0 skipped"));
+        assert!(rendered.contains(
+            "objects: 0 retained, 0 protected, 1 would remove, 0 cache paths skipped, 0 worktree pointers skipped"
+        ));
         assert!(rendered.contains("would remove"));
         assert!(rendered.contains(object.oid.as_hex()));
     }
@@ -7355,7 +7367,9 @@ mod tests {
         assert!(!layout.object_path(&object).exists());
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
         assert!(rendered.contains("worktrees: 0 active, 0 unavailable, 0 pruned"));
-        assert!(rendered.contains("objects: 0 retained, 0 protected, 1 removed, 0 skipped"));
+        assert!(rendered.contains(
+            "objects: 0 retained, 0 protected, 1 removed, 0 cache paths skipped, 0 worktree pointers skipped"
+        ));
     }
 
     #[test]

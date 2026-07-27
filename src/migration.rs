@@ -1756,7 +1756,7 @@ fn wait_for_git_command(
             context: format!("failed to capture stderr from {command}"),
             source: io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "git lfs fetch stderr was not piped",
+                format!("{command} stderr was not piped"),
             ),
         });
     }

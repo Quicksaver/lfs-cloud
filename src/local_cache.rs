@@ -673,6 +673,11 @@ pub struct LocalCacheGarbageCollection {
     pub deleted_objects: Vec<LocalCacheGarbageCollectionObject>,
     /// Cache paths ignored because they did not match the sharded object layout.
     pub skipped_cache_paths: Vec<PathBuf>,
+    /// Tracked LFS worktree paths skipped because they were not regular files.
+    ///
+    /// These candidates are not followed for reachability, so their target
+    /// bytes may appear in [`Self::unreferenced_objects`].
+    pub skipped_worktree_pointer_paths: Vec<PathBuf>,
 }
 
 /// Cached object file found during local cache garbage collection.
@@ -1137,7 +1142,8 @@ impl LocalCacheLayout {
         let mut registry = self.load_worktree_registry()?;
         let (active_worktrees, unavailable_worktrees) =
             partition_existing_worktrees(registry.worktrees())?;
-        let referenced_oids = referenced_worktree_oids(&active_worktrees)?;
+        let (referenced_oids, mut skipped_worktree_pointer_paths) =
+            referenced_worktree_oids(&active_worktrees)?;
         let (mut cache_objects, mut skipped_cache_paths) = self.cache_object_files()?;
         let mut retained_objects = Vec::new();
         let mut protected_objects = Vec::new();
@@ -1151,6 +1157,8 @@ impl LocalCacheLayout {
 
         cache_objects.sort_by(|left, right| left.path.cmp(&right.path));
         skipped_cache_paths.sort();
+        skipped_worktree_pointer_paths.sort();
+        skipped_worktree_pointer_paths.dedup();
 
         if !dry_run && prune_unavailable_worktrees && !pruned_worktrees.is_empty() {
             for registration in &pruned_worktrees {
@@ -1186,6 +1194,7 @@ impl LocalCacheLayout {
             unreferenced_objects,
             deleted_objects,
             skipped_cache_paths,
+            skipped_worktree_pointer_paths,
         })
     }
 
@@ -1440,19 +1449,25 @@ fn partition_existing_worktrees(
 
 fn referenced_worktree_oids(
     registrations: &[LocalCacheWorktreeRegistration],
-) -> LocalCacheResult<BTreeSet<LfsOid>> {
+) -> LocalCacheResult<(BTreeSet<LfsOid>, Vec<PathBuf>)> {
     let mut referenced = BTreeSet::new();
+    let mut skipped_worktree_pointer_paths = Vec::new();
 
     for registration in registrations {
-        collect_tracked_lfs_pointer_oids(registration, &mut referenced)?;
+        collect_tracked_lfs_pointer_oids(
+            registration,
+            &mut referenced,
+            &mut skipped_worktree_pointer_paths,
+        )?;
     }
 
-    Ok(referenced)
+    Ok((referenced, skipped_worktree_pointer_paths))
 }
 
 fn collect_tracked_lfs_pointer_oids(
     registration: &LocalCacheWorktreeRegistration,
     referenced: &mut BTreeSet<LfsOid>,
+    skipped_worktree_pointer_paths: &mut Vec<PathBuf>,
 ) -> LocalCacheResult<()> {
     const LS_FILES: &str = "git ls-files -z";
     let tracked_paths = registered_git_command(registration)
@@ -1478,7 +1493,10 @@ fn collect_tracked_lfs_pointer_oids(
     let lfs_paths = parse_lfs_filter_attribute_paths(&attributes)
         .map_err(|error| local_cache_git_path_output_error(error, registration))?;
     for relative_path in lfs_paths {
-        collect_pointer_oid_from_file(&registration.worktree_root.join(relative_path), referenced)?;
+        let path = registration.worktree_root.join(relative_path);
+        if collect_pointer_oid_from_file(&path, referenced)? {
+            skipped_worktree_pointer_paths.push(path);
+        }
     }
 
     Ok(())
@@ -1555,10 +1573,18 @@ fn local_cache_child_process_error(
     registration: &LocalCacheWorktreeRegistration,
 ) -> LocalCacheError {
     let (context, source) = match error {
-        ChildProcessError::Io { source, .. } => (
-            "failed to wait for git check-attr during local cache garbage collection",
-            source,
-        ),
+        ChildProcessError::Io { context, source } => {
+            let context = if context.starts_with("failed to read stdout") {
+                "failed to read git check-attr stdout during local cache garbage collection"
+            } else if context.starts_with("failed to read stderr") {
+                "failed to read git check-attr stderr during local cache garbage collection"
+            } else if context.contains("reader thread panicked") {
+                "git check-attr output reader panicked during local cache garbage collection"
+            } else {
+                "failed to wait for git check-attr during local cache garbage collection"
+            };
+            (context, source)
+        }
         ChildProcessError::TimedOut { .. } => (
             "git check-attr unexpectedly timed out",
             io::Error::new(io::ErrorKind::TimedOut, "no timeout was configured"),
@@ -1631,7 +1657,7 @@ fn local_cache_git_path_output_error(
 fn collect_pointer_oid_from_file(
     path: &Path,
     referenced: &mut BTreeSet<LfsOid>,
-) -> LocalCacheResult<()> {
+) -> LocalCacheResult<bool> {
     collect_pointer_oid_from_file_with_before_open(path, referenced, || {})
 }
 
@@ -1639,11 +1665,11 @@ fn collect_pointer_oid_from_file_with_before_open(
     path: &Path,
     referenced: &mut BTreeSet<LfsOid>,
     before_open: impl FnOnce(),
-) -> LocalCacheResult<()> {
+) -> LocalCacheResult<bool> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.is_file() => return Ok(()),
+        Ok(metadata) if !metadata.is_file() => return Ok(true),
         Ok(_) => {}
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(source) => {
             return Err(LocalCacheError::Io {
                 context: "failed to inspect worktree pointer candidate",
@@ -1672,9 +1698,9 @@ fn collect_pointer_oid_from_file_with_before_open(
 
     let file = match file {
         Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(source) if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) => {
-            return Ok(());
+            return Ok(true);
         }
         Err(source) => {
             return Err(LocalCacheError::Io {
@@ -1684,17 +1710,19 @@ fn collect_pointer_oid_from_file_with_before_open(
             });
         }
     };
-    let BoundedPointerBytes::Contents(contents) = read_bounded_pointer_bytes(
+    let bounded_contents = read_bounded_pointer_bytes(
         file,
         path,
         "failed to inspect worktree pointer candidate",
         "failed to read worktree pointer candidate",
-    )?
-    else {
-        return Ok(());
+    )?;
+    let contents = match bounded_contents {
+        BoundedPointerBytes::Contents(contents) => contents,
+        BoundedPointerBytes::NotRegularFile => return Ok(true),
+        BoundedPointerBytes::TooLarge { .. } => return Ok(false),
     };
     let Ok(contents) = std::str::from_utf8(&contents) else {
-        return Ok(());
+        return Ok(false);
     };
     if let Ok(pointer) = LfsPointer::parse(contents)
         && !pointer.is_empty()
@@ -1702,7 +1730,7 @@ fn collect_pointer_oid_from_file_with_before_open(
         referenced.insert(pointer.object.oid);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 enum BoundedPointerBytes {
@@ -1739,10 +1767,9 @@ fn read_bounded_pointer_bytes(
             path: path.to_path_buf(),
             source,
         })?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) >= LFS_POINTER_SIZE_CUTOFF {
-        Ok(BoundedPointerBytes::TooLarge {
-            size: u64::try_from(contents.len()).unwrap_or(u64::MAX),
-        })
+    let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+    if size >= LFS_POINTER_SIZE_CUTOFF {
+        Ok(BoundedPointerBytes::TooLarge { size })
     } else {
         Ok(BoundedPointerBytes::Contents(contents))
     }
@@ -4710,9 +4737,10 @@ mod tests {
             .expect("tracked symlink should be created");
         let mut referenced = BTreeSet::new();
 
-        collect_pointer_oid_from_file(&tracked_path, &mut referenced)
+        let skipped = collect_pointer_oid_from_file(&tracked_path, &mut referenced)
             .expect("a final symlink should be skipped");
 
+        assert!(skipped);
         assert!(referenced.is_empty());
     }
 
@@ -4743,7 +4771,7 @@ mod tests {
                 },
             );
             done_tx
-                .send(result.map(|()| referenced))
+                .send(result.map(|skipped| (skipped, referenced)))
                 .expect("test should receive collection result");
         });
 
@@ -4771,7 +4799,9 @@ mod tests {
             .join()
             .expect("pointer collection worker should not panic");
 
-        assert!(result.expect("FIFO candidate should be skipped").is_empty());
+        let (skipped, referenced) = result.expect("FIFO candidate should be skipped");
+        assert!(skipped);
+        assert!(referenced.is_empty());
     }
 
     #[cfg(unix)]
@@ -4882,6 +4912,10 @@ mod tests {
         let report = report.expect("garbage collection should succeed");
         assert_eq!(report.unreferenced_objects.len(), 1);
         assert_eq!(report.unreferenced_objects[0].oid, object.oid);
+        assert_eq!(
+            report.skipped_worktree_pointer_paths,
+            vec![direct_fifo, symlink_fifo]
+        );
         assert!(!layout.object_path(&object).exists());
     }
 
