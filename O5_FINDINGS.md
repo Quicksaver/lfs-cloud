@@ -26,7 +26,7 @@ Two project constraints were applied and materially changed several conclusions:
 | 5 | **[DONE / REVIEWED]** Shared CLI `--server` validation | Consistency fix | Shared contract | Low | Completed |
 | 6.4 | **[DONE / REVIEWED]** Four copies of child-process/pipe handling | Deduplication | Shared contract | Medium | Completed |
 | 6.5 | **[DONE / REVIEWED]** Three copies of the `check-attr` pipeline | Deduplication | Shared contract | Medium | Completed |
-| 7 | Mechanical duplication across modules | Deduplication | ~700 lines | Low | Before launch |
+| 7 | **[DONE / REVIEWED]** Mechanical duplication across modules | Deduplication | Shared contracts | Low | Completed |
 | 6.1 | **[DONE / REVIEWED]** `dispatch` test boilerplate | Test restructure | Same coverage | Low | Completed |
 | 8 | Dead public API | Removal | ~80 lines | Low | Before launch |
 | 1 | No provider factory; 8 concrete-variant matches | Design | Extensibility | Medium | Scoped separately |
@@ -205,54 +205,37 @@ The coverage argument is the strongest reason to do this. `AGENTS.md` records th
 
 **Reviewer quality:** The original review was high quality overall: §6.1, §6.3, §6.4, and §6.5 were current and correctly preserved their coverage and race/mode boundaries. §6.2's pipe consolidation was valid, but its constructor/convenience-removal remainder understated current public and production use. CodeRabbit and Codex were consistently precise and found valid cross-platform, availability, and bounded-cleanup defects. Blast was productive but mixed: Claude Opus was strong, while Grok included several duplicated or speculative claims alongside useful race findings. The final Claude Opus 5 pass was exceptionally precise: all twelve comments were current, in scope, and actionable, ranging from cross-platform test correctness and security-sensitive process signaling to operator diagnostics and small maintainability fixes.
 
-## 7. Mechanical duplication
+## 7. **[DONE / REVIEWED]** Mechanical duplication
 
-### 7.1 Google Drive URL builders: seven copies of the same block
+### 7.1 **[DONE / REVIEWED]** Google Drive URL builders
 
-`drive_file_metadata_url`, `drive_object_metadata_url`, `drive_shard_folder_metadata_url`, `drive_object_lookup_url`, `drive_shard_folder_lookup_url`, `drive_file_create_url`, `drive_media_download_url`, and `drive_resumable_upload_url` (`src/google_drive.rs:2319-2642`, ~320 lines). Each repeats: blank-ID check, `drive_api_base_path_already_targets_drive_api`, `path_segments_mut` with an identical error, `pop_if_empty`, then `if already_targets { ... } else { extend(["drive", "v3", ...]) }`. They diverge only in the `fields=` query.
+**Validity and outcome:** Valid and actionable. `drive_api_url` now owns the configurable proxy-prefix and trailing `/drive/v3` rules, `drive_files_url` supplies the common files endpoint, and `require_drive_identifier` retains the endpoint-specific blank-ID diagnostics. Query fields remain beside each endpoint. The resumable-upload exception is explicit in `DriveApiEndpoint::ResumableUpload`: it removes an existing Drive suffix before appending `/upload/drive/v3/files`. The existing learning now points at this canonical enforcement point.
 
-**Gain:** ~200 lines. One helper `fn drive_files_url(base, extra_segments) -> StorageResult<Url>` plus per-endpoint query parameters. The `/drive/v3` suffix rule has its own `Learnings` entry and is currently enforced in eight places. As provider-internal cleanup, a tidier Drive module is also a better template for the next storage provider. **Drawback:** `drive_resumable_upload_url` is the outlier — it pops two segments and prepends `upload` — so it remains partly special-cased.
+### 7.2 **[DONE / REVIEWED]** Google Drive URL validators
 
-### 7.2 Two Drive URL validators agreeing on four of five rules
+**Validity and outcome:** Valid and actionable. `validate_drive_url` shares parsing, absolute HTTP(S), exact literal-loopback HTTP, credential, and fragment checks; `DriveUrlComponentPolicy` preserves the real distinction that API bases reject queries while resumable session URLs allow them. `drive_upstream_error` centralizes secret-safe status-less provider errors. Assessment caught and fixed the initial use of the older named-loopback helper, then added API and session regressions proving that `localhost` is rejected while literal IPv4 and IPv6 loopback addresses remain accepted. `docs/configuration.md` and the Drive safety learning now state the literal-IP rule consistently.
 
-`validate_drive_api_base_url` (`src/google_drive.rs:2261`) and `validate_drive_resumable_upload_session_url` (`src/google_drive.rs:2644`) both check scheme, loopback HTTP, credentials, and fragment, with the same `StorageError::Upstream { provider: "google_drive", status: None, ... }` boilerplate repeated eleven times between them.
+### 7.3 **[DONE / REVIEWED]** `metadata.rs` boilerplate
 
-**Gain:** ~90 lines, plus a `drive_config_error(msg)` helper removes roughly 20 more instances of that four-line error literal across the file. **Drawback:** The query-string rules genuinely differ (the base rejects, the session URL allows), so a small policy flag is needed — mirroring the `HttpUrlPolicy` pattern `src/http_transport.rs` already uses well.
+**Validity and outcome:** Valid and actionable. The five async wrappers now use `run_blocking`, retaining owned inputs, Tokio blocking-pool dispatch, `MetadataTaskJoin`, and the database path. `METADATA_MIGRATIONS` preserves ascending versions 2 through 5, including PAT-session invalidation, while tests assert contiguity and alignment with `METADATA_SCHEMA_VERSION`. `migration_error` and `operation_error` centralize path-preserving mappings within `MetadataDatabase`; path-aware free helpers remain explicit. Existing migration and SQLite responsiveness tests continue to exercise ordering and the async boundary.
 
-### 7.3 `metadata.rs` boilerplate
+### 7.4 **[DONE / REVIEWED]** Small cross-file duplicates
 
-- Five `_async` twins (`lookup_object_async`, `mark_object_stale_async`, `record_verified_object_async`, `start_transfer_attempt_async`, `finish_transfer_attempt_async`) are each entirely `Arc::clone`, `spawn_blocking`, `map_err(MetadataTaskJoin)`. One generic `async fn blocking<T>(self: &Arc<Self>, f: impl FnOnce(&Self) -> ServerResult<T> + Send + 'static)` replaces all five bodies.
-- `run_migrations` (`src/metadata.rs:573-607`) has five identical `if version < N { execute_batch(SQL).map_err(...) }` blocks. Iterate a `[(u32, &str)]` slice instead.
-- `.map_err(|source| ServerError::MetadataOperation { path: self.path.clone(), source })` appears roughly 20 times. One `fn op_err(&self)` closure factory removes it.
+**Validity and outcome:** Partly stale after §6, but the remaining duplication was valid and actionable. The neutral `process_output` module now owns canonical signal-status text, UTF-8-safe bounded lossy diagnostics, and UTF-8-boundary ellipsis truncation. Credentials retain their deliberately richer platform status rendering and domain-specific redaction order. Git command spawning, success handling, bounded decoding, and migration array/vector argument variants share generic cores while preserving optional-config exit semantics and command-specific error enums. Drive and GitHub bounded error-body reads share `read_bounded_lossy_response_body` in neutral `http_transport`; no provider module depends on another provider. The upload response reader remains separate because it resets an idle timeout between chunks.
 
-**Gain:** ~120 lines, and adding migration 6 becomes a one-line array entry instead of a copy-paste. The async-boundary test recorded in `[tests] SQLite lock timing` still applies, since it tests the blocking-pool dispatch, not each individual method. **Drawback:** The generic `blocking` needs `Self: Send + Sync + 'static` bounds. Straightforward, but the closure signature reads slightly less obviously than the current spelled-out version.
+### 7.5 **[DONE / REVIEWED]** Server error mappings
 
-### 7.4 Small cross-file duplicates
+**Validity and outcome:** Valid and actionable. `classify_lfs_storage_error` is the single variant table and carries upload status/message, download status/message, and batch code/message independently. This preserves the intentional integrity-mismatch split (upload 422 versus download 502) and every existing client-facing phrase. `finish_failed_transfer_attempt` now calls `server_error_log_category`; assessment added regression coverage proving nested storage and repository-provider categories remain intact.
 
-- `command_status_text`: three copies (`src/git.rs:652`, `src/migration.rs:4184`, `src/credentials.rs:1575`) plus `process_status_text` (`src/cli.rs:3829`), all the same four lines.
-- `truncated_lossy_message`: identical in `src/git.rs:712` and `src/migration.rs:4191`.
-- The `is_char_boundary`-walking stderr truncator: `src/cli.rs:3836` and `src/credentials.rs:1049`.
-- `read_google_response_body` (`src/google_drive.rs:3500`) and `read_github_error_body` (`src/github_auth.rs:881`): the same bounded 16 KiB chunk reader.
-- `src/git.rs`: `git_stdout`, `git_config_get`, and `run_git_config` are three copies of spawn, status check, size cap, UTF-8 decode.
-- `src/migration.rs`: `run_git`, `run_git_os`, `run_git_os_with_limit`, `run_git_os_vec`, and `run_git_os_vec_with_limit` are five wrappers differing only in argument type and limit.
+### 7.6 **[DONE / REVIEWED]** Batch response builders
 
-**Constraint from the plugin goal:** the Drive and GitHub response readers must be shared through a neutral module alongside `src/http_transport.rs`. A `google_drive.rs` to `github_auth.rs` dependency in either direction would be worse than the duplication.
+**Validity and outcome:** Valid and worth consolidating in the current tree. `batch_objects_with_storage_lookup` shares deduplication, bounded ordered lookups, and request-order reconstruction through a function-pointer mapper, avoiding a trait over unrelated response enums. Download and upload keep small explicit outcome mappers, so their available/missing and present/needed semantics remain obvious. Existing tests prove duplicate requests still count in responses, perform one storage lookup per unique object, and preserve request order.
 
-**Gain:** Individually small, collectively ~150 lines, and it removes the "which copy is canonical?" question. **Drawback:** Crosses module boundaries with different error enums, so it needs a shared module plus a generic error mapper. Low risk, moderate churn.
+**Assessment and commits:** The verified implementation was committed as `0898b9c9e5fe5d00bf992f909cd7b05943146e29` against `a3693342e0047c5ce4ae1652920a683db5e8564b`. Initial CodeRabbit found one valid minor literal-loopback regression, fixed in `c9906e0c19dac6c9a523762695abd2cebc103981`; initial Codex found no actionable defect. Blast produced `ee3044ddff4fc7c699bd867d40fe540aef1e56cf`, addressing valid helper-contract, migration-invariant, UTF-8 truncation, Git cleanup, Drive guidance, and error-classification feedback, while one transfer-category comment was already satisfied and received regression coverage. Claude Sonnet and Gemini Blast passes were quota-limited no-ops. Final CodeRabbit and final Codex found no actionable defects.
 
-### 7.5 Duplicated error-mapping tables in `server.rs`
+**Verification:** Focused Drive, metadata, server, Git, migration, credentials, and CLI tests passed. The implementation and assessment commits passed Yarn linting, `cargo fmt --all`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all 621 automated test-target tests (12 expected helper/live-provider tests ignored), and all 29 doc tests.
 
-`git_lfs_storage_error_response_parts` (`src/server.rs:3072`) and `lfs_batch_object_error_from_server_error` (`src/server.rs:3149`) match the same nine `StorageError` variants to an HTTP status and an LFS batch code respectively, in two separate ~50-line tables. Adding a variant means remembering both.
-
-Additionally, the category match inside `finish_failed_transfer_attempt` (`src/server.rs:2206-2210`) is character-for-character identical to `server_error_log_category` (`src/server.rs:2216-2220`). Call the function.
-
-**Gain:** ~50 lines and one fewer synchronization hazard. This also matters for extensibility: a new provider only needs to produce the right `StorageError` variant, and both mappings follow. **Drawback:** The messages differ slightly by design ("Git LFS object was not found" vs "object not found"), so the unified entry needs both fields.
-
-### 7.6 Duplicated batch response builders
-
-`download_batch_response_with_storage_lookup` and `upload_batch_response_with_storage_lookup` (`src/server.rs:2901-2977`) share identical dedupe, `buffered` lookup, and reorder-by-request logic, differing only in `LfsBatchDownloadObject` vs `LfsBatchUploadObject`. `outcome_object` and `upload_outcome_object` are both eight-line variant-collapsing matches.
-
-**Gain:** ~60 lines via one generic over a small trait or an `impl Fn(LfsObject, Option<&StoredObject>) -> T` mapper. **Drawback:** Generics over two unrelated enums require a trait, which may read slightly worse than the honest duplication. Marginal call.
+**Reviewer quality:** The original reviewer was high quality: all six groups identified real consolidation opportunities, correctly required a neutral provider boundary, and explicitly preserved query, upload-path, migration, error-message, and batch-readability distinctions. Its §7.4 status-text claim became partly stale after §6 because credentials now intentionally render signal termination differently, but the remaining items were current. Initial CodeRabbit was precise (one valid finding out of one). Both Codex passes were clean and relevant. Blast was productive: Claude Opus feedback was fully relevant, Grok supplied four valid comments out of five, and the unavailable Sonnet and Gemini passes cannot be assessed.
 
 ## 8. Dead public API
 
