@@ -2675,28 +2675,6 @@ impl Drop for UploadStagingDiskReservation {
     }
 }
 
-#[cfg(test)]
-fn ensure_temp_space_for_upload_with_available_space(
-    expected_size: u64,
-    min_free_bytes: u64,
-    available_space: u64,
-) -> Result<(), UploadStagingError> {
-    let required_space = expected_size.checked_add(min_free_bytes).ok_or(
-        UploadStagingError::InsufficientTempSpace {
-            required_space: None,
-            available_space: Some(available_space),
-        },
-    )?;
-    if available_space < required_space {
-        return Err(UploadStagingError::InsufficientTempSpace {
-            required_space: Some(required_space),
-            available_space: Some(available_space),
-        });
-    }
-
-    Ok(())
-}
-
 fn upload_staging_file_io_error(source: io::Error, action: &str) -> UploadStagingError {
     if is_temp_space_exhausted(&source) {
         return UploadStagingError::InsufficientTempSpace {
@@ -3661,8 +3639,7 @@ mod tests {
         LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES,
         ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients, ServerShutdownOutcome,
         UploadStagingCoordinator, UploadStagingGuardrails, advertised_server_urls,
-        authenticate_lfs_session, ensure_temp_space_for_upload_with_available_space,
-        lfs_server_router_with_sessions,
+        authenticate_lfs_session, lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
         lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails,
         production_session_store, render_server_startup_message, serve_with_graceful_shutdown,
@@ -6514,11 +6491,16 @@ repositories:
 
     #[test]
     fn temp_space_guardrail_requires_expected_size_plus_headroom() {
-        ensure_temp_space_for_upload_with_available_space(10, 5, 15)
+        let coordinator = UploadStagingCoordinator::new(1, 1);
+        let reservation = coordinator
+            .reserve_with_available_space(10, 5, 15)
             .expect("exact expected size plus headroom should be accepted");
+        drop(reservation);
 
-        let error = ensure_temp_space_for_upload_with_available_space(10, 5, 14)
-            .expect_err("insufficient temp space should be rejected");
+        let error = match coordinator.reserve_with_available_space(10, 5, 14) {
+            Ok(_) => panic!("insufficient temp space should be rejected"),
+            Err(error) => error,
+        };
         assert!(matches!(
             error,
             super::UploadStagingError::InsufficientTempSpace {
@@ -6527,8 +6509,10 @@ repositories:
             }
         ));
 
-        let overflow = ensure_temp_space_for_upload_with_available_space(u64::MAX, 1, u64::MAX)
-            .expect_err("overflowing required space should be rejected");
+        let overflow = match coordinator.reserve_with_available_space(u64::MAX, 1, u64::MAX) {
+            Ok(_) => panic!("overflowing required space should be rejected"),
+            Err(error) => error,
+        };
         assert!(matches!(
             overflow,
             super::UploadStagingError::InsufficientTempSpace {
@@ -6803,6 +6787,163 @@ repositories:
         assert_eq!(first_response.status(), StatusCode::OK);
         assert_eq!(second_response.status(), StatusCode::OK);
         assert_eq!(transfer_store.uploads().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_enforces_per_user_staging_limit() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let upload_started = Arc::new(Notify::new());
+        let upload_release = Arc::new(Barrier::new(2));
+        let transfer_store = RecordingTransferStore::blocking_missing(
+            upload_started.clone(),
+            upload_release.clone(),
+        );
+        let mut config = test_config();
+        config.server.max_concurrent_uploads = 2;
+        config.server.max_concurrent_uploads_per_user = 1;
+        let router = test_router_with_config_authorizer_and_transfer_store(
+            config,
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store,
+        );
+        let first_body = b"first per-user upload";
+        let first_oid = format!("{:x}", Sha256::digest(first_body));
+        let first_path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{first_oid}?size={}",
+            first_body.len()
+        );
+        let first_upload_started = upload_started.notified();
+        let first = tokio::spawn({
+            let router = router.clone();
+            let token = token.clone();
+            async move {
+                router
+                    .oneshot(lfs_request_with_method_and_body(
+                        Method::PUT,
+                        &first_path,
+                        Some(&format!("Bearer {token}")),
+                        first_body.to_vec(),
+                    ))
+                    .await
+                    .expect("first router response should exist")
+            }
+        });
+        first_upload_started.await;
+
+        let second_body = b"second per-user upload";
+        let second_oid = format!("{:x}", Sha256::digest(second_body));
+        let second_path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{second_oid}?size={}",
+            second_body.len()
+        );
+        let overloaded = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::PUT,
+                &second_path,
+                Some(&format!("Bearer {token}")),
+                second_body.to_vec(),
+            ))
+            .await
+            .expect("competing router response should exist");
+
+        upload_release.wait().await;
+        assert_eq!(
+            first
+                .await
+                .expect("first upload task should complete")
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            overloaded.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        assert_lfs_json_error(
+            overloaded,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Git LFS upload staging has reached its concurrency limit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_enforces_global_staging_limit_across_users() {
+        let store = LocalLfsSessionStore::new();
+        let first_token = issue_session_token(&store, "octocat", "42", Duration::from_secs(60));
+        let second_token = issue_session_token(&store, "hubot", "84", Duration::from_secs(60));
+        let upload_started = Arc::new(Notify::new());
+        let upload_release = Arc::new(Barrier::new(2));
+        let transfer_store = RecordingTransferStore::blocking_missing(
+            upload_started.clone(),
+            upload_release.clone(),
+        );
+        let mut config = test_config();
+        config.server.max_concurrent_uploads = 1;
+        config.server.max_concurrent_uploads_per_user = 1;
+        let router = test_router_with_config_authorizer_and_transfer_store(
+            config,
+            store,
+            RecordingBatchAuthorizer::allow(),
+            transfer_store,
+        );
+        let first_body = b"first global upload";
+        let first_oid = format!("{:x}", Sha256::digest(first_body));
+        let first_path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{first_oid}?size={}",
+            first_body.len()
+        );
+        let first_upload_started = upload_started.notified();
+        let first = tokio::spawn({
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(lfs_request_with_method_and_body(
+                        Method::PUT,
+                        &first_path,
+                        Some(&format!("Bearer {first_token}")),
+                        first_body.to_vec(),
+                    ))
+                    .await
+                    .expect("first router response should exist")
+            }
+        });
+        first_upload_started.await;
+
+        let second_body = b"second global upload";
+        let second_oid = format!("{:x}", Sha256::digest(second_body));
+        let second_path = format!(
+            "/github.com/owner/repo.git/info/lfs/objects/{second_oid}?size={}",
+            second_body.len()
+        );
+        let overloaded = router
+            .oneshot(lfs_request_with_method_and_body(
+                Method::PUT,
+                &second_path,
+                Some(&format!("Bearer {second_token}")),
+                second_body.to_vec(),
+            ))
+            .await
+            .expect("competing router response should exist");
+
+        upload_release.wait().await;
+        assert_eq!(
+            first
+                .await
+                .expect("first upload task should complete")
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            overloaded.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        assert_lfs_json_error(
+            overloaded,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Git LFS upload staging has reached its concurrency limit",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -7548,12 +7689,23 @@ repositories:
 
     fn issued_session_token(ttl: Duration) -> (LocalLfsSessionStore, String) {
         let store = LocalLfsSessionStore::new();
-        let user = RepositoryUser::new("github-main", "octocat", Some("42".to_owned()));
+        let token = issue_session_token(&store, "octocat", "42", ttl);
+
+        (store, token)
+    }
+
+    fn issue_session_token(
+        store: &LocalLfsSessionStore,
+        login: &str,
+        stable_id: &str,
+        ttl: Duration,
+    ) -> String {
+        let user = RepositoryUser::new("github-main", login, Some(stable_id.to_owned()));
         let issued = store
             .issue_session_with_ttl(&user, ["read:user"], ttl)
             .expect("session token should be issued");
 
-        (store, issued.token.as_str().to_owned())
+        issued.token.as_str().to_owned()
     }
 
     async fn start_permission_server(permission: &'static str) -> String {

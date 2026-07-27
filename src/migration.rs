@@ -3491,70 +3491,6 @@ impl Drop for GitBatchObjectReader {
     }
 }
 
-#[cfg(test)]
-fn parse_ls_tree_blob_output(
-    stdout: &[u8],
-    command_name: &str,
-) -> MigrationResult<Vec<GitTreeBlob>> {
-    let mut blobs = Vec::new();
-    let mut fields = stdout.split(|byte| *byte == b'\0').peekable();
-
-    while let Some(object_type) = fields.next() {
-        if object_type.is_empty() {
-            if fields.peek().is_none() {
-                break;
-            }
-
-            return Err(MigrationError::ExternalCommandOutput {
-                command: command_name.to_owned(),
-                message: SanitizedMessage::new("git returned malformed tree output"),
-            });
-        }
-
-        let Some(object_id) = fields.next() else {
-            return Err(MigrationError::ExternalCommandOutput {
-                command: command_name.to_owned(),
-                message: SanitizedMessage::new("git returned malformed tree output"),
-            });
-        };
-        let Some(relative_path) = fields.next() else {
-            return Err(MigrationError::ExternalCommandOutput {
-                command: command_name.to_owned(),
-                message: SanitizedMessage::new("git returned malformed tree output"),
-            });
-        };
-        let object_type = std::str::from_utf8(object_type).map_err(|_| {
-            MigrationError::ExternalCommandOutput {
-                command: command_name.to_owned(),
-                message: SanitizedMessage::new("git returned non-UTF-8 object type output"),
-            }
-        })?;
-        if object_type != "blob" {
-            continue;
-        }
-
-        let object_id =
-            std::str::from_utf8(object_id).map_err(|_| MigrationError::ExternalCommandOutput {
-                command: command_name.to_owned(),
-                message: SanitizedMessage::new("git returned non-UTF-8 object ID output"),
-            })?;
-        if !is_git_object_id(object_id) {
-            return Err(MigrationError::ExternalCommandOutput {
-                command: command_name.to_owned(),
-                message: SanitizedMessage::new("git returned an invalid blob object ID"),
-            });
-        }
-
-        blobs.push(GitTreeBlob {
-            object_id: object_id.to_owned(),
-            relative_path: safe_git_relative_path(relative_path, command_name)?,
-            relative_path_bytes: relative_path.to_owned(),
-        });
-    }
-
-    Ok(blobs)
-}
-
 fn git_check_attr_lfs_paths_for_tree_blobs(
     worktree_root: &Path,
     blobs: &[GitTreeBlob],
@@ -4271,7 +4207,7 @@ mod tests {
         fetch_missing_migration_objects, fetch_missing_migration_objects_with_runner,
         git_lfs_object_path, hash_migration_object_file, migration_source_fetch_command,
         parse_git_check_attr_filter_stdout, parse_lfs_patterns_from_attributes,
-        parse_ls_tree_blob_output, repo_relative_path_from_git_output, split_gitattributes_line,
+        repo_relative_path_from_git_output, split_gitattributes_line,
         upload_migration_objects_to_storage, upload_migration_objects_to_storage_with_options,
         validate_historical_scan_git_version, validate_history_ref_name,
         verified_migration_upload_source_path, wait_for_git_command,
@@ -5595,24 +5531,6 @@ mod tests {
                 .iter()
                 .all(|pointer| pointer.relative_path != Path::new("vendor/tooling"))
         );
-    }
-
-    #[test]
-    fn ls_tree_parser_skips_non_blob_entries() {
-        let mut stdout = Vec::new();
-        stdout
-            .extend_from_slice(format!("commit\0{}\0vendor/tooling\0", "1".repeat(40)).as_bytes());
-        stdout.extend_from_slice(format!("blob\0{}\0asset/model.bin\0", "2".repeat(40)).as_bytes());
-
-        let blobs = parse_ls_tree_blob_output(&stdout, "git ls-tree test")
-            .expect("non-blob entries should be skipped");
-
-        assert_eq!(blobs.len(), 1);
-        assert_eq!(
-            blobs[0].object_id,
-            "2222222222222222222222222222222222222222"
-        );
-        assert_eq!(blobs[0].relative_path, Path::new("asset/model.bin"));
     }
 
     #[test]
