@@ -110,6 +110,8 @@ pub(crate) fn configure_process_tree(command: &mut Command) {
 
         command.process_group(0);
     }
+    #[cfg(not(unix))]
+    let _ = command;
 }
 
 /// Waits for a child while concurrently draining configured output pipes.
