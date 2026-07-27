@@ -23,7 +23,7 @@ Two project constraints were applied and materially changed several conclusions:
 | --- | --- | --- | --- | --- | --- |
 | 3 | **[DONE / REVIEWED]** `StorageProvider` contract test | Additive tests | New coverage | None | Completed |
 | 4 | **[DONE / REVIEWED]** Tests that exercise scaffolding, not production | Coverage repair | Removes false trust | None | Completed |
-| 5 | `login` and `init` validate `--server` unequally | Consistency fix | ~30 lines | Low | Before launch |
+| 5 | **[DONE / REVIEWED]** Shared CLI `--server` validation | Consistency fix | Shared contract | Low | Completed |
 | 6.4 | Four copies of child-process/pipe handling | Deduplication | ~500–600 lines | Medium | Before launch |
 | 6.5 | Three copies of the `check-attr` pipeline | Deduplication | ~200 lines | Medium | Before launch |
 | 7 | Mechanical duplication across modules | Deduplication | ~700 lines | Low | Before launch |
@@ -115,23 +115,20 @@ These create a false impression of coverage. Repairing them raises real coverage
 
 **Verification:** The initial implementation passed Yarn linting, `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all 578 non-ignored library tests, every integration target, and all 29 doc tests. The Codex remediation reran the required verification successfully. The original reviewer was high quality: all three findings were valid, current, and correctly distinguished dead scaffolding from a real missing handler-level test. Codex's single P2 was also valid and directly improved regression behavior; CodeRabbit and Blast quality could not be assessed because their steps were rate-limited.
 
-## 5. `login` and `init` validate `--server` differently
+## 5. **[DONE / REVIEWED] `login` and `init` validate `--server` differently**
 
-`auth_url_for_server` (`src/cli.rs:3792`) hand-rolls URL validation that `init::validate_server_url` -> `http_transport::validate_http_url` already performs, but more weakly: it omits the whitespace, control-character, and backslash check, and it omits the dot-segment check.
+- **Shared `--server` validation** (Low, `src/cli.rs`): **Partly stale but valid and actionable.** Production `login` already passed the raw argument through `LfsInitRoute::resolve_with_insecure_http`, so the stated command-level dot-segment acceptance example no longer reproduced. However, `auth_url_for_server` still maintained a weaker hand-written validator and could accept those unsafe forms when called directly. It now delegates to `init::validate_server_url`, and its regression matrix covers whitespace, control characters, backslashes, and raw or encoded dot segments.
+- **Repeated route-segment appends** (Low, `src/cli.rs`): **Valid and actionable.** Login, logout, and the authenticated migration probe repeated `Url::path_segments_mut` composition. They now share `append_url_path_segments`; login and logout also share `auth_url_for_server`. Root and nested-base tests cover both auth routes.
+- **Repeated redirect-disabled clients and runtime bridges** (Low, `src/cli.rs`): **Partly valid and actionable.** All three request paths repeated the redirect-disabled client builder, but only synchronous login and logout used `block_in_place` plus `block_on`; the migration probe was already async. `redirect_free_http_client` now centralizes the token-safety policy, while `block_on_reqwest` deduplicates only the genuine synchronous bridges and leaves the async probe async.
+- **Repeated dehydration containment** (Low, `src/cli.rs`): **Valid and actionable.** `run_dehydrate_from_dir` already supplied a canonical contained regular-file path, but the indexed-object lookup repeated the parent canonicalization, containment, and symlink-metadata checks. The contained path now flows through the lookup directly; naming, comments, and absolute plus `..` traversal regressions make the caller precondition explicit. Claims that this introduced a traversal or symlink vulnerability were invalid because the caller still performs the full containment gate before reaching the optimized helper.
 
-Concretely, `login --server` routes through `auth_url_for_server`, while `logout --server` and `init --server` route through `validate_server_url`. So `--server https://host/a/../b` is rejected by `init` and accepted by `login`.
+**User-facing documentation and release notes:** `docs/configuration.md` already documents the shared CLI route-base policy, including rejection of whitespace, control characters, backslashes, and dot segments, so the current guide became accurate without a separate wording change. This pre-release repository has no changelog file; `scripts/release.sh` generates GitHub release notes, so the user-visible tightening is carried by the descriptive `ccfa98088d9f48d7696415055a89dbb2c9e55c0e` implementation commit and its follow-up.
 
-`AGENTS.md` `[config] Shared HTTP route bases` explicitly requires these to share the validator.
+**Assessment and commits:** The implementation was committed as `ccfa98088d9f48d7696415055a89dbb2c9e55c0e` against `46ff9e5536ac3148d5e75de65ef1582fc734e513`. Initial CodeRabbit raised one invalid critical claim that the two-argument validator signature was obsolete; the current definition accepts exactly those arguments. Initial Codex found no actionable regression. Blast rejected three dehydration security claims that overlooked the caller containment gate, accepted useful contract clarity, composition, traversal-coverage, and helper-documentation feedback, and committed the resulting refinements as `ecacbfea91b7add0f795b6a75c96c3fcc5fa4319`. Claude Sonnet and Gemini Blast passes were quota-limited no-ops. Final CodeRabbit repeated the same invalid validator-signature claim; final Codex found no actionable defects. No assessment comments remain unaddressed.
 
-**Action:** Route `auth_url_for_server` through `validate_server_url`; delete the hand-rolled checks.
+**Verification:** The initial implementation passed `cargo fmt --all`, Yarn linting, `git diff --check`, Clippy across all targets with warnings denied, `cargo build`, all 578 non-ignored library tests, every integration target, and all 29 doc tests. The Blast remediation reran formatting, linting, Clippy, build, all-target tests, and doc tests successfully; final CodeRabbit also passed `git diff --check` and `cargo check`.
 
-Related, in the same area:
-
-- Three helpers append path segments to a validated server URL: `session_revocation_url_for_server` (`src/cli.rs:808`), `auth_url_for_server` (`src/cli.rs:3792`), and an inline block in `probe_authenticated_migration_target` (`src/cli.rs:3698`).
-- Three sites build `Client::builder().redirect(Policy::none())` and wrap it in the same `block_in_place` plus `block_on` dance.
-- `run_dehydrate_from_dir` (`src/cli.rs:1162-1171`) calls `contained_worktree_file_path`, then `indexed_lfs_object_for_dehydration` -> `dehydration_relative_path` -> `contained_worktree_file_path` again. Net effect per path: `dunce::canonicalize(worktree_root)` runs three times, and the parent canonicalize plus `symlink_metadata` twice. Harmless but confusing; pass the already-contained path down.
-
-**Gain:** One validation contract across all CLI entry points, ~60 lines removed. **Drawback:** Tightening `login` may reject a server URL a user could previously pass. That is the intended behavior and matches `init`, but it is a user-visible change and belongs in release notes.
+**Reviewer quality:** The original review was useful and found four worthwhile consistency or duplication issues, but its central command-level reproduction and three-way blocking-runtime claim were not current-tree accurate. CodeRabbit was low quality here because both passes repeated one factually incorrect critical finding. Codex was precise in both clean passes. Blast was mixed but productive: it rejected existing caller guarantees in three security claims, while its valid maintainability and regression-test suggestions materially clarified the final implementation.
 
 ## 6. Scaffolding and duplication with test implications
 
