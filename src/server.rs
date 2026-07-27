@@ -951,6 +951,14 @@ impl StorageProviderTransferStore {
     ) -> ServerResult<StorageDownloadResponse> {
         let provider = runtime.provider();
         let provider_id = provider.provider_id().to_owned();
+        let metadata = self
+            .metadata_database
+            .lookup_object_async(
+                repository.id.clone(),
+                repository.storage_provider.clone(),
+                object.clone(),
+            )
+            .await?;
         let temp_file = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
             .await
             .map_err(|source| ServerError::Storage {
@@ -965,10 +973,42 @@ impl StorageProviderTransferStore {
                     message: format!("download staging file could not be created: {source}"),
                 },
             })?;
-        let stored_object = provider
+        let stored_object = match provider
             .download_object(&repository.id, object, temp_file.path())
-            .await?;
+            .await
+        {
+            Ok(stored_object) => stored_object,
+            Err(source) => {
+                if matches!(source, StorageError::ObjectNotFound { .. })
+                    && let Some(metadata) = &metadata
+                {
+                    self.metadata_database
+                        .mark_object_stale_async(
+                            repository.id.clone(),
+                            repository.storage_provider.clone(),
+                            object.clone(),
+                            metadata.backend_id.clone(),
+                        )
+                        .await?;
+                }
+                return Err(ServerError::Storage { source });
+            }
+        };
         let stored_object = Self::ensure_stored_object_namespace(repository, stored_object)?;
+        // The fallback download already discovered the object while staging it,
+        // so reconcile from that result instead of repeating a provider lookup.
+        if let Some(metadata) = metadata
+            && (stored_object.backend_id != metadata.backend_id
+                || metadata.verification_status != MetadataObjectVerificationStatus::Verified)
+        {
+            self.record_verified_object_metadata(
+                repository,
+                object,
+                stored_object.backend_id.clone(),
+                metadata.created_by,
+            )
+            .await?;
+        }
         let file = tokio::fs::File::open(temp_file.path())
             .await
             .map_err(|source| ServerError::Storage {
@@ -3572,11 +3612,11 @@ mod tests {
         DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GitHubPersonalAccessToken,
         GitHubUserClient, GoogleDriveAccessToken, GoogleDriveRootValidator,
         GoogleDriveStorageConfig, LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize,
-        LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture,
-        RepositoryMapping, RepositoryPermission, RepositoryProviderConfig, RepositoryProviderError,
-        RepositoryUser, SanitizedMessage, ServerConfig, ServerError, ServerResult,
-        StorageDeleteOutcome, StorageDownloadResponse, StorageError, StorageProvider,
-        StorageProviderConfig, StorageResult, StoredObject,
+        LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase,
+        MetadataObjectVerificationStatus, ProviderFuture, RepositoryMapping, RepositoryPermission,
+        RepositoryProviderConfig, RepositoryProviderError, RepositoryUser, SanitizedMessage,
+        ServerConfig, ServerError, ServerResult, StorageDeleteOutcome, StorageDownloadResponse,
+        StorageError, StorageProvider, StorageProviderConfig, StorageResult, StoredObject,
         google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
         provider_factory::ServerStorageProviderFactory,
     };
@@ -3781,10 +3821,21 @@ repositories:
         let repository = &config.repositories[0];
         let providers = ConfiguredStorageProviders::from_provider(&config, provider.clone())
             .expect("fallback provider should compose");
-        let store = StorageProviderTransferStore::new(
-            providers,
-            Arc::new(MetadataDatabase::open_in_memory().expect("metadata should open")),
-        );
+        let metadata = Arc::new(MetadataDatabase::open_in_memory().expect("metadata should open"));
+        metadata
+            .sync_config(&config)
+            .expect("metadata config should synchronize");
+        let creator = RepositoryUser::new("github-main", "octocat", Some("user-1".to_owned()));
+        metadata
+            .record_verified_object(
+                &repository.id,
+                &repository.storage_provider,
+                &object,
+                "stale-fallback-object",
+                &creator,
+            )
+            .expect("stale backend metadata should record");
+        let store = StorageProviderTransferStore::new(providers, metadata.clone());
 
         let response = store
             .download_object_response(repository, &object)
@@ -3792,10 +3843,91 @@ repositories:
             .expect("fallback download should succeed");
 
         assert_eq!(response.stored_object().backend_id, "fallback-object");
+        let repaired = metadata
+            .lookup_object(&repository.id, &repository.storage_provider, &object)
+            .expect("repaired metadata should load")
+            .expect("repaired metadata should exist");
+        assert_eq!(repaired.backend_id, "fallback-object");
+        assert_eq!(
+            repaired.verification_status,
+            MetadataObjectVerificationStatus::Verified
+        );
         assert_eq!(
             provider.lookup_calls.load(Ordering::SeqCst),
             1,
             "fallback download should not repeat object discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_download_marks_missing_fallback_provider_object_stale() {
+        let available_bytes = b"available fallback object".to_vec();
+        let available_object = LfsObject::new(
+            LfsOid::new(format!("{:x}", Sha256::digest(&available_bytes)))
+                .expect("test object OID should parse"),
+            LfsObjectSize::new(
+                u64::try_from(available_bytes.len()).expect("test bytes should fit u64"),
+            ),
+        );
+        let missing_bytes = b"missing fallback object";
+        let missing_object = LfsObject::new(
+            LfsOid::new(format!("{:x}", Sha256::digest(missing_bytes)))
+                .expect("test object OID should parse"),
+            LfsObjectSize::new(
+                u64::try_from(missing_bytes.len()).expect("test bytes should fit u64"),
+            ),
+        );
+        let provider = Arc::new(CountingFallbackStorageProvider {
+            object: available_object,
+            bytes: available_bytes,
+            lookup_calls: AtomicUsize::new(0),
+        });
+        let config = test_config();
+        let repository = &config.repositories[0];
+        let providers = ConfiguredStorageProviders::from_provider(&config, provider.clone())
+            .expect("fallback provider should compose");
+        let metadata = Arc::new(MetadataDatabase::open_in_memory().expect("metadata should open"));
+        metadata
+            .sync_config(&config)
+            .expect("metadata config should synchronize");
+        metadata
+            .record_verified_object(
+                &repository.id,
+                &repository.storage_provider,
+                &missing_object,
+                "missing-fallback-object",
+                &RepositoryUser::new("github-main", "octocat", Some("user-1".to_owned())),
+            )
+            .expect("missing backend metadata should record");
+        let store = StorageProviderTransferStore::new(providers, metadata.clone());
+
+        let error = store
+            .download_object_response(repository, &missing_object)
+            .await
+            .expect_err("missing fallback download should fail");
+
+        assert!(matches!(
+            error,
+            ServerError::Storage {
+                source: StorageError::ObjectNotFound { .. }
+            }
+        ));
+        let stale = metadata
+            .lookup_object(
+                &repository.id,
+                &repository.storage_provider,
+                &missing_object,
+            )
+            .expect("stale metadata should load")
+            .expect("stale metadata should exist");
+        assert_eq!(
+            stale.verification_status,
+            MetadataObjectVerificationStatus::Stale
+        );
+        assert_eq!(
+            provider.lookup_calls.load(Ordering::SeqCst),
+            1,
+            "missing fallback download should not repeat object discovery"
         );
     }
 
