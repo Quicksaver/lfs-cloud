@@ -34,6 +34,7 @@ use crate::git_output::{
     GitPathOutputError, parse_lfs_filter_attribute_paths,
     safe_git_relative_path as parse_safe_git_relative_path,
 };
+use crate::process_output::{command_status_text, truncated_lossy_message};
 use crate::{
     LFS_POINTER_SIZE_CUTOFF, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout,
     MigrationError, MigrationResult, SanitizedMessage, StorageProvider, StoredObject,
@@ -2994,7 +2995,7 @@ fn validate_history_ref_name(ref_name: &str) -> MigrationResult<()> {
 fn resolve_ref_commit(worktree_root: &Path, ref_name: &str) -> MigrationResult<String> {
     let revision = format!("{ref_name}^{{commit}}");
     let command_name = format!("git rev-parse --verify --end-of-options {revision}");
-    let output = run_git_os_vec(
+    let output = run_git_os(
         worktree_root,
         vec![
             OsString::from("rev-parse"),
@@ -3023,7 +3024,7 @@ fn all_fetched_ref_names(
 ) -> MigrationResult<Vec<String>> {
     let command_name = "git for-each-ref --format=%(refname)%00%(symref) refs/heads refs/remotes/<source> refs/tags";
     let remote_refs = format!("refs/remotes/{source_remote}");
-    let output = run_git_os_vec_with_limit(
+    let output = run_git_os_with_limit(
         worktree_root,
         vec![
             OsString::from("for-each-ref"),
@@ -3063,7 +3064,7 @@ fn rev_list_commits(
 ) -> MigrationResult<Vec<GitHistoryCommit>> {
     let command_name =
         format!("git rev-list --topo-order --format=%H%x20%T --no-commit-header {root_commit}");
-    let output = run_git_os_vec_with_limit(
+    let output = run_git_os_with_limit(
         worktree_root,
         vec![
             OsString::from("rev-list"),
@@ -3470,7 +3471,7 @@ fn read_history_pointer_blob_candidate(
     object_id: &str,
 ) -> MigrationResult<Option<LfsPointer>> {
     let size_command = format!("git cat-file -s {object_id}");
-    let size_output = run_git_os_vec(
+    let size_output = run_git_os(
         worktree_root,
         vec![
             OsString::from("cat-file"),
@@ -3497,7 +3498,7 @@ fn read_history_pointer_blob_candidate(
     }
 
     let blob_command = format!("git cat-file blob {object_id}");
-    let blob_output = run_git_os_vec(
+    let blob_output = run_git_os(
         worktree_root,
         vec![
             OsString::from("cat-file"),
@@ -3676,11 +3677,11 @@ fn run_git<const N: usize>(current_dir: &Path, args: [&str; N]) -> MigrationResu
     run_bounded_command_output(&mut command, &command_name, MAX_MIGRATION_GIT_OUTPUT_BYTES)
 }
 
-fn run_git_os<const N: usize>(
-    current_dir: &Path,
-    args: [&OsStr; N],
-    command_name: &str,
-) -> MigrationResult<Output> {
+fn run_git_os<I, S>(current_dir: &Path, args: I, command_name: &str) -> MigrationResult<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     run_git_os_with_limit(
         current_dir,
         args,
@@ -3689,36 +3690,16 @@ fn run_git_os<const N: usize>(
     )
 }
 
-fn run_git_os_with_limit<const N: usize>(
+fn run_git_os_with_limit<I, S>(
     current_dir: &Path,
-    args: [&OsStr; N],
+    args: I,
     command_name: &str,
     stdout_limit: usize,
-) -> MigrationResult<Output> {
-    let mut command = read_only_git_command();
-    command.args(args).current_dir(current_dir);
-    run_bounded_command_output(&mut command, command_name, stdout_limit)
-}
-
-fn run_git_os_vec(
-    current_dir: &Path,
-    args: Vec<OsString>,
-    command_name: &str,
-) -> MigrationResult<Output> {
-    run_git_os_vec_with_limit(
-        current_dir,
-        args,
-        command_name,
-        MAX_MIGRATION_GIT_OUTPUT_BYTES,
-    )
-}
-
-fn run_git_os_vec_with_limit(
-    current_dir: &Path,
-    args: Vec<OsString>,
-    command_name: &str,
-    stdout_limit: usize,
-) -> MigrationResult<Output> {
+) -> MigrationResult<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = read_only_git_command();
     command.args(args).current_dir(current_dir);
     run_bounded_command_output(&mut command, command_name, stdout_limit)
@@ -3786,7 +3767,10 @@ fn child_process_migration_error(error: ChildProcessError, command_name: &str) -
         } => MigrationError::ExternalCommand {
             command: command_name.to_owned(),
             status: format!("timed out after {} seconds", timeout.as_secs()),
-            stderr: SanitizedMessage::new(truncated_lossy_message(&stderr)),
+            stderr: SanitizedMessage::new(truncated_lossy_message(
+                &stderr,
+                MAX_MIGRATION_GIT_OUTPUT_BYTES,
+            )),
         },
         ChildProcessError::OutputLimit { stream, limit } => MigrationError::ExternalCommandOutput {
             command: command_name.to_owned(),
@@ -3863,12 +3847,15 @@ fn command_error(command: &str, status: ExitStatus, stderr: &[u8]) -> MigrationE
     MigrationError::ExternalCommand {
         command: command.to_owned(),
         status: command_status_text(status),
-        stderr: SanitizedMessage::new(truncated_lossy_message(stderr)),
+        stderr: SanitizedMessage::new(truncated_lossy_message(
+            stderr,
+            MAX_MIGRATION_GIT_OUTPUT_BYTES,
+        )),
     }
 }
 
 fn git_lfs_probe_diagnostic(output: &Output) -> String {
-    let stderr = truncated_lossy_message(&output.stderr);
+    let stderr = truncated_lossy_message(&output.stderr, MAX_MIGRATION_GIT_OUTPUT_BYTES);
     if stderr.trim().is_empty() {
         format!(
             "git lfs version exited with status {}",
@@ -3877,24 +3864,6 @@ fn git_lfs_probe_diagnostic(output: &Output) -> String {
     } else {
         stderr.trim().to_owned()
     }
-}
-
-fn command_status_text(status: ExitStatus) -> String {
-    status.code().map_or_else(
-        || "terminated by signal".to_owned(),
-        |code| code.to_string(),
-    )
-}
-
-fn truncated_lossy_message(bytes: &[u8]) -> String {
-    if bytes.len() <= MAX_MIGRATION_GIT_OUTPUT_BYTES {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-
-    let mut message =
-        String::from_utf8_lossy(&bytes[..MAX_MIGRATION_GIT_OUTPUT_BYTES]).into_owned();
-    message.push_str("\n[truncated]");
-    message
 }
 
 fn first_non_empty_line(value: &str) -> Option<&str> {

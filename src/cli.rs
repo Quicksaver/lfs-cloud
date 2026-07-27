@@ -29,7 +29,11 @@ use crate::child_process::{
 };
 use crate::git_output::{GitPathOutputError, parse_lfs_filter_attribute_paths};
 use crate::google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource};
-use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
+use crate::{
+    CliError, CliResult, SanitizedMessage,
+    git::redacted_url_for_display,
+    process_output::{command_status_text, truncate_with_ellipsis},
+};
 use crate::{
     GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup,
     GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers,
@@ -2550,7 +2554,7 @@ fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
     } else {
         Err(CliError::ExternalCommand {
             command: "git lfs fetch".to_owned(),
-            status: process_status_text(output.status),
+            status: command_status_text(output.status),
             stderr: sanitized_external_failure_output(&output.stderr, &output.stdout),
         })
     }
@@ -2668,7 +2672,7 @@ fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> CliResult<Vec<Pat
     if !output.status.success() {
         return Err(CliError::ExternalCommand {
             command: "git ls-files -z".to_owned(),
-            status: process_status_text(output.status),
+            status: command_status_text(output.status),
             stderr: sanitized_external_stderr(&output.stderr),
         });
     }
@@ -2727,7 +2731,7 @@ fn git_check_attr_filter(
     if !output.status.success() {
         return Err(CliError::ExternalCommand {
             command: "git check-attr -z --stdin filter".to_owned(),
-            status: process_status_text(output.status),
+            status: command_status_text(output.status),
             stderr: sanitized_external_stderr(&output.stderr),
         });
     }
@@ -2775,7 +2779,7 @@ fn configured_git_lfs_storage_dir(worktree_root: &Path) -> CliResult<Option<Path
     } else {
         Err(CliError::ExternalCommand {
             command: "git config --get lfs.storage".to_owned(),
-            status: process_status_text(output.status),
+            status: command_status_text(output.status),
             stderr: sanitized_external_stderr(&output.stderr),
         })
     }
@@ -2925,7 +2929,7 @@ fn require_lfs_filter(
     if !output.status.success() {
         return Err(CliError::ExternalCommand {
             command: "git check-attr -z filter -- <path>".to_owned(),
-            status: process_status_text(output.status),
+            status: command_status_text(output.status),
             stderr: sanitized_external_stderr(&output.stderr),
         });
     }
@@ -2969,7 +2973,7 @@ fn index_blob_oid(
     if !output.status.success() {
         return Err(CliError::ExternalCommand {
             command: "git --literal-pathspecs ls-files --stage -z -- <path>".to_owned(),
-            status: process_status_text(output.status),
+            status: command_status_text(output.status),
             stderr: sanitized_external_stderr(&output.stderr),
         });
     }
@@ -3035,7 +3039,7 @@ fn read_index_lfs_pointer(
     if !size_output.status.success() {
         return Err(CliError::ExternalCommand {
             command: "git cat-file -s <index-object>".to_owned(),
-            status: process_status_text(size_output.status),
+            status: command_status_text(size_output.status),
             stderr: sanitized_external_stderr(&size_output.stderr),
         });
     }
@@ -3061,7 +3065,7 @@ fn read_index_lfs_pointer(
     if !pointer_output.status.success() {
         return Err(CliError::ExternalCommand {
             command: "git cat-file blob <index-object>".to_owned(),
-            status: process_status_text(pointer_output.status),
+            status: command_status_text(pointer_output.status),
             stderr: sanitized_external_stderr(&pointer_output.stderr),
         });
     }
@@ -3569,26 +3573,12 @@ fn block_on_reqwest<T>(
     )
 }
 
-fn process_status_text(status: std::process::ExitStatus) -> String {
-    status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "terminated by signal".to_owned())
-}
-
 fn sanitized_external_stderr(stderr: &[u8]) -> SanitizedMessage {
     const MAX_EXTERNAL_STDERR_LEN: usize = 1024;
 
     let mut message = String::from_utf8_lossy(stderr).into_owned();
     message = message.replace(['\r', '\n'], " ");
-    if message.len() > MAX_EXTERNAL_STDERR_LEN {
-        let boundary = (0..=MAX_EXTERNAL_STDERR_LEN)
-            .rev()
-            .find(|&index| message.is_char_boundary(index))
-            .expect("zero is always a valid string boundary");
-        message.truncate(boundary);
-        message.push_str("...");
-    }
+    truncate_with_ellipsis(&mut message, MAX_EXTERNAL_STDERR_LEN);
     let message = message.trim();
 
     if message.is_empty() {

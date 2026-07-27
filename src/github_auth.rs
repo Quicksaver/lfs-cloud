@@ -25,7 +25,8 @@ use crate::{
     GitHubProviderConfig, IssuedLfsSession, LocalLfsSessionStore, ProviderFuture,
     RepositoryAuthentication, RepositoryAuthorization, RepositoryIdentity, RepositoryPermission,
     RepositoryProvider, RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerError,
-    ServerResult, http_transport::uses_protected_http_transport,
+    ServerResult,
+    http_transport::{read_bounded_lossy_response_body, uses_protected_http_transport},
 };
 
 const MAX_GITHUB_SENSITIVE_VALUE_LEN: usize = 1024;
@@ -879,21 +880,7 @@ fn github_repository_not_found(
 }
 
 async fn read_github_error_body(response: reqwest::Response) -> Result<String, reqwest::Error> {
-    let mut response = response;
-    let mut body = Vec::new();
-    while body.len() < MAX_GITHUB_ERROR_BODY_LEN {
-        let Some(chunk) = response.chunk().await? else {
-            break;
-        };
-        let remaining = MAX_GITHUB_ERROR_BODY_LEN - body.len();
-        if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
-            break;
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    read_bounded_lossy_response_body(response, MAX_GITHUB_ERROR_BODY_LEN).await
 }
 
 fn malformed_github_user_response_error(

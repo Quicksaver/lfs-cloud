@@ -2203,11 +2203,7 @@ async fn finish_failed_transfer_attempt(
     error: &ServerError,
     download: bool,
 ) {
-    let category = match error {
-        ServerError::Storage { source } => source.category(),
-        ServerError::RepositoryProvider { source } => source.category(),
-        _ => error.category(),
-    };
+    let category = server_error_log_category(error);
     let (_, message) = git_lfs_storage_error_response_parts(error, download);
     finish_failed_transfer_attempt_with_message(state, attempt_id, category, message).await;
 }
@@ -2881,32 +2877,13 @@ async fn download_batch_response_with_storage_lookup(
     state: &LfsServerState,
     request: LfsBatchRequest,
 ) -> ServerResult<LfsBatchResponse> {
-    let requested_objects = request.objects;
-    let unique_objects = requested_objects.iter().cloned().collect::<BTreeSet<_>>();
-    let outcomes = stream::iter(unique_objects)
-        .map(|object| async move {
-            let outcome = match state.lookup_object(repository, &object).await {
-                Ok(Some(_)) => LfsBatchDownloadObject::available(object),
-                Ok(None) => LfsBatchDownloadObject::missing(object),
-                Err(error) => LfsBatchDownloadObject::error(
-                    object,
-                    lfs_batch_object_error_from_server_error(&error),
-                ),
-            };
-            (outcome_object(&outcome).clone(), outcome)
-        })
-        .buffered(BATCH_STORAGE_LOOKUP_CONCURRENCY)
-        .collect::<BTreeMap<_, _>>()
-        .await;
-    let objects = requested_objects
-        .into_iter()
-        .map(|object| {
-            outcomes
-                .get(&object)
-                .expect("every requested object should have one lookup outcome")
-                .clone()
-        })
-        .collect::<Vec<_>>();
+    let objects = batch_objects_with_storage_lookup(
+        repository,
+        state,
+        request.objects,
+        download_batch_lookup_outcome,
+    )
+    .await;
 
     Ok(LfsBatchResponse::download(
         &state.public_url,
@@ -2920,32 +2897,13 @@ async fn upload_batch_response_with_storage_lookup(
     state: &LfsServerState,
     request: LfsBatchRequest,
 ) -> ServerResult<LfsBatchResponse> {
-    let requested_objects = request.objects;
-    let unique_objects = requested_objects.iter().cloned().collect::<BTreeSet<_>>();
-    let outcomes = stream::iter(unique_objects)
-        .map(|object| async move {
-            let outcome = match state.lookup_object(repository, &object).await {
-                Ok(Some(_)) => LfsBatchUploadObject::present(object),
-                Ok(None) => LfsBatchUploadObject::needed(object),
-                Err(error) => LfsBatchUploadObject::error(
-                    object,
-                    lfs_batch_object_error_from_server_error(&error),
-                ),
-            };
-            (upload_outcome_object(&outcome).clone(), outcome)
-        })
-        .buffered(BATCH_STORAGE_LOOKUP_CONCURRENCY)
-        .collect::<BTreeMap<_, _>>()
-        .await;
-    let objects = requested_objects
-        .into_iter()
-        .map(|object| {
-            outcomes
-                .get(&object)
-                .expect("every requested object should have one lookup outcome")
-                .clone()
-        })
-        .collect::<Vec<_>>();
+    let objects = batch_objects_with_storage_lookup(
+        repository,
+        state,
+        request.objects,
+        upload_batch_lookup_outcome,
+    )
+    .await;
 
     Ok(LfsBatchResponse::upload(
         &state.public_url,
@@ -2954,19 +2912,58 @@ async fn upload_batch_response_with_storage_lookup(
     ))
 }
 
-fn outcome_object(outcome: &LfsBatchDownloadObject) -> &LfsObject {
-    match outcome {
-        LfsBatchDownloadObject::Available { object }
-        | LfsBatchDownloadObject::Missing { object }
-        | LfsBatchDownloadObject::Error { object, .. } => object,
+async fn batch_objects_with_storage_lookup<T>(
+    repository: &RepositoryMapping,
+    state: &LfsServerState,
+    requested_objects: Vec<LfsObject>,
+    outcome_from_lookup: fn(LfsObject, ServerResult<Option<StoredObject>>) -> T,
+) -> Vec<T>
+where
+    T: Clone,
+{
+    let unique_objects = requested_objects.iter().cloned().collect::<BTreeSet<_>>();
+    let outcomes = stream::iter(unique_objects)
+        .map(|object| async move {
+            let lookup = state.lookup_object(repository, &object).await;
+            (object.clone(), outcome_from_lookup(object, lookup))
+        })
+        .buffered(BATCH_STORAGE_LOOKUP_CONCURRENCY)
+        .collect::<BTreeMap<_, _>>()
+        .await;
+    requested_objects
+        .into_iter()
+        .map(|object| {
+            outcomes
+                .get(&object)
+                .expect("every requested object should have one lookup outcome")
+                .clone()
+        })
+        .collect()
+}
+
+fn download_batch_lookup_outcome(
+    object: LfsObject,
+    lookup: ServerResult<Option<StoredObject>>,
+) -> LfsBatchDownloadObject {
+    match lookup {
+        Ok(Some(_)) => LfsBatchDownloadObject::available(object),
+        Ok(None) => LfsBatchDownloadObject::missing(object),
+        Err(error) => {
+            LfsBatchDownloadObject::error(object, lfs_batch_object_error_from_server_error(&error))
+        }
     }
 }
 
-fn upload_outcome_object(outcome: &LfsBatchUploadObject) -> &LfsObject {
-    match outcome {
-        LfsBatchUploadObject::Needed { object }
-        | LfsBatchUploadObject::Present { object }
-        | LfsBatchUploadObject::Error { object, .. } => object,
+fn upload_batch_lookup_outcome(
+    object: LfsObject,
+    lookup: ServerResult<Option<StoredObject>>,
+) -> LfsBatchUploadObject {
+    match lookup {
+        Ok(Some(_)) => LfsBatchUploadObject::present(object),
+        Ok(None) => LfsBatchUploadObject::needed(object),
+        Err(error) => {
+            LfsBatchUploadObject::error(object, lfs_batch_object_error_from_server_error(&error))
+        }
     }
 }
 
@@ -3051,70 +3048,125 @@ fn git_lfs_storage_error_response_parts(
     error: &ServerError,
     download: bool,
 ) -> (StatusCode, &'static str) {
-    if download
-        && matches!(
-            error,
-            ServerError::Storage {
-                source: StorageError::IntegrityMismatch { .. },
-            }
+    let classification = classify_lfs_storage_error(error);
+    if download {
+        (
+            classification.download_status,
+            classification.download_message,
         )
-    {
-        return (
-            StatusCode::BAD_GATEWAY,
-            "Git LFS storage returned an object that failed integrity validation",
-        );
+    } else {
+        (classification.upload_status, classification.upload_message)
     }
+}
 
+#[derive(Clone, Copy)]
+struct LfsStorageErrorClassification {
+    upload_status: StatusCode,
+    download_status: StatusCode,
+    upload_message: &'static str,
+    download_message: &'static str,
+    batch_code: u16,
+    batch_message: &'static str,
+}
+
+impl LfsStorageErrorClassification {
+    const fn same_transfer_response(
+        status: StatusCode,
+        message: &'static str,
+        batch_code: u16,
+        batch_message: &'static str,
+    ) -> Self {
+        Self {
+            upload_status: status,
+            download_status: status,
+            upload_message: message,
+            download_message: message,
+            batch_code,
+            batch_message,
+        }
+    }
+}
+
+fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassification {
     match error {
         ServerError::Storage {
             source: StorageError::IntegrityMismatch { .. },
-        } => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "uploaded Git LFS object did not match the requested OID or size",
-        ),
+        } => LfsStorageErrorClassification {
+            upload_status: StatusCode::UNPROCESSABLE_ENTITY,
+            download_status: StatusCode::BAD_GATEWAY,
+            upload_message: "uploaded Git LFS object did not match the requested OID or size",
+            download_message: "Git LFS storage returned an object that failed integrity validation",
+            batch_code: 502,
+            batch_message: "object storage lookup failed",
+        },
         ServerError::Storage {
             source: StorageError::ObjectNotFound { .. },
-        } => (StatusCode::NOT_FOUND, "Git LFS object was not found"),
+        } => LfsStorageErrorClassification::same_transfer_response(
+            StatusCode::NOT_FOUND,
+            "Git LFS object was not found",
+            404,
+            "object not found",
+        ),
         ServerError::Storage {
             source: StorageError::Conflict { .. },
-        } => (
+        } => LfsStorageErrorClassification::same_transfer_response(
             StatusCode::CONFLICT,
             "Git LFS storage reported an object conflict",
+            409,
+            "object storage conflict",
         ),
         ServerError::Storage {
             source: StorageError::QuotaExceeded { .. },
-        } => (
+        } => LfsStorageErrorClassification::same_transfer_response(
             StatusCode::INSUFFICIENT_STORAGE,
             "Git LFS storage quota was exceeded",
+            507,
+            "object storage quota exceeded",
         ),
         ServerError::Storage {
             source: StorageError::Retryable { .. },
-        } => (
+        } => LfsStorageErrorClassification::same_transfer_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Git LFS storage operation can be retried later",
+            503,
+            "object storage lookup can be retried later",
         ),
         ServerError::Storage {
             source: StorageError::PermissionDenied { .. },
-        } => (StatusCode::BAD_GATEWAY, "Git LFS storage access was denied"),
+        } => LfsStorageErrorClassification::same_transfer_response(
+            StatusCode::BAD_GATEWAY,
+            "Git LFS storage access was denied",
+            502,
+            "object storage access was denied",
+        ),
         ServerError::Storage {
             source:
                 StorageError::AuthenticationRequired { .. } | StorageError::CredentialLoad { .. },
-        } => (
+        } => LfsStorageErrorClassification::same_transfer_response(
             StatusCode::BAD_GATEWAY,
             "Git LFS storage authentication failed",
+            502,
+            "object storage authentication failed",
         ),
         ServerError::Storage {
             source: StorageError::Unsupported { .. },
-        } => (
+        } => LfsStorageErrorClassification::same_transfer_response(
             StatusCode::NOT_IMPLEMENTED,
             "Git LFS storage transfer handling is not configured",
+            501,
+            "object storage lookup is not configured",
         ),
-        ServerError::Storage { .. } => {
-            (StatusCode::BAD_GATEWAY, "Git LFS storage operation failed")
-        }
-        _ => (
+        ServerError::Storage { .. } => LfsStorageErrorClassification::same_transfer_response(
+            StatusCode::BAD_GATEWAY,
+            "Git LFS storage operation failed",
+            502,
+            "object storage lookup failed",
+        ),
+        _ => LfsStorageErrorClassification::same_transfer_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Git LFS transfer handling failed",
+            500,
+            "object availability lookup failed",
         ),
     }
 }
@@ -3125,34 +3177,8 @@ fn git_lfs_download_storage_error_response(error: ServerError) -> Response {
 }
 
 fn lfs_batch_object_error_from_server_error(error: &ServerError) -> LfsBatchObjectError {
-    match error {
-        ServerError::Storage {
-            source: StorageError::ObjectNotFound { .. },
-        } => LfsBatchObjectError::new(404, "object not found"),
-        ServerError::Storage {
-            source: StorageError::Conflict { .. },
-        } => LfsBatchObjectError::new(409, "object storage conflict"),
-        ServerError::Storage {
-            source: StorageError::QuotaExceeded { .. },
-        } => LfsBatchObjectError::new(507, "object storage quota exceeded"),
-        ServerError::Storage {
-            source: StorageError::Retryable { .. },
-        } => LfsBatchObjectError::new(503, "object storage lookup can be retried later"),
-        ServerError::Storage {
-            source: StorageError::PermissionDenied { .. },
-        } => LfsBatchObjectError::new(502, "object storage access was denied"),
-        ServerError::Storage {
-            source:
-                StorageError::AuthenticationRequired { .. } | StorageError::CredentialLoad { .. },
-        } => LfsBatchObjectError::new(502, "object storage authentication failed"),
-        ServerError::Storage {
-            source: StorageError::Unsupported { .. },
-        } => LfsBatchObjectError::new(501, "object storage lookup is not configured"),
-        ServerError::Storage { .. } => {
-            LfsBatchObjectError::new(502, "object storage lookup failed")
-        }
-        _ => LfsBatchObjectError::new(500, "object availability lookup failed"),
-    }
+    let classification = classify_lfs_storage_error(error);
+    LfsBatchObjectError::new(classification.batch_code, classification.batch_message)
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -20,6 +20,7 @@ use crate::{
         ChildProcessError, ChildProcessOptions, PipeCapture, configure_process_tree, wait_for_child,
     },
     http_transport::uses_protected_http_transport,
+    process_output::truncate_with_ellipsis,
 };
 
 /// Username stored alongside local LFS Cloud bearer tokens in Git credentials.
@@ -1052,14 +1053,7 @@ fn sanitize_command_stderr(stderr: &[u8], token: &str) -> SanitizedMessage {
         message = message.replace(token, "<redacted>");
     }
     message = message.replace(['\r', '\n'], " ");
-    if message.len() > MAX_COMMAND_STDERR_LEN {
-        let boundary = (0..=MAX_COMMAND_STDERR_LEN)
-            .rev()
-            .find(|&index| message.is_char_boundary(index))
-            .expect("zero is always a valid string boundary");
-        message.truncate(boundary);
-        message.push_str("...");
-    }
+    truncate_with_ellipsis(&mut message, MAX_COMMAND_STDERR_LEN);
     let message = message.trim();
 
     if message.is_empty() {

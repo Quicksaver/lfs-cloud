@@ -41,7 +41,7 @@ use url::Url;
 use crate::{
     GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, LfsObject, ProviderFuture,
     SanitizedMessage, StorageDeleteOutcome, StorageError, StorageProvider, StorageResult,
-    StoredObject,
+    StoredObject, http_transport::read_bounded_lossy_response_body,
 };
 
 const GCLOUD_ADC_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -123,13 +123,10 @@ impl GoogleDriveAccessToken {
     /// header value.
     pub fn authorization_header_value(&self, provider: &str) -> StorageResult<HeaderValue> {
         HeaderValue::from_str(&format!("Bearer {}", self.access_token)).map_err(|_| {
-            StorageError::Upstream {
-                provider: provider.to_owned(),
-                status: None,
-                message: SanitizedMessage::new(
-                    "Google OAuth access token could not be encoded as an HTTP header",
-                ),
-            }
+            drive_upstream_error(
+                provider,
+                "Google OAuth access token could not be encoded as an HTTP header",
+            )
         })
     }
 
@@ -1546,23 +1543,19 @@ impl GoogleDriveObjectStore {
             ));
         }
         let Some(actual_size) = download_response.content_length() else {
-            return Err(StorageError::Upstream {
-                provider: self.storage.id.clone(),
-                status: None,
-                message: SanitizedMessage::new(
-                    "Google Drive download response omitted Content-Length",
-                ),
-            });
+            return Err(drive_upstream_error(
+                &self.storage.id,
+                "Google Drive download response omitted Content-Length",
+            ));
         };
         if actual_size != object.size.bytes() {
-            return Err(StorageError::Upstream {
-                provider: self.storage.id.clone(),
-                status: None,
-                message: SanitizedMessage::new(format!(
+            return Err(drive_upstream_error(
+                &self.storage.id,
+                format!(
                     "Google Drive download response Content-Length {actual_size} did not match requested size {}",
                     object.size.bytes()
-                )),
-            });
+                ),
+            ));
         }
 
         let expected_oid = object.oid.as_hex().to_owned();
@@ -1615,12 +1608,11 @@ impl GoogleDriveObjectStore {
             .header(CONTENT_TYPE, GOOGLE_DRIVE_OBJECT_CONTENT_TYPE)
             .header(CONTENT_LENGTH, object.size.bytes().to_string())
             .body(response_body)
-            .map_err(|source| StorageError::Upstream {
-                provider: self.storage.id.clone(),
-                status: None,
-                message: SanitizedMessage::new(format!(
-                    "Google Drive download response could not be built: {source}"
-                )),
+            .map_err(|source| {
+                drive_upstream_error(
+                    &self.storage.id,
+                    format!("Google Drive download response could not be built: {source}"),
+                )
             })?;
 
         Ok(GoogleDriveDownloadResponse {
@@ -1672,23 +1664,19 @@ impl GoogleDriveObjectStore {
         }
 
         let Some(actual_size) = download_response.content_length() else {
-            return Err(StorageError::Upstream {
-                provider: self.storage.id.clone(),
-                status: None,
-                message: SanitizedMessage::new(
-                    "Google Drive download response omitted Content-Length",
-                ),
-            });
+            return Err(drive_upstream_error(
+                &self.storage.id,
+                "Google Drive download response omitted Content-Length",
+            ));
         };
         if actual_size != object.size.bytes() {
-            return Err(StorageError::Upstream {
-                provider: self.storage.id.clone(),
-                status: None,
-                message: SanitizedMessage::new(format!(
+            return Err(drive_upstream_error(
+                &self.storage.id,
+                format!(
                     "Google Drive download response Content-Length {actual_size} did not match requested size {}",
                     object.size.bytes()
-                )),
-            });
+                ),
+            ));
         }
 
         let verified_file = verify_drive_download_response_to_tempfile(
@@ -2328,50 +2316,72 @@ fn default_google_drive_object_download_http_client() -> StorageResult<Client> {
     }
 }
 
-fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
-    let url = Url::parse(value).map_err(|_| StorageError::Upstream {
-        provider: "google_drive".to_owned(),
+#[derive(Clone, Copy)]
+enum DriveUrlQueryPolicy {
+    Reject,
+    Allow,
+}
+
+fn drive_upstream_error(provider: &str, message: impl Into<String>) -> StorageError {
+    StorageError::Upstream {
+        provider: provider.to_owned(),
         status: None,
-        message: SanitizedMessage::new("Google Drive API base URL must be valid"),
-    })?;
+        message: SanitizedMessage::new(message.into()),
+    }
+}
+
+fn validate_drive_url(
+    value: &str,
+    provider: &str,
+    label: &str,
+    query_policy: DriveUrlQueryPolicy,
+) -> StorageResult<Url> {
+    let url = Url::parse(value)
+        .map_err(|_| drive_upstream_error(provider, format!("{label} must be valid")))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive API base URL must be an absolute http or https URL",
-            ),
-        });
+        return Err(drive_upstream_error(
+            provider,
+            format!("{label} must be an absolute http or https URL"),
+        ));
     }
     if url.scheme() == "http" && !is_loopback_http_url(&url) {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive API base URL must use https unless it targets a loopback host",
-            ),
-        });
+        return Err(drive_upstream_error(
+            provider,
+            format!("{label} must use https unless it targets a loopback host"),
+        ));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive API base URL must not include credentials",
-            ),
-        });
+        return Err(drive_upstream_error(
+            provider,
+            format!("{label} must not include credentials"),
+        ));
     }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive API base URL must not include query strings or fragments",
-            ),
-        });
+    if matches!(query_policy, DriveUrlQueryPolicy::Reject) && url.query().is_some() {
+        return Err(drive_upstream_error(
+            provider,
+            format!("{label} must not include query strings or fragments"),
+        ));
+    }
+    if url.fragment().is_some() {
+        let message = match query_policy {
+            DriveUrlQueryPolicy::Reject => {
+                format!("{label} must not include query strings or fragments")
+            }
+            DriveUrlQueryPolicy::Allow => format!("{label} must not include fragments"),
+        };
+        return Err(drive_upstream_error(provider, message));
     }
 
     Ok(url)
+}
+
+fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
+    validate_drive_url(
+        value,
+        "google_drive",
+        "Google Drive API base URL",
+        DriveUrlQueryPolicy::Reject,
+    )
 }
 
 fn drive_api_base_path_already_targets_drive_api(api_base_url: &Url) -> bool {
@@ -2386,36 +2396,59 @@ fn drive_api_base_path_already_targets_drive_api(api_base_url: &Url) -> bool {
         .unwrap_or(false)
 }
 
-fn drive_file_metadata_url(mut api_base_url: Url, root_folder_id: &str) -> StorageResult<Url> {
-    if root_folder_id.trim().is_empty() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new("Google Drive root_folder_id must not be blank"),
-        });
-    }
+enum DriveApiEndpoint<'a> {
+    Files(&'a [&'a str]),
+    ResumableUpload,
+}
 
-    let base_path_already_targets_drive_api =
-        drive_api_base_path_already_targets_drive_api(&api_base_url);
-
-    {
-        let mut segments =
-            api_base_url
-                .path_segments_mut()
-                .map_err(|_| StorageError::Upstream {
-                    provider: "google_drive".to_owned(),
-                    status: None,
-                    message: SanitizedMessage::new(
-                        "Google Drive API base URL cannot be used for path construction",
-                    ),
-                })?;
-        segments.pop_if_empty();
-        if base_path_already_targets_drive_api {
-            segments.extend(["files", root_folder_id]);
-        } else {
-            segments.extend(["drive", "v3", "files", root_folder_id]);
+fn drive_api_url(mut api_base_url: Url, endpoint: DriveApiEndpoint<'_>) -> StorageResult<Url> {
+    let already_targets_drive_api = drive_api_base_path_already_targets_drive_api(&api_base_url);
+    let mut segments = api_base_url.path_segments_mut().map_err(|_| {
+        drive_upstream_error(
+            "google_drive",
+            "Google Drive API base URL cannot be used for path construction",
+        )
+    })?;
+    segments.pop_if_empty();
+    match endpoint {
+        DriveApiEndpoint::Files(extra_segments) => {
+            if !already_targets_drive_api {
+                segments.extend(["drive", "v3"]);
+            }
+            segments.push("files");
+            segments.extend(extra_segments.iter().copied());
+        }
+        DriveApiEndpoint::ResumableUpload => {
+            if already_targets_drive_api {
+                segments.pop();
+                segments.pop();
+            }
+            segments.extend(["upload", "drive", "v3", "files"]);
         }
     }
+    drop(segments);
+
+    Ok(api_base_url)
+}
+
+fn drive_files_url(api_base_url: Url, extra_segments: &[&str]) -> StorageResult<Url> {
+    drive_api_url(api_base_url, DriveApiEndpoint::Files(extra_segments))
+}
+
+fn require_drive_identifier(value: &str, label: &str) -> StorageResult<()> {
+    if value.trim().is_empty() {
+        return Err(drive_upstream_error(
+            "google_drive",
+            format!("Google Drive {label} must not be blank"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn drive_file_metadata_url(api_base_url: Url, root_folder_id: &str) -> StorageResult<Url> {
+    require_drive_identifier(root_folder_id, "root_folder_id")?;
+    let mut api_base_url = drive_files_url(api_base_url, &[root_folder_id])?;
     api_base_url
         .query_pairs_mut()
         .append_pair(
@@ -2427,34 +2460,9 @@ fn drive_file_metadata_url(mut api_base_url: Url, root_folder_id: &str) -> Stora
     Ok(api_base_url)
 }
 
-fn drive_object_metadata_url(mut api_base_url: Url, file_id: &str) -> StorageResult<Url> {
-    if file_id.trim().is_empty() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new("Google Drive file ID must not be blank"),
-        });
-    }
-    let base_path_already_targets_drive_api =
-        drive_api_base_path_already_targets_drive_api(&api_base_url);
-    {
-        let mut segments =
-            api_base_url
-                .path_segments_mut()
-                .map_err(|_| StorageError::Upstream {
-                    provider: "google_drive".to_owned(),
-                    status: None,
-                    message: SanitizedMessage::new(
-                        "Google Drive API base URL cannot be used for path construction",
-                    ),
-                })?;
-        segments.pop_if_empty();
-        if base_path_already_targets_drive_api {
-            segments.extend(["files", file_id]);
-        } else {
-            segments.extend(["drive", "v3", "files", file_id]);
-        }
-    }
+fn drive_object_metadata_url(api_base_url: Url, file_id: &str) -> StorageResult<Url> {
+    require_drive_identifier(file_id, "file ID")?;
+    let mut api_base_url = drive_files_url(api_base_url, &[file_id])?;
     api_base_url
         .query_pairs_mut()
         .append_pair("fields", "id,name,size,parents,trashed,appProperties")
@@ -2463,34 +2471,9 @@ fn drive_object_metadata_url(mut api_base_url: Url, file_id: &str) -> StorageRes
     Ok(api_base_url)
 }
 
-fn drive_shard_folder_metadata_url(mut api_base_url: Url, folder_id: &str) -> StorageResult<Url> {
-    if folder_id.trim().is_empty() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new("Google Drive folder ID must not be blank"),
-        });
-    }
-    let base_path_already_targets_drive_api =
-        drive_api_base_path_already_targets_drive_api(&api_base_url);
-    {
-        let mut segments =
-            api_base_url
-                .path_segments_mut()
-                .map_err(|_| StorageError::Upstream {
-                    provider: "google_drive".to_owned(),
-                    status: None,
-                    message: SanitizedMessage::new(
-                        "Google Drive API base URL cannot be used for path construction",
-                    ),
-                })?;
-        segments.pop_if_empty();
-        if base_path_already_targets_drive_api {
-            segments.extend(["files", folder_id]);
-        } else {
-            segments.extend(["drive", "v3", "files", folder_id]);
-        }
-    }
+fn drive_shard_folder_metadata_url(api_base_url: Url, folder_id: &str) -> StorageResult<Url> {
+    require_drive_identifier(folder_id, "folder ID")?;
+    let mut api_base_url = drive_files_url(api_base_url, &[folder_id])?;
     api_base_url
         .query_pairs_mut()
         .append_pair("fields", "id,name,mimeType,parents,trashed,appProperties")
@@ -2500,41 +2483,14 @@ fn drive_shard_folder_metadata_url(mut api_base_url: Url, folder_id: &str) -> St
 }
 
 fn drive_object_lookup_url(
-    mut api_base_url: Url,
+    api_base_url: Url,
     root_folder_id: &str,
     key: &GoogleDriveObjectKey,
     expected_properties: &GoogleDriveObjectProperties,
     page_token: Option<&str>,
 ) -> StorageResult<Url> {
-    if root_folder_id.trim().is_empty() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new("Google Drive root_folder_id must not be blank"),
-        });
-    }
-
-    let base_path_already_targets_drive_api =
-        drive_api_base_path_already_targets_drive_api(&api_base_url);
-    {
-        let mut segments =
-            api_base_url
-                .path_segments_mut()
-                .map_err(|_| StorageError::Upstream {
-                    provider: "google_drive".to_owned(),
-                    status: None,
-                    message: SanitizedMessage::new(
-                        "Google Drive API base URL cannot be used for path construction",
-                    ),
-                })?;
-        segments.pop_if_empty();
-        if base_path_already_targets_drive_api {
-            segments.push("files");
-        } else {
-            segments.extend(["drive", "v3", "files"]);
-        }
-    }
-
+    require_drive_identifier(root_folder_id, "root_folder_id")?;
+    let mut api_base_url = drive_files_url(api_base_url, &[])?;
     api_base_url
         .query_pairs_mut()
         .append_pair(
@@ -2560,38 +2516,13 @@ fn drive_object_lookup_url(
 }
 
 fn drive_shard_folder_lookup_url(
-    mut api_base_url: Url,
+    api_base_url: Url,
     root_folder_id: &str,
     key: &GoogleDriveObjectKey,
     page_token: Option<&str>,
 ) -> StorageResult<Url> {
-    if root_folder_id.trim().is_empty() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new("Google Drive root_folder_id must not be blank"),
-        });
-    }
-    let base_path_already_targets_drive_api =
-        drive_api_base_path_already_targets_drive_api(&api_base_url);
-    {
-        let mut segments =
-            api_base_url
-                .path_segments_mut()
-                .map_err(|_| StorageError::Upstream {
-                    provider: "google_drive".to_owned(),
-                    status: None,
-                    message: SanitizedMessage::new(
-                        "Google Drive API base URL cannot be used for path construction",
-                    ),
-                })?;
-        segments.pop_if_empty();
-        if base_path_already_targets_drive_api {
-            segments.push("files");
-        } else {
-            segments.extend(["drive", "v3", "files"]);
-        }
-    }
+    require_drive_identifier(root_folder_id, "root_folder_id")?;
+    let mut api_base_url = drive_files_url(api_base_url, &[])?;
     api_base_url
         .query_pairs_mut()
         .append_pair(
@@ -2613,27 +2544,8 @@ fn drive_shard_folder_lookup_url(
     Ok(api_base_url)
 }
 
-fn drive_file_create_url(mut api_base_url: Url) -> StorageResult<Url> {
-    let base_path_already_targets_drive_api =
-        drive_api_base_path_already_targets_drive_api(&api_base_url);
-    {
-        let mut segments =
-            api_base_url
-                .path_segments_mut()
-                .map_err(|_| StorageError::Upstream {
-                    provider: "google_drive".to_owned(),
-                    status: None,
-                    message: SanitizedMessage::new(
-                        "Google Drive API base URL cannot be used for path construction",
-                    ),
-                })?;
-        segments.pop_if_empty();
-        if base_path_already_targets_drive_api {
-            segments.push("files");
-        } else {
-            segments.extend(["drive", "v3", "files"]);
-        }
-    }
+fn drive_file_create_url(api_base_url: Url) -> StorageResult<Url> {
+    let mut api_base_url = drive_files_url(api_base_url, &[])?;
     api_base_url
         .query_pairs_mut()
         .append_pair("fields", "id,name,mimeType,parents,trashed,appProperties")
@@ -2642,29 +2554,8 @@ fn drive_file_create_url(mut api_base_url: Url) -> StorageResult<Url> {
     Ok(api_base_url)
 }
 
-fn drive_resumable_upload_url(mut api_base_url: Url) -> StorageResult<Url> {
-    let base_path_already_targets_drive_api =
-        drive_api_base_path_already_targets_drive_api(&api_base_url);
-
-    {
-        let mut segments =
-            api_base_url
-                .path_segments_mut()
-                .map_err(|_| StorageError::Upstream {
-                    provider: "google_drive".to_owned(),
-                    status: None,
-                    message: SanitizedMessage::new(
-                        "Google Drive API base URL cannot be used for path construction",
-                    ),
-                })?;
-        segments.pop_if_empty();
-        if base_path_already_targets_drive_api {
-            segments.pop();
-            segments.pop();
-        }
-        segments.extend(["upload", "drive", "v3", "files"]);
-    }
-
+fn drive_resumable_upload_url(api_base_url: Url) -> StorageResult<Url> {
+    let mut api_base_url = drive_api_url(api_base_url, DriveApiEndpoint::ResumableUpload)?;
     api_base_url
         .query_pairs_mut()
         .append_pair("uploadType", "resumable")
@@ -2674,35 +2565,9 @@ fn drive_resumable_upload_url(mut api_base_url: Url) -> StorageResult<Url> {
     Ok(api_base_url)
 }
 
-fn drive_media_download_url(mut api_base_url: Url, file_id: &str) -> StorageResult<Url> {
-    if file_id.trim().is_empty() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new("Google Drive file ID must not be blank"),
-        });
-    }
-    let base_path_already_targets_drive_api =
-        drive_api_base_path_already_targets_drive_api(&api_base_url);
-
-    {
-        let mut segments =
-            api_base_url
-                .path_segments_mut()
-                .map_err(|_| StorageError::Upstream {
-                    provider: "google_drive".to_owned(),
-                    status: None,
-                    message: SanitizedMessage::new(
-                        "Google Drive API base URL cannot be used for path construction",
-                    ),
-                })?;
-        segments.pop_if_empty();
-        if base_path_already_targets_drive_api {
-            segments.extend(["files", file_id]);
-        } else {
-            segments.extend(["drive", "v3", "files", file_id]);
-        }
-    }
+fn drive_media_download_url(api_base_url: Url, file_id: &str) -> StorageResult<Url> {
+    require_drive_identifier(file_id, "file ID")?;
+    let mut api_base_url = drive_files_url(api_base_url, &[file_id])?;
     api_base_url
         .query_pairs_mut()
         .append_pair("alt", "media")
@@ -2716,55 +2581,17 @@ fn validate_drive_resumable_upload_session_url(
     api_base_url: &Url,
     value: &str,
 ) -> StorageResult<Url> {
-    let url = Url::parse(value).map_err(|_| StorageError::Upstream {
-        provider: storage.id.clone(),
-        status: None,
-        message: SanitizedMessage::new("Google Drive resumable upload session URL must be valid"),
-    })?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(StorageError::Upstream {
-            provider: storage.id.clone(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive resumable upload session URL must be an absolute http or https URL",
-            ),
-        });
-    }
-    if url.scheme() == "http" && !is_loopback_http_url(&url) {
-        return Err(StorageError::Upstream {
-            provider: storage.id.clone(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive resumable upload session URL must use https unless it targets a loopback host",
-            ),
-        });
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(StorageError::Upstream {
-            provider: storage.id.clone(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive resumable upload session URL must not include credentials",
-            ),
-        });
-    }
-    if url.fragment().is_some() {
-        return Err(StorageError::Upstream {
-            provider: storage.id.clone(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive resumable upload session URL must not include fragments",
-            ),
-        });
-    }
+    let url = validate_drive_url(
+        value,
+        &storage.id,
+        "Google Drive resumable upload session URL",
+        DriveUrlQueryPolicy::Allow,
+    )?;
     if !url_origins_match(&url, api_base_url) {
-        return Err(StorageError::Upstream {
-            provider: storage.id.clone(),
-            status: None,
-            message: SanitizedMessage::new(
-                "Google Drive resumable upload session URL must match the configured Drive API origin",
-            ),
-        });
+        return Err(drive_upstream_error(
+            &storage.id,
+            "Google Drive resumable upload session URL must match the configured Drive API origin",
+        ));
     }
 
     Ok(url)
@@ -2844,20 +2671,16 @@ fn drive_shard_folder_lookup_query(root_folder_id: &str, key: &GoogleDriveObject
 fn validate_repo_namespace(value: &str) -> StorageResult<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new("repository namespace must not be blank"),
-        });
+        return Err(drive_upstream_error(
+            "google_drive",
+            "repository namespace must not be blank",
+        ));
     }
     if trimmed.chars().any(char::is_control) {
-        return Err(StorageError::Upstream {
-            provider: "google_drive".to_owned(),
-            status: None,
-            message: SanitizedMessage::new(
-                "repository namespace must not contain control characters",
-            ),
-        });
+        return Err(drive_upstream_error(
+            "google_drive",
+            "repository namespace must not contain control characters",
+        ));
     }
 
     Ok(trimmed.to_owned())
@@ -3567,23 +3390,8 @@ fn redact_secret_from_message(message: &str, secret: &str) -> String {
     sanitized
 }
 
-async fn read_google_response_body(
-    mut response: reqwest::Response,
-) -> Result<String, reqwest::Error> {
-    let mut body = Vec::new();
-    while body.len() < MAX_GOOGLE_ERROR_BODY_LEN {
-        let Some(chunk) = response.chunk().await? else {
-            break;
-        };
-        let remaining = MAX_GOOGLE_ERROR_BODY_LEN - body.len();
-        if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
-            break;
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    Ok(String::from_utf8_lossy(&body).into_owned())
+async fn read_google_response_body(response: reqwest::Response) -> Result<String, reqwest::Error> {
+    read_bounded_lossy_response_body(response, MAX_GOOGLE_ERROR_BODY_LEN).await
 }
 
 #[cfg(test)]

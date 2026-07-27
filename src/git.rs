@@ -9,12 +9,15 @@ use std::{
     ffi::OsStr,
     fmt,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus},
+    process::{Command, ExitStatus, Output},
 };
 
 use url::Url;
 
-use crate::{CliError, CliResult, SanitizedMessage};
+use crate::{
+    CliError, CliResult, SanitizedMessage,
+    process_output::{command_status_text, truncated_lossy_message},
+};
 
 const DEFAULT_REMOTE_NAME: &str = "origin";
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
@@ -389,6 +392,47 @@ fn git_stdout<const N: usize>(
     args: [&str; N],
     command_name: &str,
 ) -> CliResult<String> {
+    let output = git_output(current_dir, args, command_name)?;
+    required_git_success(output, command_name)
+        .and_then(|output| decode_git_stdout(output, command_name))
+}
+
+fn git_config_get<const N: usize>(
+    current_dir: &Path,
+    args: [&OsStr; N],
+    command_name: &str,
+) -> CliResult<Option<String>> {
+    let output = git_output(current_dir, args, command_name)?;
+
+    if !output.status.success() {
+        if output.status.code() == Some(1) && output.stderr.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+
+        return Err(git_command_error(
+            command_name,
+            output.status,
+            output.stderr,
+        ));
+    }
+
+    decode_git_stdout(output, command_name).map(|value| Some(value.trim_end().to_owned()))
+}
+
+fn run_git_config<const N: usize>(
+    current_dir: &Path,
+    args: [&OsStr; N],
+    command_name: &str,
+) -> CliResult<()> {
+    let output = git_output(current_dir, args, command_name)?;
+    required_git_success(output, command_name).map(|_| ())
+}
+
+fn git_output<I, S>(current_dir: &Path, args: I, command_name: &str) -> CliResult<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let output = Command::new("git")
         .args(args)
         .current_dir(current_dir)
@@ -398,6 +442,10 @@ fn git_stdout<const N: usize>(
             source,
         })?;
 
+    Ok(output)
+}
+
+fn required_git_success(output: Output, command_name: &str) -> CliResult<Output> {
     if !output.status.success() {
         return Err(git_command_error(
             command_name,
@@ -405,6 +453,11 @@ fn git_stdout<const N: usize>(
             output.stderr,
         ));
     }
+
+    Ok(output)
+}
+
+fn decode_git_stdout(output: Output, command_name: &str) -> CliResult<String> {
     if output.stdout.len() > MAX_GIT_OUTPUT_BYTES {
         return Err(CliError::ExternalCommandOutput {
             command: command_name.to_owned(),
@@ -418,73 +471,8 @@ fn git_stdout<const N: usize>(
     })
 }
 
-fn git_config_get<const N: usize>(
-    current_dir: &Path,
-    args: [&OsStr; N],
-    command_name: &str,
-) -> CliResult<Option<String>> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .map_err(|source| CliError::Io {
-            context: format!("failed to start {command_name}"),
-            source,
-        })?;
-
-    if !output.status.success() {
-        if output.status.code() == Some(1) && output.stderr.iter().all(u8::is_ascii_whitespace) {
-            return Ok(None);
-        }
-
-        return Err(git_command_error(
-            command_name,
-            output.status,
-            output.stderr,
-        ));
-    }
-    if output.stdout.len() > MAX_GIT_OUTPUT_BYTES {
-        return Err(CliError::ExternalCommandOutput {
-            command: command_name.to_owned(),
-            message: SanitizedMessage::new("git returned too much output"),
-        });
-    }
-
-    String::from_utf8(output.stdout)
-        .map(|value| Some(value.trim_end().to_owned()))
-        .map_err(|_| CliError::ExternalCommandOutput {
-            command: command_name.to_owned(),
-            message: SanitizedMessage::new("git returned non-UTF-8 output"),
-        })
-}
-
-fn run_git_config<const N: usize>(
-    current_dir: &Path,
-    args: [&OsStr; N],
-    command_name: &str,
-) -> CliResult<()> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .map_err(|source| CliError::Io {
-            context: format!("failed to start {command_name}"),
-            source,
-        })?;
-
-    if !output.status.success() {
-        return Err(git_command_error(
-            command_name,
-            output.status,
-            output.stderr,
-        ));
-    }
-
-    Ok(())
-}
-
 fn git_command_error(command: &str, status: ExitStatus, stderr: Vec<u8>) -> CliError {
-    let stderr = truncated_lossy_message(&stderr);
+    let stderr = truncated_lossy_message(&stderr, MAX_GIT_OUTPUT_BYTES);
     let message = if stderr.trim().is_empty() {
         "no error output".to_owned()
     } else {
@@ -649,13 +637,6 @@ fn invalid_remote<T>(message: impl Into<String>) -> CliResult<T> {
     })
 }
 
-fn command_status_text(status: ExitStatus) -> String {
-    status.code().map_or_else(
-        || "terminated by signal".to_owned(),
-        |code| code.to_string(),
-    )
-}
-
 pub(crate) fn redacted_url_for_display(value: &str) -> String {
     // Query and fragment data can coexist with URL or scp-like credentials.
     // Remove those suffixes first so choosing either userinfo strategy below
@@ -707,16 +688,6 @@ fn redact_query_fragment_for_display(value: &str) -> String {
         redacted.push_str("#REDACTED");
     }
     redacted
-}
-
-fn truncated_lossy_message(bytes: &[u8]) -> String {
-    if bytes.len() <= MAX_GIT_OUTPUT_BYTES {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-
-    let mut message = String::from_utf8_lossy(&bytes[..MAX_GIT_OUTPUT_BYTES]).into_owned();
-    message.push_str("\n[truncated]");
-    message
 }
 
 #[cfg(test)]

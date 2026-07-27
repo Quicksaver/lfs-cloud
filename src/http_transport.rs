@@ -6,6 +6,31 @@
 use thiserror::Error;
 use url::{Host, Url};
 
+/// Reads at most `limit` response bytes and decodes them lossily.
+///
+/// Provider error responses are diagnostic only. Bounding the shared reader
+/// prevents an upstream from making either provider retain an unbounded error
+/// body while preserving a useful UTF-8-safe prefix.
+pub(crate) async fn read_bounded_lossy_response_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<String, reqwest::Error> {
+    let mut body = Vec::new();
+    while body.len() < limit {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        let remaining = limit - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 /// Context-specific exceptions to the shared HTTP route-base policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HttpUrlPolicy {

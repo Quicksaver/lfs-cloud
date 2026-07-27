@@ -18,6 +18,7 @@ pub mod local_cache;
 pub mod logging;
 pub mod metadata;
 pub mod migration;
+mod process_output;
 pub mod providers;
 pub mod server;
 pub mod server_config;

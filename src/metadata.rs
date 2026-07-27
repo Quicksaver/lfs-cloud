@@ -233,6 +233,15 @@ VALUES (5, 'invalidate_oauth_sessions_for_pat_authentication');
 PRAGMA user_version = 5;
 "#;
 
+const METADATA_MIGRATIONS: &[(u32, &str)] = &[
+    (2, NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION),
+    (3, PROTECTED_SESSION_TOKEN_MIGRATION),
+    (4, ACTIVE_REPOSITORY_MAPPING_MIGRATION),
+    // OAuth sessions used the removed client-secret key and must be invalidated
+    // before the PAT-derived session key can load current durable rows.
+    (5, PAT_AUTHENTICATION_SESSION_MIGRATION),
+];
+
 /// Verification state recorded for a repository-scoped object mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataObjectVerificationStatus {
@@ -546,10 +555,7 @@ impl MetadataDatabase {
         let mut connection = self.lock_connection()?;
         let schema_version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-            .map_err(|source| ServerError::MetadataMigration {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| self.migration_error(source))?;
         if schema_version > METADATA_SCHEMA_VERSION {
             return Err(ServerError::MetadataSchemaTooNew {
                 path: self.path.clone(),
@@ -557,60 +563,23 @@ impl MetadataDatabase {
                 supported: METADATA_SCHEMA_VERSION,
             });
         }
-        let transaction =
-            connection
-                .transaction()
-                .map_err(|source| ServerError::MetadataMigration {
-                    path: self.path.clone(),
-                    source,
-                })?;
+        let transaction = connection
+            .transaction()
+            .map_err(|source| self.migration_error(source))?;
         transaction
             .execute_batch(INITIAL_SCHEMA)
-            .map_err(|source| ServerError::MetadataMigration {
-                path: self.path.clone(),
-                source,
-            })?;
-        if schema_version < 2 {
+            .map_err(|source| self.migration_error(source))?;
+        for &(version, migration) in METADATA_MIGRATIONS {
+            if schema_version >= version {
+                continue;
+            }
             transaction
-                .execute_batch(NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION)
-                .map_err(|source| ServerError::MetadataMigration {
-                    path: self.path.clone(),
-                    source,
-                })?;
-        }
-        if schema_version < 3 {
-            transaction
-                .execute_batch(PROTECTED_SESSION_TOKEN_MIGRATION)
-                .map_err(|source| ServerError::MetadataMigration {
-                    path: self.path.clone(),
-                    source,
-                })?;
-        }
-        if schema_version < 4 {
-            transaction
-                .execute_batch(ACTIVE_REPOSITORY_MAPPING_MIGRATION)
-                .map_err(|source| ServerError::MetadataMigration {
-                    path: self.path.clone(),
-                    source,
-                })?;
-        }
-        if schema_version < 5 {
-            // OAuth sessions were encrypted from the removed client secret.
-            // They cannot be restored with the PAT-derived key, so invalidate
-            // them once during upgrade rather than aborting every startup.
-            transaction
-                .execute_batch(PAT_AUTHENTICATION_SESSION_MIGRATION)
-                .map_err(|source| ServerError::MetadataMigration {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .execute_batch(migration)
+                .map_err(|source| self.migration_error(source))?;
         }
         transaction
             .commit()
-            .map_err(|source| ServerError::MetadataMigration {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.migration_error(source))
     }
 
     /// Returns the SQLite `user_version` set by the migration runner.
@@ -641,13 +610,9 @@ impl MetadataDatabase {
     /// configuration.
     pub fn sync_config(&self, config: &ServerConfig) -> ServerResult<()> {
         let mut connection = self.lock_connection()?;
-        let transaction =
-            connection
-                .transaction()
-                .map_err(|source| ServerError::MetadataOperation {
-                    path: self.path.clone(),
-                    source,
-                })?;
+        let transaction = connection
+            .transaction()
+            .map_err(|source| self.operation_error(source))?;
 
         release_inactive_repository_routes(&transaction, config, &self.path)?;
 
@@ -660,10 +625,7 @@ impl MetadataDatabase {
 
         transaction
             .commit()
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.operation_error(source))
     }
 
     /// Looks up repository-scoped object metadata by exact object identity.
@@ -701,13 +663,10 @@ impl MetadataDatabase {
         storage_provider_id: String,
         object: LfsObject,
     ) -> ServerResult<Option<MetadataObjectRecord>> {
-        let database = Arc::clone(self);
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move |database| {
             database.lookup_object(&repo_id, &storage_provider_id, &object)
         })
         .await
-        .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
     }
 
     /// Marks a backend mapping stale if it still points at the expected ID.
@@ -746,10 +705,7 @@ impl MetadataDatabase {
                     expected_backend_id,
                 ],
             )
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| self.operation_error(source))?;
         Ok(updated == 1)
     }
 
@@ -761,9 +717,7 @@ impl MetadataDatabase {
         object: LfsObject,
         expected_backend_id: String,
     ) -> ServerResult<bool> {
-        let database = Arc::clone(self);
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move |database| {
             database.mark_object_stale(
                 &repo_id,
                 &storage_provider_id,
@@ -772,7 +726,6 @@ impl MetadataDatabase {
             )
         })
         .await
-        .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
     }
 
     /// Inserts or repairs object metadata after a successful verified upload.
@@ -843,10 +796,7 @@ impl MetadataDatabase {
                 ],
                 metadata_object_record_from_row,
             )
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.operation_error(source))
     }
 
     /// Records verified object metadata without blocking an async runtime worker.
@@ -862,9 +812,7 @@ impl MetadataDatabase {
         backend_id: String,
         creator_if_missing: RepositoryUser,
     ) -> ServerResult<MetadataObjectRecord> {
-        let database = Arc::clone(self);
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move |database| {
             database.record_verified_object(
                 &repo_id,
                 &storage_provider_id,
@@ -874,7 +822,6 @@ impl MetadataDatabase {
             )
         })
         .await
-        .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
     }
 
     /// Inserts the started row for one authenticated object transfer.
@@ -917,10 +864,7 @@ impl MetadataDatabase {
                 ],
                 |row| row.get(0),
             )
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.operation_error(source))
     }
 
     /// Inserts a transfer start row without blocking an async runtime worker.
@@ -932,9 +876,7 @@ impl MetadataDatabase {
         operation: MetadataTransferOperation,
         user: RepositoryUser,
     ) -> ServerResult<i64> {
-        let database = Arc::clone(self);
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move |database| {
             database.start_transfer_attempt(
                 &repo_id,
                 &storage_provider_id,
@@ -944,7 +886,6 @@ impl MetadataDatabase {
             )
         })
         .await
-        .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
     }
 
     /// Completes one started transfer-attempt row exactly once.
@@ -994,10 +935,7 @@ impl MetadataDatabase {
                 ],
                 |_| Ok(()),
             )
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.operation_error(source))
     }
 
     /// Completes a transfer-attempt row without blocking an async worker.
@@ -1006,11 +944,8 @@ impl MetadataDatabase {
         attempt_id: i64,
         result: MetadataTransferResult,
     ) -> ServerResult<()> {
-        let database = Arc::clone(self);
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || database.finish_transfer_attempt(attempt_id, &result))
+        self.run_blocking(move |database| database.finish_transfer_attempt(attempt_id, &result))
             .await
-            .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
     }
 
     /// Loads all persisted local sessions that have not expired.
@@ -1038,22 +973,13 @@ impl MetadataDatabase {
                  FROM sessions
                  WHERE expires_at_unix_seconds > ?1",
             )
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| self.operation_error(source))?;
         let rows = statement
             .query_map([now_unix_seconds], metadata_session_record_from_row)
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| self.operation_error(source))?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.operation_error(source))
     }
 
     /// Inserts or replaces one protected durable local-session row.
@@ -1098,10 +1024,7 @@ impl MetadataDatabase {
                 ],
             )
             .map(|_| ())
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.operation_error(source))
     }
 
     /// Deletes one durable local session by token digest.
@@ -1116,10 +1039,7 @@ impl MetadataDatabase {
                 [token_sha256],
             )
             .map(|deleted| deleted > 0)
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.operation_error(source))
     }
 
     /// Removes expired durable local sessions.
@@ -1133,10 +1053,7 @@ impl MetadataDatabase {
                 "DELETE FROM sessions WHERE expires_at_unix_seconds <= ?1",
                 [now_unix_seconds],
             )
-            .map_err(|source| ServerError::MetadataOperation {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(|source| self.operation_error(source))
     }
 
     fn configure_connection(&self) -> ServerResult<()> {
@@ -1153,6 +1070,34 @@ impl MetadataDatabase {
                 source,
             })?;
         Ok(())
+    }
+
+    async fn run_blocking<T>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&Self) -> ServerResult<T> + Send + 'static,
+    ) -> ServerResult<T>
+    where
+        T: Send + 'static,
+    {
+        let database = Arc::clone(self);
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || operation(database.as_ref()))
+            .await
+            .map_err(|source| ServerError::MetadataTaskJoin { path, source })?
+    }
+
+    fn migration_error(&self, source: rusqlite::Error) -> ServerError {
+        ServerError::MetadataMigration {
+            path: self.path.clone(),
+            source,
+        }
+    }
+
+    fn operation_error(&self, source: rusqlite::Error) -> ServerError {
+        ServerError::MetadataOperation {
+            path: self.path.clone(),
+            source,
+        }
     }
 
     fn lock_connection(&self) -> ServerResult<MutexGuard<'_, Connection>> {
