@@ -10,9 +10,8 @@ use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    thread,
 };
 
 #[cfg(unix)]
@@ -32,8 +31,12 @@ use std::{
     os::windows::ffi::{OsStrExt, OsStringExt},
 };
 
+use crate::git_output::{GitPathOutputError, parse_lfs_filter_attribute_paths};
 use crate::{
     LFS_POINTER_SIZE_CUTOFF, LfsObject, LfsObjectError, LfsObjectSize, LfsOid, LfsPointer,
+    child_process::{
+        ChildProcessError, ChildProcessOptions, PipeCapture, configure_process_tree, wait_for_child,
+    },
 };
 
 /// Default directory name used below a user's home directory for local state.
@@ -1465,28 +1468,9 @@ fn collect_tracked_lfs_pointer_oids(
     }
 
     let attributes = check_tracked_path_filter_attributes(registration, tracked_paths.stdout)?;
-    let mut fields = attributes.split(|byte| *byte == b'\0').collect::<Vec<_>>();
-    if fields.last() == Some(&&[][..]) {
-        fields.pop();
-    }
-    let chunks = fields.chunks_exact(3);
-    if !chunks.remainder().is_empty() {
-        return Err(git_command_output(
-            "git check-attr --cached -z --stdin filter",
-            registration,
-            "expected path, attribute, and value triples",
-        ));
-    }
-
-    for chunk in chunks {
-        let [relative_path, attribute, value] = chunk else {
-            unreachable!("chunks_exact yielded a non-triple chunk");
-        };
-        if *attribute != b"filter" || *value != b"lfs" {
-            continue;
-        }
-
-        let relative_path = git_relative_path(relative_path, registration)?;
+    let lfs_paths = parse_lfs_filter_attribute_paths(&attributes)
+        .map_err(|error| local_cache_git_path_output_error(error, registration))?;
+    for relative_path in lfs_paths {
         collect_pointer_oid_from_file(&registration.worktree_root.join(relative_path), referenced)?;
     }
 
@@ -1509,33 +1493,38 @@ fn check_tracked_path_filter_attributes(
     tracked_paths: Vec<u8>,
 ) -> LocalCacheResult<Vec<u8>> {
     const CHECK_ATTR: &str = "git check-attr --cached -z --stdin filter";
-    let mut child = registered_git_command(registration)
+    let mut command = registered_git_command(registration);
+    command
         .args(["check-attr", "--cached", "-z", "--stdin", "filter"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| LocalCacheError::Io {
-            context: "failed to start git check-attr for local cache garbage collection",
-            path: registration.worktree_root.clone(),
-            source,
-        })?;
+        .stderr(Stdio::null());
+    configure_process_tree(&mut command);
+    let mut child = command.spawn().map_err(|source| LocalCacheError::Io {
+        context: "failed to start git check-attr for local cache garbage collection",
+        path: registration.worktree_root.clone(),
+        source,
+    })?;
     let mut stdin = child
         .stdin
         .take()
         .expect("Git attribute stdin should be piped");
-    let writer = thread::spawn(move || {
+    let writer = std::thread::spawn(move || {
         let result = stdin.write_all(&tracked_paths);
         drop(stdin);
         result
     });
-    let output = child
-        .wait_with_output()
-        .map_err(|source| LocalCacheError::Io {
-            context: "failed to wait for git check-attr during local cache garbage collection",
-            path: registration.worktree_root.clone(),
-            source,
-        })?;
+    let output = wait_for_child(
+        &mut child,
+        CHECK_ATTR,
+        ChildProcessOptions {
+            timeout: None,
+            stdout: PipeCapture::Unlimited,
+            stderr: PipeCapture::Unlimited,
+            inherited_pipe_is_error: false,
+        },
+    )
+    .map_err(|error| local_cache_child_process_error(error, registration))?;
     let write_result = writer.join().map_err(|_| LocalCacheError::Io {
         context: "git check-attr input writer panicked during local cache garbage collection",
         path: registration.worktree_root.clone(),
@@ -1552,6 +1541,39 @@ fn check_tracked_path_filter_attributes(
     })?;
 
     Ok(output.stdout)
+}
+
+fn local_cache_child_process_error(
+    error: ChildProcessError,
+    registration: &LocalCacheWorktreeRegistration,
+) -> LocalCacheError {
+    let (context, source) = match error {
+        ChildProcessError::Io { source, .. } => (
+            "failed to wait for git check-attr during local cache garbage collection",
+            source,
+        ),
+        ChildProcessError::TimedOut { .. } => (
+            "git check-attr unexpectedly timed out",
+            io::Error::new(io::ErrorKind::TimedOut, "no timeout was configured"),
+        ),
+        ChildProcessError::OutputLimit { .. } => (
+            "git check-attr unexpectedly exceeded an output limit",
+            io::Error::other("no output limit was configured"),
+        ),
+        ChildProcessError::InheritedPipe => (
+            "timed out draining git check-attr output",
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Git output pipes remained open after process-tree cleanup",
+            ),
+        ),
+    };
+
+    LocalCacheError::Io {
+        context,
+        path: registration.worktree_root.clone(),
+        source,
+    }
 }
 
 fn git_command_failed(
@@ -1578,87 +1600,51 @@ fn git_command_output(
     }
 }
 
-fn git_relative_path(
-    relative_path: &[u8],
+fn local_cache_git_path_output_error(
+    error: GitPathOutputError,
     registration: &LocalCacheWorktreeRegistration,
-) -> LocalCacheResult<PathBuf> {
-    let path = git_path_bytes_to_path_buf(relative_path, registration)?;
-    let contained = !path.is_absolute()
-        && path.components().next().is_some()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)));
-    if !contained {
-        return Err(git_command_output(
-            "git check-attr --cached -z --stdin filter",
-            registration,
-            "returned a path outside the registered worktree",
-        ));
-    }
-
-    Ok(path)
-}
-
-#[cfg(unix)]
-fn git_path_bytes_to_path_buf(
-    relative_path: &[u8],
-    _registration: &LocalCacheWorktreeRegistration,
-) -> LocalCacheResult<PathBuf> {
-    Ok(PathBuf::from(OsString::from_vec(relative_path.to_owned())))
-}
-
-#[cfg(not(unix))]
-fn git_path_bytes_to_path_buf(
-    relative_path: &[u8],
-    registration: &LocalCacheWorktreeRegistration,
-) -> LocalCacheResult<PathBuf> {
-    String::from_utf8(relative_path.to_owned())
-        .map(PathBuf::from)
-        .map_err(|_| {
-            git_command_output(
-                "git check-attr --cached -z --stdin filter",
-                registration,
-                "returned a non-UTF-8 path",
-            )
-        })
+) -> LocalCacheError {
+    let message = match error {
+        GitPathOutputError::MalformedAttributeOutput => {
+            "expected path, attribute, and value triples"
+        }
+        #[cfg(not(unix))]
+        GitPathOutputError::NonUtf8Path => "returned a non-UTF-8 path",
+        GitPathOutputError::PathOutsideWorktree => {
+            "returned a path outside the registered worktree"
+        }
+    };
+    git_command_output(
+        "git check-attr --cached -z --stdin filter",
+        registration,
+        message,
+    )
 }
 
 fn collect_pointer_oid_from_file(
     path: &Path,
     referenced: &mut BTreeSet<LfsOid>,
 ) -> LocalCacheResult<()> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
             return Err(LocalCacheError::Io {
-                context: "failed to inspect worktree pointer candidate",
+                context: "failed to open worktree pointer candidate",
                 path: path.to_path_buf(),
                 source,
             });
         }
     };
-    if !metadata.is_file() || metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
+    let BoundedPointerBytes::Contents(contents) = read_bounded_pointer_bytes(
+        file,
+        path,
+        "failed to inspect worktree pointer candidate",
+        "failed to read worktree pointer candidate",
+    )?
+    else {
         return Ok(());
-    }
-
-    let file = File::open(path).map_err(|source| LocalCacheError::Io {
-        context: "failed to open worktree pointer candidate",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut contents = Vec::new();
-    file.take(LFS_POINTER_SIZE_CUTOFF)
-        .read_to_end(&mut contents)
-        .map_err(|source| LocalCacheError::Io {
-            context: "failed to read worktree pointer candidate",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if contents.len() as u64 >= LFS_POINTER_SIZE_CUTOFF {
-        return Ok(());
-    }
-
+    };
     let Ok(contents) = std::str::from_utf8(&contents) else {
         return Ok(());
     };
@@ -1669,6 +1655,45 @@ fn collect_pointer_oid_from_file(
     }
 
     Ok(())
+}
+
+enum BoundedPointerBytes {
+    Contents(Vec<u8>),
+    NotCandidate { size: u64 },
+}
+
+fn read_bounded_pointer_bytes(
+    file: File,
+    path: &Path,
+    inspect_context: &'static str,
+    read_context: &'static str,
+) -> LocalCacheResult<BoundedPointerBytes> {
+    let metadata = file.metadata().map_err(|source| LocalCacheError::Io {
+        context: inspect_context,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
+        return Ok(BoundedPointerBytes::NotCandidate {
+            size: metadata.len(),
+        });
+    }
+
+    let mut contents = Vec::new();
+    file.take(LFS_POINTER_SIZE_CUTOFF)
+        .read_to_end(&mut contents)
+        .map_err(|source| LocalCacheError::Io {
+            context: read_context,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) >= LFS_POINTER_SIZE_CUTOFF {
+        Ok(BoundedPointerBytes::NotCandidate {
+            size: u64::try_from(contents.len()).unwrap_or(u64::MAX),
+        })
+    } else {
+        Ok(BoundedPointerBytes::Contents(contents))
+    }
 }
 
 fn collect_cache_object_files(
@@ -1691,7 +1716,11 @@ fn collect_cache_object_files(
     for first_shard in first_shards {
         let first_shard = read_cache_entry(first_shard, objects_dir)?;
         let first_path = first_shard.path();
-        if !entry_is_directory(&first_shard, "first-level cache shard")? {
+        if !entry_is_kind(
+            &first_shard,
+            "first-level cache shard",
+            fs::FileType::is_dir,
+        )? {
             skipped.push(first_path);
             continue;
         }
@@ -1704,7 +1733,11 @@ fn collect_cache_object_files(
         for second_shard in second_shards {
             let second_shard = read_cache_entry(second_shard, &first_path)?;
             let second_path = second_shard.path();
-            if !entry_is_directory(&second_shard, "second-level cache shard")? {
+            if !entry_is_kind(
+                &second_shard,
+                "second-level cache shard",
+                fs::FileType::is_dir,
+            )? {
                 skipped.push(second_path);
                 continue;
             }
@@ -1718,7 +1751,7 @@ fn collect_cache_object_files(
             for object_entry in object_entries {
                 let object_entry = read_cache_entry(object_entry, &second_path)?;
                 let path = object_entry.path();
-                if !entry_is_file(&object_entry, "cache object path")? {
+                if !entry_is_kind(&object_entry, "cache object path", fs::FileType::is_file)? {
                     skipped.push(path);
                     continue;
                 }
@@ -1745,21 +1778,14 @@ fn read_cache_entry(
     })
 }
 
-fn entry_is_directory(entry: &fs::DirEntry, label: &'static str) -> LocalCacheResult<bool> {
+fn entry_is_kind(
+    entry: &fs::DirEntry,
+    label: &'static str,
+    matches: fn(&fs::FileType) -> bool,
+) -> LocalCacheResult<bool> {
     entry
         .file_type()
-        .map(|file_type| file_type.is_dir())
-        .map_err(|source| LocalCacheError::Io {
-            context: label,
-            path: entry.path(),
-            source,
-        })
-}
-
-fn entry_is_file(entry: &fs::DirEntry, label: &'static str) -> LocalCacheResult<bool> {
-    entry
-        .file_type()
-        .map(|file_type| file_type.is_file())
+        .map(|file_type| matches(&file_type))
         .map_err(|source| LocalCacheError::Io {
             context: label,
             path: entry.path(),
@@ -1853,35 +1879,21 @@ enum MaterializationMode {
 fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
     let file =
         open_worktree_file_without_following_symlinks(path, "failed to open Git LFS pointer file")?;
-    let metadata = file.metadata().map_err(|source| LocalCacheError::Io {
-        context: "failed to inspect Git LFS pointer file",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
-        return Err(LocalCacheError::PointerFileTooLarge {
-            path: path.to_path_buf(),
-            size: metadata.len(),
-            size_cutoff: LFS_POINTER_SIZE_CUTOFF,
-        });
-    }
-
-    let mut contents = Vec::new();
-    file.take(LFS_POINTER_SIZE_CUTOFF)
-        .read_to_end(&mut contents)
-        .map_err(|source| LocalCacheError::Io {
-            context: "failed to read Git LFS pointer file",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
-    if size >= LFS_POINTER_SIZE_CUTOFF {
-        return Err(LocalCacheError::PointerFileTooLarge {
-            path: path.to_path_buf(),
-            size,
-            size_cutoff: LFS_POINTER_SIZE_CUTOFF,
-        });
-    }
+    let contents = match read_bounded_pointer_bytes(
+        file,
+        path,
+        "failed to inspect Git LFS pointer file",
+        "failed to read Git LFS pointer file",
+    )? {
+        BoundedPointerBytes::Contents(contents) => contents,
+        BoundedPointerBytes::NotCandidate { size } => {
+            return Err(LocalCacheError::PointerFileTooLarge {
+                path: path.to_path_buf(),
+                size,
+                size_cutoff: LFS_POINTER_SIZE_CUTOFF,
+            });
+        }
+    };
 
     let contents = std::str::from_utf8(&contents).map_err(|source| {
         LocalCacheError::PointerFileInvalidUtf8 {
@@ -1899,26 +1911,15 @@ fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
 fn read_existing_lfs_pointer_file(path: &Path) -> LocalCacheResult<Option<LfsPointer>> {
     let file =
         open_worktree_file_without_following_symlinks(path, "failed to open dehydration target")?;
-    let metadata = file.metadata().map_err(|source| LocalCacheError::Io {
-        context: "failed to inspect dehydration target",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
+    let BoundedPointerBytes::Contents(contents) = read_bounded_pointer_bytes(
+        file,
+        path,
+        "failed to inspect dehydration target",
+        "failed to read dehydration target",
+    )?
+    else {
         return Ok(None);
-    }
-
-    let mut contents = Vec::new();
-    file.take(LFS_POINTER_SIZE_CUTOFF)
-        .read_to_end(&mut contents)
-        .map_err(|source| LocalCacheError::Io {
-            context: "failed to read dehydration target",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) >= LFS_POINTER_SIZE_CUTOFF {
-        return Ok(None);
-    }
+    };
 
     let Ok(contents) = std::str::from_utf8(&contents) else {
         return Ok(None);
@@ -2163,58 +2164,21 @@ fn copy_cache_object_to_temporary_file(
             path: temp_path.clone(),
             source,
         })?;
-    let mut hasher = Sha256::new();
-    let mut total_size = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|source| LocalCacheError::Io {
-                context: "failed to read verified cache object",
-                path: cache_path.to_path_buf(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-
-        destination
-            .write_all(&buffer[..read])
-            .map_err(|source| LocalCacheError::Io {
-                context: "failed to write temporary materialized object",
-                path: temp_path.clone(),
-                source,
-            })?;
-        hasher.update(&buffer[..read]);
-        total_size = total_size
-            .checked_add(read as u64)
-            .ok_or_else(|| LocalCacheError::Io {
-                context: "object is too large to measure",
-                path: cache_path.to_path_buf(),
-                source: io::Error::new(io::ErrorKind::InvalidData, "object size overflow"),
-            })?;
-    }
+    let actual =
+        hash_and_optionally_copy(&mut source, Some(&mut *destination)).map_err(|error| {
+            object_stream_error(
+                error,
+                cache_path,
+                "failed to read verified cache object",
+                Some((&temp_path, "failed to write temporary materialized object")),
+            )
+        })?;
     destination.flush().map_err(|source| LocalCacheError::Io {
         context: "failed to flush temporary materialized object",
         path: temp_path,
         source,
     })?;
-
-    let actual_oid =
-        LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid");
-    let actual_size = LfsObjectSize::new(total_size);
-    if actual_oid != expected.oid || actual_size != expected.size {
-        return Err(LocalCacheError::IntegrityMismatch {
-            path: cache_path.to_path_buf(),
-            expected_oid: expected.oid.clone(),
-            expected_size: expected.size,
-            actual_oid,
-            actual_size,
-        });
-    }
-
-    Ok(())
+    ensure_object_identity(cache_path, expected, actual)
 }
 
 fn publish_materialized_file(
@@ -2559,16 +2523,28 @@ fn git_lfs_object_path(git_lfs_objects_dir: &Path, oid: &LfsOid) -> PathBuf {
 }
 
 fn cache_object_path_exists(path: &Path) -> LocalCacheResult<bool> {
+    regular_file_exists(
+        path,
+        "failed to inspect cache object",
+        "cache object path is not a file",
+    )
+}
+
+fn regular_file_exists(
+    path: &Path,
+    inspect_context: &'static str,
+    wrong_type_context: &'static str,
+) -> LocalCacheResult<bool> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(true),
         Ok(_) => Err(LocalCacheError::Io {
-            context: "cache object path is not a file",
+            context: wrong_type_context,
             path: path.to_path_buf(),
             source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
         }),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(LocalCacheError::Io {
-            context: "failed to inspect cache object",
+            context: inspect_context,
             path: path.to_path_buf(),
             source,
         }),
@@ -2576,48 +2552,34 @@ fn cache_object_path_exists(path: &Path) -> LocalCacheResult<bool> {
 }
 
 fn ensure_cache_object_file(path: &Path, object: &LfsObject) -> LocalCacheResult<()> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(()),
-        Ok(_) => Err(LocalCacheError::Io {
-            context: "cache object path is not a file",
+    if regular_file_exists(
+        path,
+        "failed to inspect cache object",
+        "cache object path is not a file",
+    )? {
+        Ok(())
+    } else {
+        Err(LocalCacheError::MissingCacheObject {
+            oid: object.oid.clone(),
+            size: object.size,
             path: path.to_path_buf(),
-            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
-        }),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            Err(LocalCacheError::MissingCacheObject {
-                oid: object.oid.clone(),
-                size: object.size,
-                path: path.to_path_buf(),
-            })
-        }
-        Err(source) => Err(LocalCacheError::Io {
-            context: "failed to inspect cache object",
-            path: path.to_path_buf(),
-            source,
-        }),
+        })
     }
 }
 
 fn ensure_source_object_file(path: &Path, object: &LfsObject) -> LocalCacheResult<()> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(()),
-        Ok(_) => Err(LocalCacheError::Io {
-            context: "Git LFS source object path is not a file",
+    if regular_file_exists(
+        path,
+        "failed to inspect Git LFS source object",
+        "Git LFS source object path is not a file",
+    )? {
+        Ok(())
+    } else {
+        Err(LocalCacheError::MissingSourceObject {
+            oid: object.oid.clone(),
+            size: object.size,
             path: path.to_path_buf(),
-            source: io::Error::new(io::ErrorKind::InvalidData, "expected a regular file"),
-        }),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            Err(LocalCacheError::MissingSourceObject {
-                oid: object.oid.clone(),
-                size: object.size,
-                path: path.to_path_buf(),
-            })
-        }
-        Err(source) => Err(LocalCacheError::Io {
-            context: "failed to inspect Git LFS source object",
-            path: path.to_path_buf(),
-            source,
-        }),
+        })
     }
 }
 
@@ -2625,22 +2587,8 @@ fn verify_file_object(
     path: &Path,
     expected: &LfsObject,
 ) -> LocalCacheResult<VerifiedLocalCacheObject> {
-    let (actual_oid, actual_size) = hash_file(path)?;
-
-    if actual_oid != expected.oid || actual_size != expected.size {
-        return Err(LocalCacheError::IntegrityMismatch {
-            path: path.to_path_buf(),
-            expected_oid: expected.oid.clone(),
-            expected_size: expected.size,
-            actual_oid,
-            actual_size,
-        });
-    }
-
-    Ok(VerifiedLocalCacheObject {
-        object: expected.clone(),
-        path: path.to_path_buf(),
-    })
+    let actual = hash_file(path)?;
+    verified_object(path, expected, actual)
 }
 
 fn verify_worktree_file_object(
@@ -2651,8 +2599,27 @@ fn verify_worktree_file_object(
         path,
         "failed to open worktree object for hashing",
     )?;
-    let (actual_oid, actual_size) = hash_open_file(file, path)?;
+    let actual = hash_open_file(file, path)?;
+    verified_object(path, expected, actual)
+}
 
+fn verified_object(
+    path: &Path,
+    expected: &LfsObject,
+    (actual_oid, actual_size): (LfsOid, LfsObjectSize),
+) -> LocalCacheResult<VerifiedLocalCacheObject> {
+    ensure_object_identity(path, expected, (actual_oid, actual_size))?;
+    Ok(VerifiedLocalCacheObject {
+        object: expected.clone(),
+        path: path.to_path_buf(),
+    })
+}
+
+fn ensure_object_identity(
+    path: &Path,
+    expected: &LfsObject,
+    (actual_oid, actual_size): (LfsOid, LfsObjectSize),
+) -> LocalCacheResult<()> {
     if actual_oid != expected.oid || actual_size != expected.size {
         return Err(LocalCacheError::IntegrityMismatch {
             path: path.to_path_buf(),
@@ -2663,10 +2630,7 @@ fn verify_worktree_file_object(
         });
     }
 
-    Ok(VerifiedLocalCacheObject {
-        object: expected.clone(),
-        path: path.to_path_buf(),
-    })
+    Ok(())
 }
 
 fn copy_verified_object_to_cache(
@@ -2816,54 +2780,15 @@ fn copy_and_verify_object(
     expected: &LfsObject,
     read_context: &'static str,
 ) -> LocalCacheResult<()> {
-    let mut hasher = Sha256::new();
-    let mut total_size = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|source| LocalCacheError::Io {
-                context: read_context,
-                path: source_path.to_path_buf(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-
-        destination
-            .write_all(&buffer[..read])
-            .map_err(|source| LocalCacheError::Io {
-                context: "failed to write temporary cache object",
-                path: destination_path.to_path_buf(),
-                source,
-            })?;
-        hasher.update(&buffer[..read]);
-        total_size = total_size
-            .checked_add(read as u64)
-            .ok_or_else(|| LocalCacheError::Io {
-                context: "object is too large to measure",
-                path: source_path.to_path_buf(),
-                source: io::Error::new(io::ErrorKind::InvalidData, "object size overflow"),
-            })?;
-    }
-
-    let actual_oid =
-        LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid");
-    let actual_size = LfsObjectSize::new(total_size);
-
-    if actual_oid != expected.oid || actual_size != expected.size {
-        return Err(LocalCacheError::IntegrityMismatch {
-            path: source_path.to_path_buf(),
-            expected_oid: expected.oid.clone(),
-            expected_size: expected.size,
-            actual_oid,
-            actual_size,
-        });
-    }
-
-    Ok(())
+    let actual = hash_and_optionally_copy(source, Some(destination)).map_err(|error| {
+        object_stream_error(
+            error,
+            source_path,
+            read_context,
+            Some((destination_path, "failed to write temporary cache object")),
+        )
+    })?;
+    ensure_object_identity(source_path, expected, actual)
 }
 
 fn hash_file(path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
@@ -2877,35 +2802,71 @@ fn hash_file(path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
 }
 
 fn hash_open_file(mut file: File, path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
+    hash_and_optionally_copy(&mut file, None).map_err(|error| {
+        object_stream_error(error, path, "failed to read object for hashing", None)
+    })
+}
+
+enum ObjectStreamError {
+    Read(io::Error),
+    Write(io::Error),
+    SizeOverflow,
+}
+
+fn hash_and_optionally_copy(
+    source: &mut impl Read,
+    mut destination: Option<&mut dyn Write>,
+) -> Result<(LfsOid, LfsObjectSize), ObjectStreamError> {
     let mut hasher = Sha256::new();
     let mut total_size = 0u64;
     let mut buffer = [0u8; 64 * 1024];
 
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| LocalCacheError::Io {
-                context: "failed to read object for hashing",
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let read = source.read(&mut buffer).map_err(ObjectStreamError::Read)?;
         if read == 0 {
             break;
+        }
+        if let Some(destination) = destination.as_deref_mut() {
+            destination
+                .write_all(&buffer[..read])
+                .map_err(ObjectStreamError::Write)?;
         }
         hasher.update(&buffer[..read]);
         total_size = total_size
             .checked_add(read as u64)
-            .ok_or_else(|| LocalCacheError::Io {
-                context: "object is too large to measure",
-                path: path.to_path_buf(),
-                source: io::Error::new(io::ErrorKind::InvalidData, "object size overflow"),
-            })?;
+            .ok_or(ObjectStreamError::SizeOverflow)?;
     }
 
     Ok((
         LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid"),
         LfsObjectSize::new(total_size),
     ))
+}
+
+fn object_stream_error(
+    error: ObjectStreamError,
+    source_path: &Path,
+    read_context: &'static str,
+    destination: Option<(&Path, &'static str)>,
+) -> LocalCacheError {
+    let (context, path, source) = match error {
+        ObjectStreamError::Read(source) => (read_context, source_path, source),
+        ObjectStreamError::Write(source) => {
+            let (path, context) =
+                destination.expect("copy destinations provide write error context");
+            (context, path, source)
+        }
+        ObjectStreamError::SizeOverflow => (
+            "object is too large to measure",
+            source_path,
+            io::Error::new(io::ErrorKind::InvalidData, "object size overflow"),
+        ),
+    };
+    LocalCacheError::Io {
+        context,
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 fn worktree_file_metadata_without_following_symlinks(

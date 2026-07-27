@@ -6,18 +6,19 @@
 
 use std::{
     fmt,
-    io::{Read, Write},
+    io::Write,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use url::Url;
 
 use crate::{
     CliError, CliResult, LfsSessionToken, SanitizedMessage,
+    child_process::{
+        ChildProcessError, ChildProcessOptions, PipeCapture, configure_process_tree, wait_for_child,
+    },
     http_transport::uses_protected_http_transport,
 };
 
@@ -30,9 +31,6 @@ const MAX_COMMAND_STDERR_LEN: usize = 4096;
 const MAX_RETAINED_COMMAND_STDERR_LEN: usize = MAX_COMMAND_STDERR_LEN + MAX_CREDENTIAL_FIELD_LEN;
 const CREDENTIAL_LOOKUP_STDERR_SUPPRESSED: &str = "credential helper stderr suppressed";
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const STDERR_DRAIN_AFTER_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
-const STDERR_DRAIN_AFTER_KILL_TIMEOUT: Duration = Duration::from_millis(100);
-const PIPE_EVENTS_PER_DRAIN: usize = 64;
 
 /// Credential-helper payload for approving one configured LFS URL.
 #[derive(Clone, Eq, PartialEq)]
@@ -1085,45 +1083,8 @@ fn wait_for_git_command_timeout(
     token: &str,
     timeout: Duration,
 ) -> CliResult<(ExitStatus, Vec<u8>)> {
-    let deadline = Instant::now() + timeout;
-    let mut stderr = Vec::new();
-    let mut stderr_reader = child.stderr.take().map(PipeReader::new);
-
-    loop {
-        drain_available_stderr(&mut stderr_reader, &mut stderr, command_name)?;
-
-        if let Some(status) = child.try_wait().map_err(|source| CliError::Io {
-            context: format!("failed to wait for {command_name}"),
-            source,
-        })? {
-            finish_stderr_reader_after_child_exit(
-                child,
-                &mut stderr_reader,
-                &mut stderr,
-                command_name,
-            )?;
-            return Ok((status, stderr));
-        }
-
-        if Instant::now() >= deadline {
-            stop_timed_out_child(child, command_name)?;
-            let _ = child.wait();
-            drain_stderr_until(
-                &mut stderr_reader,
-                &mut stderr,
-                command_name,
-                STDERR_DRAIN_AFTER_KILL_TIMEOUT,
-            )?;
-            join_pipe_reader(&mut stderr_reader, command_name)?;
-            return Err(CliError::ExternalCommand {
-                command: command_name.to_owned(),
-                status: format!("timed out after {} seconds", timeout.as_secs()),
-                stderr: sanitize_command_stderr(&stderr, token),
-            });
-        }
-
-        thread::sleep(Duration::from_millis(10));
-    }
+    let output = wait_for_git_command_capture(child, command_name, token, timeout, None)?;
+    Ok((output.status, output.stderr))
 }
 
 fn wait_for_git_command_output(
@@ -1132,426 +1093,77 @@ fn wait_for_git_command_output(
     stderr_secret: &str,
     timeout: Duration,
 ) -> CliResult<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    let deadline = Instant::now() + timeout;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut stdout_reader = child.stdout.take().map(PipeReader::new);
-    let mut stderr_reader = child.stderr.take().map(PipeReader::new);
-
-    loop {
-        drain_available_pipe(
-            &mut stdout_reader,
-            &mut stdout,
-            command_name,
-            retain_stdout_data,
-        )?;
-        drain_available_pipe(
-            &mut stderr_reader,
-            &mut stderr,
-            command_name,
-            retain_stderr_data,
-        )?;
-
-        if let Some(status) = child.try_wait().map_err(|source| CliError::Io {
-            context: format!("failed to wait for {command_name}"),
-            source,
-        })? {
-            finish_output_readers_after_child_exit(
-                child,
-                &mut stdout_reader,
-                &mut stdout,
-                &mut stderr_reader,
-                &mut stderr,
-                command_name,
-            )?;
-            return Ok((status, stdout, stderr));
-        }
-
-        if Instant::now() >= deadline {
-            stop_timed_out_child(child, command_name)?;
-            let _ = child.wait();
-            drain_pipe_until(
-                &mut stdout_reader,
-                &mut stdout,
-                command_name,
-                retain_stdout_data,
-                STDERR_DRAIN_AFTER_KILL_TIMEOUT,
-            )?;
-            drain_pipe_until(
-                &mut stderr_reader,
-                &mut stderr,
-                command_name,
-                retain_stderr_data,
-                STDERR_DRAIN_AFTER_KILL_TIMEOUT,
-            )?;
-            join_pipe_reader(&mut stdout_reader, command_name)?;
-            join_pipe_reader(&mut stderr_reader, command_name)?;
-            return Err(CliError::ExternalCommand {
-                command: command_name.to_owned(),
-                status: format!("timed out after {} seconds", timeout.as_secs()),
-                stderr: sanitize_command_stderr(&stderr, stderr_secret),
-            });
-        }
-
-        thread::sleep(Duration::from_millis(10));
-    }
+    let output = wait_for_git_command_capture(
+        child,
+        command_name,
+        stderr_secret,
+        timeout,
+        Some(MAX_CREDENTIAL_OUTPUT_LEN + 1),
+    )?;
+    Ok((output.status, output.stdout, output.stderr))
 }
 
-fn git_command(git_program: &Path) -> Command {
-    let command = Command::new(git_program);
-    #[cfg(unix)]
-    let command = {
-        use std::os::unix::process::CommandExt;
-
-        // Git may invoke credential helpers that fork. A dedicated process
-        // group gives the command boundary deterministic ownership of those
-        // descendants even after the direct Git child has exited.
-        let mut command = command;
-        command.process_group(0);
-        command
-    };
-    command
-}
-
-fn stop_timed_out_child(child: &mut Child, command_name: &str) -> CliResult<()> {
-    stop_child_process_tree(child);
-
-    if child
-        .try_wait()
-        .map_err(|source| CliError::Io {
-            context: format!("failed to wait for timed-out {command_name}"),
-            source,
-        })?
-        .is_none()
-    {
-        child.kill().map_err(|source| CliError::Io {
-            context: format!("failed to stop timed-out {command_name}"),
-            source,
-        })?;
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn stop_child_process_tree(child: &Child) {
-    signal_process_group("TERM", child.id());
-    thread::sleep(Duration::from_millis(50));
-    signal_process_group("KILL", child.id());
-}
-
-#[cfg(unix)]
-fn signal_process_group(signal: &str, process_group_id: u32) {
-    let _ = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(format!("-{process_group_id}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(windows)]
-fn stop_child_process_tree(child: &Child) {
-    let _ = Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn stop_child_process_tree(_child: &Child) {}
-
-struct PipeReader {
-    receiver: Receiver<PipeEvent>,
-    reader_thread: Option<thread::JoinHandle<()>>,
-    closed: bool,
-}
-
-impl PipeReader {
-    fn new(mut pipe: impl Read + Send + 'static) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(PIPE_EVENTS_PER_DRAIN);
-        let reader_thread = thread::spawn(move || {
-            let mut buffer = [0; 8192];
-            loop {
-                match pipe.read(&mut buffer) {
-                    Ok(0) => {
-                        let _ = sender.send(PipeEvent::Closed);
-                        break;
-                    }
-                    Ok(count) => {
-                        if sender
-                            .send(PipeEvent::Data(buffer[..count].to_vec()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(source) => {
-                        let _ = sender.send(PipeEvent::Error(source));
-                        break;
-                    }
-                }
-            }
-        });
-
-        Self {
-            receiver,
-            reader_thread: Some(reader_thread),
-            closed: false,
-        }
-    }
-
-    fn join(&mut self, command_name: &str) -> CliResult<()> {
-        let Some(reader_thread) = self.reader_thread.take() else {
-            return Ok(());
-        };
-        reader_thread.join().map_err(|_| CliError::Io {
-            context: format!("pipe reader thread panicked for {command_name}"),
-            source: std::io::Error::other("pipe reader thread panicked"),
-        })
-    }
-}
-
-enum PipeEvent {
-    Data(Vec<u8>),
-    Error(std::io::Error),
-    Closed,
-}
-
-fn finish_stderr_reader_after_child_exit(
-    child: &Child,
-    reader: &mut Option<PipeReader>,
-    stderr: &mut Vec<u8>,
+fn wait_for_git_command_capture(
+    child: &mut Child,
     command_name: &str,
-) -> CliResult<()> {
-    drain_stderr_until(
-        reader,
-        stderr,
+    stderr_secret: &str,
+    timeout: Duration,
+    stdout_limit: Option<usize>,
+) -> CliResult<crate::child_process::ChildProcessOutput> {
+    wait_for_child(
+        child,
         command_name,
-        STDERR_DRAIN_AFTER_KILL_TIMEOUT,
-    )?;
-    if pipe_reader_is_open(reader) {
-        // A pipe that remains open after the direct child exits is owned by a
-        // descendant. Stop the command's remaining process tree before waiting
-        // for EOF so no blocked reader thread is detached on return.
-        stop_child_process_tree(child);
-    }
-    drain_stderr_until(
-        reader,
-        stderr,
-        command_name,
-        STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
-    )?;
-    join_pipe_reader(reader, command_name)
+        ChildProcessOptions {
+            timeout: Some(timeout),
+            stdout: PipeCapture::Truncate {
+                limit: stdout_limit.unwrap_or(0),
+            },
+            stderr: PipeCapture::Truncate {
+                limit: MAX_RETAINED_COMMAND_STDERR_LEN,
+            },
+            inherited_pipe_is_error: false,
+        },
+    )
+    .map_err(|error| credential_child_process_error(error, command_name, stderr_secret))
 }
 
-fn finish_output_readers_after_child_exit(
-    child: &Child,
-    stdout_reader: &mut Option<PipeReader>,
-    stdout: &mut Vec<u8>,
-    stderr_reader: &mut Option<PipeReader>,
-    stderr: &mut Vec<u8>,
+fn credential_child_process_error(
+    error: ChildProcessError,
     command_name: &str,
-) -> CliResult<()> {
-    drain_pipe_until(
-        stdout_reader,
-        stdout,
-        command_name,
-        retain_stdout_data,
-        STDERR_DRAIN_AFTER_KILL_TIMEOUT,
-    )?;
-    drain_pipe_until(
-        stderr_reader,
-        stderr,
-        command_name,
-        retain_stderr_data,
-        STDERR_DRAIN_AFTER_KILL_TIMEOUT,
-    )?;
-    if pipe_reader_is_open(stdout_reader) || pipe_reader_is_open(stderr_reader) {
-        stop_child_process_tree(child);
-    }
-    drain_pipe_until(
-        stdout_reader,
-        stdout,
-        command_name,
-        retain_stdout_data,
-        STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
-    )?;
-    drain_pipe_until(
-        stderr_reader,
-        stderr,
-        command_name,
-        retain_stderr_data,
-        STDERR_DRAIN_AFTER_EXIT_TIMEOUT,
-    )?;
-    join_pipe_reader(stdout_reader, command_name)?;
-    join_pipe_reader(stderr_reader, command_name)
-}
-
-fn pipe_reader_is_open(reader: &Option<PipeReader>) -> bool {
-    reader.as_ref().is_some_and(|reader| !reader.closed)
-}
-
-fn join_pipe_reader(reader: &mut Option<PipeReader>, command_name: &str) -> CliResult<()> {
-    let Some(reader) = reader else {
-        return Ok(());
-    };
-    if !reader.closed {
-        return Err(CliError::Io {
+    stderr_secret: &str,
+) -> CliError {
+    match error {
+        ChildProcessError::Io { context, source } => CliError::Io { context, source },
+        ChildProcessError::TimedOut {
+            timeout, stderr, ..
+        } => CliError::ExternalCommand {
+            command: command_name.to_owned(),
+            status: format!("timed out after {} seconds", timeout.as_secs()),
+            stderr: sanitize_command_stderr(&stderr, stderr_secret),
+        },
+        ChildProcessError::OutputLimit { .. } => CliError::Io {
+            context: format!("credential output policy failed for {command_name}"),
+            source: std::io::Error::other("truncating credential pipes cannot exceed a hard limit"),
+        },
+        ChildProcessError::InheritedPipe => CliError::Io {
             context: format!("timed out draining pipe output from {command_name}"),
             source: std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "pipe remained open after process-tree cleanup",
             ),
-        });
+        },
     }
-    reader.join(command_name)
 }
 
-fn drain_available_stderr(
-    reader: &mut Option<PipeReader>,
-    stderr: &mut Vec<u8>,
-    command_name: &str,
-) -> CliResult<()> {
-    let Some(reader) = reader else {
-        return Ok(());
-    };
-
-    drain_available_stderr_reader(reader, stderr, command_name)
+fn git_command(git_program: &Path) -> Command {
+    let mut command = Command::new(git_program);
+    // Git may invoke credential helpers that fork. A dedicated process group
+    // gives the command boundary deterministic ownership of those descendants.
+    configure_process_tree(&mut command);
+    command
 }
 
-fn drain_available_stderr_reader(
-    reader: &mut PipeReader,
-    stderr: &mut Vec<u8>,
-    command_name: &str,
-) -> CliResult<()> {
-    drain_available_pipe_reader(reader, stderr, command_name, retain_stderr_data)
-}
-
-fn drain_available_pipe(
-    reader: &mut Option<PipeReader>,
-    output: &mut Vec<u8>,
-    command_name: &str,
-    retain: fn(&mut Vec<u8>, &[u8]),
-) -> CliResult<()> {
-    let Some(reader) = reader else {
-        return Ok(());
-    };
-
-    drain_available_pipe_reader(reader, output, command_name, retain)
-}
-
-fn drain_available_pipe_reader(
-    reader: &mut PipeReader,
-    output: &mut Vec<u8>,
-    command_name: &str,
-    retain: fn(&mut Vec<u8>, &[u8]),
-) -> CliResult<()> {
-    for _ in 0..PIPE_EVENTS_PER_DRAIN {
-        if reader.closed {
-            break;
-        }
-
-        match reader.receiver.try_recv() {
-            Ok(event) => handle_pipe_event(event, reader, output, command_name, retain)?,
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                reader.closed = true;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn drain_stderr_until(
-    reader: &mut Option<PipeReader>,
-    stderr: &mut Vec<u8>,
-    command_name: &str,
-    timeout: Duration,
-) -> CliResult<()> {
-    let Some(reader) = reader else {
-        return Ok(());
-    };
-
-    let deadline = Instant::now() + timeout;
-    while !reader.closed {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match reader.receiver.recv_timeout(remaining) {
-            Ok(event) => {
-                handle_pipe_event(event, reader, stderr, command_name, retain_stderr_data)?
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                reader.closed = true;
-            }
-        }
-    }
-
-    drain_available_stderr_reader(reader, stderr, command_name)
-}
-
-fn drain_pipe_until(
-    reader: &mut Option<PipeReader>,
-    output: &mut Vec<u8>,
-    command_name: &str,
-    retain: fn(&mut Vec<u8>, &[u8]),
-    timeout: Duration,
-) -> CliResult<()> {
-    let Some(reader) = reader else {
-        return Ok(());
-    };
-
-    let deadline = Instant::now() + timeout;
-    while !reader.closed {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match reader.receiver.recv_timeout(remaining) {
-            Ok(event) => handle_pipe_event(event, reader, output, command_name, retain)?,
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                reader.closed = true;
-            }
-        }
-    }
-
-    drain_available_pipe_reader(reader, output, command_name, retain)
-}
-
-fn handle_pipe_event(
-    event: PipeEvent,
-    reader: &mut PipeReader,
-    output: &mut Vec<u8>,
-    command_name: &str,
-    retain: fn(&mut Vec<u8>, &[u8]),
-) -> CliResult<()> {
-    match event {
-        PipeEvent::Data(data) => retain(output, &data),
-        PipeEvent::Closed => {
-            reader.closed = true;
-        }
-        PipeEvent::Error(source) => {
-            reader.closed = true;
-            return Err(CliError::Io {
-                context: format!("failed to read pipe output from {command_name}"),
-                source,
-            });
-        }
-    }
-
-    Ok(())
-}
-
+#[cfg(test)]
 fn retain_stdout_data(stdout: &mut Vec<u8>, data: &[u8]) {
     let retained = stdout.len();
     if retained > MAX_CREDENTIAL_OUTPUT_LEN {
@@ -1562,6 +1174,7 @@ fn retain_stdout_data(stdout: &mut Vec<u8>, data: &[u8]) {
     stdout.extend_from_slice(&data[..remaining.min(data.len())]);
 }
 
+#[cfg(test)]
 fn retain_stderr_data(stderr: &mut Vec<u8>, data: &[u8]) {
     let retained = stderr.len();
     if retained >= MAX_RETAINED_COMMAND_STDERR_LEN {

@@ -5,8 +5,6 @@
 //! tracing initialization, while parser and dispatch helpers stay side-effect
 //! free for focused tests.
 
-#[cfg(unix)]
-use std::os::unix::ffi::OsStringExt;
 use std::{
     collections::BTreeSet,
     ffi::OsString,
@@ -14,8 +12,8 @@ use std::{
     future::Future,
     io::{self, BufRead, IsTerminal, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
-    path::{Component, Path, PathBuf},
-    process::{Child, Command as ProcessCommand, ExitStatus, Stdio},
+    path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -25,6 +23,11 @@ use clap::{Args, Parser, Subcommand};
 use reqwest::{Client, StatusCode as HttpStatusCode, redirect::Policy};
 use url::Url;
 
+use crate::child_process::{
+    ChildProcessError, ChildProcessOptions, ChildProcessOutput, PipeCapture,
+    configure_process_tree, wait_for_child,
+};
+use crate::git_output::{GitPathOutputError, parse_lfs_filter_attribute_paths};
 use crate::google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource};
 use crate::{CliError, CliResult, SanitizedMessage, git::redacted_url_for_display};
 use crate::{
@@ -52,8 +55,6 @@ const SESSION_REVOCATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MIGRATION_TARGET_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PULL_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_PULL_FETCH_OUTPUT_BYTES: usize = 256 * 1024;
-const CHILD_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
-const CHILD_OUTPUT_DRAIN_AFTER_KILL: Duration = Duration::from_secs(1);
 const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
 const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
@@ -103,7 +104,7 @@ enum Command {
     Migrate(MigrateCommand),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct ServeCommand {
     /// Host or interface address to bind.
     #[arg(long)]
@@ -114,7 +115,7 @@ struct ServeCommand {
     port: Option<u16>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct LoginCommand {
     /// Base URL of the running LFS Cloud server.
     #[arg(long, value_name = "URL")]
@@ -125,7 +126,7 @@ struct LoginCommand {
     allow_insecure_http: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct LogoutCommand {
     /// Base URL of the running LFS Cloud server.
     #[arg(long, value_name = "URL")]
@@ -136,7 +137,7 @@ struct LogoutCommand {
     allow_insecure_http: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct InitCommand {
     /// Base URL of the running LFS Cloud server.
     #[arg(long, value_name = "URL")]
@@ -151,7 +152,7 @@ struct InitCommand {
     local: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct StatusCommand {
     /// Base URL of the running LFS Cloud server.
     #[arg(long, value_name = "URL")]
@@ -166,14 +167,14 @@ struct StatusCommand {
     cache_root: Option<PathBuf>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct PullCommand {
     /// Local cache root to use instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
     cache_root: Option<PathBuf>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct HydrateCommand {
     /// Local cache root to use instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
@@ -184,7 +185,7 @@ struct HydrateCommand {
     paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct DehydrateCommand {
     /// Local cache root to use instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
@@ -195,7 +196,7 @@ struct DehydrateCommand {
     paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct GcCommand {
     /// Local cache root to clean instead of ~/.lfscloud.
     #[arg(long, value_name = "PATH")]
@@ -210,7 +211,7 @@ struct GcCommand {
     prune_unavailable_worktrees: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Eq, PartialEq)]
 struct MigrateCommand {
     /// Base URL of the running LFS Cloud server.
     #[arg(long, value_name = "URL")]
@@ -2555,25 +2556,6 @@ fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
     }
 }
 
-#[derive(Debug)]
-struct BoundedChildOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct BoundedPipeOutput {
-    bytes: Vec<u8>,
-    exceeded_limit: bool,
-}
-
-#[derive(Debug)]
-enum BoundedPipeEvent {
-    Stdout(io::Result<BoundedPipeOutput>),
-    Stderr(io::Result<BoundedPipeOutput>),
-}
-
 /// Runs a child while bounding its lifetime and retained output.
 ///
 /// Both output streams are drained on separate threads so a chatty stream
@@ -2586,254 +2568,59 @@ fn run_bounded_child_command(
     command_name: &str,
     timeout: Duration,
     max_output_bytes: usize,
-) -> CliResult<BoundedChildOutput> {
+) -> CliResult<ChildProcessOutput> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_child_process_tree(command);
+    configure_process_tree(command);
 
     let mut child = command.spawn().map_err(|source| CliError::Io {
         context: format!("failed to start {command_name}"),
         source,
     })?;
-    let stdout = child.stdout.take().ok_or_else(|| CliError::Io {
-        context: format!("failed to capture stdout for {command_name}"),
-        source: io::Error::other("child stdout was not piped"),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| CliError::Io {
-        context: format!("failed to capture stderr for {command_name}"),
-        source: io::Error::other("child stderr was not piped"),
-    })?;
+    wait_for_child(
+        &mut child,
+        command_name,
+        ChildProcessOptions {
+            timeout: Some(timeout),
+            stdout: PipeCapture::HardLimit {
+                limit: max_output_bytes,
+            },
+            stderr: PipeCapture::HardLimit {
+                limit: max_output_bytes,
+            },
+            inherited_pipe_is_error: false,
+        },
+    )
+    .map_err(|error| child_process_cli_error(error, command_name))
+}
 
-    let (sender, receiver) = mpsc::channel();
-    let stdout_sender = sender.clone();
-    let stdout_reader = std::thread::spawn(move || {
-        let result = read_pipe_with_hard_limit(stdout, max_output_bytes);
-        let _ = stdout_sender.send(BoundedPipeEvent::Stdout(result));
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let result = read_pipe_with_hard_limit(stderr, max_output_bytes);
-        let _ = sender.send(BoundedPipeEvent::Stderr(result));
-    });
-
-    let deadline = Instant::now() + timeout;
-    let mut status = None;
-    let mut drain_deadline = None;
-    let mut stdout = None;
-    let mut stderr = None;
-
-    loop {
-        while let Ok(event) = receiver.try_recv() {
-            let (stream_name, result, destination) = match event {
-                BoundedPipeEvent::Stdout(result) => ("stdout", result, &mut stdout),
-                BoundedPipeEvent::Stderr(result) => ("stderr", result, &mut stderr),
-            };
-            let output = match result {
-                Ok(output) => output,
-                Err(source) => {
-                    terminate_child_process_tree(&mut child, command_name)?;
-                    return Err(CliError::Io {
-                        context: format!("failed to read {stream_name} from {command_name}"),
-                        source,
-                    });
-                }
-            };
-            if output.exceeded_limit {
-                terminate_child_process_tree(&mut child, command_name)?;
-                return Err(CliError::ExternalCommandOutput {
-                    command: command_name.to_owned(),
-                    message: SanitizedMessage::new(format!(
-                        "{stream_name} exceeded the {max_output_bytes}-byte limit"
-                    )),
-                });
-            }
-            *destination = Some(output.bytes);
-        }
-
-        if status.is_none() {
-            status = child.try_wait().map_err(|source| CliError::Io {
-                context: format!("failed to wait for {command_name}"),
-                source,
-            })?;
-            if status.is_some() {
-                drain_deadline = Some(Instant::now() + CHILD_OUTPUT_DRAIN_GRACE);
-            }
-        }
-
-        if let Some(status) = status.filter(|_| stdout.is_some() && stderr.is_some()) {
-            let stdout = stdout.take().expect("stdout was checked above");
-            let stderr = stderr.take().expect("stderr was checked above");
-            stdout_reader.join().map_err(|_| CliError::Io {
-                context: format!("stdout reader thread panicked for {command_name}"),
-                source: io::Error::other("stdout reader thread panicked"),
-            })?;
-            stderr_reader.join().map_err(|_| CliError::Io {
-                context: format!("stderr reader thread panicked for {command_name}"),
-                source: io::Error::other("stderr reader thread panicked"),
-            })?;
-            return Ok(BoundedChildOutput {
-                status,
-                stdout,
-                stderr,
-            });
-        }
-
-        if status.is_none() && Instant::now() >= deadline {
-            terminate_child_process_tree(&mut child, command_name)?;
-            collect_pipe_events_after_kill(
-                &receiver,
-                &mut stdout,
-                &mut stderr,
-                CHILD_OUTPUT_DRAIN_AFTER_KILL,
-            );
-            return Err(CliError::ExternalCommand {
-                command: command_name.to_owned(),
-                status: format!("timed out after {} seconds", timeout.as_secs_f64()),
-                stderr: sanitized_external_failure_output(
-                    stderr.as_deref().unwrap_or_default(),
-                    stdout.as_deref().unwrap_or_default(),
-                ),
-            });
-        }
-
-        if status.is_some_and(|_| drain_deadline.is_some_and(|deadline| Instant::now() >= deadline))
-        {
-            // A descendant inherited one of the pipes after the direct child
-            // exited. Terminate the remaining process group before waiting for
-            // EOF so this command boundary cannot hang on the descendant.
-            stop_child_process_tree(&child);
-            collect_pipe_events_after_kill(
-                &receiver,
-                &mut stdout,
-                &mut stderr,
-                CHILD_OUTPUT_DRAIN_AFTER_KILL,
-            );
-            if stdout.is_none() || stderr.is_none() {
-                return Err(CliError::Io {
-                    context: format!("timed out draining output from {command_name}"),
-                    source: io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "child output pipes remained open after process exit",
-                    ),
-                });
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(10));
+fn child_process_cli_error(error: ChildProcessError, command_name: &str) -> CliError {
+    match error {
+        ChildProcessError::Io { context, source } => CliError::Io { context, source },
+        ChildProcessError::TimedOut {
+            timeout,
+            stdout,
+            stderr,
+        } => CliError::ExternalCommand {
+            command: command_name.to_owned(),
+            status: format!("timed out after {} seconds", timeout.as_secs_f64()),
+            stderr: sanitized_external_failure_output(&stderr, &stdout),
+        },
+        ChildProcessError::OutputLimit { stream, limit } => CliError::ExternalCommandOutput {
+            command: command_name.to_owned(),
+            message: SanitizedMessage::new(format!("{stream} exceeded the {limit}-byte limit")),
+        },
+        ChildProcessError::InheritedPipe => CliError::Io {
+            context: format!("timed out draining output from {command_name}"),
+            source: io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child output pipes remained open after process exit",
+            ),
+        },
     }
 }
-
-fn read_pipe_with_hard_limit(
-    mut pipe: impl Read,
-    max_output_bytes: usize,
-) -> io::Result<BoundedPipeOutput> {
-    let mut bytes = Vec::with_capacity(max_output_bytes.min(8192));
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = pipe.read(&mut buffer)?;
-        if count == 0 {
-            return Ok(BoundedPipeOutput {
-                bytes,
-                exceeded_limit: false,
-            });
-        }
-
-        let remaining = max_output_bytes.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&buffer[..count.min(remaining)]);
-        if count > remaining {
-            return Ok(BoundedPipeOutput {
-                bytes,
-                exceeded_limit: true,
-            });
-        }
-    }
-}
-
-fn collect_pipe_events_after_kill(
-    receiver: &mpsc::Receiver<BoundedPipeEvent>,
-    stdout: &mut Option<Vec<u8>>,
-    stderr: &mut Option<Vec<u8>>,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    while (stdout.is_none() || stderr.is_none()) && Instant::now() < deadline {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default();
-        let Ok(event) = receiver.recv_timeout(remaining) else {
-            break;
-        };
-        match event {
-            BoundedPipeEvent::Stdout(Ok(output)) => *stdout = Some(output.bytes),
-            BoundedPipeEvent::Stderr(Ok(output)) => *stderr = Some(output.bytes),
-            BoundedPipeEvent::Stdout(Err(_)) | BoundedPipeEvent::Stderr(Err(_)) => {}
-        }
-    }
-}
-
-#[cfg(unix)]
-fn configure_child_process_tree(command: &mut ProcessCommand) {
-    use std::os::unix::process::CommandExt;
-
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_child_process_tree(_command: &mut ProcessCommand) {}
-
-fn terminate_child_process_tree(child: &mut Child, command_name: &str) -> CliResult<()> {
-    stop_child_process_tree(child);
-    if child
-        .try_wait()
-        .map_err(|source| CliError::Io {
-            context: format!("failed to wait for stopped {command_name}"),
-            source,
-        })?
-        .is_none()
-    {
-        child.kill().map_err(|source| CliError::Io {
-            context: format!("failed to stop {command_name}"),
-            source,
-        })?;
-        child.wait().map_err(|source| CliError::Io {
-            context: format!("failed to reap stopped {command_name}"),
-            source,
-        })?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn stop_child_process_tree(child: &Child) {
-    signal_child_process_group("TERM", child.id());
-    std::thread::sleep(Duration::from_millis(50));
-    signal_child_process_group("KILL", child.id());
-}
-
-#[cfg(unix)]
-fn signal_child_process_group(signal: &str, process_group_id: u32) {
-    let _ = ProcessCommand::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(format!("-{process_group_id}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(windows)]
-fn stop_child_process_tree(child: &Child) {
-    let _ = ProcessCommand::new("taskkill")
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn stop_child_process_tree(_child: &Child) {}
 
 #[cfg(test)]
 fn current_checkout_lfs_pointer_files(
@@ -2893,28 +2680,11 @@ fn current_checkout_lfs_tracked_paths(worktree_root: &Path) -> CliResult<Vec<Pat
     }
 
     let output = git_check_attr_filter(worktree_root, &tracked_paths)?;
-    let mut fields = output
-        .stdout
-        .split(|byte| *byte == b'\0')
-        .collect::<Vec<_>>();
-    if fields.last() == Some(&&[][..]) {
-        fields.pop();
-    }
-    let chunks = fields.chunks_exact(3);
-    if !chunks.remainder().is_empty() {
-        return Err(git_check_attr_parse_error());
-    }
-    for chunk in chunks {
-        let [relative_path, attribute, value] = chunk else {
-            unreachable!("chunks_exact yielded a non-triple chunk");
-        };
-        if *attribute != b"filter" || *value != b"lfs" {
-            continue;
-        }
-
-        let relative_path = safe_git_relative_path(relative_path)?;
-        lfs_tracked_paths.push(relative_path);
-    }
+    lfs_tracked_paths.extend(
+        parse_lfs_filter_attribute_paths(&output.stdout).map_err(|error| {
+            cli_git_path_output_error(error, "git check-attr -z --stdin filter")
+        })?,
+    );
 
     Ok(lfs_tracked_paths)
 }
@@ -2970,13 +2740,6 @@ fn git_check_attr_filter(
     Ok(output)
 }
 
-fn git_check_attr_parse_error() -> CliError {
-    CliError::ExternalCommandOutput {
-        command: "git check-attr -z --stdin filter".to_owned(),
-        message: SanitizedMessage::new("git returned malformed attribute output"),
-    }
-}
-
 fn git_lfs_objects_dir(repository: &GitRepository) -> CliResult<PathBuf> {
     let git_common_dir = repository.git_common_dir_path()?;
     let storage_dir = match configured_git_lfs_storage_dir(&repository.worktree_root)? {
@@ -3018,37 +2781,17 @@ fn configured_git_lfs_storage_dir(worktree_root: &Path) -> CliResult<Option<Path
     }
 }
 
-fn safe_git_relative_path(relative_path: &[u8]) -> CliResult<PathBuf> {
-    let path = git_path_bytes_to_path_buf(relative_path, "git check-attr -z --stdin filter")?;
-    let valid = !path.is_absolute()
-        && path.components().next().is_some()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)));
-
-    if valid {
-        Ok(path)
-    } else {
-        Err(CliError::ExternalCommandOutput {
-            command: "git check-attr -z --stdin filter".to_owned(),
-            message: SanitizedMessage::new("git returned a path outside the worktree"),
-        })
+fn cli_git_path_output_error(error: GitPathOutputError, command: &str) -> CliError {
+    let message = match error {
+        GitPathOutputError::MalformedAttributeOutput => "git returned malformed attribute output",
+        #[cfg(not(unix))]
+        GitPathOutputError::NonUtf8Path => "git returned non-UTF-8 path output",
+        GitPathOutputError::PathOutsideWorktree => "git returned a path outside the worktree",
+    };
+    CliError::ExternalCommandOutput {
+        command: command.to_owned(),
+        message: SanitizedMessage::new(message),
     }
-}
-
-#[cfg(unix)]
-fn git_path_bytes_to_path_buf(relative_path: &[u8], _command: &str) -> CliResult<PathBuf> {
-    Ok(PathBuf::from(OsString::from_vec(relative_path.to_owned())))
-}
-
-#[cfg(not(unix))]
-fn git_path_bytes_to_path_buf(relative_path: &[u8], command: &str) -> CliResult<PathBuf> {
-    String::from_utf8(relative_path.to_owned())
-        .map(PathBuf::from)
-        .map_err(|_| CliError::ExternalCommandOutput {
-            command: command.to_owned(),
-            message: SanitizedMessage::new("git returned non-UTF-8 path output"),
-        })
 }
 
 fn read_current_checkout_pointer_candidate(path: &Path) -> CliResult<Option<LfsPointer>> {
@@ -5002,383 +4745,265 @@ mod tests {
         assert!(config.env_filter_var.is_none());
     }
 
-    #[tokio::test]
-    async fn dispatches_serve_with_global_config_and_overrides() {
-        let cli = Cli::try_parse_from([
-            "lfscloud",
-            "--config",
-            "lfscloud.test.yml",
-            "serve",
-            "--host",
-            "127.0.0.2",
-            "--port",
-            "8088",
-        ])
-        .expect("serve command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
+    #[derive(Debug, Eq, PartialEq)]
+    enum Invoked {
+        Serve(ServeOptions),
+        Init(InitCommand),
+        Login(LoginCommand),
+        Logout(LogoutCommand),
+        Status(StatusCommand, Option<PathBuf>),
+        Pull(PullCommand),
+        Hydrate(HydrateCommand),
+        Dehydrate(DehydrateCommand),
+        Gc(GcCommand),
+        Migrate(MigrateCommand, Option<PathBuf>),
+    }
 
-        dispatch(
-            cli,
-            move |options| {
-                let captured = Arc::clone(&captured_for_runner);
-                async move {
-                    *captured.lock().expect("capture mutex should lock") = Some(options);
+    fn record_invocation(recorder: &Mutex<Option<Invoked>>, invoked: Invoked) {
+        let previous = recorder
+            .lock()
+            .expect("dispatch recorder mutex should lock")
+            .replace(invoked);
+        assert!(
+            previous.is_none(),
+            "dispatch must invoke exactly one runner"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_every_subcommand_to_its_matching_runner() {
+        let cases = [
+            (
+                vec![
+                    "lfscloud",
+                    "--config",
+                    "lfscloud.test.yml",
+                    "serve",
+                    "--host",
+                    "127.0.0.2",
+                    "--port",
+                    "8088",
+                ],
+                Invoked::Serve(ServeOptions::new(
+                    Some("lfscloud.test.yml".into()),
+                    Some("127.0.0.2".to_owned()),
+                    Some(8088),
+                )),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "init",
+                    "--server",
+                    "http://lfs.example.com",
+                    "--allow-insecure-http",
+                    "--local",
+                ],
+                Invoked::Init(InitCommand {
+                    server: "http://lfs.example.com".to_owned(),
+                    allow_insecure_http: true,
+                    local: true,
+                }),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "login",
+                    "--server",
+                    "http://lfs.example.com",
+                    "--allow-insecure-http",
+                ],
+                Invoked::Login(LoginCommand {
+                    server: "http://lfs.example.com".to_owned(),
+                    allow_insecure_http: true,
+                }),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "logout",
+                    "--server",
+                    "http://lfs.example.com",
+                    "--allow-insecure-http",
+                ],
+                Invoked::Logout(LogoutCommand {
+                    server: "http://lfs.example.com".to_owned(),
+                    allow_insecure_http: true,
+                }),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "--config",
+                    "lfscloud.test.yml",
+                    "status",
+                    "--server",
+                    "http://lfs.example.com",
+                    "--allow-insecure-http",
+                    "--cache-root",
+                    "/tmp/lfscloud-status-cache",
+                ],
+                Invoked::Status(
+                    StatusCommand {
+                        server: Some("http://lfs.example.com".to_owned()),
+                        allow_insecure_http: true,
+                        cache_root: Some("/tmp/lfscloud-status-cache".into()),
+                    },
+                    Some("lfscloud.test.yml".into()),
+                ),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "pull",
+                    "--cache-root",
+                    "/tmp/lfscloud-pull-cache",
+                ],
+                Invoked::Pull(PullCommand {
+                    cache_root: Some("/tmp/lfscloud-pull-cache".into()),
+                }),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "hydrate",
+                    "--cache-root",
+                    "/tmp/lfscloud-hydrate-cache",
+                    "asset/model.bin",
+                    "asset/audio.bin",
+                ],
+                Invoked::Hydrate(HydrateCommand {
+                    cache_root: Some("/tmp/lfscloud-hydrate-cache".into()),
+                    paths: vec!["asset/model.bin".into(), "asset/audio.bin".into()],
+                }),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "dehydrate",
+                    "--cache-root",
+                    "/tmp/lfscloud-dehydrate-cache",
+                    "asset/model.bin",
+                    "asset/audio.bin",
+                ],
+                Invoked::Dehydrate(DehydrateCommand {
+                    cache_root: Some("/tmp/lfscloud-dehydrate-cache".into()),
+                    paths: vec!["asset/model.bin".into(), "asset/audio.bin".into()],
+                }),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "gc",
+                    "--cache-root",
+                    "/tmp/lfscloud-gc-cache",
+                    "--dry-run",
+                    "--prune-unavailable-worktrees",
+                ],
+                Invoked::Gc(GcCommand {
+                    cache_root: Some("/tmp/lfscloud-gc-cache".into()),
+                    dry_run: true,
+                    prune_unavailable_worktrees: true,
+                }),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "--config",
+                    "lfscloud.test.yml",
+                    "migrate",
+                    "--server",
+                    "http://lfs.example.com",
+                    "--allow-insecure-http",
+                    "--cache-root",
+                    "/tmp/lfscloud-migrate-cache",
+                    "--source-remote",
+                    "upstream",
+                    "--allow-cross-remote",
+                    "--ref",
+                    "main",
+                    "--ref",
+                    "feature",
+                    "--dry-run",
+                    "--purge-source-lfs",
+                ],
+                Invoked::Migrate(
+                    MigrateCommand {
+                        server: "http://lfs.example.com".to_owned(),
+                        allow_insecure_http: true,
+                        cache_root: Some("/tmp/lfscloud-migrate-cache".into()),
+                        source_remote: "upstream".to_owned(),
+                        allow_cross_remote: true,
+                        refs: vec!["main".to_owned(), "feature".to_owned()],
+                        all_refs: false,
+                        dry_run: true,
+                        purge_source_lfs: true,
+                    },
+                    Some("lfscloud.test.yml".into()),
+                ),
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let cli = Cli::try_parse_from(&args).expect("subcommand should parse");
+            let recorded = Mutex::new(None);
+            let recorder = &recorded;
+
+            dispatch(
+                cli,
+                |options| async move {
+                    record_invocation(recorder, Invoked::Serve(options));
                     Ok(())
-                }
-            },
-            |_| unreachable!("init runner must not be called for serve command"),
-            |_| unreachable!("login runner must not be called for serve command"),
-            |_| unreachable!("logout runner must not be called for serve command"),
-            |_, _| unreachable!("status runner must not be called for serve command"),
-            |_| unreachable!("pull runner must not be called for serve command"),
-            |_| unreachable!("hydrate runner must not be called for serve command"),
-            |_| unreachable!("dehydrate runner must not be called for serve command"),
-            |_| unreachable!("gc runner must not be called for serve command"),
-            |_, _| unreachable!("migrate runner must not be called for serve command"),
-        )
-        .await
-        .expect("serve dispatch should succeed");
+                },
+                |command| {
+                    record_invocation(recorder, Invoked::Init(command));
+                    Ok(())
+                },
+                |command| {
+                    record_invocation(recorder, Invoked::Login(command));
+                    Ok(())
+                },
+                |command| {
+                    record_invocation(recorder, Invoked::Logout(command));
+                    Ok(())
+                },
+                |command, config| {
+                    record_invocation(recorder, Invoked::Status(command, config));
+                    Ok(())
+                },
+                |command| {
+                    record_invocation(recorder, Invoked::Pull(command));
+                    Ok(())
+                },
+                |command| {
+                    record_invocation(recorder, Invoked::Hydrate(command));
+                    Ok(())
+                },
+                |command| {
+                    record_invocation(recorder, Invoked::Dehydrate(command));
+                    Ok(())
+                },
+                |command| {
+                    record_invocation(recorder, Invoked::Gc(command));
+                    Ok(())
+                },
+                |command, config| {
+                    record_invocation(recorder, Invoked::Migrate(command, config));
+                    Ok(())
+                },
+            )
+            .await
+            .expect("dispatch should succeed");
 
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some(ServeOptions::new(
-                Some("lfscloud.test.yml".into()),
-                Some("127.0.0.2".to_owned()),
-                Some(8088),
-            ))
-        );
+            assert_eq!(
+                recorded
+                    .into_inner()
+                    .expect("dispatch recorder mutex should not poison"),
+                Some(expected),
+                "wrong runner or parsed fields for {args:?}",
+            );
+        }
     }
-
-    #[tokio::test]
-    async fn dispatches_init_with_server_url() {
-        let cli = Cli::try_parse_from(["lfscloud", "init", "--server", "http://127.0.0.1:8080"])
-            .expect("init command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for init command") },
-            move |command| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some(command.server);
-                Ok(())
-            },
-            |_| unreachable!("login runner must not be called for init command"),
-            |_| unreachable!("logout runner must not be called for init command"),
-            |_, _| unreachable!("status runner must not be called for init command"),
-            |_| unreachable!("pull runner must not be called for init command"),
-            |_| unreachable!("hydrate runner must not be called for init command"),
-            |_| unreachable!("dehydrate runner must not be called for init command"),
-            |_| unreachable!("gc runner must not be called for init command"),
-            |_, _| unreachable!("migrate runner must not be called for init command"),
-        )
-        .await
-        .expect("init dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some("http://127.0.0.1:8080".to_owned())
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatches_login_with_server_url() {
-        let cli = Cli::try_parse_from(["lfscloud", "login", "--server", "http://127.0.0.1:8080"])
-            .expect("login command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for login command") },
-            |_| unreachable!("init runner must not be called for login command"),
-            move |command| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some(command.server);
-                Ok(())
-            },
-            |_| unreachable!("logout runner must not be called for login command"),
-            |_, _| unreachable!("status runner must not be called for login command"),
-            |_| unreachable!("pull runner must not be called for login command"),
-            |_| unreachable!("hydrate runner must not be called for login command"),
-            |_| unreachable!("dehydrate runner must not be called for login command"),
-            |_| unreachable!("gc runner must not be called for login command"),
-            |_, _| unreachable!("migrate runner must not be called for login command"),
-        )
-        .await
-        .expect("login dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some("http://127.0.0.1:8080".to_owned())
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatches_logout_with_server_url() {
-        let cli = Cli::try_parse_from(["lfscloud", "logout", "--server", "http://127.0.0.1:8080"])
-            .expect("logout command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for logout command") },
-            |_| unreachable!("init runner must not be called for logout command"),
-            |_| unreachable!("login runner must not be called for logout command"),
-            move |command| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some(command.server);
-                Ok(())
-            },
-            |_, _| unreachable!("status runner must not be called for logout command"),
-            |_| unreachable!("pull runner must not be called for logout command"),
-            |_| unreachable!("hydrate runner must not be called for logout command"),
-            |_| unreachable!("dehydrate runner must not be called for logout command"),
-            |_| unreachable!("gc runner must not be called for logout command"),
-            |_, _| unreachable!("migrate runner must not be called for logout command"),
-        )
-        .await
-        .expect("logout dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some("http://127.0.0.1:8080".to_owned())
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatches_status_with_global_config() {
-        let cli = Cli::try_parse_from([
-            "lfscloud",
-            "--config",
-            "lfscloud.test.yml",
-            "status",
-            "--server",
-            "http://127.0.0.1:8080",
-        ])
-        .expect("status command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for status command") },
-            |_| unreachable!("init runner must not be called for status command"),
-            |_| unreachable!("login runner must not be called for status command"),
-            |_| unreachable!("logout runner must not be called for status command"),
-            move |command, config_path| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some((command.server, config_path));
-                Ok(())
-            },
-            |_| unreachable!("pull runner must not be called for status command"),
-            |_| unreachable!("hydrate runner must not be called for status command"),
-            |_| unreachable!("dehydrate runner must not be called for status command"),
-            |_| unreachable!("gc runner must not be called for status command"),
-            |_, _| unreachable!("migrate runner must not be called for status command"),
-        )
-        .await
-        .expect("status dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some((
-                Some("http://127.0.0.1:8080".to_owned()),
-                Some("lfscloud.test.yml".into())
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatches_pull_with_cache_root() {
-        let cli = Cli::try_parse_from(["lfscloud", "pull", "--cache-root", "/tmp/lfscloud-cache"])
-            .expect("pull command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for pull command") },
-            |_| unreachable!("init runner must not be called for pull command"),
-            |_| unreachable!("login runner must not be called for pull command"),
-            |_| unreachable!("logout runner must not be called for pull command"),
-            |_, _| unreachable!("status runner must not be called for pull command"),
-            move |command| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some(command.cache_root);
-                Ok(())
-            },
-            |_| unreachable!("hydrate runner must not be called for pull command"),
-            |_| unreachable!("dehydrate runner must not be called for pull command"),
-            |_| unreachable!("gc runner must not be called for pull command"),
-            |_, _| unreachable!("migrate runner must not be called for pull command"),
-        )
-        .await
-        .expect("pull dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some(Some(PathBuf::from("/tmp/lfscloud-cache")))
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatches_hydrate_with_paths() {
-        let cli = Cli::try_parse_from(["lfscloud", "hydrate", "asset/model.bin"])
-            .expect("hydrate command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for hydrate command") },
-            |_| unreachable!("init runner must not be called for hydrate command"),
-            |_| unreachable!("login runner must not be called for hydrate command"),
-            |_| unreachable!("logout runner must not be called for hydrate command"),
-            |_, _| unreachable!("status runner must not be called for hydrate command"),
-            |_| unreachable!("pull runner must not be called for hydrate command"),
-            move |command| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some(command.paths);
-                Ok(())
-            },
-            |_| unreachable!("dehydrate runner must not be called for hydrate command"),
-            |_| unreachable!("gc runner must not be called for hydrate command"),
-            |_, _| unreachable!("migrate runner must not be called for hydrate command"),
-        )
-        .await
-        .expect("hydrate dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some(vec![PathBuf::from("asset/model.bin")])
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatches_dehydrate_with_paths() {
-        let cli = Cli::try_parse_from(["lfscloud", "dehydrate", "asset/model.bin"])
-            .expect("dehydrate command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for dehydrate command") },
-            |_| unreachable!("init runner must not be called for dehydrate command"),
-            |_| unreachable!("login runner must not be called for dehydrate command"),
-            |_| unreachable!("logout runner must not be called for dehydrate command"),
-            |_, _| unreachable!("status runner must not be called for dehydrate command"),
-            |_| unreachable!("pull runner must not be called for dehydrate command"),
-            |_| unreachable!("hydrate runner must not be called for dehydrate command"),
-            move |command| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some(command.paths);
-                Ok(())
-            },
-            |_| unreachable!("gc runner must not be called for dehydrate command"),
-            |_, _| unreachable!("migrate runner must not be called for dehydrate command"),
-        )
-        .await
-        .expect("dehydrate dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some(vec![PathBuf::from("asset/model.bin")])
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatches_gc_with_dry_run() {
-        let cli =
-            Cli::try_parse_from(["lfscloud", "gc", "--dry-run"]).expect("gc command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for gc command") },
-            |_| unreachable!("init runner must not be called for gc command"),
-            |_| unreachable!("login runner must not be called for gc command"),
-            |_| unreachable!("logout runner must not be called for gc command"),
-            |_, _| unreachable!("status runner must not be called for gc command"),
-            |_| unreachable!("pull runner must not be called for gc command"),
-            |_| unreachable!("hydrate runner must not be called for gc command"),
-            |_| unreachable!("dehydrate runner must not be called for gc command"),
-            move |command| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") = Some(command.dry_run);
-                Ok(())
-            },
-            |_, _| unreachable!("migrate runner must not be called for gc command"),
-        )
-        .await
-        .expect("gc dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some(true)
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatches_migrate_with_global_config() {
-        let cli = Cli::try_parse_from([
-            "lfscloud",
-            "--config",
-            "lfscloud.test.yml",
-            "migrate",
-            "--server",
-            "http://127.0.0.1:8080",
-            "--dry-run",
-        ])
-        .expect("migrate command should parse");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_for_runner = Arc::clone(&captured);
-
-        dispatch(
-            cli,
-            |_| async { unreachable!("serve runner must not be called for migrate command") },
-            |_| unreachable!("init runner must not be called for migrate command"),
-            |_| unreachable!("login runner must not be called for migrate command"),
-            |_| unreachable!("logout runner must not be called for migrate command"),
-            |_, _| unreachable!("status runner must not be called for migrate command"),
-            |_| unreachable!("pull runner must not be called for migrate command"),
-            |_| unreachable!("hydrate runner must not be called for migrate command"),
-            |_| unreachable!("dehydrate runner must not be called for migrate command"),
-            |_| unreachable!("gc runner must not be called for migrate command"),
-            move |command, config_path| {
-                *captured_for_runner
-                    .lock()
-                    .expect("capture mutex should lock") =
-                    Some((command.server, command.dry_run, config_path));
-                Ok(())
-            },
-        )
-        .await
-        .expect("migrate dispatch should succeed");
-
-        assert_eq!(
-            *captured.lock().expect("capture mutex should lock"),
-            Some((
-                "http://127.0.0.1:8080".to_owned(),
-                true,
-                Some("lfscloud.test.yml".into())
-            ))
-        );
-    }
-
     #[test]
     fn init_writes_lfsconfig_from_current_repo_origin() {
         require_git();

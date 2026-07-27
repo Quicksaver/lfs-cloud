@@ -6,7 +6,7 @@
 //! can build dry-run and transfer plans from one consistent snapshot.
 
 #[cfg(unix)]
-use std::os::unix::{ffi::OsStringExt, fs::OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
@@ -17,9 +17,8 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio},
     str::FromStr,
-    sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use fs4::FileExt;
@@ -27,6 +26,13 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::child_process::{
+    ChildProcessError, ChildProcessOptions, PipeCapture, configure_process_tree, wait_for_child,
+};
+use crate::git_output::{
+    GitPathOutputError, parse_lfs_filter_attribute_paths,
+    safe_git_relative_path as parse_safe_git_relative_path,
+};
 use crate::{
     LFS_POINTER_SIZE_CUTOFF, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LocalCacheLayout,
     MigrationError, MigrationResult, SanitizedMessage, StorageProvider, StoredObject,
@@ -43,9 +49,6 @@ const MAX_HISTORY_TREE_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_CHECK_ATTR_INPUT_BYTES: usize = 1024 * 1024;
 const GIT_NO_LAZY_FETCH_ENV: &str = "GIT_NO_LAZY_FETCH";
 const MIGRATION_SOURCE_FETCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
-const MIGRATION_SOURCE_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const MIGRATION_GIT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const MIGRATION_GIT_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const MINIMUM_HISTORICAL_SCAN_GIT_VERSION: GitVersion = GitVersion::new(2, 40, 0);
 const MINIMUM_HISTORICAL_SCAN_GIT_VERSION_TEXT: &str = "2.40.0";
 /// Default number of migration objects uploaded concurrently.
@@ -878,7 +881,7 @@ pub fn fetch_migration_git_refs(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    configure_bounded_git_process_tree(&mut process);
+    configure_process_tree(&mut process);
     let mut child = process.spawn().map_err(|source| MigrationError::Io {
         context: format!("failed to start {display}"),
         source,
@@ -1725,7 +1728,7 @@ fn run_git_lfs_fetch_command(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    configure_bounded_git_process_tree(&mut process);
+    configure_process_tree(&mut process);
     let mut child = process.spawn().map_err(|source| MigrationError::Io {
         context: "failed to start git lfs fetch".to_owned(),
         source,
@@ -1745,74 +1748,21 @@ fn wait_for_git_command(
     command: &str,
     timeout: Duration,
 ) -> MigrationResult<(ExitStatus, Vec<u8>)> {
-    let stderr = child.stderr.take().ok_or_else(|| MigrationError::Io {
-        context: "git lfs fetch stderr was not piped".to_owned(),
-        source: io::Error::other("git lfs fetch stderr was not piped"),
-    })?;
-    let stderr_reader =
-        thread::spawn(move || read_pipe_with_limit(stderr, MAX_MIGRATION_GIT_OUTPUT_BYTES + 1));
-    let deadline = Instant::now() + timeout;
+    let output = wait_for_child(
+        child,
+        command,
+        ChildProcessOptions {
+            timeout: Some(timeout),
+            stdout: PipeCapture::Truncate { limit: 0 },
+            stderr: PipeCapture::Truncate {
+                limit: MAX_MIGRATION_GIT_OUTPUT_BYTES + 1,
+            },
+            inherited_pipe_is_error: false,
+        },
+    )
+    .map_err(|error| child_process_migration_error(error, command))?;
 
-    loop {
-        if let Some(status) = child.try_wait().map_err(|source| MigrationError::Io {
-            context: format!("failed to wait for {command}"),
-            source,
-        })? {
-            let stderr = join_git_stderr_reader(stderr_reader)?;
-            return Ok((status, stderr.bytes));
-        }
-
-        if Instant::now() >= deadline {
-            stop_timed_out_git_child(child, command)?;
-            let stderr = join_git_stderr_reader(stderr_reader)?;
-            return Err(MigrationError::ExternalCommand {
-                command: command.to_owned(),
-                status: format!("timed out after {} seconds", timeout.as_secs()),
-                stderr: SanitizedMessage::new(truncated_lossy_message(&stderr.bytes)),
-            });
-        }
-
-        thread::sleep(MIGRATION_SOURCE_FETCH_POLL_INTERVAL);
-    }
-}
-
-fn stop_timed_out_git_child(child: &mut Child, command: &str) -> MigrationResult<()> {
-    stop_bounded_git_process_tree(child);
-
-    if child
-        .try_wait()
-        .map_err(|source| MigrationError::Io {
-            context: format!("failed to wait for timed-out {command}"),
-            source,
-        })?
-        .is_none()
-    {
-        child.kill().map_err(|source| MigrationError::Io {
-            context: format!("failed to stop timed-out {command}"),
-            source,
-        })?;
-    }
-    child.wait().map_err(|source| MigrationError::Io {
-        context: format!("failed to reap timed-out {command}"),
-        source,
-    })?;
-
-    Ok(())
-}
-
-fn join_git_stderr_reader(
-    reader: thread::JoinHandle<io::Result<PipeReadResult>>,
-) -> MigrationResult<PipeReadResult> {
-    reader
-        .join()
-        .map_err(|_| MigrationError::Io {
-            context: "git lfs fetch stderr reader panicked".to_owned(),
-            source: io::Error::other("git lfs fetch stderr reader panicked"),
-        })?
-        .map_err(|source| MigrationError::Io {
-            context: "failed to read git lfs fetch stderr".to_owned(),
-            source,
-        })
+    Ok((output.status, output.stderr))
 }
 
 fn fetched_migration_objects(
@@ -2476,30 +2426,8 @@ fn parse_git_check_attr_filter_stdout(
     stdout: &[u8],
     command_name: &str,
 ) -> MigrationResult<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    let mut fields = stdout.split(|byte| *byte == b'\0').peekable();
-    while let Some(relative_path) = fields.next() {
-        if relative_path.is_empty() {
-            if fields.peek().is_none() {
-                break;
-            }
-
-            return Err(git_check_attr_parse_error(command_name));
-        }
-
-        let Some(attribute) = fields.next() else {
-            return Err(git_check_attr_parse_error(command_name));
-        };
-        let Some(value) = fields.next() else {
-            return Err(git_check_attr_parse_error(command_name));
-        };
-
-        if attribute == b"filter" && value == b"lfs" {
-            paths.push(safe_git_relative_path(relative_path, command_name)?);
-        }
-    }
-
-    Ok(paths)
+    parse_lfs_filter_attribute_paths(stdout)
+        .map_err(|error| migration_git_path_output_error(error, command_name))
 }
 
 fn git_check_attr_filter(worktree_root: &Path, tracked_paths: Vec<u8>) -> MigrationResult<Output> {
@@ -2655,44 +2583,22 @@ fn git_check_attr_filter_command_name(source: Option<&str>) -> String {
     )
 }
 
-fn git_check_attr_parse_error(command_name: &str) -> MigrationError {
-    MigrationError::ExternalCommandOutput {
-        command: command_name.to_owned(),
-        message: SanitizedMessage::new("git returned malformed attribute output"),
-    }
-}
-
 fn safe_git_relative_path(relative_path: &[u8], command: &str) -> MigrationResult<PathBuf> {
-    let path = git_path_bytes_to_path_buf(relative_path, command)?;
-    let valid = !path.is_absolute()
-        && path.components().next().is_some()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)));
+    parse_safe_git_relative_path(relative_path)
+        .map_err(|error| migration_git_path_output_error(error, command))
+}
 
-    if valid {
-        Ok(path)
-    } else {
-        Err(MigrationError::ExternalCommandOutput {
-            command: command.to_owned(),
-            message: SanitizedMessage::new("git returned a path outside the worktree"),
-        })
+fn migration_git_path_output_error(error: GitPathOutputError, command: &str) -> MigrationError {
+    let message = match error {
+        GitPathOutputError::MalformedAttributeOutput => "git returned malformed attribute output",
+        #[cfg(not(unix))]
+        GitPathOutputError::NonUtf8Path => "git returned non-UTF-8 path output",
+        GitPathOutputError::PathOutsideWorktree => "git returned a path outside the worktree",
+    };
+    MigrationError::ExternalCommandOutput {
+        command: command.to_owned(),
+        message: SanitizedMessage::new(message),
     }
-}
-
-#[cfg(unix)]
-fn git_path_bytes_to_path_buf(relative_path: &[u8], _command: &str) -> MigrationResult<PathBuf> {
-    Ok(PathBuf::from(OsString::from_vec(relative_path.to_owned())))
-}
-
-#[cfg(not(unix))]
-fn git_path_bytes_to_path_buf(relative_path: &[u8], command: &str) -> MigrationResult<PathBuf> {
-    String::from_utf8(relative_path.to_owned())
-        .map(PathBuf::from)
-        .map_err(|_| MigrationError::ExternalCommandOutput {
-            command: command.to_owned(),
-            message: SanitizedMessage::new("git returned non-UTF-8 path output"),
-        })
 }
 
 fn read_index_pointer_blob_candidate(
@@ -3815,11 +3721,6 @@ fn read_only_git_command() -> Command {
     command
 }
 
-enum BoundedGitPipeEvent {
-    Stdout(io::Result<PipeReadResult>),
-    Stderr(io::Result<PipeReadResult>),
-}
-
 /// Runs a migration Git command without allowing either captured pipe to grow
 /// beyond its declared boundary.
 ///
@@ -3836,209 +3737,58 @@ fn run_bounded_command_output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_bounded_git_process_tree(command);
+    configure_process_tree(command);
 
     let mut child = command.spawn().map_err(|source| MigrationError::Io {
         context: format!("failed to start {command_name}"),
         source,
     })?;
-    let stdout = child.stdout.take().ok_or_else(|| MigrationError::Io {
-        context: format!("failed to capture stdout for {command_name}"),
-        source: io::Error::other("git stdout was not piped"),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| MigrationError::Io {
-        context: format!("failed to capture stderr for {command_name}"),
-        source: io::Error::other("git stderr was not piped"),
-    })?;
+    let output = wait_for_child(
+        &mut child,
+        command_name,
+        ChildProcessOptions {
+            timeout: None,
+            stdout: PipeCapture::HardLimit {
+                limit: stdout_limit,
+            },
+            stderr: PipeCapture::HardLimit {
+                limit: MAX_MIGRATION_GIT_OUTPUT_BYTES,
+            },
+            inherited_pipe_is_error: true,
+        },
+    )
+    .map_err(|error| child_process_migration_error(error, command_name))?;
 
-    let (sender, receiver) = mpsc::channel();
-    let stdout_sender = sender.clone();
-    let stdout_reader = thread::spawn(move || {
-        let result = read_pipe_with_hard_limit(stdout, stdout_limit);
-        let _ = stdout_sender.send(BoundedGitPipeEvent::Stdout(result));
-    });
-    let stderr_reader = thread::spawn(move || {
-        let result = read_pipe_with_hard_limit(stderr, MAX_MIGRATION_GIT_OUTPUT_BYTES);
-        let _ = sender.send(BoundedGitPipeEvent::Stderr(result));
-    });
+    Ok(Output {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
 
-    let mut status = None;
-    let mut drain_deadline = None;
-    let mut stdout = None;
-    let mut stderr = None;
-
-    loop {
-        while let Ok(event) = receiver.try_recv() {
-            let (stream_name, stream_limit, result, destination) = match event {
-                BoundedGitPipeEvent::Stdout(result) => {
-                    ("stdout", stdout_limit, result, &mut stdout)
-                }
-                BoundedGitPipeEvent::Stderr(result) => (
-                    "stderr",
-                    MAX_MIGRATION_GIT_OUTPUT_BYTES,
-                    result,
-                    &mut stderr,
-                ),
-            };
-            let output = match result {
-                Ok(output) => output,
-                Err(source) => {
-                    terminate_bounded_git_child(&mut child, command_name)?;
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(MigrationError::Io {
-                        context: format!("failed to read {stream_name} from {command_name}"),
-                        source,
-                    });
-                }
-            };
-            if output.exceeded_limit {
-                terminate_bounded_git_child(&mut child, command_name)?;
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(MigrationError::ExternalCommandOutput {
-                    command: command_name.to_owned(),
-                    message: SanitizedMessage::new(format!(
-                        "git {stream_name} exceeded the {stream_limit}-byte limit"
-                    )),
-                });
-            }
-            *destination = Some(output.bytes);
-        }
-
-        if status.is_none() {
-            status = child.try_wait().map_err(|source| MigrationError::Io {
-                context: format!("failed to wait for {command_name}"),
-                source,
-            })?;
-            if status.is_some() {
-                drain_deadline = Some(Instant::now() + MIGRATION_GIT_OUTPUT_DRAIN_GRACE);
-            }
-        }
-
-        if let Some(status) = status.filter(|_| stdout.is_some() && stderr.is_some()) {
-            stdout_reader.join().map_err(|_| MigrationError::Io {
-                context: format!("stdout reader thread panicked for {command_name}"),
-                source: io::Error::other("git stdout reader thread panicked"),
-            })?;
-            stderr_reader.join().map_err(|_| MigrationError::Io {
-                context: format!("stderr reader thread panicked for {command_name}"),
-                source: io::Error::other("git stderr reader thread panicked"),
-            })?;
-            return Ok(Output {
-                status,
-                stdout: stdout.take().expect("stdout was checked above"),
-                stderr: stderr.take().expect("stderr was checked above"),
-            });
-        }
-
-        if status.is_some_and(|_| drain_deadline.is_some_and(|deadline| Instant::now() >= deadline))
-        {
-            // A descendant inherited a pipe after the direct Git process exited.
-            // Stop the process group before waiting for EOF so discovery cannot
-            // hang on a helper that outlives Git itself.
-            stop_bounded_git_process_tree(&child);
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(MigrationError::Io {
-                context: format!("timed out draining output from {command_name}"),
-                source: io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "git output pipes remained open after process exit",
-                ),
-            });
-        }
-
-        thread::sleep(MIGRATION_GIT_OUTPUT_POLL_INTERVAL);
+fn child_process_migration_error(error: ChildProcessError, command_name: &str) -> MigrationError {
+    match error {
+        ChildProcessError::Io { context, source } => MigrationError::Io { context, source },
+        ChildProcessError::TimedOut {
+            timeout, stderr, ..
+        } => MigrationError::ExternalCommand {
+            command: command_name.to_owned(),
+            status: format!("timed out after {} seconds", timeout.as_secs()),
+            stderr: SanitizedMessage::new(truncated_lossy_message(&stderr)),
+        },
+        ChildProcessError::OutputLimit { stream, limit } => MigrationError::ExternalCommandOutput {
+            command: command_name.to_owned(),
+            message: SanitizedMessage::new(format!("git {stream} exceeded the {limit}-byte limit")),
+        },
+        ChildProcessError::InheritedPipe => MigrationError::Io {
+            context: format!("timed out draining output from {command_name}"),
+            source: io::Error::new(
+                io::ErrorKind::TimedOut,
+                "git output pipes remained open after process exit",
+            ),
+        },
     }
 }
-
-fn read_pipe_with_hard_limit(mut reader: impl Read, limit: usize) -> io::Result<PipeReadResult> {
-    let mut bytes = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0; 8192];
-
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(PipeReadResult {
-                bytes,
-                exceeded_limit: false,
-            });
-        }
-
-        let remaining = limit.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
-        if read > remaining {
-            return Ok(PipeReadResult {
-                bytes,
-                exceeded_limit: true,
-            });
-        }
-    }
-}
-
-#[cfg(unix)]
-fn configure_bounded_git_process_tree(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_bounded_git_process_tree(_command: &mut Command) {}
-
-fn terminate_bounded_git_child(child: &mut Child, command_name: &str) -> MigrationResult<()> {
-    stop_bounded_git_process_tree(child);
-    if child
-        .try_wait()
-        .map_err(|source| MigrationError::Io {
-            context: format!("failed to wait for stopped {command_name}"),
-            source,
-        })?
-        .is_none()
-    {
-        child.kill().map_err(|source| MigrationError::Io {
-            context: format!("failed to stop {command_name}"),
-            source,
-        })?;
-        child.wait().map_err(|source| MigrationError::Io {
-            context: format!("failed to reap stopped {command_name}"),
-            source,
-        })?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn stop_bounded_git_process_tree(child: &Child) {
-    signal_bounded_git_process_group("TERM", child.id());
-    thread::sleep(Duration::from_millis(50));
-    signal_bounded_git_process_group("KILL", child.id());
-}
-
-#[cfg(unix)]
-fn signal_bounded_git_process_group(signal: &str, process_group_id: u32) {
-    let _ = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(format!("-{process_group_id}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(windows)]
-fn stop_bounded_git_process_tree(child: &Child) {
-    let _ = Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn stop_bounded_git_process_tree(_child: &Child) {}
 
 fn required_success_stdout(output: Output, command_name: &str) -> MigrationResult<String> {
     required_success_stdout_with_limit(output, command_name, MAX_MIGRATION_GIT_OUTPUT_BYTES)
@@ -4193,7 +3943,7 @@ mod tests {
         StorageDeleteOutcome, StorageError, StorageProvider, StorageResult, StoredObject,
     };
 
-    use super::configure_bounded_git_process_tree;
+    use super::configure_process_tree;
     use super::{
         GitLfsSourceEndpointSource, LocalMigrationObject, LocalMigrationObjectLocation,
         LocalMigrationObjectLocationKind, LocalMigrationObjectLocationStatus,
@@ -6338,7 +6088,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        configure_bounded_git_process_tree(&mut command);
+        configure_process_tree(&mut command);
         let mut child = command.spawn().expect("test shell should start");
 
         let started_at = Instant::now();

@@ -3,10 +3,12 @@
 //! The root package keeps shared CLI, server, provider, storage, metadata, and
 //! protocol code in one library target so the binary target can stay small.
 
+mod child_process;
 mod cli;
 pub mod credentials;
 pub mod error;
 pub mod git;
+mod git_output;
 pub mod github_auth;
 pub mod google_drive;
 mod http_transport;

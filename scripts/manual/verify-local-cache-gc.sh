@@ -106,7 +106,7 @@ test -f "$keep_cache_path"
 test -f "$remove_cache_path"
 grep -F "protected while worktree unavailable" "$tmp_dir/gc-dry-run-output" >/dev/null
 grep -F "$remove_oid" "$tmp_dir/gc-dry-run-output" >/dev/null
-grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null
+grep -F "github-main:owner/missing" "$cache_root/worktrees.json" >/dev/null
 
 (
   cd "$repo_dir"
@@ -117,7 +117,7 @@ test -f "$keep_cache_path"
 test -f "$remove_cache_path"
 grep -F "protected while worktree unavailable" "$tmp_dir/gc-output" >/dev/null
 grep -F "$remove_oid" "$tmp_dir/gc-output" >/dev/null
-grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null
+grep -F "github-main:owner/missing" "$cache_root/worktrees.json" >/dev/null
 
 (
   cd "$repo_dir"
@@ -129,7 +129,7 @@ test -f "$keep_cache_path"
 test ! -e "$remove_cache_path"
 grep -F "removed" "$tmp_dir/gc-prune-output" >/dev/null
 grep -F "$remove_oid" "$tmp_dir/gc-prune-output" >/dev/null
-if grep -F "missing-repo" "$cache_root/worktrees.json" >/dev/null; then
+if grep -F "github-main:owner/missing" "$cache_root/worktrees.json" >/dev/null; then
   echo "explicitly pruned worktree registration remains" >&2
   exit 1
 fi
