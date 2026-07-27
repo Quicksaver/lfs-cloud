@@ -4103,17 +4103,25 @@ mod tests {
             &self.provider_id
         }
 
-        fn object_exists<'a>(
+        fn lookup_object<'a>(
             &'a self,
             repository_namespace: &'a str,
             object: &'a LfsObject,
-        ) -> ProviderFuture<'a, StorageResult<bool>> {
+        ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>> {
             Box::pin(async move {
                 Ok(self
                     .existing
                     .lock()
                     .expect("fake storage lock should not poison")
-                    .contains(&(repository_namespace.to_owned(), object.clone())))
+                    .contains(&(repository_namespace.to_owned(), object.clone()))
+                    .then(|| {
+                        StoredObject::new(
+                            self.provider_id.clone(),
+                            repository_namespace,
+                            object.clone(),
+                            format!("fake-storage-{}", object.oid),
+                        )
+                    }))
             })
         }
 

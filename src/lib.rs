@@ -88,8 +88,9 @@ pub use migration::{
     upload_migration_objects_to_storage_with_options,
 };
 pub use providers::{
-    ProviderFuture, RepositoryAuthentication, RepositoryAuthorization, RepositoryIdentity,
-    RepositoryProvider, RepositoryUser, StorageDeleteOutcome, StorageProvider, StoredObject,
+    BackendIdLookup, ProviderFuture, RepositoryAuthentication, RepositoryAuthorization,
+    RepositoryIdentity, RepositoryProvider, RepositoryUser, StorageDeleteOutcome,
+    StorageDownloadResponse, StorageProvider, StoredObject, StreamingStorageProvider,
 };
 #[doc(hidden)]
 pub use server::lfs_server_router_with_provider_adapters;

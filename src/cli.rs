@@ -3574,17 +3574,25 @@ mod tests {
             &self.provider_id
         }
 
-        fn object_exists<'a>(
+        fn lookup_object<'a>(
             &'a self,
-            _repository_namespace: &'a str,
+            repository_namespace: &'a str,
             object: &'a LfsObject,
-        ) -> ProviderFuture<'a, StorageResult<bool>> {
+        ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>> {
             Box::pin(async move {
                 Ok(self
                     .objects
                     .lock()
                     .expect("recording migration storage lock should not poison")
-                    .contains_key(object))
+                    .contains_key(object)
+                    .then(|| {
+                        StoredObject::new(
+                            &self.provider_id,
+                            repository_namespace,
+                            object.clone(),
+                            format!("recorded-{}", object.oid.as_hex()),
+                        )
+                    }))
             })
         }
 

@@ -38,9 +38,9 @@ use tokio::{
 use url::Url;
 
 use crate::{
-    GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, LfsObject, ProviderFuture,
-    SanitizedMessage, StorageDeleteOutcome, StorageError, StorageProvider, StorageResult,
-    StoredObject,
+    BackendIdLookup, GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, LfsObject,
+    ProviderFuture, SanitizedMessage, StorageDeleteOutcome, StorageDownloadResponse, StorageError,
+    StorageProvider, StorageResult, StoredObject, StreamingStorageProvider,
     http_transport::{has_exact_loopback_host, read_bounded_lossy_response_body},
 };
 
@@ -699,41 +699,8 @@ enum DriveUploadPhase {
     Transfer,
 }
 
-/// A verified Google Drive object download exposed as an HTTP response body.
-///
-/// The response proxies Drive bytes directly while checking the requested LFS
-/// object hash and size. It intentionally
-/// does not expose Drive file IDs, URLs, or credentials to Git LFS clients. The
-/// current scaffold uses Axum as its HTTP server boundary; this wrapper can move
-/// behind a server crate boundary when the package is split.
-pub struct GoogleDriveDownloadResponse {
-    stored_object: StoredObject,
-    response: AxumResponse,
-}
-
-impl GoogleDriveDownloadResponse {
-    /// Returns the verified storage metadata for the downloaded object.
-    #[must_use]
-    pub fn stored_object(&self) -> &StoredObject {
-        &self.stored_object
-    }
-
-    /// Consumes this download and returns the HTTP response to send downstream.
-    #[must_use]
-    pub fn into_response(self) -> AxumResponse {
-        self.response
-    }
-}
-
-impl fmt::Debug for GoogleDriveDownloadResponse {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GoogleDriveDownloadResponse")
-            .field("stored_object", &self.stored_object)
-            .field("response", &"<streaming body>")
-            .finish()
-    }
-}
+/// Backwards-compatible name for a verified Google Drive streaming response.
+pub type GoogleDriveDownloadResponse = StorageDownloadResponse;
 
 /// Looks up repository-scoped LFS objects in Google Drive.
 #[derive(Clone)]
@@ -1608,10 +1575,7 @@ impl GoogleDriveObjectStore {
                 )
             })?;
 
-        Ok(GoogleDriveDownloadResponse {
-            stored_object,
-            response,
-        })
+        Ok(StorageDownloadResponse::new(stored_object, response))
     }
 
     async fn download_object_to_verified_file(
@@ -1689,14 +1653,14 @@ impl StorageProvider for GoogleDriveObjectStore {
         GoogleDriveObjectStore::provider_id(self)
     }
 
-    fn object_exists<'a>(
+    fn lookup_object<'a>(
         &'a self,
         repository_namespace: &'a str,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, StorageResult<bool>> {
+    ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>> {
         Box::pin(async move {
             self.ensure_repository_namespace(repository_namespace)?;
-            GoogleDriveObjectStore::object_exists(self, object).await
+            GoogleDriveObjectStore::lookup_object(self, object).await
         })
     }
 
@@ -1736,6 +1700,35 @@ impl StorageProvider for GoogleDriveObjectStore {
             Ok(StorageDeleteOutcome::Retained {
                 reason: "Google Drive object deletion is not implemented".to_owned(),
             })
+        })
+    }
+}
+
+impl BackendIdLookup for GoogleDriveObjectStore {
+    fn lookup_object_by_backend_id<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+        backend_id: &'a str,
+    ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>> {
+        Box::pin(async move {
+            self.ensure_repository_namespace(repository_namespace)?;
+            GoogleDriveObjectStore::lookup_object_by_backend_id(self, object, backend_id).await
+        })
+    }
+}
+
+impl StreamingStorageProvider for GoogleDriveObjectStore {
+    fn download_object_response<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+        stored_object: StoredObject,
+    ) -> ProviderFuture<'a, StorageResult<StorageDownloadResponse>> {
+        Box::pin(async move {
+            self.ensure_repository_namespace(repository_namespace)?;
+            self.download_object_response_for_stored_object(object, stored_object)
+                .await
         })
     }
 }

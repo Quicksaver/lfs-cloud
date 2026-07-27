@@ -6,6 +6,8 @@
 
 use std::{fmt, future::Future, path::Path, pin::Pin};
 
+use axum::response::Response;
+
 use crate::{LfsObject, RepositoryPermission, ServerResult, StorageResult};
 
 /// Boxed asynchronous provider operation.
@@ -165,6 +167,49 @@ impl StoredObject {
     }
 }
 
+/// A verified storage-provider download exposed as an HTTP response body.
+///
+/// The response body may stream backend bytes while the provider verifies
+/// their LFS object hash and size. Provider implementations must not expose
+/// backend credentials or private object locations through the response.
+pub struct StorageDownloadResponse {
+    stored_object: StoredObject,
+    response: Response,
+}
+
+impl StorageDownloadResponse {
+    /// Creates a download response from verified object metadata and a body.
+    #[must_use]
+    pub fn new(stored_object: StoredObject, response: Response) -> Self {
+        Self {
+            stored_object,
+            response,
+        }
+    }
+
+    /// Returns the verified storage metadata for the downloaded object.
+    #[must_use]
+    pub fn stored_object(&self) -> &StoredObject {
+        &self.stored_object
+    }
+
+    /// Consumes this download and returns the HTTP response to send downstream.
+    #[must_use]
+    pub fn into_response(self) -> Response {
+        self.response
+    }
+}
+
+impl fmt::Debug for StorageDownloadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageDownloadResponse")
+            .field("stored_object", &self.stored_object)
+            .field("response", &"<streaming body>")
+            .finish()
+    }
+}
+
 /// Result of a storage provider's delete-or-mark operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageDeleteOutcome {
@@ -187,16 +232,33 @@ pub enum StorageDeleteOutcome {
 /// Every object operation includes the stable repository mapping ID as its
 /// namespace. Implementations must scope existence, transfer, and cleanup to
 /// that namespace even when multiple repositories share one provider account.
-pub trait StorageProvider {
+pub trait StorageProvider: Send + Sync {
     /// Returns this provider's configured ID.
     fn provider_id(&self) -> &str;
+
+    /// Returns verified backend metadata for an object in one repository namespace.
+    ///
+    /// Implementations with duplicate backend objects must select one stable
+    /// identity so metadata repair and idempotent uploads converge.
+    fn lookup_object<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+    ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>>;
 
     /// Checks whether an object exists in one repository namespace.
     fn object_exists<'a>(
         &'a self,
         repository_namespace: &'a str,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, StorageResult<bool>>;
+    ) -> ProviderFuture<'a, StorageResult<bool>> {
+        Box::pin(async move {
+            Ok(self
+                .lookup_object(repository_namespace, object)
+                .await?
+                .is_some())
+        })
+    }
 
     /// Uploads an already-staged and verified object file to one repository namespace.
     ///
@@ -226,6 +288,35 @@ pub trait StorageProvider {
         repository_namespace: &'a str,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>>;
+}
+
+/// Optional indexed lookup capability for storage providers with backend IDs.
+///
+/// The production transfer path uses this capability to verify a metadata
+/// record without scanning the provider namespace. Providers that do not
+/// implement it fall back to [`StorageProvider::lookup_object`].
+pub trait BackendIdLookup: Send + Sync {
+    /// Resolves one backend ID only when it still identifies the exact object.
+    fn lookup_object_by_backend_id<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+        backend_id: &'a str,
+    ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>>;
+}
+
+/// Optional direct-streaming capability for storage providers.
+///
+/// Providers that do not implement this capability remain usable by the
+/// server through a verified temporary-file fallback.
+pub trait StreamingStorageProvider: Send + Sync {
+    /// Streams an already-discovered object as a verified HTTP response.
+    fn download_object_response<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+        stored_object: StoredObject,
+    ) -> ProviderFuture<'a, StorageResult<StorageDownloadResponse>>;
 }
 
 #[cfg(test)]

@@ -41,17 +41,16 @@ use url::{Url, form_urlencoded};
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GitHubPersonalAccessTokenLoginRouteState,
-    GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore, GoogleDriveRootValidator,
     LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation,
     LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid,
     LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, MetadataObjectVerificationStatus,
     ProviderFuture, RepositoryAuthentication, RepositoryIdentity, RepositoryMapping,
     RepositoryPermission, RepositoryProvider, RepositoryProviderError, RepositoryUser,
-    SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError, StorageProvider,
-    StorageProviderConfig, StoredObject, github_personal_access_token_login_router,
-    google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
+    SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageDownloadResponse,
+    StorageError, StorageProvider, StoredObject, github_personal_access_token_login_router,
     metadata::{MetadataTransferOperation, MetadataTransferResult},
     parse_lfs_batch_request_json,
+    provider_factory::{ConfiguredStorageProviders, ServerStorageProviderFactory},
     sessions::LfsSessionRecord,
 };
 
@@ -117,16 +116,14 @@ pub async fn serve(options: ServeOptions) -> ServerResult<()> {
 type ServerShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct ServerCompositionClients {
-    drive_token_source: Arc<dyn GoogleDriveAccessTokenSource>,
-    drive_root_validator: GoogleDriveRootValidator,
+    storage_provider_factory: ServerStorageProviderFactory,
     github_user_client: crate::GitHubUserClient,
 }
 
 impl ServerCompositionClients {
     fn production() -> ServerResult<Self> {
         Ok(Self {
-            drive_token_source: Arc::new(GoogleDriveGcloudTokenProvider::new()),
-            drive_root_validator: GoogleDriveRootValidator::new()?,
+            storage_provider_factory: ServerStorageProviderFactory::production()?,
             github_user_client: crate::GitHubUserClient::new()?,
         })
     }
@@ -197,19 +194,21 @@ impl ServerBuilder {
             None => ServerCompositionClients::production()?,
         };
         let session_store = production_session_store(&config, metadata_database.clone())?;
-        let transfer_store = GoogleDriveTransferStore::with_dependencies(
-            config.clone(),
-            metadata_database.clone(),
-            clients.drive_token_source,
-            clients.drive_root_validator,
-        );
+        let storage_provider_factory = clients.storage_provider_factory;
         #[cfg(test)]
-        let transfer_store = match self.drive_object_api_base_url {
-            Some(api_base_url) => transfer_store.with_object_api_base_url(api_base_url),
-            None => transfer_store,
+        let storage_provider_factory = match self.drive_object_api_base_url {
+            Some(api_base_url) => {
+                storage_provider_factory.with_drive_object_api_base_url(api_base_url)
+            }
+            None => storage_provider_factory,
         };
-        let transfer_store = Arc::new(transfer_store);
-        transfer_store.validate_storage_providers().await?;
+        let storage_providers = storage_provider_factory
+            .build(&config, metadata_database.clone())
+            .await?;
+        let transfer_store = Arc::new(StorageProviderTransferStore::new(
+            storage_providers,
+            metadata_database.clone(),
+        ));
         let router = server_router_with_sessions_and_transfer_store(
             config,
             session_store,
@@ -464,14 +463,11 @@ pub fn lfs_server_router_with_sessions(
 
 /// Builds the Git LFS router with explicit provider-trait adapters.
 ///
-/// This is a narrow test seam for exercising the normal route, authentication,
-/// authorization, and transfer handlers without real GitHub or Google Drive
-/// network calls. It does not mount login routes or durable metadata storage;
-/// production serving still uses the configured GitHub and Google Drive
-/// clients. The configured repository provider and storage provider IDs must
-/// match the injected providers. Existing-object lookups synthesize backend IDs
-/// because the generic [`StorageProvider`] trait only reports object existence;
-/// the adapter never persists those synthetic IDs to metadata.
+/// This is a narrow test seam for exercising the production metadata-recording
+/// provider adapter without real GitHub or Google Drive network calls. It does
+/// not mount login routes and uses an in-memory metadata database. The
+/// configured repository and storage provider IDs must match the injected
+/// providers.
 ///
 /// # Errors
 ///
@@ -489,15 +485,26 @@ pub fn lfs_server_router_with_provider_adapters(
         repository_provider.provider_id(),
         storage_provider.provider_id(),
     )?;
+    let metadata_database = Arc::new(MetadataDatabase::open_in_memory()?);
+    metadata_database.sync_config(&config)?;
+    let storage_providers = ConfiguredStorageProviders::from_provider(&config, storage_provider)?;
+    let transfer_store = Arc::new(StorageProviderTransferStore::new(
+        storage_providers,
+        metadata_database.clone(),
+    ));
+    let max_concurrent_requests = config.server.max_concurrent_requests;
 
-    Ok(
-        lfs_server_router_with_sessions_authorizer_and_transfer_store(
+    Ok(with_http_request_limit(
+        build_lfs_server_router(
             config,
             session_store,
             Arc::new(ProviderBatchAuthorizer::new(repository_provider)),
-            Arc::new(StorageProviderTransferStore::new(storage_provider)),
+            transfer_store,
+            BatchBodyGuardrails::default(),
+            Some(metadata_database),
         ),
-    )
+        max_concurrent_requests,
+    ))
 }
 
 fn validate_provider_adapter_config(
@@ -693,27 +700,7 @@ trait LfsObjectTransferStore: Send + Sync {
     ) -> ProviderFuture<'a, ServerResult<()>>;
 }
 
-struct LfsDownloadResponse {
-    stored_object: StoredObject,
-    response: Response,
-}
-
-impl LfsDownloadResponse {
-    fn new(stored_object: StoredObject, response: Response) -> Self {
-        Self {
-            stored_object,
-            response,
-        }
-    }
-
-    fn stored_object(&self) -> &StoredObject {
-        &self.stored_object
-    }
-
-    fn into_response(self) -> Response {
-        self.response
-    }
-}
+type LfsDownloadResponse = StorageDownloadResponse;
 
 #[derive(Clone)]
 struct ProviderBatchAuthorizer {
@@ -798,51 +785,199 @@ impl LfsBatchAuthorizer for ProviderBatchAuthorizer {
 
 #[derive(Clone)]
 struct StorageProviderTransferStore {
-    provider: Arc<dyn StorageProvider + Send + Sync>,
+    providers: ConfiguredStorageProviders,
+    metadata_database: Arc<MetadataDatabase>,
 }
 
 impl StorageProviderTransferStore {
-    fn new(provider: Arc<dyn StorageProvider + Send + Sync>) -> Self {
-        Self { provider }
-    }
-
-    fn ensure_provider_matches(&self, repository: &RepositoryMapping) -> ServerResult<()> {
-        if self.provider.provider_id() == repository.storage_provider {
-            return Ok(());
+    fn new(
+        providers: ConfiguredStorageProviders,
+        metadata_database: Arc<MetadataDatabase>,
+    ) -> Self {
+        Self {
+            providers,
+            metadata_database,
         }
-
-        Err(ServerError::InvalidConfiguration {
-            message: format!(
-                "repository {} references storage provider {}, but injected provider is {}",
-                repository.id,
-                repository.storage_provider,
-                self.provider.provider_id()
-            ),
-        })
-    }
-
-    fn synthetic_existing_backend_id(&self, object: &LfsObject) -> String {
-        format!(
-            "lfscloud-provider-adapter-existing://{}/objects/{}",
-            self.provider.provider_id(),
-            object.oid.as_hex()
-        )
     }
 
     fn ensure_stored_object_namespace(
-        &self,
+        provider: &(dyn StorageProvider + Send + Sync),
         repository: &RepositoryMapping,
         stored_object: StoredObject,
     ) -> ServerResult<StoredObject> {
-        if stored_object.repository_namespace == repository.id {
+        if stored_object.provider_id == repository.storage_provider
+            && stored_object.repository_namespace == repository.id
+        {
             Ok(stored_object)
         } else {
             Err(ServerError::Storage {
                 source: StorageError::RepositoryNamespaceMismatch {
-                    provider: self.provider.provider_id().to_owned(),
+                    provider: provider.provider_id().to_owned(),
                 },
             })
         }
+    }
+
+    async fn record_verified_object_metadata(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+        backend_id: String,
+        created_by: RepositoryUser,
+    ) -> ServerResult<()> {
+        self.metadata_database
+            .record_verified_object_async(
+                repository.id.clone(),
+                repository.storage_provider.clone(),
+                object.clone(),
+                backend_id,
+                created_by,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn lookup_and_repair_object(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+    ) -> ServerResult<Option<StoredObject>> {
+        let runtime = self.providers.provider_for(repository)?;
+        let provider = runtime.provider();
+        let metadata = self
+            .metadata_database
+            .lookup_object_async(
+                repository.id.clone(),
+                repository.storage_provider.clone(),
+                object.clone(),
+            )
+            .await?;
+        let Some(metadata) = metadata else {
+            return provider
+                .lookup_object(&repository.id, object)
+                .await?
+                .map(|stored_object| {
+                    Self::ensure_stored_object_namespace(provider, repository, stored_object)
+                })
+                .transpose();
+        };
+
+        if let Some(backend_id_lookup) = runtime.backend_id_lookup()
+            && let Some(stored_object) = backend_id_lookup
+                .lookup_object_by_backend_id(&repository.id, object, &metadata.backend_id)
+                .await?
+        {
+            let stored_object =
+                Self::ensure_stored_object_namespace(provider, repository, stored_object)?;
+            if metadata.verification_status != MetadataObjectVerificationStatus::Verified {
+                self.record_verified_object_metadata(
+                    repository,
+                    object,
+                    stored_object.backend_id.clone(),
+                    metadata.created_by,
+                )
+                .await?;
+            }
+            return Ok(Some(stored_object));
+        }
+
+        let replacement = provider
+            .lookup_object(&repository.id, object)
+            .await?
+            .map(|stored_object| {
+                Self::ensure_stored_object_namespace(provider, repository, stored_object)
+            })
+            .transpose()?;
+        if let Some(stored_object) = &replacement {
+            if stored_object.backend_id != metadata.backend_id
+                || metadata.verification_status != MetadataObjectVerificationStatus::Verified
+            {
+                self.record_verified_object_metadata(
+                    repository,
+                    object,
+                    stored_object.backend_id.clone(),
+                    metadata.created_by,
+                )
+                .await?;
+            }
+        } else {
+            self.metadata_database
+                .mark_object_stale_async(
+                    repository.id.clone(),
+                    repository.storage_provider.clone(),
+                    object.clone(),
+                    metadata.backend_id,
+                )
+                .await?;
+        }
+
+        Ok(replacement)
+    }
+
+    async fn staged_download_response(
+        &self,
+        repository: &RepositoryMapping,
+        object: &LfsObject,
+    ) -> ServerResult<StorageDownloadResponse> {
+        let runtime = self.providers.provider_for(repository)?;
+        let provider = runtime.provider();
+        let provider_id = provider.provider_id().to_owned();
+        let temp_file = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
+            .await
+            .map_err(|source| ServerError::Storage {
+                source: StorageError::Retryable {
+                    provider: provider_id.clone(),
+                    message: format!("download staging file task could not join: {source}"),
+                },
+            })?
+            .map_err(|source| ServerError::Storage {
+                source: StorageError::Retryable {
+                    provider: provider_id.clone(),
+                    message: format!("download staging file could not be created: {source}"),
+                },
+            })?;
+        let stored_object = provider
+            .download_object(&repository.id, object, temp_file.path())
+            .await?;
+        let stored_object =
+            Self::ensure_stored_object_namespace(provider, repository, stored_object)?;
+        let file = tokio::fs::File::open(temp_file.path())
+            .await
+            .map_err(|source| ServerError::Storage {
+                source: StorageError::Retryable {
+                    provider: provider_id.clone(),
+                    message: format!("download staging file could not be opened: {source}"),
+                },
+            })?;
+        let content_length = file
+            .metadata()
+            .await
+            .map_err(|source| ServerError::Storage {
+                source: StorageError::Retryable {
+                    provider: provider_id,
+                    message: format!("download staging file metadata could not be read: {source}"),
+                },
+            })?;
+        let temp_path = temp_file.into_temp_path();
+        let body_stream = stream::unfold(
+            (ReaderStream::new(file), temp_path),
+            |(mut reader, temp_path)| async move {
+                reader
+                    .next()
+                    .await
+                    .map(|chunk| (chunk, (reader, temp_path)))
+            },
+        );
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(CONTENT_LENGTH, content_length.len().to_string())
+            .body(Body::from_stream(body_stream))
+            .map_err(|source| ServerError::Internal {
+                message: format!("download response could not be built: {source}"),
+            })?;
+
+        Ok(StorageDownloadResponse::new(stored_object, response))
     }
 }
 
@@ -852,19 +987,7 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
         repository: &'a RepositoryMapping,
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
-        Box::pin(async move {
-            self.ensure_provider_matches(repository)?;
-            if self.provider.object_exists(&repository.id, object).await? {
-                Ok(Some(StoredObject::new(
-                    self.provider.provider_id().to_owned(),
-                    repository.id.clone(),
-                    object.clone(),
-                    self.synthetic_existing_backend_id(object),
-                )))
-            } else {
-                Ok(None)
-            }
-        })
+        Box::pin(async move { self.lookup_and_repair_object(repository, object).await })
     }
 
     fn upload_object<'a>(
@@ -872,16 +995,23 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
         repository: &'a RepositoryMapping,
         object: &'a LfsObject,
         source: &'a Path,
-        _created_by: &'a RepositoryUser,
+        created_by: &'a RepositoryUser,
     ) -> ProviderFuture<'a, ServerResult<StoredObject>> {
         Box::pin(async move {
-            self.ensure_provider_matches(repository)?;
-            let stored_object = self
-                .provider
+            let provider = self.providers.provider_for(repository)?.provider();
+            let stored_object = provider
                 .upload_object(&repository.id, object, source)
-                .await
-                .map_err(ServerError::from)?;
-            self.ensure_stored_object_namespace(repository, stored_object)
+                .await?;
+            let stored_object =
+                Self::ensure_stored_object_namespace(provider, repository, stored_object)?;
+            self.record_verified_object_metadata(
+                repository,
+                object,
+                stored_object.backend_id.clone(),
+                created_by.clone(),
+            )
+            .await?;
+            Ok(stored_object)
         })
     }
 
@@ -891,71 +1021,43 @@ impl LfsObjectTransferStore for StorageProviderTransferStore {
         object: &'a LfsObject,
     ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
         Box::pin(async move {
-            self.ensure_provider_matches(repository)?;
-            let provider_id = self.provider.provider_id().to_owned();
-            let temp_file = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
-                .await
-                .map_err(|source| ServerError::Storage {
-                    source: StorageError::Retryable {
-                        provider: provider_id.clone(),
-                        message: format!("download staging file task could not join: {source}"),
-                    },
-                })?
-                .map_err(|source| ServerError::Storage {
-                    source: StorageError::Retryable {
-                        provider: provider_id.clone(),
-                        message: format!("download staging file could not be created: {source}"),
-                    },
-                })?;
             let stored_object = self
-                .provider
-                .download_object(&repository.id, object, temp_file.path())
-                .await?;
-            let stored_object = self.ensure_stored_object_namespace(repository, stored_object)?;
-            let file = tokio::fs::File::open(temp_file.path())
-                .await
-                .map_err(|source| ServerError::Storage {
-                    source: StorageError::Retryable {
-                        provider: provider_id.clone(),
-                        message: format!("download staging file could not be opened: {source}"),
+                .lookup_and_repair_object(repository, object)
+                .await?
+                .ok_or_else(|| ServerError::Storage {
+                    source: StorageError::ObjectNotFound {
+                        provider: repository.storage_provider.clone(),
+                        oid: object.oid.as_hex().to_owned(),
+                        size: object.size.bytes(),
                     },
                 })?;
-            let content_length = file
-                .metadata()
-                .await
-                .map_err(|source| ServerError::Storage {
-                    source: StorageError::Retryable {
-                        provider: provider_id,
-                        message: format!(
-                            "download staging file metadata could not be read: {source}"
-                        ),
-                    },
-                })?;
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .header(CONTENT_LENGTH, content_length.len().to_string())
-                .body(Body::from_stream(ReaderStream::new(file)))
-                .map_err(|source| ServerError::Internal {
-                    message: format!("download response could not be built: {source}"),
-                })?;
-
-            Ok(LfsDownloadResponse::new(stored_object, response))
+            let runtime = self.providers.provider_for(repository)?;
+            if let Some(streaming_download) = runtime.streaming_download() {
+                return streaming_download
+                    .download_object_response(&repository.id, object, stored_object)
+                    .await
+                    .map_err(ServerError::from);
+            }
+            self.staged_download_response(repository, object).await
         })
     }
 
     fn record_verified_object<'a>(
         &'a self,
         repository: &'a RepositoryMapping,
-        _object: &'a LfsObject,
-        _backend_id: &'a str,
-        _created_by: &'a RepositoryUser,
+        object: &'a LfsObject,
+        backend_id: &'a str,
+        created_by: &'a RepositoryUser,
     ) -> ProviderFuture<'a, ServerResult<()>> {
         Box::pin(async move {
-            self.ensure_provider_matches(repository)?;
-            // The provider-adapter seam has no durable metadata store; production
-            // serving records verified objects through GoogleDriveTransferStore.
-            Ok(())
+            self.providers.provider_for(repository)?;
+            self.record_verified_object_metadata(
+                repository,
+                object,
+                backend_id.to_owned(),
+                created_by.clone(),
+            )
+            .await
         })
     }
 }
@@ -1020,231 +1122,6 @@ impl LfsObjectTransferStore for PendingLfsObjectTransferStore {
                     provider_type: "storage transfer handling is not configured".to_owned(),
                 },
             })
-        })
-    }
-}
-
-#[derive(Clone)]
-struct GoogleDriveTransferStore {
-    storage_providers: BTreeMap<String, StorageProviderConfig>,
-    metadata_database: Arc<MetadataDatabase>,
-    token_source: Arc<dyn GoogleDriveAccessTokenSource>,
-    token_cache: GoogleDriveAccessTokenCache,
-    root_validator: GoogleDriveRootValidator,
-    #[cfg(test)]
-    object_api_base_url: Option<String>,
-}
-
-impl GoogleDriveTransferStore {
-    fn with_dependencies(
-        config: ServerConfig,
-        metadata_database: Arc<MetadataDatabase>,
-        token_source: Arc<dyn GoogleDriveAccessTokenSource>,
-        root_validator: GoogleDriveRootValidator,
-    ) -> Self {
-        Self {
-            storage_providers: config.storage_providers,
-            metadata_database,
-            token_source,
-            token_cache: GoogleDriveAccessTokenCache::default(),
-            root_validator,
-            #[cfg(test)]
-            object_api_base_url: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_object_api_base_url(mut self, api_base_url: impl Into<String>) -> Self {
-        self.object_api_base_url = Some(api_base_url.into());
-        self
-    }
-
-    async fn validate_storage_providers(&self) -> ServerResult<()> {
-        for storage in self.storage_providers.values() {
-            let StorageProviderConfig::GoogleDrive(storage) = storage;
-            let token = self
-                .token_cache
-                .get_or_refresh(storage, self.token_source.as_ref())
-                .await?;
-            self.root_validator
-                .validate_root_folder(storage, &token)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    async fn object_store_for_repository(
-        &self,
-        repository: &RepositoryMapping,
-    ) -> ServerResult<GoogleDriveObjectStore> {
-        let storage = match self.storage_providers.get(&repository.storage_provider) {
-            Some(StorageProviderConfig::GoogleDrive(storage)) => storage.clone(),
-            None => {
-                return Err(ServerError::InvalidConfiguration {
-                    message: format!(
-                        "repository {} references unknown storage provider {}",
-                        repository.id, repository.storage_provider
-                    ),
-                });
-            }
-        };
-        let token = self
-            .token_cache
-            .get_or_refresh(&storage, self.token_source.as_ref())
-            .await?;
-
-        #[cfg(test)]
-        if let Some(api_base_url) = &self.object_api_base_url {
-            return GoogleDriveObjectStore::with_client_and_api_base_url(
-                storage,
-                &repository.id,
-                token,
-                reqwest::Client::new(),
-                api_base_url,
-            )
-            .map_err(ServerError::from);
-        }
-
-        GoogleDriveObjectStore::new(storage, &repository.id, token).map_err(ServerError::from)
-    }
-
-    async fn lookup_and_repair_object(
-        &self,
-        repository: &RepositoryMapping,
-        object: &LfsObject,
-        store: &GoogleDriveObjectStore,
-    ) -> ServerResult<Option<StoredObject>> {
-        let metadata = self
-            .metadata_database
-            .lookup_object_async(
-                repository.id.clone(),
-                repository.storage_provider.clone(),
-                object.clone(),
-            )
-            .await?;
-        let Some(metadata) = metadata else {
-            return store.lookup_object(object).await.map_err(ServerError::from);
-        };
-
-        if let Some(stored_object) = store
-            .lookup_object_by_backend_id(object, &metadata.backend_id)
-            .await?
-        {
-            if metadata.verification_status != MetadataObjectVerificationStatus::Verified {
-                self.metadata_database
-                    .record_verified_object_async(
-                        repository.id.clone(),
-                        repository.storage_provider.clone(),
-                        object.clone(),
-                        stored_object.backend_id.clone(),
-                        metadata.created_by,
-                    )
-                    .await?;
-            }
-            return Ok(Some(stored_object));
-        }
-
-        let replacement = store.lookup_object(object).await?;
-        if let Some(stored_object) = &replacement {
-            self.metadata_database
-                .record_verified_object_async(
-                    repository.id.clone(),
-                    repository.storage_provider.clone(),
-                    object.clone(),
-                    stored_object.backend_id.clone(),
-                    metadata.created_by,
-                )
-                .await?;
-        } else {
-            self.metadata_database
-                .mark_object_stale_async(
-                    repository.id.clone(),
-                    repository.storage_provider.clone(),
-                    object.clone(),
-                    metadata.backend_id,
-                )
-                .await?;
-        }
-
-        Ok(replacement)
-    }
-}
-
-impl LfsObjectTransferStore for GoogleDriveTransferStore {
-    fn lookup_object<'a>(
-        &'a self,
-        repository: &'a RepositoryMapping,
-        object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<Option<StoredObject>>> {
-        Box::pin(async move {
-            let store = self.object_store_for_repository(repository).await?;
-            self.lookup_and_repair_object(repository, object, &store)
-                .await
-        })
-    }
-
-    fn upload_object<'a>(
-        &'a self,
-        repository: &'a RepositoryMapping,
-        object: &'a LfsObject,
-        source: &'a Path,
-        created_by: &'a RepositoryUser,
-    ) -> ProviderFuture<'a, ServerResult<StoredObject>> {
-        Box::pin(async move {
-            let store = self.object_store_for_repository(repository).await?;
-            let stored_object = store.upload_object(object, source).await?;
-            self.record_verified_object(repository, object, &stored_object.backend_id, created_by)
-                .await?;
-            Ok(stored_object)
-        })
-    }
-
-    fn download_object_response<'a>(
-        &'a self,
-        repository: &'a RepositoryMapping,
-        object: &'a LfsObject,
-    ) -> ProviderFuture<'a, ServerResult<LfsDownloadResponse>> {
-        Box::pin(async move {
-            let store = self.object_store_for_repository(repository).await?;
-            let stored_object = self
-                .lookup_and_repair_object(repository, object, &store)
-                .await?
-                .ok_or_else(|| ServerError::Storage {
-                    source: StorageError::ObjectNotFound {
-                        provider: repository.storage_provider.clone(),
-                        oid: object.oid.as_hex().to_owned(),
-                        size: object.size.bytes(),
-                    },
-                })?;
-            let download = store
-                .download_object_response_for_stored_object(object, stored_object)
-                .await?;
-            Ok(LfsDownloadResponse::new(
-                download.stored_object().clone(),
-                download.into_response(),
-            ))
-        })
-    }
-
-    fn record_verified_object<'a>(
-        &'a self,
-        repository: &'a RepositoryMapping,
-        object: &'a LfsObject,
-        backend_id: &'a str,
-        created_by: &'a RepositoryUser,
-    ) -> ProviderFuture<'a, ServerResult<()>> {
-        Box::pin(async move {
-            self.metadata_database
-                .record_verified_object_async(
-                    repository.id.clone(),
-                    repository.storage_provider.clone(),
-                    object.clone(),
-                    backend_id.to_owned(),
-                    created_by.clone(),
-                )
-                .await?;
-            Ok(())
         })
     }
 }
@@ -3639,11 +3516,11 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, BatchBodyGuardrails, GoogleDriveTransferStore, LFS_AUTH_CHALLENGE,
-        LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore,
-        LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES,
-        ProviderBatchAuthorizer, ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients,
-        ServerShutdownOutcome, UploadStagingCoordinator, UploadStagingGuardrails,
+        BASE64_STANDARD, BatchBodyGuardrails, LFS_AUTH_CHALLENGE, LFS_SESSION_REVOKE_PATH,
+        LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore, LfsRouteEndpoint,
+        LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES, ProviderBatchAuthorizer,
+        ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients, ServerShutdownOutcome,
+        StorageProviderTransferStore, UploadStagingCoordinator, UploadStagingGuardrails,
         advertised_server_urls, authenticate_lfs_session, lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
         lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails,
@@ -3666,6 +3543,7 @@ mod tests {
         RepositoryUser, SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
         StorageProviderConfig, StorageResult, StoredObject,
         google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
+        provider_factory::ServerStorageProviderFactory,
     };
 
     const VALID_BATCH_REQUEST: &str = r#"{
@@ -3869,12 +3747,14 @@ repositories:
         )
         .expect("composition config should be written");
         let clients = ServerCompositionClients {
-            drive_token_source: static_drive_token_source(),
-            drive_root_validator: GoogleDriveRootValidator::with_client_and_api_base_url(
-                reqwest::Client::new(),
-                &upstream_url,
-            )
-            .expect("composition Drive root validator should build"),
+            storage_provider_factory: ServerStorageProviderFactory::with_drive_dependencies(
+                static_drive_token_source(),
+                GoogleDriveRootValidator::with_client_and_api_base_url(
+                    reqwest::Client::new(),
+                    &upstream_url,
+                )
+                .expect("composition Drive root validator should build"),
+            ),
             github_user_client: GitHubUserClient::new()
                 .expect("composition GitHub user client should build"),
         };
@@ -4007,25 +3887,30 @@ repositories:
     async fn google_drive_startup_validation_mints_one_token_and_checks_root() {
         let token_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let root_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let app = Router::new().route(
-            "/drive/v3/files/{file_id}",
-            get({
-                let root_requests = root_requests.clone();
-                move |Path(file_id): Path<String>| {
+        let app = Router::new()
+            .route(
+                "/drive/v3/files/{file_id}",
+                get({
                     let root_requests = root_requests.clone();
-                    async move {
-                        root_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Json(serde_json::json!({
-                            "id": file_id,
-                            "name": "LFS Cloud Root",
-                            "mimeType": "application/vnd.google-apps.folder",
-                            "trashed": false,
-                            "capabilities": { "canAddChildren": true }
-                        }))
+                    move |Path(file_id): Path<String>| {
+                        let root_requests = root_requests.clone();
+                        async move {
+                            root_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Json(serde_json::json!({
+                                "id": file_id,
+                                "name": "LFS Cloud Root",
+                                "mimeType": "application/vnd.google-apps.folder",
+                                "trashed": false,
+                                "capabilities": { "canAddChildren": true }
+                            }))
+                        }
                     }
-                }
-            }),
-        );
+                }),
+            )
+            .route(
+                "/drive/v3/files",
+                get(|| async { Json(serde_json::json!({ "files": [] })) }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Drive startup test server should bind");
@@ -4044,10 +3929,11 @@ repositories:
                 .expect("metadata database should open"),
         );
         let config = test_config();
+        database
+            .sync_config(&config)
+            .expect("metadata config should synchronize");
         let repository = config.repositories[0].clone();
-        let store = GoogleDriveTransferStore::with_dependencies(
-            config,
-            database,
+        let factory = ServerStorageProviderFactory::with_drive_dependencies(
             Arc::new(CountingGoogleDriveAccessTokenSource {
                 calls: token_requests.clone(),
             }),
@@ -4056,14 +3942,20 @@ repositories:
                 format!("http://{address}"),
             )
             .expect("root validator should build"),
-        );
-
-        store
-            .validate_storage_providers()
+        )
+        .with_drive_object_api_base_url(format!("http://{address}"));
+        let providers = factory
+            .build(&config, database.clone())
             .await
             .expect("configured Drive root should validate before startup");
+        let store = StorageProviderTransferStore::new(providers, database);
+        let object = LfsObject::new(
+            LfsOid::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("test OID should parse"),
+            LfsObjectSize::new(42),
+        );
         store
-            .object_store_for_repository(&repository)
+            .lookup_object(&repository, &object)
             .await
             .expect("validated token should remain cached for transfers");
 
@@ -4102,9 +3994,11 @@ repositories:
             MetadataDatabase::open(directory.path().join("metadata.sqlite3"))
                 .expect("metadata database should open"),
         );
-        let store = GoogleDriveTransferStore::with_dependencies(
-            test_config(),
-            database,
+        let config = test_config();
+        database
+            .sync_config(&config)
+            .expect("metadata config should synchronize");
+        let factory = ServerStorageProviderFactory::with_drive_dependencies(
             static_drive_token_source(),
             GoogleDriveRootValidator::with_client_and_api_base_url(
                 reqwest::Client::new(),
@@ -4113,10 +4007,10 @@ repositories:
             .expect("root validator should build"),
         );
 
-        let error = store
-            .validate_storage_providers()
-            .await
-            .expect_err("read-only Drive root must prevent server readiness");
+        let error = match factory.build(&config, database).await {
+            Ok(_) => panic!("read-only Drive root must prevent server readiness"),
+            Err(error) => error,
+        };
 
         assert!(matches!(
             error,
@@ -4160,6 +4054,16 @@ repositories:
                                 .lock()
                                 .expect("Drive metadata requests lock should not poison")
                                 .push(format!("get:{file_id}"));
+                            if file_id == "root" {
+                                return Json(serde_json::json!({
+                                    "id": "root",
+                                    "name": "LFS Cloud Root",
+                                    "mimeType": "application/vnd.google-apps.folder",
+                                    "trashed": false,
+                                    "capabilities": { "canAddChildren": true }
+                                }))
+                                .into_response();
+                            }
                             if file_id == "drive-file-current" {
                                 return Json(serde_json::json!({
                                     "id": "drive-file-current",
@@ -4243,9 +4147,7 @@ repositories:
             )
             .expect("verified object metadata should record");
         let repository = config.repositories[0].clone();
-        let store = GoogleDriveTransferStore::with_dependencies(
-            config,
-            database.clone(),
+        let factory = ServerStorageProviderFactory::with_drive_dependencies(
             static_drive_token_source(),
             GoogleDriveRootValidator::with_client_and_api_base_url(
                 reqwest::Client::new(),
@@ -4253,7 +4155,21 @@ repositories:
             )
             .expect("root validator should build"),
         )
-        .with_object_api_base_url(format!("http://{address}"));
+        .with_drive_object_api_base_url(format!("http://{address}"));
+        let providers = factory
+            .build(&config, database.clone())
+            .await
+            .expect("configured Drive provider should build");
+        let runtime = providers
+            .provider_for(&repository)
+            .expect("repository provider should be registered");
+        assert!(runtime.backend_id_lookup().is_some());
+        assert!(runtime.streaming_download().is_some());
+        let store = StorageProviderTransferStore::new(providers, database.clone());
+        drive_requests
+            .lock()
+            .expect("Drive metadata requests lock should not poison")
+            .clear();
 
         let found = store
             .lookup_object(&repository, &object)

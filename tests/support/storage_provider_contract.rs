@@ -99,6 +99,16 @@ pub async fn assert_storage_provider_contract(
             .expect("uploaded object existence check should succeed"),
         "a successful upload must be discoverable"
     );
+    let looked_up = provider
+        .lookup_object(repository_namespace, &object)
+        .await
+        .expect("uploaded object lookup should succeed")
+        .expect("uploaded object lookup should return metadata");
+    assert_stored_object_identity(provider, repository_namespace, &object, &looked_up);
+    assert_eq!(
+        looked_up.backend_id, uploaded.backend_id,
+        "lookup must return the uploaded backend object identity"
+    );
 
     let downloaded = provider
         .download_object(repository_namespace, &object, &destination)

@@ -2,18 +2,18 @@
 //!
 //! Configuration parsing names concrete provider variants, while the rest of
 //! the application consumes repository and storage traits. This module is the
-//! registration boundary between those two layers. The only intentionally
-//! concrete production exception remains the Google Drive transfer store in
-//! `server`, pending the separately scoped generic transfer-store design.
+//! registration boundary between those two layers, including production server
+//! storage composition and optional provider capabilities.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use crate::{
-    GitHubProviderConfig, GitHubRepositoryProvider, GoogleDriveGcloudTokenProvider,
-    GoogleDriveObjectStore, GoogleDriveRootValidator, GoogleDriveStorageConfig, LfsObject,
-    MetadataDatabase, ProviderFuture, RepositoryMapping, RepositoryProvider,
-    RepositoryProviderConfig, ServerConfig, ServerError, ServerResult, StorageDeleteOutcome,
-    StorageError, StorageProvider, StorageProviderConfig, StorageResult, StoredObject,
+    BackendIdLookup, GitHubProviderConfig, GitHubRepositoryProvider,
+    GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore, GoogleDriveRootValidator,
+    GoogleDriveStorageConfig, LfsObject, MetadataDatabase, ProviderFuture, RepositoryMapping,
+    RepositoryProvider, RepositoryProviderConfig, ServerConfig, ServerError, ServerResult,
+    StorageDeleteOutcome, StorageDownloadResponse, StorageError, StorageProvider,
+    StorageProviderConfig, StorageResult, StoredObject, StreamingStorageProvider,
     google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
 };
 
@@ -139,10 +139,200 @@ impl ServerConfig {
     }
 }
 
+/// One configured storage provider plus production transfer capabilities.
+#[derive(Clone)]
+pub(crate) struct ServerStorageProvider {
+    provider: Arc<dyn StorageProvider + Send + Sync>,
+    backend_id_lookup: Option<Arc<dyn BackendIdLookup>>,
+    streaming_download: Option<Arc<dyn StreamingStorageProvider>>,
+}
+
+impl ServerStorageProvider {
+    fn with_capabilities<T>(provider: Arc<T>) -> Self
+    where
+        T: StorageProvider + BackendIdLookup + StreamingStorageProvider + Send + Sync + 'static,
+    {
+        Self {
+            provider: provider.clone(),
+            backend_id_lookup: Some(provider.clone()),
+            streaming_download: Some(provider),
+        }
+    }
+
+    /// Builds the default server adapter for a provider without optional capabilities.
+    pub(crate) fn from_provider(provider: Arc<dyn StorageProvider + Send + Sync>) -> Self {
+        Self {
+            provider,
+            backend_id_lookup: None,
+            streaming_download: None,
+        }
+    }
+
+    /// Returns the provider's generic storage contract.
+    pub(crate) fn provider(&self) -> &(dyn StorageProvider + Send + Sync) {
+        self.provider.as_ref()
+    }
+
+    /// Returns indexed backend-ID lookup when the provider supports it.
+    pub(crate) fn backend_id_lookup(&self) -> Option<&dyn BackendIdLookup> {
+        self.backend_id_lookup.as_deref()
+    }
+
+    /// Returns direct streaming when the provider supports it.
+    pub(crate) fn streaming_download(&self) -> Option<&dyn StreamingStorageProvider> {
+        self.streaming_download.as_deref()
+    }
+}
+
+/// Repository-scoped storage providers composed through config registration.
+#[derive(Clone)]
+pub(crate) struct ConfiguredStorageProviders {
+    by_repository_id: BTreeMap<String, ServerStorageProvider>,
+}
+
+impl ConfiguredStorageProviders {
+    /// Builds a registry around one injected provider for local end-to-end tests.
+    pub(crate) fn from_provider(
+        config: &ServerConfig,
+        provider: Arc<dyn StorageProvider + Send + Sync>,
+    ) -> ServerResult<Self> {
+        let mut by_repository_id = BTreeMap::new();
+        for repository in &config.repositories {
+            if repository.storage_provider != provider.provider_id() {
+                return Err(ServerError::InvalidConfiguration {
+                    message: format!(
+                        "repository {} references storage provider {}, but injected provider is {}",
+                        repository.id,
+                        repository.storage_provider,
+                        provider.provider_id()
+                    ),
+                });
+            }
+            by_repository_id.insert(
+                repository.id.clone(),
+                ServerStorageProvider::from_provider(provider.clone()),
+            );
+        }
+        Ok(Self { by_repository_id })
+    }
+
+    /// Resolves the provider registered for one validated repository mapping.
+    pub(crate) fn provider_for(
+        &self,
+        repository: &RepositoryMapping,
+    ) -> ServerResult<&ServerStorageProvider> {
+        let provider = self.by_repository_id.get(&repository.id).ok_or_else(|| {
+            ServerError::InvalidConfiguration {
+                message: format!(
+                    "repository {} has no configured server storage provider",
+                    repository.id
+                ),
+            }
+        })?;
+        if provider.provider().provider_id() != repository.storage_provider {
+            return Err(ServerError::InvalidConfiguration {
+                message: format!(
+                    "repository {} references storage provider {}, but composed provider is {}",
+                    repository.id,
+                    repository.storage_provider,
+                    provider.provider().provider_id()
+                ),
+            });
+        }
+        Ok(provider)
+    }
+}
+
+/// Constructs readiness-checked production storage providers.
+///
+/// Provider-specific clients remain private to this registration boundary.
+/// The server receives only the generic provider contract and optional
+/// capabilities that preserve indexed lookup and direct streaming.
+#[derive(Clone)]
+pub(crate) struct ServerStorageProviderFactory {
+    drive_token_source: Arc<dyn GoogleDriveAccessTokenSource>,
+    drive_token_cache: GoogleDriveAccessTokenCache,
+    drive_root_validator: GoogleDriveRootValidator,
+    #[cfg(test)]
+    drive_object_api_base_url: Option<String>,
+}
+
+impl ServerStorageProviderFactory {
+    /// Builds production provider dependencies.
+    pub(crate) fn production() -> StorageResult<Self> {
+        Ok(Self {
+            drive_token_source: Arc::new(GoogleDriveGcloudTokenProvider::new()),
+            drive_token_cache: GoogleDriveAccessTokenCache::default(),
+            drive_root_validator: GoogleDriveRootValidator::new()?,
+            #[cfg(test)]
+            drive_object_api_base_url: None,
+        })
+    }
+
+    /// Builds deterministic Drive dependencies for server composition tests.
+    #[cfg(test)]
+    pub(crate) fn with_drive_dependencies(
+        token_source: Arc<dyn GoogleDriveAccessTokenSource>,
+        root_validator: GoogleDriveRootValidator,
+    ) -> Self {
+        Self {
+            drive_token_source: token_source,
+            drive_token_cache: GoogleDriveAccessTokenCache::default(),
+            drive_root_validator: root_validator,
+            drive_object_api_base_url: None,
+        }
+    }
+
+    /// Overrides the Drive object API base for loopback server tests.
+    #[cfg(test)]
+    pub(crate) fn with_drive_object_api_base_url(
+        mut self,
+        api_base_url: impl Into<String>,
+    ) -> Self {
+        self.drive_object_api_base_url = Some(api_base_url.into());
+        self
+    }
+
+    /// Validates configured storage roots and builds repository-scoped adapters.
+    pub(crate) async fn build(
+        &self,
+        config: &ServerConfig,
+        metadata: Arc<MetadataDatabase>,
+    ) -> ServerResult<ConfiguredStorageProviders> {
+        for storage in config.storage_providers.values() {
+            storage
+                .registration()
+                .validate_server_readiness(self)
+                .await?;
+        }
+
+        let mut by_repository_id = BTreeMap::new();
+        for repository in &config.repositories {
+            let storage = config
+                .storage_providers
+                .get(&repository.storage_provider)
+                .ok_or_else(|| ServerError::InvalidConfiguration {
+                    message: format!(
+                        "repository {} references unknown storage provider {}",
+                        repository.id, repository.storage_provider
+                    ),
+                })?;
+            let provider = storage.registration().build_server_provider(
+                repository.id.clone(),
+                metadata.clone(),
+                self,
+            );
+            by_repository_id.insert(repository.id.clone(), provider);
+        }
+
+        Ok(ConfiguredStorageProviders { by_repository_id })
+    }
+}
+
 /// Provider-neutral behavior registered by each storage config variant.
 ///
-/// Runtime transfer concerns that require concrete dependencies stay with the
-/// concrete transfer path instead of leaking those types through this trait.
+/// Runtime transfer concerns are composed here so the server does not match
+/// concrete provider variants.
 trait StorageProviderRegistration {
     /// Returns the provider ID embedded by validated configuration loading.
     fn id(&self) -> &str;
@@ -160,6 +350,18 @@ trait StorageProviderRegistration {
         repository_namespace: String,
         metadata: Arc<MetadataDatabase>,
     ) -> ProviderFuture<'static, StorageResult<Arc<dyn StorageProvider + Send + Sync>>>;
+    /// Validates provider readiness before the production listener binds.
+    fn validate_server_readiness<'a>(
+        &'a self,
+        factory: &'a ServerStorageProviderFactory,
+    ) -> ProviderFuture<'a, StorageResult<()>>;
+    /// Builds one repository-scoped production server provider.
+    fn build_server_provider(
+        &self,
+        repository_namespace: String,
+        metadata: Arc<MetadataDatabase>,
+        factory: &ServerStorageProviderFactory,
+    ) -> ServerStorageProvider;
 }
 
 impl StorageProviderRegistration for GoogleDriveStorageConfig {
@@ -214,6 +416,45 @@ impl StorageProviderRegistration for GoogleDriveStorageConfig {
                 metadata,
             )) as Arc<dyn StorageProvider + Send + Sync>)
         })
+    }
+
+    fn validate_server_readiness<'a>(
+        &'a self,
+        factory: &'a ServerStorageProviderFactory,
+    ) -> ProviderFuture<'a, StorageResult<()>> {
+        Box::pin(async move {
+            let token = factory
+                .drive_token_cache
+                .get_or_refresh(self, factory.drive_token_source.as_ref())
+                .await?;
+            factory
+                .drive_root_validator
+                .validate_root_folder(self, &token)
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn build_server_provider(
+        &self,
+        repository_namespace: String,
+        metadata: Arc<MetadataDatabase>,
+        factory: &ServerStorageProviderFactory,
+    ) -> ServerStorageProvider {
+        let provider = GoogleDriveStorageProvider::with_dependencies(
+            self.clone(),
+            repository_namespace,
+            factory.drive_token_source.clone(),
+            factory.drive_token_cache.clone(),
+            metadata,
+        )
+        .without_provider_upload_lock();
+        #[cfg(test)]
+        let provider = match &factory.drive_object_api_base_url {
+            Some(api_base_url) => provider.with_object_api_base_url(api_base_url.clone()),
+            None => provider,
+        };
+        ServerStorageProvider::with_capabilities(Arc::new(provider))
     }
 }
 
@@ -274,6 +515,7 @@ pub(crate) struct GoogleDriveStorageProvider {
     token_source: Arc<dyn GoogleDriveAccessTokenSource>,
     token_cache: GoogleDriveAccessTokenCache,
     metadata: Arc<MetadataDatabase>,
+    acquire_upload_lock: bool,
     #[cfg(test)]
     api_base_url: Option<String>,
 }
@@ -293,6 +535,7 @@ impl GoogleDriveStorageProvider {
             token_source,
             token_cache,
             metadata,
+            acquire_upload_lock: true,
             #[cfg(test)]
             api_base_url: None,
         }
@@ -317,6 +560,17 @@ impl GoogleDriveStorageProvider {
         );
         provider.api_base_url = api_base_url;
         provider
+    }
+
+    #[cfg(test)]
+    fn with_object_api_base_url(mut self, api_base_url: impl Into<String>) -> Self {
+        self.api_base_url = Some(api_base_url.into());
+        self
+    }
+
+    fn without_provider_upload_lock(mut self) -> Self {
+        self.acquire_upload_lock = false;
+        self
     }
 
     async fn object_store(&self) -> StorageResult<GoogleDriveObjectStore> {
@@ -352,19 +606,14 @@ impl StorageProvider for GoogleDriveStorageProvider {
         &self.storage.id
     }
 
-    fn object_exists<'a>(
+    fn lookup_object<'a>(
         &'a self,
         repository_namespace: &'a str,
         object: &'a LfsObject,
-    ) -> ProviderFuture<'a, StorageResult<bool>> {
+    ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>> {
         Box::pin(async move {
             self.validate_repository_namespace(repository_namespace)?;
-            Ok(self
-                .object_store()
-                .await?
-                .lookup_object(object)
-                .await?
-                .is_some())
+            self.object_store().await?.lookup_object(object).await
         })
     }
 
@@ -382,18 +631,21 @@ impl StorageProvider for GoogleDriveStorageProvider {
                 source,
             )
             .await?;
-            let _upload_lock = self
-                .metadata
-                .acquire_object_upload_lock(
-                    repository_namespace.to_owned(),
-                    self.storage.id.clone(),
-                    object.clone(),
-                )
-                .await
-                .map_err(|error| StorageError::Retryable {
-                    provider: self.storage.id.clone(),
-                    message: format!("provider upload lock failed: {error}"),
-                })?;
+            let _upload_lock = if self.acquire_upload_lock {
+                self.metadata
+                    .acquire_object_upload_lock(
+                        repository_namespace.to_owned(),
+                        self.storage.id.clone(),
+                        object.clone(),
+                    )
+                    .await
+                    .map_err(|error| StorageError::Retryable {
+                        provider: self.storage.id.clone(),
+                        message: format!("provider upload lock failed: {error}"),
+                    })?
+            } else {
+                None
+            };
 
             // Verify before waiting so cache-hit retries do not serialize
             // large-file reads. Keep lookup and possible upload under the
@@ -438,6 +690,40 @@ impl StorageProvider for GoogleDriveStorageProvider {
                 object,
             )
             .await
+        })
+    }
+}
+
+impl BackendIdLookup for GoogleDriveStorageProvider {
+    fn lookup_object_by_backend_id<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+        backend_id: &'a str,
+    ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>> {
+        Box::pin(async move {
+            self.validate_repository_namespace(repository_namespace)?;
+            self.object_store()
+                .await?
+                .lookup_object_by_backend_id(object, backend_id)
+                .await
+        })
+    }
+}
+
+impl StreamingStorageProvider for GoogleDriveStorageProvider {
+    fn download_object_response<'a>(
+        &'a self,
+        repository_namespace: &'a str,
+        object: &'a LfsObject,
+        stored_object: StoredObject,
+    ) -> ProviderFuture<'a, StorageResult<StorageDownloadResponse>> {
+        Box::pin(async move {
+            self.validate_repository_namespace(repository_namespace)?;
+            self.object_store()
+                .await?
+                .download_object_response_for_stored_object(object, stored_object)
+                .await
         })
     }
 }

@@ -547,6 +547,51 @@ async fn configured_google_drive_upload_acquires_token_after_upload_lock() {
     );
 }
 
+#[tokio::test]
+async fn server_google_drive_provider_uses_the_server_owned_upload_lock() {
+    let server = DriveStorageContractServer::start().await;
+    let source_root = tempfile::tempdir().expect("provider source root should be created");
+    let source = source_root.path().join("object.bin");
+    let object_bytes = b"server-owned upload lock";
+    fs::write(&source, object_bytes).expect("provider source should be written");
+    let object = lfs_object_for_bytes(object_bytes);
+    let repository_namespace = "github.com/owner/repo";
+    let storage_config = drive_contract_storage_config();
+    let metadata = Arc::new(
+        MetadataDatabase::open(source_root.path().join("metadata.sqlite3"))
+            .expect("provider metadata should open"),
+    );
+    let held_lock = metadata
+        .acquire_object_upload_lock(
+            repository_namespace.to_owned(),
+            storage_config.id.clone(),
+            object.clone(),
+        )
+        .await
+        .expect("server upload lock should be acquired")
+        .expect("file-backed metadata should return an upload lock");
+    let storage = GoogleDriveStorageProvider::with_test_dependencies(
+        storage_config,
+        repository_namespace,
+        Arc::new(FixedDriveTokenSource),
+        GoogleDriveAccessTokenCache::default(),
+        metadata,
+        Some(server.base_url.clone()),
+    )
+    .without_provider_upload_lock();
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        StorageProvider::upload_object(&storage, repository_namespace, &object, &source),
+    )
+    .await
+    .expect("server provider must not reacquire the lock already held by the handler")
+    .expect("server provider upload should succeed");
+    drop(held_lock);
+
+    assert_eq!(server.upload_count(), 1);
+}
+
 fn drive_contract_storage_config() -> GoogleDriveStorageConfig {
     GoogleDriveStorageConfig {
         id: "drive-user-a".to_owned(),
