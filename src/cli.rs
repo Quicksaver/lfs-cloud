@@ -2590,7 +2590,7 @@ fn run_bounded_child_command(
             stderr: PipeCapture::HardLimit {
                 limit: max_output_bytes,
             },
-            inherited_pipe_is_error: false,
+            inherited_pipe_is_error: true,
         },
     )
     .map_err(|error| child_process_cli_error(error, command_name))

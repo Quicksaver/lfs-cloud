@@ -227,6 +227,13 @@ pub enum LocalCacheError {
         size_cutoff: u64,
     },
 
+    /// A worktree path opened for pointer parsing was not a regular file.
+    #[error("Git LFS pointer path is not a regular file: {}", path.display())]
+    PointerPathNotRegularFile {
+        /// Pointer path whose opened filesystem object was not a regular file.
+        path: PathBuf,
+    },
+
     /// A worktree path was small enough to be a pointer but was not UTF-8 text.
     #[error("Git LFS pointer at {} is not valid UTF-8: {source}", path.display())]
     PointerFileInvalidUtf8 {
@@ -1625,7 +1632,15 @@ fn collect_pointer_oid_from_file(
     path: &Path,
     referenced: &mut BTreeSet<LfsOid>,
 ) -> LocalCacheResult<()> {
-    match fs::metadata(path) {
+    collect_pointer_oid_from_file_with_before_open(path, referenced, || {})
+}
+
+fn collect_pointer_oid_from_file_with_before_open(
+    path: &Path,
+    referenced: &mut BTreeSet<LfsOid>,
+    before_open: impl FnOnce(),
+) -> LocalCacheResult<()> {
+    match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() => return Ok(()),
         Ok(_) => {}
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1637,12 +1652,16 @@ fn collect_pointer_oid_from_file(
             });
         }
     }
+    before_open();
 
     #[cfg(unix)]
     let file = rustix::fs::openat(
         rustix::fs::CWD,
         path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
     )
     .map(File::from)
@@ -1654,6 +1673,9 @@ fn collect_pointer_oid_from_file(
     let file = match file {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) => {
+            return Ok(());
+        }
         Err(source) => {
             return Err(LocalCacheError::Io {
                 context: "failed to open worktree pointer candidate",
@@ -1685,7 +1707,8 @@ fn collect_pointer_oid_from_file(
 
 enum BoundedPointerBytes {
     Contents(Vec<u8>),
-    NotCandidate { size: u64 },
+    NotRegularFile,
+    TooLarge { size: u64 },
 }
 
 fn read_bounded_pointer_bytes(
@@ -1699,8 +1722,11 @@ fn read_bounded_pointer_bytes(
         path: path.to_path_buf(),
         source,
     })?;
-    if !metadata.is_file() || metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
-        return Ok(BoundedPointerBytes::NotCandidate {
+    if !metadata.is_file() {
+        return Ok(BoundedPointerBytes::NotRegularFile);
+    }
+    if metadata.len() >= LFS_POINTER_SIZE_CUTOFF {
+        return Ok(BoundedPointerBytes::TooLarge {
             size: metadata.len(),
         });
     }
@@ -1714,7 +1740,7 @@ fn read_bounded_pointer_bytes(
             source,
         })?;
     if u64::try_from(contents.len()).unwrap_or(u64::MAX) >= LFS_POINTER_SIZE_CUTOFF {
-        Ok(BoundedPointerBytes::NotCandidate {
+        Ok(BoundedPointerBytes::TooLarge {
             size: u64::try_from(contents.len()).unwrap_or(u64::MAX),
         })
     } else {
@@ -1912,11 +1938,16 @@ fn read_lfs_pointer_file(path: &Path) -> LocalCacheResult<LfsPointer> {
         "failed to read Git LFS pointer file",
     )? {
         BoundedPointerBytes::Contents(contents) => contents,
-        BoundedPointerBytes::NotCandidate { size } => {
+        BoundedPointerBytes::TooLarge { size } => {
             return Err(LocalCacheError::PointerFileTooLarge {
                 path: path.to_path_buf(),
                 size,
                 size_cutoff: LFS_POINTER_SIZE_CUTOFF,
+            });
+        }
+        BoundedPointerBytes::NotRegularFile => {
+            return Err(LocalCacheError::PointerPathNotRegularFile {
+                path: path.to_path_buf(),
             });
         }
     };
@@ -2190,15 +2221,16 @@ fn copy_cache_object_to_temporary_file(
             path: temp_path.clone(),
             source,
         })?;
-    let actual =
-        hash_and_optionally_copy(&mut source, Some(&mut *destination)).map_err(|error| {
-            object_stream_error(
-                error,
-                cache_path,
-                "failed to read verified cache object",
-                Some((&temp_path, "failed to write temporary materialized object")),
-            )
-        })?;
+    let actual = hash_and_optionally_copy(
+        &mut source,
+        cache_path,
+        "failed to read verified cache object",
+        Some(ObjectCopyDestination {
+            writer: &mut *destination,
+            path: &temp_path,
+            context: "failed to write temporary materialized object",
+        }),
+    )?;
     destination.flush().map_err(|source| LocalCacheError::Io {
         context: "failed to flush temporary materialized object",
         path: temp_path,
@@ -2806,14 +2838,16 @@ fn copy_and_verify_object(
     expected: &LfsObject,
     read_context: &'static str,
 ) -> LocalCacheResult<()> {
-    let actual = hash_and_optionally_copy(source, Some(destination)).map_err(|error| {
-        object_stream_error(
-            error,
-            source_path,
-            read_context,
-            Some((destination_path, "failed to write temporary cache object")),
-        )
-    })?;
+    let actual = hash_and_optionally_copy(
+        source,
+        source_path,
+        read_context,
+        Some(ObjectCopyDestination {
+            writer: destination,
+            path: destination_path,
+            context: "failed to write temporary cache object",
+        }),
+    )?;
     ensure_object_identity(source_path, expected, actual)
 }
 
@@ -2828,71 +2862,60 @@ fn hash_file(path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
 }
 
 fn hash_open_file(mut file: File, path: &Path) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
-    hash_and_optionally_copy(&mut file, None).map_err(|error| {
-        object_stream_error(error, path, "failed to read object for hashing", None)
-    })
+    hash_and_optionally_copy(&mut file, path, "failed to read object for hashing", None)
 }
 
-enum ObjectStreamError {
-    Read(io::Error),
-    Write(io::Error),
-    SizeOverflow,
+struct ObjectCopyDestination<'a> {
+    writer: &'a mut dyn Write,
+    path: &'a Path,
+    context: &'static str,
 }
 
 fn hash_and_optionally_copy(
     source: &mut impl Read,
-    mut destination: Option<&mut dyn Write>,
-) -> Result<(LfsOid, LfsObjectSize), ObjectStreamError> {
+    source_path: &Path,
+    read_context: &'static str,
+    mut destination: Option<ObjectCopyDestination<'_>>,
+) -> LocalCacheResult<(LfsOid, LfsObjectSize)> {
     let mut hasher = Sha256::new();
     let mut total_size = 0u64;
     let mut buffer = [0u8; 64 * 1024];
 
     loop {
-        let read = source.read(&mut buffer).map_err(ObjectStreamError::Read)?;
+        let read = source
+            .read(&mut buffer)
+            .map_err(|source| LocalCacheError::Io {
+                context: read_context,
+                path: source_path.to_path_buf(),
+                source,
+            })?;
         if read == 0 {
             break;
         }
-        if let Some(destination) = destination.as_deref_mut() {
+        if let Some(destination) = destination.as_mut() {
             destination
+                .writer
                 .write_all(&buffer[..read])
-                .map_err(ObjectStreamError::Write)?;
+                .map_err(|source| LocalCacheError::Io {
+                    context: destination.context,
+                    path: destination.path.to_path_buf(),
+                    source,
+                })?;
         }
         hasher.update(&buffer[..read]);
         total_size = total_size
             .checked_add(read as u64)
-            .ok_or(ObjectStreamError::SizeOverflow)?;
+            .ok_or_else(|| LocalCacheError::Io {
+                context: "object is too large to measure",
+                path: source_path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::InvalidData, "object size overflow"),
+            })?;
     }
 
     Ok((
         LfsOid::new(format!("{:x}", hasher.finalize())).expect("SHA-256 hex should be valid"),
         LfsObjectSize::new(total_size),
     ))
-}
-
-fn object_stream_error(
-    error: ObjectStreamError,
-    source_path: &Path,
-    read_context: &'static str,
-    destination: Option<(&Path, &'static str)>,
-) -> LocalCacheError {
-    let (context, path, source) = match error {
-        ObjectStreamError::Read(source) => (read_context, source_path, source),
-        ObjectStreamError::Write(source) => {
-            let (path, context) =
-                destination.expect("copy destinations provide write error context");
-            (context, path, source)
-        }
-        ObjectStreamError::SizeOverflow => (
-            "object is too large to measure",
-            source_path,
-            io::Error::new(io::ErrorKind::InvalidData, "object size overflow"),
-        ),
-    };
-    LocalCacheError::Io {
-        context,
-        path: path.to_path_buf(),
-        source,
-    }
 }
 
 fn worktree_file_metadata_without_following_symlinks(
@@ -4674,6 +4697,85 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn pointer_collection_does_not_follow_a_final_symlink() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let object = object_for_bytes(b"outside pointer object");
+        let outside_pointer = temp.path().join("outside-pointer");
+        let tracked_path = temp.path().join("tracked.bin");
+        write_file(
+            &outside_pointer,
+            LfsPointer::new(object).to_pointer_file().as_bytes(),
+        );
+        std::os::unix::fs::symlink(&outside_pointer, &tracked_path)
+            .expect("tracked symlink should be created");
+        let mut referenced = BTreeSet::new();
+
+        collect_pointer_oid_from_file(&tracked_path, &mut referenced)
+            .expect("a final symlink should be skipped");
+
+        assert!(referenced.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pointer_collection_does_not_block_when_file_becomes_fifo_before_open() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let candidate = temp.path().join("candidate.bin");
+        write_file(&candidate, b"regular before pointer open");
+        let worker_candidate = candidate.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut referenced = BTreeSet::new();
+            let result = collect_pointer_oid_from_file_with_before_open(
+                &worker_candidate,
+                &mut referenced,
+                || {
+                    fs::remove_file(&worker_candidate)
+                        .expect("regular candidate should be removable");
+                    assert!(
+                        Command::new("mkfifo")
+                            .arg(&worker_candidate)
+                            .status()
+                            .expect("mkfifo should start")
+                            .success(),
+                        "FIFO should replace the inspected regular file"
+                    );
+                },
+            );
+            done_tx
+                .send(result.map(|()| referenced))
+                .expect("test should receive collection result");
+        });
+
+        let result = match done_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _unblocker = rustix::fs::openat(
+                    rustix::fs::CWD,
+                    &candidate,
+                    rustix::fs::OFlags::RDWR
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(File::from)
+                .expect("FIFO should open for test cleanup");
+                let _ = done_rx.recv_timeout(Duration::from_secs(2));
+                panic!("pointer collection blocked while opening a FIFO");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("pointer collection worker disconnected")
+            }
+        };
+        worker
+            .join()
+            .expect("pointer collection worker should not panic");
+
+        assert!(result.expect("FIFO candidate should be skipped").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn garbage_collect_does_not_wait_for_tracked_fifos() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let layout = LocalCacheLayout::new(temp.path().join("cache"));
@@ -4737,8 +4839,7 @@ mod tests {
                 .send(collection_layout.garbage_collect(false, false))
                 .expect("test should receive collection result");
         });
-        let (timed_out, report) = match collection_done_rx.recv_timeout(Duration::from_millis(250))
-        {
+        let (timed_out, report) = match collection_done_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(report) => (false, report),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let _direct_unblocker = rustix::fs::openat(

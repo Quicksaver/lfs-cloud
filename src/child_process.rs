@@ -5,6 +5,7 @@
 //! behavior while leaving domain-specific error rendering to the caller.
 
 use std::{
+    fmt,
     io::{self, Read},
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc,
@@ -36,12 +37,12 @@ pub(crate) struct ChildProcessOptions {
     pub(crate) stdout: PipeCapture,
     /// Standard-error capture policy.
     pub(crate) stderr: PipeCapture,
-    /// Whether an inherited pipe that outlives the direct child is an error.
+    /// Whether successfully stopping descendants that retain output pipes
+    /// after the direct child exits must still fail the command.
     pub(crate) inherited_pipe_is_error: bool,
 }
 
 /// Captured output from a completed child.
-#[derive(Debug)]
 pub(crate) struct ChildProcessOutput {
     /// Direct child exit status.
     pub(crate) status: ExitStatus,
@@ -51,8 +52,18 @@ pub(crate) struct ChildProcessOutput {
     pub(crate) stderr: Vec<u8>,
 }
 
+impl fmt::Debug for ChildProcessOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildProcessOutput")
+            .field("status", &self.status)
+            .field("stdout_len", &self.stdout.len())
+            .field("stderr_len", &self.stderr.len())
+            .finish()
+    }
+}
+
 /// Failure while waiting for or draining a child process tree.
-#[derive(Debug)]
 pub(crate) enum ChildProcessError {
     /// A process or pipe operation failed.
     Io {
@@ -81,6 +92,34 @@ pub(crate) enum ChildProcessError {
     InheritedPipe,
 }
 
+impl fmt::Debug for ChildProcessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { context, source } => formatter
+                .debug_struct("Io")
+                .field("context", context)
+                .field("source", source)
+                .finish(),
+            Self::TimedOut {
+                timeout,
+                stdout,
+                stderr,
+            } => formatter
+                .debug_struct("TimedOut")
+                .field("timeout", timeout)
+                .field("stdout_len", &stdout.len())
+                .field("stderr_len", &stderr.len())
+                .finish(),
+            Self::OutputLimit { stream, limit } => formatter
+                .debug_struct("OutputLimit")
+                .field("stream", stream)
+                .field("limit", limit)
+                .finish(),
+            Self::InheritedPipe => formatter.write_str("InheritedPipe"),
+        }
+    }
+}
+
 impl ChildProcessError {
     fn io(context: impl Into<String>, source: io::Error) -> Self {
         Self::Io {
@@ -93,7 +132,7 @@ impl ChildProcessError {
 #[derive(Debug)]
 struct PipeReadResult {
     bytes: Vec<u8>,
-    exceeded_limit: bool,
+    exceeded_limit: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -114,7 +153,12 @@ pub(crate) fn configure_process_tree(command: &mut Command) {
     let _ = command;
 }
 
-/// Waits for a child while concurrently draining configured output pipes.
+/// Waits for a configured process-tree child while draining its output pipes.
+///
+/// The child must have been spawned from a [`Command`] passed to
+/// [`configure_process_tree`]. Process-tree termination uses the direct
+/// child's process identifier as the owned process-group identifier on Unix,
+/// so calling this function for any other child is not safe.
 pub(crate) fn wait_for_child(
     child: &mut Child,
     command_name: &str,
@@ -143,7 +187,19 @@ pub(crate) fn wait_for_child(
 
     loop {
         while let Ok(event) = receiver.try_recv() {
-            accept_pipe_event(event, child, command_name, &mut stdout, &mut stderr)?;
+            if let Err(error) = accept_pipe_event(event, command_name, &mut stdout, &mut stderr) {
+                terminate_process_tree(child, command_name)?;
+                let _ = collect_pipe_events(
+                    &receiver,
+                    &mut stdout,
+                    &mut stderr,
+                    OUTPUT_DRAIN_AFTER_STOP,
+                    command_name,
+                );
+                join_reader(&mut stdout_reader, "stdout", command_name)?;
+                join_reader(&mut stderr_reader, "stderr", command_name)?;
+                return Err(error);
+            }
         }
 
         if status.is_none() {
@@ -167,9 +223,15 @@ pub(crate) fn wait_for_child(
 
         if status.is_none() && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             terminate_process_tree(child, command_name)?;
-            collect_pipe_events(&receiver, &mut stdout, &mut stderr, OUTPUT_DRAIN_AFTER_STOP);
-            join_completed_reader(&mut stdout_reader, stdout.as_ref(), "stdout", command_name)?;
-            join_completed_reader(&mut stderr_reader, stderr.as_ref(), "stderr", command_name)?;
+            let _ = collect_pipe_events(
+                &receiver,
+                &mut stdout,
+                &mut stderr,
+                OUTPUT_DRAIN_AFTER_STOP,
+                command_name,
+            );
+            join_reader(&mut stdout_reader, "stdout", command_name)?;
+            join_reader(&mut stderr_reader, "stderr", command_name)?;
             return Err(ChildProcessError::TimedOut {
                 timeout: options
                     .timeout
@@ -183,10 +245,19 @@ pub(crate) fn wait_for_child(
             // The direct child exited, so any open output pipe belongs to a
             // descendant in the command's process group.
             stop_process_tree(child);
-            collect_pipe_events(&receiver, &mut stdout, &mut stderr, OUTPUT_DRAIN_AFTER_STOP);
+            let drain_error = collect_pipe_events(
+                &receiver,
+                &mut stdout,
+                &mut stderr,
+                OUTPUT_DRAIN_AFTER_STOP,
+                command_name,
+            );
             join_completed_reader(&mut stdout_reader, stdout.as_ref(), "stdout", command_name)?;
             join_completed_reader(&mut stderr_reader, stderr.as_ref(), "stderr", command_name)?;
 
+            if let Some(error) = drain_error {
+                return Err(error);
+            }
             if stdout.is_none() || stderr.is_none() || options.inherited_pipe_is_error {
                 return Err(ChildProcessError::InheritedPipe);
             }
@@ -198,7 +269,6 @@ pub(crate) fn wait_for_child(
 
 fn accept_pipe_event(
     event: PipeEvent,
-    child: &mut Child,
     command_name: &str,
     stdout: &mut Option<Vec<u8>>,
     stderr: &mut Option<Vec<u8>>,
@@ -210,16 +280,13 @@ fn accept_pipe_event(
     let output = match result {
         Ok(output) => output,
         Err(source) => {
-            terminate_process_tree(child, command_name)?;
             return Err(ChildProcessError::io(
                 format!("failed to read {stream} from {command_name}"),
                 source,
             ));
         }
     };
-    if output.exceeded_limit {
-        let limit = output.bytes.len();
-        terminate_process_tree(child, command_name)?;
+    if let Some(limit) = output.exceeded_limit {
         return Err(ChildProcessError::OutputLimit { stream, limit });
     }
     *destination = Some(output.bytes);
@@ -239,7 +306,7 @@ fn read_pipe(mut pipe: impl Read, policy: PipeCapture) -> io::Result<PipeReadRes
         if count == 0 {
             return Ok(PipeReadResult {
                 bytes,
-                exceeded_limit: false,
+                exceeded_limit: None,
             });
         }
 
@@ -255,7 +322,7 @@ fn read_pipe(mut pipe: impl Read, policy: PipeCapture) -> io::Result<PipeReadRes
                 if count > remaining {
                     return Ok(PipeReadResult {
                         bytes,
-                        exceeded_limit: true,
+                        exceeded_limit: Some(limit),
                     });
                 }
             }
@@ -268,8 +335,10 @@ fn collect_pipe_events(
     stdout: &mut Option<Vec<u8>>,
     stderr: &mut Option<Vec<u8>>,
     timeout: Duration,
-) {
+    command_name: &str,
+) -> Option<ChildProcessError> {
     let deadline = Instant::now() + timeout;
+    let mut first_error = None;
     while (stdout.is_none() || stderr.is_none()) && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let Ok(event) = receiver.recv_timeout(remaining) else {
@@ -278,9 +347,27 @@ fn collect_pipe_events(
         match event {
             PipeEvent::Stdout(Ok(output)) => *stdout = Some(output.bytes),
             PipeEvent::Stderr(Ok(output)) => *stderr = Some(output.bytes),
-            PipeEvent::Stdout(Err(_)) | PipeEvent::Stderr(Err(_)) => {}
+            PipeEvent::Stdout(Err(source)) => {
+                *stdout = Some(Vec::new());
+                first_error.get_or_insert_with(|| {
+                    ChildProcessError::io(
+                        format!("failed to read stdout from {command_name}"),
+                        source,
+                    )
+                });
+            }
+            PipeEvent::Stderr(Err(source)) => {
+                *stderr = Some(Vec::new());
+                first_error.get_or_insert_with(|| {
+                    ChildProcessError::io(
+                        format!("failed to read stderr from {command_name}"),
+                        source,
+                    )
+                });
+            }
         }
     }
+    first_error
 }
 
 fn join_reader(
@@ -363,7 +450,22 @@ fn stop_process_tree(_child: &Child) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{PipeCapture, read_pipe};
+    use std::{
+        io,
+        process::{Command, Stdio},
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    use super::{
+        ChildProcessError, ChildProcessOptions, PipeCapture, PipeEvent, collect_pipe_events,
+        configure_process_tree, read_pipe, wait_for_child,
+    };
+
+    const PROCESS_TREE_HELPER_TEST: &str = "child_process::tests::process_tree_pipe_holding_helper";
+    const PROCESS_TREE_DESCENDANT_TEST: &str =
+        "child_process::tests::process_tree_pipe_holding_descendant";
+    const PROCESS_TREE_MODE_ENV: &str = "LFSCLOUD_CHILD_PROCESS_TEST_MODE";
 
     #[test]
     fn truncated_pipe_keeps_draining_but_retains_only_the_limit() {
@@ -371,7 +473,7 @@ mod tests {
             .expect("pipe should be readable");
 
         assert_eq!(output.bytes, b"abc");
-        assert!(!output.exceeded_limit);
+        assert_eq!(output.exceeded_limit, None);
     }
 
     #[test]
@@ -380,6 +482,211 @@ mod tests {
             .expect("pipe should be readable");
 
         assert_eq!(output.bytes, b"abc");
-        assert!(output.exceeded_limit);
+        assert_eq!(output.exceeded_limit, Some(3));
+    }
+
+    #[test]
+    fn drain_reports_completed_reader_errors_without_calling_them_open_pipes() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PipeEvent::Stdout(Err(io::Error::other(
+                "injected read failure",
+            ))))
+            .expect("read failure should be sent");
+        drop(sender);
+        let mut stdout = None;
+        let mut stderr = Some(Vec::new());
+
+        let error = collect_pipe_events(
+            &receiver,
+            &mut stdout,
+            &mut stderr,
+            Duration::from_secs(1),
+            "test helper",
+        )
+        .expect("reader failure should be retained");
+
+        assert!(stdout.is_some());
+        assert!(matches!(
+            error,
+            ChildProcessError::Io { context, .. }
+                if context == "failed to read stdout from test helper"
+        ));
+    }
+
+    #[test]
+    fn output_debug_reports_lengths_without_exposing_captured_bytes() {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MODE_ENV, "complete")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().expect("helper should start");
+
+        let output = wait_for_child(
+            &mut child,
+            "test helper",
+            ChildProcessOptions {
+                timeout: Some(Duration::from_secs(5)),
+                stdout: PipeCapture::Unlimited,
+                stderr: PipeCapture::Unlimited,
+                inherited_pipe_is_error: true,
+            },
+        )
+        .expect("helper should complete");
+        let debug = format!("{output:?}");
+
+        assert!(debug.contains("stdout_len"));
+        assert!(!debug.contains("stdout-secret"));
+        assert!(!debug.contains("stderr-secret"));
+    }
+
+    #[test]
+    fn timeout_retains_output_without_exposing_it_through_debug() {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MODE_ENV, "timeout")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().expect("helper should start");
+
+        let error = wait_for_child(
+            &mut child,
+            "test helper",
+            ChildProcessOptions {
+                timeout: Some(Duration::from_millis(100)),
+                stdout: PipeCapture::Unlimited,
+                stderr: PipeCapture::Unlimited,
+                inherited_pipe_is_error: true,
+            },
+        )
+        .expect_err("helper should time out");
+        let debug = format!("{error:?}");
+
+        assert!(matches!(
+            error,
+            ChildProcessError::TimedOut {
+                ref stdout,
+                ref stderr,
+                ..
+            } if stdout.windows(b"stdout-secret\n".len()).any(|bytes| bytes == b"stdout-secret\n")
+                && stderr
+                    .windows(b"stderr-secret\n".len())
+                    .any(|bytes| bytes == b"stderr-secret\n")
+        ));
+        assert!(!debug.contains("stdout-secret"));
+        assert!(!debug.contains("stderr-secret"));
+    }
+
+    #[test]
+    fn inherited_pipe_policy_distinguishes_recovered_output() {
+        for inherited_pipe_is_error in [false, true] {
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+                .env(PROCESS_TREE_MODE_ENV, "descendant")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            configure_process_tree(&mut command);
+            let mut child = command.spawn().expect("helper should start");
+            let started = Instant::now();
+
+            let result = wait_for_child(
+                &mut child,
+                "test helper",
+                ChildProcessOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    stdout: PipeCapture::Unlimited,
+                    stderr: PipeCapture::Unlimited,
+                    inherited_pipe_is_error,
+                },
+            );
+
+            assert!(started.elapsed() < Duration::from_secs(5));
+            if inherited_pipe_is_error {
+                assert!(matches!(result, Err(ChildProcessError::InheritedPipe)));
+            } else {
+                assert!(
+                    result
+                        .expect("cleanup should recover output")
+                        .status
+                        .success()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hard_limit_reports_configured_limit_after_stopping_the_tree() {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MODE_ENV, "timeout")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().expect("helper should start");
+
+        let error = wait_for_child(
+            &mut child,
+            "test helper",
+            ChildProcessOptions {
+                timeout: Some(Duration::from_secs(5)),
+                stdout: PipeCapture::HardLimit { limit: 3 },
+                stderr: PipeCapture::Unlimited,
+                inherited_pipe_is_error: true,
+            },
+        )
+        .expect_err("stdout should exceed the hard limit");
+
+        assert!(matches!(
+            error,
+            ChildProcessError::OutputLimit {
+                stream: "stdout",
+                limit: 3
+            }
+        ));
+    }
+
+    #[test]
+    #[ignore = "invoked as a platform-native child-process helper"]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "the helper must exit while its descendant retains the inherited pipes"
+    )]
+    fn process_tree_pipe_holding_helper() {
+        use std::io::Write as _;
+
+        let mode = std::env::var(PROCESS_TREE_MODE_ENV).unwrap_or_default();
+        std::io::stdout()
+            .write_all(b"stdout-secret\n")
+            .expect("stdout should be writable");
+        std::io::stderr()
+            .write_all(b"stderr-secret\n")
+            .expect("stderr should be writable");
+        if mode == "timeout" {
+            std::thread::sleep(Duration::from_secs(30));
+        } else if mode == "descendant" {
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--ignored", "--exact", PROCESS_TREE_DESCENDANT_TEST])
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("descendant should start");
+        }
+    }
+
+    #[test]
+    #[ignore = "invoked as a platform-native child-process descendant"]
+    fn process_tree_pipe_holding_descendant() {
+        std::thread::sleep(Duration::from_secs(30));
     }
 }

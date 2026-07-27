@@ -1748,6 +1748,17 @@ fn wait_for_git_command(
     command: &str,
     timeout: Duration,
 ) -> MigrationResult<(ExitStatus, Vec<u8>)> {
+    if child.stderr.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(MigrationError::Io {
+            context: format!("failed to capture stderr from {command}"),
+            source: io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "git lfs fetch stderr was not piped",
+            ),
+        });
+    }
     let output = wait_for_child(
         child,
         command,

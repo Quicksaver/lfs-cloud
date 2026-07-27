@@ -1141,9 +1141,11 @@ fn credential_child_process_error(
             status: format!("timed out after {} seconds", timeout.as_secs()),
             stderr: sanitize_command_stderr(&stderr, stderr_secret),
         },
-        ChildProcessError::OutputLimit { .. } => CliError::Io {
-            context: format!("credential output policy failed for {command_name}"),
-            source: std::io::Error::other("truncating credential pipes cannot exceed a hard limit"),
+        ChildProcessError::OutputLimit { stream, limit } => CliError::ExternalCommandOutput {
+            command: command_name.to_owned(),
+            message: SanitizedMessage::new(format!(
+                "{stream} exceeded the {limit}-byte credential output limit"
+            )),
         },
         ChildProcessError::InheritedPipe => CliError::Io {
             context: format!("timed out draining pipe output from {command_name}"),
@@ -1161,28 +1163,6 @@ fn git_command(git_program: &Path) -> Command {
     // gives the command boundary deterministic ownership of those descendants.
     configure_process_tree(&mut command);
     command
-}
-
-#[cfg(test)]
-fn retain_stdout_data(stdout: &mut Vec<u8>, data: &[u8]) {
-    let retained = stdout.len();
-    if retained > MAX_CREDENTIAL_OUTPUT_LEN {
-        return;
-    }
-
-    let remaining = (MAX_CREDENTIAL_OUTPUT_LEN + 1) - retained;
-    stdout.extend_from_slice(&data[..remaining.min(data.len())]);
-}
-
-#[cfg(test)]
-fn retain_stderr_data(stderr: &mut Vec<u8>, data: &[u8]) {
-    let retained = stderr.len();
-    if retained >= MAX_RETAINED_COMMAND_STDERR_LEN {
-        return;
-    }
-
-    let remaining = MAX_RETAINED_COMMAND_STDERR_LEN - retained;
-    stderr.extend_from_slice(&data[..remaining.min(data.len())]);
 }
 
 fn command_status_text(status: ExitStatus) -> String {
@@ -1206,10 +1186,9 @@ mod tests {
     use super::wait_for_git_command_output;
     use super::{
         DEFAULT_GIT_CREDENTIAL_USERNAME, GitCredentialApproval, GitCredentialLookup,
-        GitCredentialRejection, MAX_COMMAND_STDERR_LEN, MAX_CREDENTIAL_FIELD_LEN,
-        MAX_CREDENTIAL_OUTPUT_LEN, MAX_RETAINED_COMMAND_STDERR_LEN, git_command,
-        git_config_output_has_helper, git_credential_helper_fallback_instructions,
-        parse_git_credential_fill_output, retain_stderr_data, retain_stdout_data,
+        GitCredentialRejection, MAX_COMMAND_STDERR_LEN, MAX_CREDENTIAL_OUTPUT_LEN,
+        MAX_RETAINED_COMMAND_STDERR_LEN, git_command, git_config_output_has_helper,
+        git_credential_helper_fallback_instructions, parse_git_credential_fill_output,
         sanitize_command_stderr, wait_for_git_command_timeout,
     };
     use crate::{CliError, LfsSessionToken};
@@ -2268,54 +2247,6 @@ exit 0
         assert!(sanitized.as_str().len() <= MAX_COMMAND_STDERR_LEN + "...".len());
         assert!(!sanitized.as_str().contains("split"));
         assert!(!sanitized.as_str().contains("split-token-secret"));
-    }
-
-    #[test]
-    fn retained_command_stderr_is_capped_before_sanitizing() {
-        let mut stderr = Vec::new();
-        retain_stderr_data(
-            &mut stderr,
-            &vec![b'x'; MAX_RETAINED_COMMAND_STDERR_LEN * 2],
-        );
-
-        assert_eq!(stderr.len(), MAX_RETAINED_COMMAND_STDERR_LEN);
-    }
-
-    #[test]
-    fn retained_credential_stdout_is_capped_before_parsing() {
-        let mut stdout = Vec::new();
-        retain_stdout_data(
-            &mut stdout,
-            &vec![b'x'; MAX_CREDENTIAL_OUTPUT_LEN + MAX_CREDENTIAL_FIELD_LEN],
-        );
-        retain_stdout_data(&mut stdout, b"extra");
-
-        assert_eq!(stdout.len(), MAX_CREDENTIAL_OUTPUT_LEN + 1);
-
-        let lfs_url = url::Url::parse("https://lfs.example.com/repo.git/info/lfs")
-            .expect("test URL should parse");
-        let error =
-            parse_git_credential_fill_output(&lfs_url, DEFAULT_GIT_CREDENTIAL_USERNAME, &stdout)
-                .expect_err("retained oversized output should be rejected");
-
-        assert!(matches!(error, CliError::ExternalCommandOutput { .. }));
-        assert!(error.to_string().contains("too much output"));
-    }
-
-    #[test]
-    fn retained_command_stderr_keeps_token_boundary_before_sanitizing() {
-        let token = "split-token-secret";
-        let mut stderr = Vec::new();
-        let prefix = "x".repeat(MAX_COMMAND_STDERR_LEN - 5);
-        let noisy_tail = "y".repeat(MAX_RETAINED_COMMAND_STDERR_LEN * 2);
-        let diagnostic = format!("{prefix}{token}{noisy_tail}");
-
-        retain_stderr_data(&mut stderr, diagnostic.as_bytes());
-        let sanitized = sanitize_command_stderr(&stderr, token);
-
-        assert!(sanitized.as_str().len() <= MAX_COMMAND_STDERR_LEN + "...".len());
-        assert!(!sanitized.as_str().contains("split"));
-        assert!(!sanitized.as_str().contains(token));
     }
 
     #[test]
