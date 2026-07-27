@@ -8,9 +8,10 @@ use url::{Host, Url};
 
 /// Reads at most `limit` response bytes and decodes them lossily.
 ///
-/// Provider error responses are diagnostic only. Bounding the shared reader
-/// prevents an upstream from making either provider retain an unbounded error
-/// body while preserving a useful UTF-8-safe prefix.
+/// HTTP error responses are diagnostic only. Bounding the shared reader keeps
+/// an upstream from making a caller retain an unbounded error body. The
+/// retained prefix is decoded lossily and may end in a replacement character
+/// when the byte limit splits a UTF-8 code point.
 pub(crate) async fn read_bounded_lossy_response_body(
     mut response: reqwest::Response,
     limit: usize,

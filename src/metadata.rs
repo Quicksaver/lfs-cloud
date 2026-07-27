@@ -1372,10 +1372,11 @@ mod tests {
     };
 
     use super::{
-        ACTIVE_REPOSITORY_MAPPING_MIGRATION, INITIAL_SCHEMA, METADATA_SCHEMA_VERSION,
-        MetadataDatabase, MetadataObjectVerificationStatus, MetadataTransferOperation,
-        MetadataTransferResult, NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION,
-        PROTECTED_SESSION_TOKEN_MIGRATION, SQLITE_BUSY_TIMEOUT,
+        ACTIVE_REPOSITORY_MAPPING_MIGRATION, INITIAL_SCHEMA, METADATA_MIGRATIONS,
+        METADATA_SCHEMA_VERSION, MetadataDatabase, MetadataObjectVerificationStatus,
+        MetadataTransferOperation, MetadataTransferResult,
+        NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION, PROTECTED_SESSION_TOKEN_MIGRATION,
+        SQLITE_BUSY_TIMEOUT,
     };
 
     const LEGACY_SCHEMA_WITH_NON_NULL_VERIFICATION_TIMESTAMP: &str = r#"
@@ -1435,6 +1436,21 @@ VALUES (1, 'initial_metadata_schema');
 
 PRAGMA user_version = 1;
 "#;
+
+    #[test]
+    fn migration_table_is_strictly_ordered_and_current() {
+        assert!(
+            METADATA_MIGRATIONS
+                .windows(2)
+                .all(|versions| versions[0].0 < versions[1].0),
+            "metadata migrations must be ordered by unique ascending version"
+        );
+        assert_eq!(
+            METADATA_MIGRATIONS.last().map(|(version, _)| *version),
+            Some(METADATA_SCHEMA_VERSION),
+            "the final migration must install the current schema version"
+        );
+    }
 
     #[test]
     fn open_creates_parent_directory_and_runs_initial_schema() {

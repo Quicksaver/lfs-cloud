@@ -393,7 +393,7 @@ fn git_stdout<const N: usize>(
     command_name: &str,
 ) -> CliResult<String> {
     let output = git_output(current_dir, args, command_name)?;
-    required_git_success(output, command_name)
+    require_git_success(output, command_name)
         .and_then(|output| decode_git_stdout(output, command_name))
 }
 
@@ -425,7 +425,7 @@ fn run_git_config<const N: usize>(
     command_name: &str,
 ) -> CliResult<()> {
     let output = git_output(current_dir, args, command_name)?;
-    required_git_success(output, command_name).map(|_| ())
+    require_git_success(output, command_name).map(|_| ())
 }
 
 fn git_output<I, S>(current_dir: &Path, args: I, command_name: &str) -> CliResult<Output>
@@ -433,19 +433,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
+    Command::new("git")
         .args(args)
         .current_dir(current_dir)
         .output()
         .map_err(|source| CliError::Io {
             context: format!("failed to start {command_name}"),
             source,
-        })?;
-
-    Ok(output)
+        })
 }
 
-fn required_git_success(output: Output, command_name: &str) -> CliResult<Output> {
+fn require_git_success(output: Output, command_name: &str) -> CliResult<Output> {
     if !output.status.success() {
         return Err(git_command_error(
             command_name,

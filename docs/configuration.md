@@ -157,7 +157,7 @@ The server creates an `upload-locks` directory beside the metadata database. All
 
 - `server.public_url`, GitHub `api_url`, and CLI `--server` route bases use the same validation policy. They must be HTTP(S) URLs without credentials, query strings, fragments, trailing slashes, whitespace, control characters, backslashes, or path dot segments. They must use HTTPS unless the host is an exact IPv4/IPv6 loopback address. Non-loopback HTTP requires the explicit development-only `server.allow_insecure_http: true` setting and the matching CLI `--allow-insecure-http` flag.
 - `server.max_batch_objects`, `server.max_provider_calls`, `server.max_concurrent_requests`, `server.max_concurrent_uploads`, and `server.max_concurrent_uploads_per_user` must be greater than zero when configured. The per-user upload limit cannot exceed the process-wide upload limit.
-- Custom Google Drive API base URLs used by embedded runtimes or tests must use HTTPS except for loopback HTTP endpoints.
+- Custom Google Drive API base URLs used by embedded runtimes or tests must use HTTPS except for literal loopback IP HTTP endpoints; names such as `localhost` are not accepted.
 - Provider IDs and storage IDs must start with an ASCII letter or digit and use only ASCII letters, digits, `_`, or `-`.
 - Repository route components must be safe path segments. Repository names must not include `.git`.
 - GitHub repository mappings must include a positive numeric `provider_repository_id` matching GitHub's stable repository ID.

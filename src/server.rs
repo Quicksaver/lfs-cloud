@@ -3059,6 +3059,11 @@ fn git_lfs_storage_error_response_parts(
     }
 }
 
+/// Stable client-facing classification shared by transfer and batch errors.
+///
+/// Upload and download transfers may require different HTTP statuses and
+/// messages, while the batch object response has its own numeric code and
+/// message.
 #[derive(Clone, Copy)]
 struct LfsStorageErrorClassification {
     upload_status: StatusCode,
@@ -3070,7 +3075,9 @@ struct LfsStorageErrorClassification {
 }
 
 impl LfsStorageErrorClassification {
-    const fn same_transfer_response(
+    /// Builds a classification whose upload and download transfers share one
+    /// status and message; the batch response remains independently specified.
+    const fn uniform_transfer_response(
         status: StatusCode,
         message: &'static str,
         batch_code: u16,
@@ -3089,6 +3096,8 @@ impl LfsStorageErrorClassification {
 
 fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassification {
     match error {
+        // Upload mismatches describe invalid client bytes (422), while
+        // download mismatches expose an invalid storage response (502).
         ServerError::Storage {
             source: StorageError::IntegrityMismatch { .. },
         } => LfsStorageErrorClassification {
@@ -3101,7 +3110,7 @@ fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassificat
         },
         ServerError::Storage {
             source: StorageError::ObjectNotFound { .. },
-        } => LfsStorageErrorClassification::same_transfer_response(
+        } => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::NOT_FOUND,
             "Git LFS object was not found",
             404,
@@ -3109,7 +3118,7 @@ fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassificat
         ),
         ServerError::Storage {
             source: StorageError::Conflict { .. },
-        } => LfsStorageErrorClassification::same_transfer_response(
+        } => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::CONFLICT,
             "Git LFS storage reported an object conflict",
             409,
@@ -3117,7 +3126,7 @@ fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassificat
         ),
         ServerError::Storage {
             source: StorageError::QuotaExceeded { .. },
-        } => LfsStorageErrorClassification::same_transfer_response(
+        } => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::INSUFFICIENT_STORAGE,
             "Git LFS storage quota was exceeded",
             507,
@@ -3125,7 +3134,7 @@ fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassificat
         ),
         ServerError::Storage {
             source: StorageError::Retryable { .. },
-        } => LfsStorageErrorClassification::same_transfer_response(
+        } => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Git LFS storage operation can be retried later",
             503,
@@ -3133,7 +3142,7 @@ fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassificat
         ),
         ServerError::Storage {
             source: StorageError::PermissionDenied { .. },
-        } => LfsStorageErrorClassification::same_transfer_response(
+        } => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::BAD_GATEWAY,
             "Git LFS storage access was denied",
             502,
@@ -3142,7 +3151,7 @@ fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassificat
         ServerError::Storage {
             source:
                 StorageError::AuthenticationRequired { .. } | StorageError::CredentialLoad { .. },
-        } => LfsStorageErrorClassification::same_transfer_response(
+        } => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::BAD_GATEWAY,
             "Git LFS storage authentication failed",
             502,
@@ -3150,19 +3159,19 @@ fn classify_lfs_storage_error(error: &ServerError) -> LfsStorageErrorClassificat
         ),
         ServerError::Storage {
             source: StorageError::Unsupported { .. },
-        } => LfsStorageErrorClassification::same_transfer_response(
+        } => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::NOT_IMPLEMENTED,
             "Git LFS storage transfer handling is not configured",
             501,
             "object storage lookup is not configured",
         ),
-        ServerError::Storage { .. } => LfsStorageErrorClassification::same_transfer_response(
+        ServerError::Storage { .. } => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::BAD_GATEWAY,
             "Git LFS storage operation failed",
             502,
             "object storage lookup failed",
         ),
-        _ => LfsStorageErrorClassification::same_transfer_response(
+        _ => LfsStorageErrorClassification::uniform_transfer_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Git LFS transfer handling failed",
             500,
@@ -3679,13 +3688,13 @@ mod tests {
     use tracing::instrument::WithSubscriber as _;
 
     use crate::{
-        DEFAULT_GIT_CREDENTIAL_USERNAME, GitHubPersonalAccessToken, GitHubUserClient,
-        GoogleDriveAccessToken, GoogleDriveRootValidator, GoogleDriveStorageConfig,
-        LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize, LfsOid, LfsSessionToken,
-        LocalLfsSessionStore, MetadataDatabase, ProviderFuture, RepositoryMapping,
-        RepositoryPermission, RepositoryProviderError, RepositoryUser, SanitizedMessage,
-        ServerConfig, ServerError, ServerResult, StorageError, StorageProviderConfig,
-        StorageResult, StoredObject,
+        DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GitHubPersonalAccessToken,
+        GitHubUserClient, GoogleDriveAccessToken, GoogleDriveRootValidator,
+        GoogleDriveStorageConfig, LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize,
+        LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture,
+        RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
+        SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
+        StorageProviderConfig, StorageResult, StoredObject,
         google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
     };
 
@@ -5789,6 +5798,30 @@ repositories:
         assert_eq!(
             super::lfs_batch_object_error_from_server_error(&error),
             crate::LfsBatchObjectError::new(502, "object storage access was denied")
+        );
+    }
+
+    #[test]
+    fn server_error_log_category_preserves_nested_error_domains() {
+        let storage_error = ServerError::Storage {
+            source: StorageError::Retryable {
+                provider: "drive-user-a".to_owned(),
+                message: "temporary Drive failure".to_owned(),
+            },
+        };
+        let repository_error = ServerError::RepositoryProvider {
+            source: RepositoryProviderError::AuthenticationRequired {
+                provider: "github".to_owned(),
+            },
+        };
+
+        assert_eq!(
+            super::server_error_log_category(&storage_error),
+            ErrorCategory::Storage
+        );
+        assert_eq!(
+            super::server_error_log_category(&repository_error),
+            ErrorCategory::RepositoryProvider
         );
     }
 

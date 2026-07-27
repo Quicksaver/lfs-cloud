@@ -499,7 +499,8 @@ impl GoogleDriveRootValidator {
     ///
     /// Returns [`StorageError`] if `api_base_url` is not an absolute HTTP(S)
     /// URL without credentials, query, or fragment components. HTTP is accepted
-    /// only for loopback hosts used by local tests and development tools.
+    /// only for literal loopback IP addresses used by local tests and
+    /// development tools.
     pub fn with_client_and_api_base_url(
         client: Client,
         api_base_url: impl AsRef<str>,
@@ -2302,10 +2303,16 @@ fn default_google_drive_object_download_http_client() -> StorageResult<Client> {
     }
 }
 
+/// Controls query handling while validating a Google Drive URL.
+///
+/// Fragments are rejected under both policies. Rejecting queries uses the
+/// combined query-or-fragment diagnostic retained for API base URLs.
 #[derive(Clone, Copy)]
-enum DriveUrlQueryPolicy {
-    Reject,
-    Allow,
+enum DriveUrlComponentPolicy {
+    /// Reject query strings and fragments.
+    RejectQuery,
+    /// Allow query strings while continuing to reject fragments.
+    AllowQuery,
 }
 
 fn drive_upstream_error(provider: &str, message: impl Into<String>) -> StorageError {
@@ -2320,7 +2327,7 @@ fn validate_drive_url(
     value: &str,
     provider: &str,
     label: &str,
-    query_policy: DriveUrlQueryPolicy,
+    component_policy: DriveUrlComponentPolicy,
 ) -> StorageResult<Url> {
     let url = Url::parse(value)
         .map_err(|_| drive_upstream_error(provider, format!("{label} must be valid")))?;
@@ -2333,7 +2340,7 @@ fn validate_drive_url(
     if url.scheme() == "http" && !has_exact_loopback_host(&url) {
         return Err(drive_upstream_error(
             provider,
-            format!("{label} must use https unless it targets a loopback host"),
+            format!("{label} must use https unless it targets an exact literal loopback IP"),
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -2342,18 +2349,18 @@ fn validate_drive_url(
             format!("{label} must not include credentials"),
         ));
     }
-    if matches!(query_policy, DriveUrlQueryPolicy::Reject) && url.query().is_some() {
+    if matches!(component_policy, DriveUrlComponentPolicy::RejectQuery) && url.query().is_some() {
         return Err(drive_upstream_error(
             provider,
             format!("{label} must not include query strings or fragments"),
         ));
     }
     if url.fragment().is_some() {
-        let message = match query_policy {
-            DriveUrlQueryPolicy::Reject => {
+        let message = match component_policy {
+            DriveUrlComponentPolicy::RejectQuery => {
                 format!("{label} must not include query strings or fragments")
             }
-            DriveUrlQueryPolicy::Allow => format!("{label} must not include fragments"),
+            DriveUrlComponentPolicy::AllowQuery => format!("{label} must not include fragments"),
         };
         return Err(drive_upstream_error(provider, message));
     }
@@ -2366,7 +2373,7 @@ fn validate_drive_api_base_url(value: &str) -> StorageResult<Url> {
         value,
         "google_drive",
         "Google Drive API base URL",
-        DriveUrlQueryPolicy::Reject,
+        DriveUrlComponentPolicy::RejectQuery,
     )
 }
 
@@ -2382,8 +2389,14 @@ fn drive_api_base_path_already_targets_drive_api(api_base_url: &Url) -> bool {
         .unwrap_or(false)
 }
 
+/// Google Drive endpoint appended to a configurable API base path.
+///
+/// Resumable uploads replace an existing trailing `/drive/v3` suffix before
+/// appending `/upload/drive/v3/files`, preserving any preceding proxy prefix.
 enum DriveApiEndpoint<'a> {
+    /// A metadata or media endpoint beneath `/drive/v3/files`.
     Files(&'a [&'a str]),
+    /// The resumable-upload creation endpoint beneath `/upload/drive/v3/files`.
     ResumableUpload,
 }
 
@@ -2571,7 +2584,7 @@ fn validate_drive_resumable_upload_session_url(
         value,
         &storage.id,
         "Google Drive resumable upload session URL",
-        DriveUrlQueryPolicy::Allow,
+        DriveUrlComponentPolicy::AllowQuery,
     )?;
     if !url_origins_match(&url, api_base_url) {
         return Err(drive_upstream_error(
@@ -3748,7 +3761,7 @@ mod tests {
     }
 
     #[test]
-    fn root_validator_requires_https_api_base_except_loopback() {
+    fn root_validator_requires_https_api_base_except_literal_loopback_ip() {
         let error = GoogleDriveRootValidator::with_client_and_api_base_url(
             reqwest::Client::new(),
             "http://drive.example.com/drive/v3",
@@ -3756,7 +3769,7 @@ mod tests {
         .expect_err("non-loopback HTTP API base should fail");
 
         assert!(error.to_string().contains(
-            "Google Drive API base URL must use https unless it targets a loopback host"
+            "Google Drive API base URL must use https unless it targets an exact literal loopback IP"
         ));
 
         let error = GoogleDriveRootValidator::with_client_and_api_base_url(
@@ -3766,7 +3779,7 @@ mod tests {
         .expect_err("localhost HTTP API base should fail");
 
         assert!(error.to_string().contains(
-            "Google Drive API base URL must use https unless it targets a loopback host"
+            "Google Drive API base URL must use https unless it targets an exact literal loopback IP"
         ));
 
         let validator = GoogleDriveRootValidator::with_client_and_api_base_url(
@@ -4021,7 +4034,7 @@ mod tests {
     }
 
     #[test]
-    fn drive_resumable_upload_session_url_requires_https_except_loopback() {
+    fn drive_resumable_upload_session_url_requires_https_except_literal_loopback_ip() {
         let storage = storage_config("google-drive-user-a");
         let error = super::validate_drive_resumable_upload_session_url(
             &storage,
@@ -4031,7 +4044,7 @@ mod tests {
         .expect_err("non-loopback HTTP session URL should fail");
 
         assert!(error.to_string().contains(
-            "Google Drive resumable upload session URL must use https unless it targets a loopback host"
+            "Google Drive resumable upload session URL must use https unless it targets an exact literal loopback IP"
         ));
 
         let url = super::validate_drive_resumable_upload_session_url(
@@ -4054,7 +4067,7 @@ mod tests {
         .expect_err("localhost HTTP session URL should fail");
 
         assert!(error.to_string().contains(
-            "Google Drive resumable upload session URL must use https unless it targets a loopback host"
+            "Google Drive resumable upload session URL must use https unless it targets an exact literal loopback IP"
         ));
     }
 
