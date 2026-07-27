@@ -19,6 +19,7 @@ pub mod logging;
 pub mod metadata;
 pub mod migration;
 mod process_output;
+mod provider_factory;
 pub mod providers;
 pub mod server;
 pub mod server_config;

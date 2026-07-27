@@ -1131,15 +1131,6 @@ fn upsert_storage_provider(
     storage: &StorageProviderConfig,
     path: &Path,
 ) -> ServerResult<()> {
-    let (id, provider_type, backend_root_id, display_name) = match storage {
-        StorageProviderConfig::GoogleDrive(storage) => (
-            storage.id.as_str(),
-            "google_drive",
-            storage.root_folder_id.as_str(),
-            storage.display_name.as_deref(),
-        ),
-    };
-
     connection
         .execute(
             "INSERT INTO storage_providers(
@@ -1154,7 +1145,12 @@ fn upsert_storage_provider(
                 backend_root_id = excluded.backend_root_id,
                 display_name = excluded.display_name,
                 updated_at_unix_seconds = unixepoch()",
-            params![id, provider_type, backend_root_id, display_name],
+            params![
+                storage.id(),
+                storage.provider_type(),
+                storage.backend_root_id(),
+                storage.display_name()
+            ],
         )
         .map(|_| ())
         .map_err(|source| ServerError::MetadataOperation {

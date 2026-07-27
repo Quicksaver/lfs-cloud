@@ -195,33 +195,19 @@ impl ServerConfig {
         for (index, repository) in self.repositories.iter().enumerate() {
             let repo_path = format!("repositories[{index}]");
 
-            if !self
+            let repository_provider = self
                 .repository_providers
-                .contains_key(&repository.repo_provider)
-            {
-                return invalid_config(
-                    format!("{repo_path}.repo_provider"),
-                    format!(
-                        "references unknown repository provider {:?}",
-                        repository.repo_provider
-                    ),
-                );
-            }
-            if matches!(
-                self.repository_providers.get(&repository.repo_provider),
-                Some(RepositoryProviderConfig::GitHub(_))
-            ) && repository
-                .provider_repository_id
-                .parse::<u64>()
-                .ok()
-                .filter(|id| *id > 0)
-                .is_none()
-            {
-                return invalid_config(
-                    format!("{repo_path}.provider_repository_id"),
-                    "must be a positive GitHub numeric repository ID",
-                );
-            }
+                .get(&repository.repo_provider)
+                .ok_or_else(|| {
+                    invalid_config_error(
+                        format!("{repo_path}.repo_provider"),
+                        format!(
+                            "references unknown repository provider {:?}",
+                            repository.repo_provider
+                        ),
+                    )
+                })?;
+            repository_provider.validate_mapping(repository, &repo_path)?;
             if !self
                 .storage_providers
                 .contains_key(&repository.storage_provider)
@@ -242,7 +228,7 @@ impl ServerConfig {
             }
 
             let route_path = repository.route_path();
-            let route_comparison_key = if self.github_repository_mapping(repository) {
+            let route_comparison_key = if repository_provider.route_identity_is_case_insensitive() {
                 route_path.to_ascii_lowercase()
             } else {
                 route_path.clone()
@@ -266,7 +252,7 @@ impl ServerConfig {
     ) -> Option<&RepositoryMapping> {
         self.repositories.iter().find(|repository| {
             repository.host.eq_ignore_ascii_case(host)
-                && if self.github_repository_mapping(repository) {
+                && if self.repository_mapping_is_case_insensitive(repository) {
                     repository.owner.eq_ignore_ascii_case(owner)
                         && repository.name.eq_ignore_ascii_case(name)
                 } else {
@@ -275,11 +261,13 @@ impl ServerConfig {
         })
     }
 
-    pub(crate) fn github_repository_mapping(&self, repository: &RepositoryMapping) -> bool {
-        matches!(
-            self.repository_providers.get(&repository.repo_provider),
-            Some(RepositoryProviderConfig::GitHub(_))
-        )
+    pub(crate) fn repository_mapping_is_case_insensitive(
+        &self,
+        repository: &RepositoryMapping,
+    ) -> bool {
+        self.repository_providers
+            .get(&repository.repo_provider)
+            .is_some_and(RepositoryProviderConfig::route_identity_is_case_insensitive)
     }
 }
 
@@ -400,22 +388,6 @@ pub enum RepositoryProviderConfig {
 }
 
 impl RepositoryProviderConfig {
-    /// Returns the configured provider ID.
-    #[must_use]
-    pub fn id(&self) -> &str {
-        match self {
-            Self::GitHub(config) => &config.id,
-        }
-    }
-
-    /// Returns the configured provider type.
-    #[must_use]
-    pub fn provider_type(&self) -> &'static str {
-        match self {
-            Self::GitHub(_) => "github",
-        }
-    }
-
     fn from_raw(
         id: String,
         raw: RawRepositoryProviderConfig,
@@ -545,22 +517,6 @@ pub enum StorageProviderConfig {
 }
 
 impl StorageProviderConfig {
-    /// Returns the configured storage provider ID.
-    #[must_use]
-    pub fn id(&self) -> &str {
-        match self {
-            Self::GoogleDrive(config) => &config.id,
-        }
-    }
-
-    /// Returns the configured storage provider type.
-    #[must_use]
-    pub fn provider_type(&self) -> &'static str {
-        match self {
-            Self::GoogleDrive(_) => "google_drive",
-        }
-    }
-
     fn from_raw(
         id: String,
         raw: RawStorageProviderConfig,
@@ -1276,6 +1232,51 @@ repositories:
         assert_eq!(
             provider.authentication.personal_access_token(),
             "github_pat_secret"
+        );
+    }
+
+    #[test]
+    fn provider_factories_preserve_configured_identity_and_metadata() {
+        let config = load_with_test_env(valid_yaml());
+        let repository_provider = &config.repository_providers["github-main"];
+        let storage_provider = &config.storage_providers["drive-user-a"];
+
+        assert_eq!(
+            repository_provider.build_provider().provider_id(),
+            "github-main"
+        );
+        assert_eq!(repository_provider.provider_type(), "github");
+        assert_eq!(storage_provider.provider_type(), "google_drive");
+        assert_eq!(storage_provider.backend_root_id(), "drive-root-folder");
+        assert_eq!(storage_provider.display_name(), Some("Main Drive"));
+    }
+
+    #[test]
+    fn single_github_pat_provider_centralizes_authentication_composition() {
+        let mut config = load_with_test_env(valid_yaml());
+        let provider = config
+            .single_github_pat_provider()
+            .expect("one GitHub provider should compose")
+            .expect("one GitHub provider should be selected");
+        assert_eq!(provider.id, "github-main");
+
+        let second = match &config.repository_providers["github-main"] {
+            RepositoryProviderConfig::GitHub(provider) => {
+                let mut provider = provider.clone();
+                provider.id = "github-secondary".to_owned();
+                RepositoryProviderConfig::GitHub(provider)
+            }
+        };
+        config
+            .repository_providers
+            .insert("github-secondary".to_owned(), second);
+
+        let error = config
+            .single_github_pat_provider()
+            .expect_err("single-account PAT composition must reject two GitHub providers");
+        assert_error_contains(
+            &error,
+            "multiple GitHub repository providers are not yet supported by single-account PAT authentication",
         );
     }
 

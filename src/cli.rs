@@ -28,7 +28,6 @@ use crate::child_process::{
     configure_process_tree, wait_for_child,
 };
 use crate::git_output::{GitPathOutputError, parse_lfs_filter_attribute_paths};
-use crate::google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource};
 use crate::{
     CliError, CliResult, SanitizedMessage,
     git::redacted_url_for_display,
@@ -38,16 +37,14 @@ use crate::{
     GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup,
     GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers,
     GitLfsMigrationDiscovery, GitLfsSourceEndpointSource, GitRemote, GitRepository,
-    GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore, GoogleDriveRootValidator,
-    GoogleDriveStorageConfig, LFS_POINTER_SIZE_CUTOFF, LFS_SESSION_REVOKE_PATH, LfsInitRoute,
-    LfsObject, LfsPointer, LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
+    LFS_POINTER_SIZE_CUTOFF, LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsPointer,
+    LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
     LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
     LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
     LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
     LocalMigrationObjectAvailability, MetadataDatabase, MigrationError, MigrationFetchMode,
-    MigrationSourceFetch, MigrationStorageUpload, ProviderFuture, RepositoryMapping, ServeOptions,
-    ServerConfig, StorageDeleteOutcome, StorageError, StorageProvider, StorageProviderConfig,
-    StorageResult, StoredObject, TracingConfig, check_local_migration_objects,
+    MigrationSourceFetch, MigrationStorageUpload, RepositoryMapping, ServeOptions, ServerConfig,
+    StorageProvider, StorageProviderConfig, TracingConfig, check_local_migration_objects,
     discover_git_lfs_migration_from_remote, enumerate_current_checkout_lfs_pointers,
     enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
     fetch_migration_git_refs, fetch_missing_migration_objects_from_remote, init_tracing,
@@ -1287,139 +1284,6 @@ struct MigrationExecutionResult {
     config_changes: Vec<GitLfsConfigChange>,
 }
 
-struct MigrationGoogleDriveStorage {
-    storage: GoogleDriveStorageConfig,
-    repository_namespace: String,
-    token_source: Arc<dyn GoogleDriveAccessTokenSource>,
-    token_cache: GoogleDriveAccessTokenCache,
-    metadata: Arc<MetadataDatabase>,
-    #[cfg(test)]
-    api_base_url: Option<String>,
-}
-
-impl MigrationGoogleDriveStorage {
-    async fn object_store(&self) -> StorageResult<GoogleDriveObjectStore> {
-        let token = self
-            .token_cache
-            .get_or_refresh(&self.storage, self.token_source.as_ref())
-            .await?;
-        #[cfg(test)]
-        if let Some(api_base_url) = &self.api_base_url {
-            return GoogleDriveObjectStore::with_api_base_url(
-                self.storage.clone(),
-                &self.repository_namespace,
-                token,
-                api_base_url,
-            );
-        }
-        GoogleDriveObjectStore::new(self.storage.clone(), &self.repository_namespace, token)
-    }
-
-    fn validate_repository_namespace(&self, repository_namespace: &str) -> StorageResult<()> {
-        if repository_namespace == self.repository_namespace {
-            Ok(())
-        } else {
-            Err(StorageError::RepositoryNamespaceMismatch {
-                provider: self.storage.id.clone(),
-            })
-        }
-    }
-}
-
-impl StorageProvider for MigrationGoogleDriveStorage {
-    fn provider_id(&self) -> &str {
-        &self.storage.id
-    }
-
-    fn object_exists<'a>(
-        &'a self,
-        repository_namespace: &'a str,
-        object: &'a LfsObject,
-    ) -> ProviderFuture<'a, StorageResult<bool>> {
-        Box::pin(async move {
-            self.validate_repository_namespace(repository_namespace)?;
-            Ok(self
-                .object_store()
-                .await?
-                .lookup_object(object)
-                .await?
-                .is_some())
-        })
-    }
-
-    fn upload_object<'a>(
-        &'a self,
-        repository_namespace: &'a str,
-        object: &'a LfsObject,
-        source: &'a Path,
-    ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
-        Box::pin(async move {
-            self.validate_repository_namespace(repository_namespace)?;
-            let verified_file = GoogleDriveObjectStore::open_verified_staged_upload_file(
-                &self.storage,
-                object,
-                source,
-            )
-            .await?;
-            let _upload_lock = self
-                .metadata
-                .acquire_object_upload_lock(
-                    repository_namespace.to_owned(),
-                    self.storage.id.clone(),
-                    object.clone(),
-                )
-                .await
-                .map_err(|error| StorageError::Retryable {
-                    provider: self.storage.id.clone(),
-                    message: format!("migration upload lock failed: {error}"),
-                })?;
-
-            // Perform the lookup and possible upload while holding the
-            // cross-process lock so a live server cannot win the race and
-            // create a duplicate Drive file. File verification stays outside
-            // the lock so cache-hit retries do not serialize large-file reads.
-            let store = self.object_store().await?;
-            store
-                .upload_verified_object_idempotent(object, source, verified_file)
-                .await
-        })
-    }
-
-    fn download_object<'a>(
-        &'a self,
-        repository_namespace: &'a str,
-        object: &'a LfsObject,
-        destination: &'a Path,
-    ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
-        Box::pin(async move {
-            self.validate_repository_namespace(repository_namespace)?;
-            StorageProvider::download_object(
-                &self.object_store().await?,
-                repository_namespace,
-                object,
-                destination,
-            )
-            .await
-        })
-    }
-
-    fn delete_or_mark_object<'a>(
-        &'a self,
-        repository_namespace: &'a str,
-        object: &'a LfsObject,
-    ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
-        Box::pin(async move {
-            self.validate_repository_namespace(repository_namespace)?;
-            StorageProvider::delete_or_mark_object(
-                &self.object_store().await?,
-                repository_namespace,
-                object,
-            )
-            .await
-        })
-    }
-}
-
 async fn run_migrate_execution_from_dir<W, P, A>(
     command: MigrateCommand,
     config_path: Option<PathBuf>,
@@ -1449,13 +1313,13 @@ where
 
     let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
     let (mapping, storage) =
-        migration_google_drive_storage(&config_path, &preparation.repository).await?;
+        migration_storage_provider(&config_path, &preparation.repository).await?;
     fetch_migration_git_refs(
         &preparation.repository.worktree_root,
         &preparation.source_remote.remote_name,
     )?;
     let context = preparation.scan_fetched_refs()?;
-    let result = execute_migration_with_storage(&context, &mapping, &storage).await?;
+    let result = execute_migration_with_storage(&context, &mapping, storage.as_ref()).await?;
     write_migration_execution_report(output, &context, &mapping, &result).map_err(output_error)
 }
 
@@ -1523,10 +1387,10 @@ fn prepare_migration_execution(
     })
 }
 
-async fn migration_google_drive_storage(
+async fn migration_storage_provider(
     config_path: &Path,
     repository: &GitRepository,
-) -> CliResult<(RepositoryMapping, MigrationGoogleDriveStorage)> {
+) -> CliResult<(RepositoryMapping, Arc<dyn StorageProvider + Send + Sync>)> {
     let config = ServerConfig::load_from_path(config_path)?;
     let mapping = config
         .repository_mapping_for_identity(
@@ -1551,34 +1415,10 @@ async fn migration_google_drive_storage(
                 mapping.id, mapping.storage_provider
             ),
         })?;
-    let StorageProviderConfig::GoogleDrive(storage) = storage;
-    let token_source: Arc<dyn GoogleDriveAccessTokenSource> =
-        Arc::new(GoogleDriveGcloudTokenProvider::new());
-    let token_cache = GoogleDriveAccessTokenCache::default();
-    let token = token_cache
-        .get_or_refresh(&storage, token_source.as_ref())
-        .await
-        .map_err(MigrationError::from)?;
-    GoogleDriveRootValidator::new()
-        .map_err(MigrationError::from)?
-        .validate_root_folder(&storage, &token)
-        .await
-        .map_err(MigrationError::from)?;
-
     let metadata = Arc::new(MetadataDatabase::open(&config.server.metadata_path)?);
     metadata.sync_config(&config)?;
-    Ok((
-        mapping.clone(),
-        MigrationGoogleDriveStorage {
-            storage,
-            repository_namespace: mapping.id,
-            token_source,
-            token_cache,
-            metadata,
-            #[cfg(test)]
-            api_base_url: None,
-        },
-    ))
+    let provider = storage.build_provider(mapping.id.clone(), metadata).await?;
+    Ok((mapping, provider))
 }
 
 async fn execute_migration_with_storage(
@@ -3508,21 +3348,10 @@ fn resolve_socket_addresses_with_timeout(host: String, port: u16) -> CliResult<V
 }
 
 fn validate_status_storage(storage: &StorageProviderConfig) -> CliResult<()> {
-    match storage {
-        StorageProviderConfig::GoogleDrive(storage) => {
-            validate_google_drive_status_storage(storage)
-        }
-    }
-}
-
-fn validate_google_drive_status_storage(storage: &GoogleDriveStorageConfig) -> CliResult<()> {
-    GoogleDriveGcloudTokenProvider::new()
-        .validate_local_readiness(&storage.id, &storage.credentials)
+    storage
+        .validate_local_readiness()
         .map_err(|_| CliError::InvalidArguments {
-            message: format!(
-                "Google Drive credential for {} is not usable; check the configured gcloud ADC credentials directory",
-                storage.id
-            ),
+            message: storage.local_readiness_error_message(),
         })
 }
 
@@ -3699,8 +3528,8 @@ mod tests {
     use super::run_bounded_child_command;
     use super::{
         Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, LoginTerminal,
-        LogoutCommand, MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, MigrationGoogleDriveStorage,
-        PullCommand, SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
+        LogoutCommand, MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, PullCommand,
+        SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
         current_checkout_lfs_pointer_scan, dispatch, execute_migration_with_storage,
         github_personal_access_token_login_url_for_server, is_git_worktree_discovery_error,
         prepare_migration_execution, probe_authenticated_migration_target, probe_server_reachable,
@@ -3713,6 +3542,7 @@ mod tests {
     use crate::google_drive::{
         GoogleDriveAccessToken, GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource,
     };
+    use crate::provider_factory::GoogleDriveStorageProvider;
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitRepository,
@@ -4253,18 +4083,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_google_drive_storage_satisfies_shared_storage_contract() {
+    async fn configured_google_drive_storage_satisfies_shared_storage_contract() {
         let server = DriveStorageContractServer::start().await;
-        let storage = MigrationGoogleDriveStorage {
-            storage: drive_contract_storage_config(),
-            repository_namespace: "github.com/owner/repo".to_owned(),
-            token_source: Arc::new(FixedDriveTokenSource),
-            token_cache: GoogleDriveAccessTokenCache::default(),
-            metadata: Arc::new(
+        let storage = GoogleDriveStorageProvider::with_test_dependencies(
+            drive_contract_storage_config(),
+            "github.com/owner/repo",
+            Arc::new(FixedDriveTokenSource),
+            GoogleDriveAccessTokenCache::default(),
+            Arc::new(
                 MetadataDatabase::open_in_memory().expect("Drive contract metadata should open"),
             ),
-            api_base_url: Some(server.base_url.clone()),
-        };
+            Some(server.base_url.clone()),
+        );
 
         let report = assert_storage_provider_contract(
             &storage,
@@ -4311,14 +4141,14 @@ mod tests {
         let token_source = Arc::new(CountingDriveTokenSource {
             calls: AtomicUsize::new(0),
         });
-        let storage = MigrationGoogleDriveStorage {
-            storage: storage_config,
-            repository_namespace: repository_namespace.to_owned(),
-            token_source: token_source.clone(),
-            token_cache: GoogleDriveAccessTokenCache::default(),
+        let storage = GoogleDriveStorageProvider::with_test_dependencies(
+            storage_config,
+            repository_namespace,
+            token_source.clone(),
+            GoogleDriveAccessTokenCache::default(),
             metadata,
-            api_base_url: Some(server.base_url.clone()),
-        };
+            Some(server.base_url.clone()),
+        );
 
         let upload = tokio::spawn(async move {
             StorageProvider::upload_object(&storage, repository_namespace, &object, &source).await

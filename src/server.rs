@@ -41,15 +41,14 @@ use url::{Url, form_urlencoded};
 
 use crate::{
     DEFAULT_GIT_CREDENTIAL_USERNAME, ErrorCategory, GitHubPersonalAccessTokenLoginRouteState,
-    GitHubRepositoryProvider, GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore,
-    GoogleDriveRootValidator, LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError,
-    LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject,
-    LfsObjectSize, LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase,
-    MetadataObjectVerificationStatus, ProviderFuture, RepositoryAuthentication, RepositoryIdentity,
-    RepositoryMapping, RepositoryPermission, RepositoryProvider, RepositoryProviderConfig,
-    RepositoryProviderError, RepositoryUser, SanitizedMessage, ServerConfig, ServerError,
-    ServerResult, StorageError, StorageProvider, StorageProviderConfig, StoredObject,
-    github_personal_access_token_login_router,
+    GoogleDriveGcloudTokenProvider, GoogleDriveObjectStore, GoogleDriveRootValidator,
+    LFS_BASIC_TRANSFER, LfsBatchDownloadObject, LfsBatchObjectError, LfsBatchOperation,
+    LfsBatchRequest, LfsBatchResponse, LfsBatchUploadObject, LfsObject, LfsObjectSize, LfsOid,
+    LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, MetadataObjectVerificationStatus,
+    ProviderFuture, RepositoryAuthentication, RepositoryIdentity, RepositoryMapping,
+    RepositoryPermission, RepositoryProvider, RepositoryProviderError, RepositoryUser,
+    SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError, StorageProvider,
+    StorageProviderConfig, StoredObject, github_personal_access_token_login_router,
     google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
     metadata::{MetadataTransferOperation, MetadataTransferResult},
     parse_lfs_batch_request_json,
@@ -323,23 +322,12 @@ fn production_session_store(
     config: &ServerConfig,
     metadata_database: Arc<MetadataDatabase>,
 ) -> ServerResult<LocalLfsSessionStore> {
-    let github_providers = config
-        .repository_providers
-        .values()
-        .map(|provider| match provider {
-            RepositoryProviderConfig::GitHub(provider) => provider,
-        })
-        .collect::<Vec<_>>();
-
-    match github_providers.as_slice() {
-        [] => Ok(LocalLfsSessionStore::new()),
-        [provider] => LocalLfsSessionStore::open_durable(
+    match config.single_github_pat_provider()? {
+        None => Ok(LocalLfsSessionStore::new()),
+        Some(provider) => LocalLfsSessionStore::open_durable(
             metadata_database,
             provider.authentication.session_encryption_secret(),
         ),
-        _ => Err(ServerError::InvalidConfiguration {
-            message: "multiple GitHub repository providers are not yet supported by durable session storage".to_owned(),
-        }),
     }
 }
 
@@ -654,25 +642,12 @@ fn github_auth_router_with_client(
     session_store: LocalLfsSessionStore,
     user_client: crate::GitHubUserClient,
 ) -> ServerResult<Option<Router>> {
-    let github_providers = config
-        .repository_providers
-        .values()
-        .map(|provider| match provider {
-            RepositoryProviderConfig::GitHub(provider) => provider,
-        })
-        .collect::<Vec<_>>();
-
-    let provider = match github_providers.as_slice() {
-        [] => return Ok(None),
-        [provider] => provider,
-        _ => {
-            return Err(ServerError::InvalidConfiguration {
-                message: "multiple GitHub repository providers are not yet supported by the PAT login router".to_owned(),
-            });
-        }
+    let provider = match config.single_github_pat_provider()? {
+        None => return Ok(None),
+        Some(provider) => provider,
     };
     let route_state = GitHubPersonalAccessTokenLoginRouteState::with_client_and_session_store(
-        (*provider).clone(),
+        provider.clone(),
         user_client,
         session_store,
     )?;
@@ -755,14 +730,8 @@ impl ProviderBatchAuthorizer {
     fn from_config(config: &ServerConfig) -> Self {
         let providers = config
             .repository_providers
-            .iter()
-            .map(|(id, provider)| match provider {
-                RepositoryProviderConfig::GitHub(provider) => (
-                    id.clone(),
-                    Arc::new(GitHubRepositoryProvider::new(provider.clone()))
-                        as Arc<dyn RepositoryProvider + Send + Sync>,
-                ),
-            })
+            .values()
+            .map(|provider| (provider.id().to_owned(), provider.build_provider()))
             .collect();
 
         Self { providers }
@@ -1092,13 +1061,12 @@ impl GoogleDriveTransferStore {
 
     async fn validate_storage_providers(&self) -> ServerResult<()> {
         for storage in self.storage_providers.values() {
-            let StorageProviderConfig::GoogleDrive(storage) = storage;
-            let token = self
-                .token_cache
-                .get_or_refresh(storage, self.token_source.as_ref())
-                .await?;
-            self.root_validator
-                .validate_root_folder(storage, &token)
+            storage
+                .validate_runtime(
+                    &self.token_cache,
+                    self.token_source.as_ref(),
+                    &self.root_validator,
+                )
                 .await?;
         }
 
@@ -3445,7 +3413,8 @@ impl LfsRouteResolver {
                     ),
                     route_path_with_slash: format!("{route_path}/"),
                     route_path,
-                    case_insensitive_identity: config.github_repository_mapping(&repository),
+                    case_insensitive_identity: config
+                        .repository_mapping_is_case_insensitive(&repository),
                     repository,
                 }
             })
