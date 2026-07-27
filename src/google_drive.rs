@@ -481,15 +481,6 @@ impl GoogleDriveRootValidator {
         )
     }
 
-    /// Creates a validator with an explicit HTTP client.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] if the default Drive API base URL is invalid.
-    pub fn with_client(client: Client) -> StorageResult<Self> {
-        Self::with_client_and_api_base_url(client, GOOGLE_DRIVE_API_BASE_URL)
-    }
-
     /// Creates a validator with an explicit HTTP client and API base URL.
     ///
     /// This is primarily useful for tests that replace Google Drive with a

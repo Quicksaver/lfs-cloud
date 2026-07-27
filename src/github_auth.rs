@@ -700,19 +700,6 @@ impl GitHubRepositoryPermissionClient {
     }
 }
 
-/// Fetches the authenticated GitHub user using the default GitHub API client.
-///
-/// # Errors
-///
-/// Returns ServerError when the GitHub user lookup cannot complete.
-pub async fn fetch_authenticated_github_user(
-    provider: &GitHubProviderConfig,
-    token: &GitHubPersonalAccessToken,
-) -> ServerResult<RepositoryUser> {
-    GitHubUserClient::new()?
-        .fetch_authenticated_user(provider, token)
-        .await
-}
 #[derive(Debug, Deserialize)]
 struct GitHubUserResponse {
     login: Option<String>,

@@ -38,8 +38,7 @@ pub use git::{GitLfsConfigChange, GitLfsConfigTarget, GitRemote, GitRepository};
 pub use github_auth::{
     GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitHubLoginRouteResponse, GitHubPersonalAccessToken,
     GitHubPersonalAccessTokenLoginRouteState, GitHubRepositoryPermissionClient,
-    GitHubRepositoryProvider, GitHubUserClient, fetch_authenticated_github_user,
-    github_personal_access_token_login_router,
+    GitHubRepositoryProvider, GitHubUserClient, github_personal_access_token_login_router,
 };
 pub use google_drive::{
     GOOGLE_DRIVE_API_BASE_URL, GOOGLE_DRIVE_FILE_SCOPE, GoogleDriveAccessToken,
