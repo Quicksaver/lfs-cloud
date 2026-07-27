@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::child_process::{
-    ChildProcessError, ChildProcessOptions, PipeCapture, configure_process_tree, wait_for_child,
+    ChildProcessError, ChildProcessOptions, PipeCapture, configure_process_tree,
+    terminate_process_tree, wait_for_child,
 };
 use crate::git_output::{
     GitPathOutputError, parse_lfs_filter_attribute_paths,
@@ -1749,8 +1750,8 @@ fn wait_for_git_command(
     timeout: Duration,
 ) -> MigrationResult<(ExitStatus, Vec<u8>)> {
     if child.stderr.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_process_tree(child, command)
+            .map_err(|error| child_process_migration_error(error, command))?;
         return Err(MigrationError::Io {
             context: format!("failed to capture stderr from {command}"),
             source: io::Error::new(
@@ -6124,8 +6125,62 @@ mod tests {
     }
 
     #[test]
+    fn source_fetch_missing_stderr_stops_the_configured_process_tree() {
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let marker_path = temp.path().join("descendant-survived");
+        let test_executable = std::env::current_exe().expect("test executable should resolve");
+        let mut command = Command::new(test_executable);
+        command
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MARKER_ENV, &marker_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().expect("test helper should start");
+        let mut readiness_output = Vec::new();
+        while !readiness_output.ends_with(b"ready\n") {
+            let mut byte = [0_u8; 1];
+            child
+                .stdout
+                .as_mut()
+                .expect("helper stdout should be captured")
+                .read_exact(&mut byte)
+                .expect("helper should report that its descendant started");
+            readiness_output.push(byte[0]);
+            assert!(
+                readiness_output.len() <= 1024,
+                "helper readiness output exceeded its test boundary"
+            );
+        }
+
+        let error = wait_for_git_command(
+            &mut child,
+            "git lfs fetch missing-stderr test",
+            Duration::from_secs(5),
+        )
+        .expect_err("missing stderr capture should fail");
+
+        assert!(matches!(
+            error,
+            MigrationError::Io { context, .. }
+                if context
+                    == "failed to capture stderr from git lfs fetch missing-stderr test"
+        ));
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            !marker_path.exists(),
+            "missing-stderr cleanup left a descendant process alive"
+        );
+    }
+
+    #[test]
     #[ignore = "invoked as a platform-native process-tree test helper"]
     fn migration_process_tree_helper() {
+        use std::io::Write as _;
+
         let Some(marker_path) = std::env::var_os(PROCESS_TREE_MARKER_ENV) else {
             return;
         };
@@ -6135,6 +6190,12 @@ mod tests {
             .env(PROCESS_TREE_MARKER_ENV, marker_path)
             .spawn()
             .expect("descendant helper should start");
+        std::io::stdout()
+            .write_all(b"ready\n")
+            .expect("helper readiness should be writable");
+        std::io::stdout()
+            .flush()
+            .expect("helper readiness should be flushed");
 
         descendant
             .wait()

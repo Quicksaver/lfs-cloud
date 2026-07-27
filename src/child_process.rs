@@ -345,8 +345,24 @@ fn collect_pipe_events(
             break;
         };
         match event {
-            PipeEvent::Stdout(Ok(output)) => *stdout = Some(output.bytes),
-            PipeEvent::Stderr(Ok(output)) => *stderr = Some(output.bytes),
+            PipeEvent::Stdout(Ok(output)) => {
+                if let Some(limit) = output.exceeded_limit {
+                    first_error.get_or_insert(ChildProcessError::OutputLimit {
+                        stream: "stdout",
+                        limit,
+                    });
+                }
+                *stdout = Some(output.bytes);
+            }
+            PipeEvent::Stderr(Ok(output)) => {
+                if let Some(limit) = output.exceeded_limit {
+                    first_error.get_or_insert(ChildProcessError::OutputLimit {
+                        stream: "stderr",
+                        limit,
+                    });
+                }
+                *stderr = Some(output.bytes);
+            }
             PipeEvent::Stdout(Err(source)) => {
                 *stdout = Some(Vec::new());
                 first_error.get_or_insert_with(|| {
@@ -398,7 +414,11 @@ fn join_completed_reader(
     Ok(())
 }
 
-fn terminate_process_tree(child: &mut Child, command_name: &str) -> Result<(), ChildProcessError> {
+/// Stops and reaps a child spawned from a configured process-tree command.
+pub(crate) fn terminate_process_tree(
+    child: &mut Child,
+    command_name: &str,
+) -> Result<(), ChildProcessError> {
     stop_process_tree(child);
     if child
         .try_wait()
@@ -511,6 +531,38 @@ mod tests {
             error,
             ChildProcessError::Io { context, .. }
                 if context == "failed to read stdout from test helper"
+        ));
+    }
+
+    #[test]
+    fn drain_reports_descendant_output_that_exceeds_a_hard_limit() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PipeEvent::Stdout(Ok(super::PipeReadResult {
+                bytes: b"abc".to_vec(),
+                exceeded_limit: Some(3),
+            })))
+            .expect("completed descendant output should be sent");
+        drop(sender);
+        let mut stdout = None;
+        let mut stderr = Some(Vec::new());
+
+        let error = collect_pipe_events(
+            &receiver,
+            &mut stdout,
+            &mut stderr,
+            Duration::from_secs(1),
+            "exited test helper",
+        )
+        .expect("post-exit drain should retain the hard-limit failure");
+
+        assert_eq!(stdout, Some(b"abc".to_vec()));
+        assert!(matches!(
+            error,
+            ChildProcessError::OutputLimit {
+                stream: "stdout",
+                limit: 3
+            }
         ));
     }
 
