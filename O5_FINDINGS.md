@@ -22,7 +22,7 @@ Two project constraints were applied and materially changed several conclusions:
 | # | Finding | Kind | Est. impact | Risk | When |
 | --- | --- | --- | --- | --- | --- |
 | 3 | **[DONE / REVIEWED]** `StorageProvider` contract test | Additive tests | New coverage | None | Completed |
-| 4 | Tests that exercise scaffolding, not production | Coverage repair | Removes false trust | None | Before launch |
+| 4 | **[DONE / REVIEWED]** Tests that exercise scaffolding, not production | Coverage repair | Removes false trust | None | Completed |
 | 5 | `login` and `init` validate `--server` unequally | Consistency fix | ~30 lines | Low | Before launch |
 | 6.4 | Four copies of child-process/pipe handling | Deduplication | ~500–600 lines | Medium | Before launch |
 | 6.5 | Three copies of the `check-attr` pipeline | Deduplication | ~200 lines | Medium | Before launch |
@@ -83,27 +83,37 @@ Likely shape: a generic `MetadataRecordingTransferStore<P: StorageProvider>` own
 
 **Verification:** The initial implementation passed Yarn linting, `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all 576 library/integration-target tests, and all 29 doc tests. After the Blast follow-up and final Codex remediation, the final tree again passed formatting, markdown lint, Clippy with warnings denied, build, all-target tests, and doc tests.
 
-## 4. Tests that exercise scaffolding instead of production code
+## 4. **[DONE / REVIEWED] Tests that exercise scaffolding instead of production code**
 
 These create a false impression of coverage. Repairing them raises real coverage.
 
-### 4.1 Free-space guardrail is tested against a copy
+### 4.1 **[DONE / REVIEWED] Free-space guardrail was tested against a copy**
 
 `ensure_temp_space_for_upload_with_available_space` (`src/server.rs:2678`, `#[cfg(test)]`) is a test-only reimplementation of the first half of `reserve_with_available_space` (`src/server.rs:2551`). The test asserting upload free-space guardrails asserts against that copy, so the production reservation path is not what runs — including the shared capacity snapshot and `reserved_bytes` accounting that `[server] Upload staging admission` identifies as race-critical.
 
-**Action:** Delete the copy; point the test at `UploadStagingCoordinator::reserve_with_available_space`.
+**Validity:** Valid and actionable. The test-only copy still existed and was called only by the guardrail test, while the production coordinator already exposed the deterministic free-space seam the test needed.
 
-### 4.2 Dead production logic kept alive by a test of itself
+**Outcome:** Deleted the copy and changed `temp_space_guardrail_requires_expected_size_plus_headroom` to call `UploadStagingCoordinator::reserve_with_available_space` directly. The test now exercises the production checked arithmetic, shared capacity snapshot, reservation accounting, and release path.
+
+### 4.2 **[DONE / REVIEWED] Dead production logic was kept alive by a test of itself**
 
 `parse_ls_tree_blob_output` (`src/migration.rs:3494`, `#[cfg(test)]`, ~62 lines) parses `git ls-tree` output that `HistoryScanner` no longer produces; it was replaced by raw tree parsing (`parse_raw_git_tree`). Its only caller is its own test at `src/migration.rs:5607`.
 
-**Action:** Delete the function and its test.
+**Validity:** Valid and actionable. Current-tree search confirmed that the parser was test-only, its sole caller was `ls_tree_parser_skips_non_blob_entries`, and production history scanning uses raw Git tree parsing.
 
-### 4.3 Upload staging helpers bypass real admission
+**Outcome:** Deleted `parse_ls_tree_blob_output`, its test import, and its self-test. Existing history-scanner tests continue to exercise the raw production tree parser, including skipping LFS-matching gitlinks.
+
+### 4.3 **[DONE / REVIEWED] Upload staging helpers bypassed real admission**
 
 `stage_upload_request_body`, `stage_upload_request_body_with_limit`, and `stage_upload_request_body_with_guardrails` (`src/server.rs:2310-2375`, all `#[cfg(test)]`) each construct a throwaway `UploadStagingCoordinator::new(1, 1)`. Tests using them never exercise real admission or the per-user slot map, so the global and per-user limits described in `[server] Upload staging admission` are untested at this layer.
 
-**Action:** Confirm whether handler-level tests cover the limits. If not, this is a coverage gap to fill rather than a cleanup.
+**Validity:** Valid and actionable as a coverage gap. Coordinator unit tests covered semaphore behavior, but no handler-level test proved that configured limits, authenticated stable-user principals, and overload responses were wired together. The three narrow helpers remain useful for post-admission body-staging tests and are not treated as admission coverage.
+
+**Outcome:** Added handler-level tests that retain a real staging lease through a blocked backend upload. One sends a competing request for the same authenticated stable user while global capacity remains, proving the per-user limit; the other uses a second stable user, proving the process-wide limit. Both require immediate HTTP 503 Git LFS JSON responses with `Retry-After: 1`. Assessment then bounded the competing requests with deadlines and abort cleanup so a limiter regression fails instead of hanging the suite.
+
+**Assessment and commits:** The initial implementation was committed as `a4b54bcc975271e6b804fea3c439df3a17512bf1` against `6c59c67d87fba8d0021bb0c62b2f5f0421309388`. Initial CodeRabbit review was rate-limited and recorded as the workflow-defined no-op. Initial Codex review found one valid P2: both new concurrency tests could deadlock indefinitely if admission regressed. Deadlines and guaranteed blocked-task cleanup were committed in `e587ee213ebe200d68d59224400f5146c7260601`. Blast review was skipped as the workflow-defined no-op after an upstream Claude quota failure; because it produced no remediation commit, `assess-work` stopped without the final CodeRabbit and Codex rounds.
+
+**Verification:** The initial implementation passed Yarn linting, `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all 578 non-ignored library tests, every integration target, and all 29 doc tests. The Codex remediation reran the required verification successfully. The original reviewer was high quality: all three findings were valid, current, and correctly distinguished dead scaffolding from a real missing handler-level test. Codex's single P2 was also valid and directly improved regression behavior; CodeRabbit and Blast quality could not be assessed because their steps were rate-limited.
 
 ## 5. `login` and `init` validate `--server` differently
 
