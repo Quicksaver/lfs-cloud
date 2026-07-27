@@ -1468,6 +1468,7 @@ impl GoogleDriveObjectStore {
         object: &LfsObject,
         stored_object: StoredObject,
     ) -> StorageResult<GoogleDriveDownloadResponse> {
+        self.ensure_repository_namespace(&stored_object.repository_namespace)?;
         if stored_object.provider_id != self.storage.id || stored_object.object != *object {
             return Err(StorageError::Conflict {
                 provider: self.storage.id.clone(),
@@ -3399,6 +3400,7 @@ mod tests {
     use crate::{
         GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, LfsObject, LfsObjectSize,
         LfsOid, ProviderFuture, StorageDeleteOutcome, StorageError, StorageProvider, StorageResult,
+        StoredObject, StreamingStorageProvider,
     };
     use axum::{
         Json, Router,
@@ -4903,6 +4905,40 @@ mod tests {
             .object_exists("github.com/owner/repo-b", &lfs_object())
             .await
             .expect_err("repository-scoped Drive store should reject another namespace");
+
+        assert!(matches!(
+            error,
+            StorageError::RepositoryNamespaceMismatch { ref provider }
+                if provider == "drive-user-a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_store_streaming_trait_rejects_stored_object_from_another_repository() {
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            storage_config("google-drive-user-a"),
+            "github.com/owner/repo-a",
+            access_token(),
+            reqwest::Client::new(),
+            "http://127.0.0.1:1",
+        )
+        .expect("object store should build");
+        let streaming: &dyn StreamingStorageProvider = &store;
+        let object = lfs_object();
+        let stored_object = StoredObject::new(
+            "drive-user-a",
+            "github.com/owner/repo-b",
+            object.clone(),
+            "foreign-drive-file",
+        );
+
+        let error = match streaming
+            .download_object_response("github.com/owner/repo-a", &object, stored_object)
+            .await
+        {
+            Ok(_) => panic!("foreign repository metadata should not stream"),
+            Err(error) => error,
+        };
 
         assert!(matches!(
             error,
