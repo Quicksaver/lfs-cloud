@@ -1417,7 +1417,10 @@ async fn migration_storage_provider(
         })?;
     let metadata = Arc::new(MetadataDatabase::open(&config.server.metadata_path)?);
     metadata.sync_config(&config)?;
-    let provider = storage.build_provider(mapping.id.clone(), metadata).await?;
+    let provider = storage
+        .build_provider(mapping.id.clone(), metadata)
+        .await
+        .map_err(MigrationError::from)?;
     Ok((mapping, provider))
 }
 
@@ -3532,12 +3535,12 @@ mod tests {
         SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
         current_checkout_lfs_pointer_scan, dispatch, execute_migration_with_storage,
         github_personal_access_token_login_url_for_server, is_git_worktree_discovery_error,
-        prepare_migration_execution, probe_authenticated_migration_target, probe_server_reachable,
-        read_bounded_login_token, read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir,
-        run_hydrate_from_dir, run_init_from_dir, run_login_from_dir, run_logout_from_dir,
-        run_migrate_from_dir, run_pull_from_dir, run_status_from_dir,
-        session_revocation_url_for_server, tracing_config, validate_status_storage,
-        write_init_change,
+        migration_storage_provider, prepare_migration_execution,
+        probe_authenticated_migration_target, probe_server_reachable, read_bounded_login_token,
+        read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir,
+        run_init_from_dir, run_login_from_dir, run_logout_from_dir, run_migrate_from_dir,
+        run_pull_from_dir, run_status_from_dir, session_revocation_url_for_server, tracing_config,
+        validate_status_storage, write_init_change,
     };
     use crate::google_drive::{
         GoogleDriveAccessToken, GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource,
@@ -5339,6 +5342,32 @@ mod tests {
         assert!(rendered.contains("drive-user-a"));
         assert!(rendered.contains("gcloud"));
         assert!(!rendered.contains("private-gcloud-drive"));
+    }
+
+    #[tokio::test]
+    async fn migration_provider_readiness_failure_remains_in_migration_domain() {
+        require_git();
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let repository =
+            GitRepository::discover(&repo).expect("temporary repository should be discovered");
+
+        let error = match migration_storage_provider(&config_path, &repository).await {
+            Ok(_) => panic!("missing Drive credentials should fail provider construction"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            CliError::Migration {
+                source: crate::MigrationError::Storage { .. }
+            }
+        ));
     }
 
     #[test]

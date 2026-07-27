@@ -138,7 +138,7 @@ trait StorageProviderRegistration {
         &self,
         repository_namespace: String,
         metadata: Arc<MetadataDatabase>,
-    ) -> ProviderFuture<'static, ServerResult<Arc<dyn StorageProvider + Send + Sync>>>;
+    ) -> ProviderFuture<'static, StorageResult<Arc<dyn StorageProvider + Send + Sync>>>;
 }
 
 impl StorageProviderRegistration for GoogleDriveStorageConfig {
@@ -186,7 +186,7 @@ impl StorageProviderRegistration for GoogleDriveStorageConfig {
         &self,
         repository_namespace: String,
         metadata: Arc<MetadataDatabase>,
-    ) -> ProviderFuture<'static, ServerResult<Arc<dyn StorageProvider + Send + Sync>>> {
+    ) -> ProviderFuture<'static, StorageResult<Arc<dyn StorageProvider + Send + Sync>>> {
         let storage = self.clone();
         Box::pin(async move {
             let token_source: Arc<dyn GoogleDriveAccessTokenSource> =
@@ -261,7 +261,7 @@ impl StorageProviderConfig {
         &self,
         repository_namespace: String,
         metadata: Arc<MetadataDatabase>,
-    ) -> ServerResult<Arc<dyn StorageProvider + Send + Sync>> {
+    ) -> StorageResult<Arc<dyn StorageProvider + Send + Sync>> {
         self.registration()
             .build_provider(repository_namespace, metadata)
             .await
