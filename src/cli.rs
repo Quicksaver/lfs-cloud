@@ -605,7 +605,7 @@ fn request_personal_access_token_lfs_session(
     )?;
     let login_url = github_personal_access_token_login_url_for_server(server_url)?;
     let client = redirect_free_http_client("failed to create GitHub PAT login client")?;
-    let response = run_blocking_http_request(
+    let response = block_on_reqwest(
         client
             .post(login_url)
             .bearer_auth(personal_access_token)
@@ -622,7 +622,7 @@ fn request_personal_access_token_lfs_session(
             )),
         });
     }
-    let response = run_blocking_http_request(
+    let response = block_on_reqwest(
         response.json::<PersonalAccessTokenLoginResponse>(),
         "failed to read GitHub PAT login response",
     )?;
@@ -791,14 +791,7 @@ where
 }
 
 fn session_revocation_url_for_server(server_url: &str) -> CliResult<String> {
-    let mut url = crate::init::validate_server_url(server_url, true)?;
-    append_url_path_segments(
-        &mut url,
-        LFS_SESSION_REVOKE_PATH,
-        "server URL cannot be used as a route base",
-    )?;
-
-    Ok(url.to_string())
+    auth_url_for_server(server_url, LFS_SESSION_REVOKE_PATH)
 }
 
 fn request_lfs_session_revocation(
@@ -806,7 +799,7 @@ fn request_lfs_session_revocation(
     token: &LfsSessionToken,
 ) -> CliResult<SessionRevocationStatus> {
     let client = redirect_free_http_client("failed to create LFS session revocation client")?;
-    let response = run_blocking_http_request(
+    let response = block_on_reqwest(
         client
             .delete(revoke_url)
             .bearer_auth(token.as_str())
@@ -3084,11 +3077,18 @@ fn read_current_checkout_pointer_candidate(path: &Path) -> CliResult<Option<LfsP
     Ok(LfsPointer::parse(contents).ok())
 }
 
-fn indexed_lfs_object_for_dehydration(worktree_root: &Path, path: &Path) -> CliResult<LfsObject> {
-    let relative_path = dehydration_relative_path_from_contained_file(worktree_root, path)?;
-    require_lfs_filter(worktree_root, &relative_path, path)?;
-    let blob_oid = index_blob_oid(worktree_root, &relative_path, path)?;
-    let pointer = read_index_lfs_pointer(worktree_root, &blob_oid, path)?;
+// `contained_path` must come from `contained_worktree_file_path`, which
+// canonicalizes its parent and rejects symlinks or traversal outside the
+// worktree before Git sees the repository-relative path.
+fn indexed_lfs_object_for_dehydration(
+    worktree_root: &Path,
+    contained_path: &Path,
+) -> CliResult<LfsObject> {
+    let relative_path =
+        dehydration_relative_path_from_contained_file(worktree_root, contained_path)?;
+    require_lfs_filter(worktree_root, &relative_path, contained_path)?;
+    let blob_oid = index_blob_oid(worktree_root, &relative_path, contained_path)?;
+    let pointer = read_index_lfs_pointer(worktree_root, &blob_oid, contained_path)?;
 
     Ok(pointer.object)
 }
@@ -3690,11 +3690,7 @@ async fn probe_authenticated_migration_target(
     token: &LfsSessionToken,
 ) -> CliResult<()> {
     let mut batch_url = crate::init::validate_server_url(lfs_url, allow_insecure_http)?;
-    append_url_path_segments(
-        &mut batch_url,
-        "objects/batch",
-        "LFS URL cannot be used as a repository route",
-    )?;
+    append_url_path_segments(&mut batch_url, "objects/batch")?;
 
     let client = redirect_free_http_client("failed to create migration target probe client")?;
     let response = client
@@ -3776,32 +3772,29 @@ fn validate_google_drive_status_storage(storage: &GoogleDriveStorageConfig) -> C
 }
 
 fn auth_url_for_server(server_url: &str, route_path: &str) -> CliResult<String> {
-    let mut login_url = crate::init::validate_server_url(server_url, true)?;
-    append_url_path_segments(
-        &mut login_url,
-        route_path,
-        "server URL cannot be used as a route base",
-    )?;
+    // Login and logout callers obtain this base from `LfsInitRoute`, which has
+    // already enforced the CLI's insecure-HTTP opt-in. Revalidation accepts
+    // HTTP here so loopback and explicitly opted-in LAN routes remain usable.
+    let mut auth_url = crate::init::validate_server_url(server_url, true)?;
+    append_url_path_segments(&mut auth_url, route_path)?;
 
-    Ok(login_url.to_string())
+    Ok(auth_url.to_string())
 }
 
-fn append_url_path_segments(
-    url: &mut Url,
-    route_path: &str,
-    invalid_base_message: &'static str,
-) -> CliResult<()> {
+fn append_url_path_segments(url: &mut Url, route_path: &str) -> CliResult<()> {
     let mut segments = url
         .path_segments_mut()
         .map_err(|()| CliError::InvalidArguments {
-            message: invalid_base_message.to_owned(),
+            message: "URL cannot be used as a route base".to_owned(),
         })?;
-    segments.extend(route_path.trim_start_matches('/').split('/'));
+    segments.extend(route_path.split('/').filter(|segment| !segment.is_empty()));
 
     Ok(())
 }
 
 fn redirect_free_http_client(context: &'static str) -> CliResult<Client> {
+    // Token-bearing requests must never forward credentials to a redirect
+    // target, even when that target shares the original host.
     Client::builder()
         .redirect(Policy::none())
         .build()
@@ -3811,11 +3804,13 @@ fn redirect_free_http_client(context: &'static str) -> CliResult<Client> {
         })
 }
 
-fn run_blocking_http_request<T>(
-    request: impl Future<Output = Result<T, reqwest::Error>>,
+fn block_on_reqwest<T>(
+    future: impl Future<Output = Result<T, reqwest::Error>>,
     context: &'static str,
 ) -> CliResult<T> {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(request)).map_err(
+    // The synchronous CLI handlers run inside the process Tokio runtime; move
+    // their reqwest futures through its handle without nesting another runtime.
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future)).map_err(
         |source| CliError::Io {
             context: context.to_owned(),
             source: io::Error::other(source),
@@ -3970,8 +3965,9 @@ mod tests {
         prepare_migration_execution, probe_authenticated_migration_target, probe_server_reachable,
         read_bounded_login_token, read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir,
         run_hydrate_from_dir, run_init_from_dir, run_login_from_dir, run_logout_from_dir,
-        run_migrate_from_dir, run_pull_from_dir, run_status_from_dir, tracing_config,
-        validate_status_storage, write_init_change,
+        run_migrate_from_dir, run_pull_from_dir, run_status_from_dir,
+        session_revocation_url_for_server, tracing_config, validate_status_storage,
+        write_init_change,
     };
     use crate::google_drive::{
         GoogleDriveAccessToken, GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource,
@@ -7312,25 +7308,26 @@ mod tests {
         let outside = temp.path().join("outside.bin");
         init_git_repo_with_origin(&repo);
         write_file(&outside, b"outside bytes");
-        let mut output = Vec::new();
+        for path in [outside.clone(), PathBuf::from("../outside.bin")] {
+            let mut output = Vec::new();
+            let error = run_dehydrate_from_dir(
+                DehydrateCommand {
+                    cache_root: Some(cache_root.clone()),
+                    paths: vec![path],
+                },
+                &repo,
+                &mut output,
+            )
+            .expect_err("outside paths must not be dehydrated");
 
-        let error = run_dehydrate_from_dir(
-            DehydrateCommand {
-                cache_root: Some(cache_root.clone()),
-                paths: vec![outside.clone()],
-            },
-            &repo,
-            &mut output,
-        )
-        .expect_err("outside paths must not be dehydrated");
-
-        assert!(matches!(error, CliError::InvalidArguments { .. }));
+            assert!(matches!(error, CliError::InvalidArguments { .. }));
+            assert!(output.is_empty());
+        }
         assert_eq!(
             fs::read(&outside).expect("outside file should remain readable"),
             b"outside bytes"
         );
         assert!(!cache_root.join("objects").exists());
-        assert!(output.is_empty());
     }
 
     #[test]
@@ -7779,6 +7776,35 @@ mod tests {
             .expect("login URL should resolve"),
             "https://lfs.example.com/custom/base/auth/github/pat"
         );
+    }
+
+    #[test]
+    fn personal_access_token_login_url_preserves_root_server_base() {
+        assert_eq!(
+            github_personal_access_token_login_url_for_server("https://lfs.example.com")
+                .expect("login URL should resolve"),
+            "https://lfs.example.com/auth/github/pat"
+        );
+    }
+
+    #[test]
+    fn session_revocation_url_preserves_server_base_paths() {
+        for (server_url, expected) in [
+            (
+                "https://lfs.example.com",
+                "https://lfs.example.com/auth/session",
+            ),
+            (
+                "https://lfs.example.com/custom/base",
+                "https://lfs.example.com/custom/base/auth/session",
+            ),
+        ] {
+            assert_eq!(
+                session_revocation_url_for_server(server_url)
+                    .expect("session revocation URL should resolve"),
+                expected
+            );
+        }
     }
 
     #[test]
