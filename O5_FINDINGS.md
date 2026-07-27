@@ -21,7 +21,7 @@ Two project constraints were applied and materially changed several conclusions:
 
 | # | Finding | Kind | Est. impact | Risk | When |
 | --- | --- | --- | --- | --- | --- |
-| 3 | No `StorageProvider` contract test | Additive tests | New coverage | None | Before launch |
+| 3 | **[DONE / REVIEWED]** `StorageProvider` contract test | Additive tests | New coverage | None | Completed |
 | 4 | Tests that exercise scaffolding, not production | Coverage repair | Removes false trust | None | Before launch |
 | 5 | `login` and `init` validate `--server` unequally | Consistency fix | ~30 lines | Low | Before launch |
 | 6.4 | Four copies of child-process/pipe handling | Deduplication | ~500–600 lines | Medium | Before launch |
@@ -73,24 +73,15 @@ Likely shape: a generic `MetadataRecordingTransferStore<P: StorageProvider>` own
 
 **Gain:** The plugin boundary becomes the path production actually runs through, so `tests/local_end_to_end.rs` stops covering a path production does not take. **Drawback:** Genuine design work on the upload and download hot path. The Drive sharding, lookup, and repair behavior is covered by four separate `Learnings` entries and must survive the move intact. This is the largest item in this document.
 
-## 3. `StorageProvider` has no contract test
+## 3. **[DONE / REVIEWED] `StorageProvider` lacked a shared contract test**
 
-The repository side already has the right pattern: `assert_repository_permission_contract` and `assert_repository_isolation_contract` in `tests/support/mod.rs:354` and `:395`, run against both `FakeRepositoryProvider` and `GitHubRepositoryProvider` in `tests/provider_contracts.rs`. `AGENTS.md` records why fake-only trait tests are insufficient.
+**Validity:** Valid and actionable. The trait's lifecycle and integrity semantics were previously distributed across prose, fakes, and Drive-specific tests, so a future provider could satisfy its own tests while violating namespace isolation, idempotency, or error-category expectations.
 
-There is no equivalent for `StorageProvider`, which is the four-method trait a future S3, R2, or MinIO plugin must implement. Its semantics — namespace isolation, upload idempotency, download integrity verification, and delete-or-mark behavior — are currently defined only by the Drive implementation plus prose.
+**Outcome:** `assert_storage_provider_contract` now exercises byte-identical upload/download round trips, foreign-namespace isolation, idempotent re-upload without duplicate backend objects, OID and size rejection before backend writes, precise `ObjectNotFound` failures, and safe documented `delete_or_mark_object` outcomes. The same contract runs against `FakeStorageProvider`, `GoogleDriveObjectStore`, and `MigrationGoogleDriveStorage`. The shared fixture lives under `tests/support`, while the Drive adapters use a loopback HTTP fixture that covers real resumable-upload behavior. This realizes the proposed additive plugin-contract coverage; the anticipated fixture and Drive-stub complexity is contained but real, including the fixture's dual use by integration tests and CLI unit tests.
 
-Proposed `assert_storage_provider_contract` cases:
+**Assessment and commits:** The initial implementation was committed as `0d753747d65cf3f5f72bf6c7ec6c9406317953a8` against `fceb2cf9faa57e6e9e305c3d84adac755819355f`. Initial CodeRabbit review reported no findings, and initial Codex review found no actionable regression. Blast review then identified valid contract-fidelity gaps: lifecycle postconditions needed stronger assertions, the Drive fixture needed to exercise resumable chunks, production HTTP clients needed coverage, and staged-file verification should not consume the upload lock. Those findings were addressed in `0cb1a6ab9d4e7152a3eba7c7e9efd7956bfde60b`. The final CodeRabbit follow-up against `0d753747d65cf3f5f72bf6c7ec6c9406317953a8` was rate-limited and therefore recorded as the workflow-defined no-op. Final Codex review found one valid P2: migration created a token-backed Drive store before waiting on the durable upload lock, allowing the token to age while blocked. Token acquisition now happens after lock acquisition, while staged-file verification remains before the wait; the fix and durable-lock regression are in `b1ba01fdb9c4a468a4cc88f1632135e9fda9a9e1`. No assessment comments remain unaddressed.
 
-- Round-trip upload then download returns identical bytes.
-- Operations for a foreign repository namespace are rejected.
-- Re-uploading an existing object is idempotent and does not create a duplicate backend object.
-- A source file whose bytes do not match the requested OID or size is rejected before any backend write.
-- A missing object reports `ObjectNotFound` rather than a generic failure.
-- `delete_or_mark_object` returns one of the three documented outcomes and never affects another namespace.
-
-Run it against the fake, `GoogleDriveObjectStore`, and `MigrationGoogleDriveStorage`.
-
-**Gain:** Purely additive coverage. Turns the plugin contract from documentation into something each provider is checked against, which directly serves the extensibility goal. **Drawback:** Needs a shared fake storage provider at the `tests/support` level. `FakeMigrationStorageProvider` already exists inside `src/migration.rs` and should be promoted rather than duplicated. Also needs a local HTTP Drive stub, for which `src/google_drive.rs` tests have extensive prior art.
+**Verification:** The initial implementation passed Yarn linting, `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all 576 library/integration-target tests, and all 29 doc tests. After the Blast follow-up and final Codex remediation, the final tree again passed formatting, markdown lint, Clippy with warnings denied, build, all-target tests, and doc tests.
 
 ## 4. Tests that exercise scaffolding instead of production code
 
