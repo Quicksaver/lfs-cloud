@@ -24,10 +24,10 @@ Two project constraints were applied and materially changed several conclusions:
 | 3 | **[DONE / REVIEWED]** `StorageProvider` contract test | Additive tests | New coverage | None | Completed |
 | 4 | **[DONE / REVIEWED]** Tests that exercise scaffolding, not production | Coverage repair | Removes false trust | None | Completed |
 | 5 | **[DONE / REVIEWED]** Shared CLI `--server` validation | Consistency fix | Shared contract | Low | Completed |
-| 6.4 | Four copies of child-process/pipe handling | Deduplication | ~500–600 lines | Medium | Before launch |
-| 6.5 | Three copies of the `check-attr` pipeline | Deduplication | ~200 lines | Medium | Before launch |
+| 6.4 | **[DONE / REVIEWED]** Four copies of child-process/pipe handling | Deduplication | Shared contract | Medium | Completed |
+| 6.5 | **[DONE / REVIEWED]** Three copies of the `check-attr` pipeline | Deduplication | Shared contract | Medium | Completed |
 | 7 | Mechanical duplication across modules | Deduplication | ~700 lines | Low | Before launch |
-| 6.1 | `dispatch` test boilerplate | Test restructure | ~300 lines | Low | Before launch |
+| 6.1 | **[DONE / REVIEWED]** `dispatch` test boilerplate | Test restructure | Same coverage | Low | Completed |
 | 8 | Dead public API | Removal | ~80 lines | Low | Before launch |
 | 1 | No provider factory; 8 concrete-variant matches | Design | Extensibility | Medium | Scoped separately |
 | 2 | Server transfer path bypasses the plugin trait | Design | Extensibility | High | Scoped separately |
@@ -130,9 +130,9 @@ These create a false impression of coverage. Repairing them raises real coverage
 
 **Reviewer quality:** The original review was useful and found four worthwhile consistency or duplication issues, but its central command-level reproduction and three-way blocking-runtime claim were not current-tree accurate. CodeRabbit was low quality here because both passes repeated one factually incorrect critical finding. Codex was precise in both clean passes. Blast was mixed but productive: it rejected existing caller guarantees in three security claims, while its valid maintainability and regression-test suggestions materially clarified the final implementation.
 
-## 6. Scaffolding and duplication with test implications
+## 6. **[DONE / REVIEWED] Scaffolding and duplication with test implications**
 
-### 6.1 `dispatch` test boilerplate
+### 6.1 **[DONE / REVIEWED] `dispatch` test boilerplate**
 
 `dispatch` (`src/cli.rs:287-334`) takes eleven closures so that ten tests (`src/cli.rs:4473-4850`, ~340 lines) can each assert "subcommand X calls runner X" with nine `unreachable!()` arms apiece.
 
@@ -142,7 +142,9 @@ These tests do cover something a parser-only test would miss: that each match ar
 
 **Gain:** Identical assertion surface in roughly 40 lines instead of 340, and it scales down rather than up as subcommands are added. Also allows asserting all parsed fields, not just the one value each current test captures. **Drawback:** None to coverage. Whether to additionally collapse the eleven generic parameters into a single `trait CommandRunner` object is separable and optional; the recorder harness works either way.
 
-### 6.2 Credential constructor ladder (partly retracted)
+**Validity and outcome:** Valid. The ten repetitive tests became one table-driven `dispatches_every_subcommand_to_its_matching_runner` test. It retains every runner edge and now compares each complete parsed command/config value, so dispatch coverage did not become parser-only coverage. The production closure seam remains unchanged.
+
+### 6.2 **[DONE / REVIEWED] Credential constructor ladder (partly retracted)**
 
 `GitCredentialApproval`, `GitCredentialRejection`, and `GitCredentialLookup` each expose a four-deep ladder: `new` -> `with_username` -> `*_in_dir` -> `*_with_git_program` -> `*_with_git_program_in_dir`.
 
@@ -154,7 +156,9 @@ Unaffected by this retraction, and still worth doing at full strength: `src/cred
 
 **Gain:** ~120 lines. Make stdout an `Option<PipeReader>` in the general path and delete the four narrow variants. **Drawback:** None material. The code is already parameterized by `retain: fn(&mut Vec<u8>, &[u8])`; the abstraction exists and is only half-applied.
 
-### 6.3 Local cache duplication (seams excluded)
+**Validity and outcome:** Partly valid. The pipe-helper duplication was real and is now routed through the shared child-process runner. The proposed constructor and current-directory convenience removal was rejected: `new`, `with_username`, `approve`, `reject`, and `lookup` are public APIs with current production, integration, test, or documentation use. All `*_with_git_program*` fake-Git seams remain intact.
+
+### 6.3 **[DONE / REVIEWED] Local cache duplication (seams excluded)**
 
 The closure ladders `hydrate_pointer_file` -> `hydrate_pointer_file_with_before_publish` and `dehydrate_file` -> `dehydrate_file_with_before_pointer_publish` -> `dehydrate_file_with_read_observer` exist to inject callbacks into the GC and publication race window. Those tests cover the invariants in `[cache] GC operation boundary` and `[cache] Worktree replacement races`. **Keep the seams.**
 
@@ -168,7 +172,9 @@ Only the mechanically identical bodies should be merged:
 
 **Gain:** ~200 lines and a substantially shorter file. **Drawback:** The mode-carrying distinctions are load-bearing — `CachePublishDurability::Recoverable` vs `Durable`, `MaterializationMode::NoReplace` vs `ReplaceMatchingPointer`. Leave those functions alone.
 
-### 6.4 Four independent implementations of child-process and pipe handling
+**Validity and outcome:** Valid within the stated seam boundary. Shared helpers now cover entry-kind and regular-file checks, bounded pointer reads, object-identity checks, and the 64 KiB hash/count/overflow/copy loop. `hydrate_pointer_file_with_before_publish`, `dehydrate_file_with_before_pointer_publish`, `dehydrate_file_with_read_observer`, `CachePublishDurability`, and `MaterializationMode` remain separate. Assessment additionally restored nonblocking, regular-file-only GC pointer probes and added FIFO, symlink, and file-type-race regressions.
+
+### 6.4 **[DONE / REVIEWED] Four independent implementations of child-process and pipe handling**
 
 | Location | Implementation |
 | --- | --- |
@@ -183,11 +189,21 @@ The coverage argument is the strongest reason to do this. `AGENTS.md` records th
 
 **Gain:** ~500–600 lines removed, and the existing thorough test starts covering all call sites. This is the subsystem with the most hard-won platform knowledge in it (six `Learnings` entries); today a fix to one copy silently leaves three others wrong. **Drawback:** The four callers have genuinely different needs — stdout plus stderr vs stderr only, timeout vs no timeout, `Output` vs a custom struct. The unified API needs two or three knobs or it will grow its own ladder. Touches every subprocess path, so it wants `cargo test --all-targets` plus the manual verifiers in `scripts/manual/` before it is trusted.
 
-### 6.5 Three implementations of the `git ls-files -z` plus `git check-attr` pipeline
+**Validity and outcome:** Valid. `src/child_process.rs` now owns process-group setup, recursive termination, bounded or truncated concurrent pipe capture, timeouts, inherited-pipe policy, and bounded cleanup; CLI, credentials, migration, and local-cache callers retain their domain-specific invocation and error mapping. Assessment made captured output secret-safe, fixed descendant cleanup and post-exit hard-limit propagation, and added escaped-descendant regressions proving timeout and output-limit cleanup cannot block on retained pipes.
+
+### 6.5 **[DONE / REVIEWED] Three implementations of the `git ls-files -z` plus `git check-attr` pipeline**
 
 `src/cli.rs:2887-2994`, `src/migration.rs:2380-2620`, and `src/local_cache.rs:1443-1624`. Each performs: NUL-delimited `ls-files`, a concurrent stdin write to `check-attr`, split on `\0`, `chunks_exact(3)`, validate `filter` / `lfs`, then a path-safety check with its own `#[cfg(unix)] OsStringExt` / `#[cfg(not(unix))] from_utf8` pair. Three copies of `git_path_bytes_to_path_buf`, three of the containment check.
 
 **Gain:** ~200 lines, one thorough test suite instead of three partial ones, and one place to maintain the non-UTF-8 and Windows path handling that already has three `Learnings` entries. **Drawback:** The three invocations differ in real ways — `local_cache` uses `--cached` with `--git-dir` and `--work-tree`, `migration` uses `--source=<commit>` with input batching. The shared piece is the parse and path-safety half, not the invocation. Extracting only that is the safe scope.
+
+**Validity and outcome:** Valid at the proposed parse/path boundary. `src/git_output.rs` now owns NUL-triple parsing, exact `filter=lfs` selection, raw-byte Unix paths, non-UTF-8 rejection elsewhere, and relative-contained path validation. Each caller still owns its different `ls-files`/`check-attr` invocation, batching, stdin writer, source/index mode, and domain error.
+
+**Assessment and commits:** The implementation was committed as `e0f1c8078dc5c49fb44504f855573f1ac645aaaa` against `ade90afc0556fc65d415e2ccada9a52e02ab9522`. Initial CodeRabbit found one valid non-Unix lint issue, fixed in `bf141f77aac16b121e1a2ebb0af1bfa3aeff3e3d`. Initial Codex found one valid P2: GC pointer candidates could block on FIFOs; regular-file preflight, nonblocking Unix opens, and regressions were committed in `44b78a0cc581326d82c4cd5eb08865dfc1a2f977`. Blast accepted the valid process secrecy/cleanup and cache path-race findings, rejected speculative or factually stale claims, and committed fixes in `c2f6683f7c67f48ae21216c6ae09145d3cfe8c68`; its Sonnet and Gemini passes were quota-limited no-ops. Final CodeRabbit found two valid process cleanup/limit-propagation gaps, fixed in `065a266213005fa7e6296630438bf3663a5ee52c`. Final Codex found one valid P1 unbounded reader join, reproduced with escaped descendants and fixed in `faf34ddae900245b15f5132c97e7e6d905008c24`. No assessment comments remain unaddressed.
+
+**Verification:** The final tree passed Yarn linting, `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, 587 library tests (with 8 more ignored), every integration target (32 passed and 3 live-provider tests ignored), and all 29 doc tests. Final-tree manual verification passed credential-helper fallback, APFS/local-cache materialization, hydrate/dehydrate plus Git LFS push, cache GC, login, logout, status, pull, historical migration execution, source fetch, and secret-redaction checks. Live GitHub and Google Drive tests remained gated because this mechanical local refactor did not provide external credentials.
+
+**Reviewer quality:** The original review was high quality overall: §6.1, §6.3, §6.4, and §6.5 were current and correctly preserved their coverage and race/mode boundaries. §6.2's pipe consolidation was valid, but its constructor/convenience-removal remainder understated current public and production use. CodeRabbit and Codex were consistently precise and found valid cross-platform, availability, and bounded-cleanup defects. Blast was productive but mixed: Claude Opus was strong, while Grok included several duplicated or speculative claims alongside useful race findings.
 
 ## 7. Mechanical duplication
 
