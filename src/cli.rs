@@ -1323,6 +1323,8 @@ struct MigrationGoogleDriveStorage {
     token_source: Arc<dyn GoogleDriveAccessTokenSource>,
     token_cache: GoogleDriveAccessTokenCache,
     metadata: Arc<MetadataDatabase>,
+    #[cfg(test)]
+    api_base_url: Option<String>,
 }
 
 impl MigrationGoogleDriveStorage {
@@ -1331,6 +1333,16 @@ impl MigrationGoogleDriveStorage {
             .token_cache
             .get_or_refresh(&self.storage, self.token_source.as_ref())
             .await?;
+        #[cfg(test)]
+        if let Some(api_base_url) = &self.api_base_url {
+            return GoogleDriveObjectStore::with_client_and_api_base_url(
+                self.storage.clone(),
+                &self.repository_namespace,
+                token,
+                Client::new(),
+                api_base_url,
+            );
+        }
         GoogleDriveObjectStore::new(self.storage.clone(), &self.repository_namespace, token)
     }
 
@@ -1391,10 +1403,7 @@ impl StorageProvider for MigrationGoogleDriveStorage {
             // this method. Repeat it while holding the cross-process lock so a
             // live server cannot win the race and create a duplicate Drive file.
             let store = self.object_store().await?;
-            if let Some(stored_object) = store.lookup_object(object).await? {
-                return Ok(stored_object);
-            }
-            store.upload_object(object, source).await
+            store.upload_object_idempotent(object, source).await
         })
     }
 
@@ -1588,6 +1597,8 @@ async fn migration_google_drive_storage(
             token_source,
             token_cache,
             metadata,
+            #[cfg(test)]
+            api_base_url: None,
         },
     ))
 }
@@ -3940,13 +3951,22 @@ mod tests {
         fs, io,
         path::{Path, PathBuf},
         process::Command as ProcessCommand,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use axum::{
         Json, Router,
-        http::{HeaderMap, StatusCode},
-        routing::post,
+        body::Bytes,
+        extract::{Path as AxumPath, State},
+        http::{
+            HeaderMap, HeaderValue, StatusCode, Uri,
+            header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
+        },
+        response::{IntoResponse, Response},
+        routing::{get, post, put},
     };
     use clap::{CommandFactory, Parser};
     use sha2::{Digest, Sha256};
@@ -3956,8 +3976,8 @@ mod tests {
     use super::run_bounded_child_command;
     use super::{
         Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, LoginTerminal,
-        LogoutCommand, MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, PullCommand,
-        SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
+        LogoutCommand, MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, MigrationGoogleDriveStorage,
+        PullCommand, SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
         current_checkout_lfs_pointer_scan, dispatch, execute_migration_with_storage,
         github_personal_access_token_login_url_for_server, is_git_worktree_discovery_error,
         prepare_migration_execution, probe_authenticated_migration_target, probe_server_reachable,
@@ -3966,14 +3986,27 @@ mod tests {
         run_migrate_from_dir, run_pull_from_dir, run_status_from_dir, tracing_config,
         validate_status_storage, write_init_change,
     };
+    use crate::google_drive::{
+        GoogleDriveAccessToken, GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource,
+    };
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
         GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitRepository,
-        GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
-        LocalCacheError, LocalCacheLayout, LocalCacheWorktreeRegistration, ProviderFuture,
-        RepositoryMapping, SanitizedMessage, ServeOptions, StorageDeleteOutcome, StorageError,
-        StorageProvider, StorageProviderConfig, StorageResult, StoredObject,
+        GoogleDriveObjectStore, GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid,
+        LfsPointer, LfsSessionToken, LocalCacheError, LocalCacheLayout,
+        LocalCacheWorktreeRegistration, MetadataDatabase, ProviderFuture, RepositoryMapping,
+        SanitizedMessage, ServeOptions, StorageDeleteOutcome, StorageError, StorageProvider,
+        StorageProviderConfig, StorageResult, StoredObject,
     };
+
+    mod storage_provider_contract {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/storage_provider_contract.rs"
+        ));
+    }
+
+    use storage_provider_contract::assert_storage_provider_contract;
 
     struct RecordingMigrationStorage {
         provider_id: String,
@@ -4079,6 +4112,336 @@ mod tests {
                     reason: "test storage retains migration objects".to_owned(),
                 })
             })
+        }
+    }
+
+    struct FixedDriveTokenSource;
+
+    impl GoogleDriveAccessTokenSource for FixedDriveTokenSource {
+        fn access_token<'a>(
+            &'a self,
+            _storage: &'a GoogleDriveStorageConfig,
+        ) -> ProviderFuture<'a, StorageResult<GoogleDriveAccessToken>> {
+            Box::pin(async { Ok(GoogleDriveAccessToken::for_test("contract-access-token")) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct DriveContractObject {
+        backend_id: String,
+        repository_namespace: String,
+        oid: String,
+        size: u64,
+        bytes: Vec<u8>,
+    }
+
+    struct DriveStorageContractServer {
+        base_url: String,
+        state: Arc<DriveStorageContractState>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl DriveStorageContractServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("Drive contract server should bind");
+            let address = listener
+                .local_addr()
+                .expect("Drive contract server address should be available");
+            let base_url = format!("http://{address}");
+            let state = Arc::new(DriveStorageContractState {
+                base_url: base_url.clone(),
+                objects: Mutex::new(BTreeMap::new()),
+                pending_upload: Mutex::new(None),
+                next_backend_id: AtomicUsize::new(1),
+                upload_count: AtomicUsize::new(0),
+            });
+            let app = Router::new()
+                .route("/drive/v3/files", get(drive_contract_list))
+                .route(
+                    "/upload/drive/v3/files",
+                    post(drive_contract_initiate_upload),
+                )
+                .route(
+                    "/upload_session/{session_id}",
+                    put(drive_contract_complete_upload),
+                )
+                .route("/drive/v3/files/{file_id}", get(drive_contract_download))
+                .with_state(state.clone());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("Drive contract server should run");
+            });
+
+            Self {
+                base_url,
+                state,
+                task,
+            }
+        }
+
+        fn upload_count(&self) -> usize {
+            self.state.upload_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for DriveStorageContractServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    struct DriveStorageContractState {
+        base_url: String,
+        objects: Mutex<BTreeMap<(String, String, u64), DriveContractObject>>,
+        pending_upload: Mutex<Option<serde_json::Value>>,
+        next_backend_id: AtomicUsize,
+        upload_count: AtomicUsize,
+    }
+
+    async fn drive_contract_list(
+        State(state): State<Arc<DriveStorageContractState>>,
+        uri: Uri,
+    ) -> Json<serde_json::Value> {
+        let query = drive_contract_query(&uri);
+        if query.contains("lfsCloudFolderKind") {
+            let shard =
+                drive_contract_property(&query, "lfsCloudShard").unwrap_or_else(|| "00".to_owned());
+            return Json(serde_json::json!({
+                "files": [{
+                    "id": format!("drive-shard-{shard}"),
+                    "name": format!("lfscloud-sha256-{shard}"),
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": ["drive-root"],
+                    "trashed": false,
+                    "appProperties": {
+                        "lfsCloudFolderKind": "objectShard",
+                        "lfsCloudShard": shard
+                    }
+                }]
+            }));
+        }
+
+        let repository_namespace =
+            drive_contract_property(&query, "lfsCloudRepoNamespace").unwrap_or_default();
+        let oid = drive_contract_property(&query, "lfsCloudOid").unwrap_or_default();
+        let size = drive_contract_property(&query, "lfsCloudSize")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        let objects = state
+            .objects
+            .lock()
+            .expect("Drive contract objects lock should not poison");
+        let files = objects
+            .get(&(repository_namespace, oid, size))
+            .map_or_else(Vec::new, |object| vec![drive_contract_object_json(object)]);
+        Json(serde_json::json!({ "files": files }))
+    }
+
+    async fn drive_contract_initiate_upload(
+        State(state): State<Arc<DriveStorageContractState>>,
+        body: Bytes,
+    ) -> Response {
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&body).expect("Drive contract upload metadata should be JSON");
+        *state
+            .pending_upload
+            .lock()
+            .expect("Drive contract pending upload lock should not poison") = Some(metadata);
+
+        let mut response = StatusCode::OK.into_response();
+        response.headers_mut().insert(
+            LOCATION,
+            HeaderValue::from_str(&format!("{}/upload_session/session-1", state.base_url))
+                .expect("Drive contract upload location should be a valid header"),
+        );
+        response
+    }
+
+    async fn drive_contract_complete_upload(
+        AxumPath(_session_id): AxumPath<String>,
+        State(state): State<Arc<DriveStorageContractState>>,
+        body: Bytes,
+    ) -> Response {
+        let metadata = state
+            .pending_upload
+            .lock()
+            .expect("Drive contract pending upload lock should not poison")
+            .take()
+            .expect("Drive contract upload should have metadata");
+        let properties = &metadata["appProperties"];
+        let repository_namespace = properties["lfsCloudRepoNamespace"]
+            .as_str()
+            .expect("Drive contract namespace should be present")
+            .to_owned();
+        let oid = properties["lfsCloudOid"]
+            .as_str()
+            .expect("Drive contract OID should be present")
+            .to_owned();
+        let size = properties["lfsCloudSize"]
+            .as_str()
+            .expect("Drive contract size should be present")
+            .parse::<u64>()
+            .expect("Drive contract size should parse");
+        let backend_id = format!(
+            "drive-contract-{}",
+            state.next_backend_id.fetch_add(1, Ordering::SeqCst)
+        );
+        let object = DriveContractObject {
+            backend_id,
+            repository_namespace: repository_namespace.clone(),
+            oid: oid.clone(),
+            size,
+            bytes: body.to_vec(),
+        };
+        state
+            .objects
+            .lock()
+            .expect("Drive contract objects lock should not poison")
+            .insert((repository_namespace, oid, size), object.clone());
+        state.upload_count.fetch_add(1, Ordering::SeqCst);
+
+        (
+            StatusCode::CREATED,
+            [(CONTENT_TYPE, "application/json")],
+            Json(drive_contract_object_json(&object)),
+        )
+            .into_response()
+    }
+
+    async fn drive_contract_download(
+        AxumPath(file_id): AxumPath<String>,
+        State(state): State<Arc<DriveStorageContractState>>,
+        uri: Uri,
+    ) -> Response {
+        let object = state
+            .objects
+            .lock()
+            .expect("Drive contract objects lock should not poison")
+            .values()
+            .find(|object| object.backend_id == file_id)
+            .cloned();
+        let Some(object) = object else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+
+        if drive_contract_query_pair(&uri, "alt").as_deref() == Some("media") {
+            let mut response = (
+                StatusCode::OK,
+                [(CONTENT_TYPE, "application/octet-stream")],
+                object.bytes,
+            )
+                .into_response();
+            response.headers_mut().insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&object.size.to_string())
+                    .expect("Drive contract content length should be a valid header"),
+            );
+            response
+        } else {
+            Json(drive_contract_object_json(&object)).into_response()
+        }
+    }
+
+    fn drive_contract_query(uri: &Uri) -> String {
+        drive_contract_query_pair(uri, "q").unwrap_or_default()
+    }
+
+    fn drive_contract_query_pair(uri: &Uri, expected_key: &str) -> Option<String> {
+        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .find_map(|(key, value)| (key == expected_key).then(|| value.into_owned()))
+    }
+
+    fn drive_contract_property(query: &str, key: &str) -> Option<String> {
+        let marker = format!("key='{key}' and value='");
+        query
+            .split_once(&marker)?
+            .1
+            .split_once('\'')
+            .map(|(value, _)| value.to_owned())
+    }
+
+    fn drive_contract_object_json(object: &DriveContractObject) -> serde_json::Value {
+        serde_json::json!({
+            "id": object.backend_id,
+            "name": format!("sha256-{}-{}.lfs", object.oid, object.size),
+            "size": object.size.to_string(),
+            "parents": [format!("drive-shard-{}", &object.oid[..2])],
+            "trashed": false,
+            "appProperties": {
+                "lfsCloudVersion": "1",
+                "lfsCloudRepoNamespace": object.repository_namespace,
+                "lfsCloudOid": object.oid,
+                "lfsCloudSize": object.size.to_string()
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn google_drive_object_store_satisfies_shared_storage_contract() {
+        let server = DriveStorageContractServer::start().await;
+        let store = GoogleDriveObjectStore::with_client_and_api_base_url(
+            drive_contract_storage_config(),
+            "github.com/owner/repo",
+            GoogleDriveAccessToken::for_test("contract-access-token"),
+            reqwest::Client::new(),
+            &server.base_url,
+        )
+        .expect("Drive contract store should build");
+
+        assert_storage_provider_contract(
+            &store,
+            "github.com/owner/repo",
+            "github.com/owner/isolated",
+        )
+        .await;
+
+        assert_eq!(
+            server.upload_count(),
+            1,
+            "idempotent re-upload must not create another Drive object"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_google_drive_storage_satisfies_shared_storage_contract() {
+        let server = DriveStorageContractServer::start().await;
+        let storage = MigrationGoogleDriveStorage {
+            storage: drive_contract_storage_config(),
+            repository_namespace: "github.com/owner/repo".to_owned(),
+            token_source: Arc::new(FixedDriveTokenSource),
+            token_cache: GoogleDriveAccessTokenCache::default(),
+            metadata: Arc::new(
+                MetadataDatabase::open_in_memory().expect("Drive contract metadata should open"),
+            ),
+            api_base_url: Some(server.base_url.clone()),
+        };
+
+        assert_storage_provider_contract(
+            &storage,
+            "github.com/owner/repo",
+            "github.com/owner/isolated",
+        )
+        .await;
+
+        assert_eq!(
+            server.upload_count(),
+            1,
+            "migration idempotency lock must not create another Drive object"
+        );
+    }
+
+    fn drive_contract_storage_config() -> GoogleDriveStorageConfig {
+        GoogleDriveStorageConfig {
+            id: "drive-user-a".to_owned(),
+            credentials: crate::GoogleDriveGcloudCredentialsConfig {
+                config_dir: ".gcloud-drive".into(),
+                executable: "gcloud".into(),
+            },
+            root_folder_id: "drive-root".to_owned(),
+            display_name: None,
         }
     }
 
@@ -7595,6 +7958,10 @@ repositories:
             oid,
             LfsObjectSize::new(u64::try_from(bytes.len()).expect("test bytes should fit u64")),
         )
+    }
+
+    fn lfs_object_for_bytes(bytes: &[u8]) -> LfsObject {
+        object_for_bytes(bytes)
     }
 
     fn write_file(path: &Path, contents: &[u8]) {

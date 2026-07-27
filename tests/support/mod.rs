@@ -25,6 +25,8 @@ use lfscloud::{
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+pub mod storage_provider_contract;
+
 /// Stable SHA-256 test object ID using only the `a` nibble.
 pub const TEST_OID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -479,6 +481,15 @@ impl FakeStorageProvider {
             .expect("fake storage lock should not poison")
             .get(&(repository_namespace.to_owned(), object.clone()))
             .map(|stored| stored.bytes.clone())
+    }
+
+    /// Returns the number of distinct backend objects retained by the fake.
+    #[must_use]
+    pub fn object_count(&self) -> usize {
+        self.objects
+            .lock()
+            .expect("fake storage lock should not poison")
+            .len()
     }
 }
 

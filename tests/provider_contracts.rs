@@ -15,8 +15,9 @@ use lfscloud::{
     RepositoryUser,
 };
 use serde_json::{Value, json};
+use support::storage_provider_contract::assert_storage_provider_contract;
 use support::{
-    FakeRepositoryProvider, assert_repository_isolation_contract,
+    FakeRepositoryProvider, FakeStorageProvider, assert_repository_isolation_contract,
     assert_repository_permission_contract,
 };
 use tokio::task::JoinHandle;
@@ -77,6 +78,24 @@ async fn github_repository_provider_satisfies_shared_isolation_contract() {
         &authentication(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn fake_storage_provider_satisfies_shared_contract() {
+    let provider = FakeStorageProvider::new("drive-user-a");
+
+    assert_storage_provider_contract(
+        &provider,
+        "github.com/owner/repo",
+        "github.com/owner/isolated",
+    )
+    .await;
+
+    assert_eq!(
+        provider.object_count(),
+        1,
+        "primary deletion must leave only the isolated backend object"
+    );
 }
 
 fn permission_levels() -> [RepositoryPermission; 3] {

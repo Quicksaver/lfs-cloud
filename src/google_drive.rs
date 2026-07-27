@@ -1222,7 +1222,36 @@ impl GoogleDriveObjectStore {
         let verified_file =
             open_verified_staged_upload_file_on_blocking_thread(&self.storage, object, &source)
                 .await?;
+        self.upload_verified_object(object, &source, verified_file)
+            .await
+    }
 
+    /// Uploads verified bytes unless the exact namespaced object already exists.
+    ///
+    /// Source verification happens before the existence lookup so callers
+    /// cannot use idempotency to bypass the staged-file integrity contract.
+    pub(crate) async fn upload_object_idempotent(
+        &self,
+        object: &LfsObject,
+        source: impl AsRef<Path>,
+    ) -> StorageResult<StoredObject> {
+        let source = source.as_ref().to_path_buf();
+        let verified_file =
+            open_verified_staged_upload_file_on_blocking_thread(&self.storage, object, &source)
+                .await?;
+        if let Some(stored_object) = self.lookup_object(object).await? {
+            return Ok(stored_object);
+        }
+        self.upload_verified_object(object, &source, verified_file)
+            .await
+    }
+
+    async fn upload_verified_object(
+        &self,
+        object: &LfsObject,
+        source: &Path,
+        verified_file: File,
+    ) -> StorageResult<StoredObject> {
         let key = self.object_key(object)?;
         let expected_properties = key.expected_app_properties();
         let upload_parent_folder_id = self.upload_parent_folder_id(&key).await?;
@@ -1284,7 +1313,7 @@ impl GoogleDriveObjectStore {
         loop {
             let chunk = read_drive_upload_chunk(
                 &self.storage,
-                &source,
+                source,
                 &mut file,
                 committed_offset,
                 total_size,
@@ -1657,7 +1686,7 @@ impl StorageProvider for GoogleDriveObjectStore {
     ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
         Box::pin(async move {
             self.ensure_repository_namespace(repository_namespace)?;
-            GoogleDriveObjectStore::upload_object(self, object, source).await
+            self.upload_object_idempotent(object, source).await
         })
     }
 
@@ -6650,12 +6679,7 @@ mod tests {
     async fn drive_upload_shard_list_handler(uri: Uri) -> Response {
         let query = uri.query().unwrap_or_default();
         let Some(shard_prefix) = shard_prefix_from_query(query) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                [(CONTENT_TYPE, "application/json")],
-                r#"{"error":{"message":"missing shard query"}}"#.to_owned(),
-            )
-                .into_response();
+            return Json(serde_json::json!({ "files": [] })).into_response();
         };
         (
             StatusCode::OK,
