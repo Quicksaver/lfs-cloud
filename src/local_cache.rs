@@ -1625,7 +1625,33 @@ fn collect_pointer_oid_from_file(
     path: &Path,
     referenced: &mut BTreeSet<LfsOid>,
 ) -> LocalCacheResult<()> {
-    let file = match File::open(path) {
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => return Ok(()),
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(LocalCacheError::Io {
+                context: "failed to inspect worktree pointer candidate",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    let file = rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from);
+
+    #[cfg(not(unix))]
+    let file = File::open(path);
+
+    let file = match file {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
@@ -4644,6 +4670,118 @@ mod tests {
         assert_eq!(report.retained_objects.len(), 1);
         assert_eq!(report.retained_objects[0].oid, object.oid);
         assert!(layout.object_path(&object).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn garbage_collect_does_not_wait_for_tracked_fifos() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let layout = LocalCacheLayout::new(temp.path().join("cache"));
+        let repo = temp.path().join("repo");
+        let direct_fifo = repo.join("asset/direct.bin");
+        let symlink_fifo = repo.join("asset/symlink.bin");
+        let symlink_target = temp.path().join("symlink-target");
+        let object = object_for_bytes(b"unreferenced FIFO cache object");
+
+        initialize_git_worktree(&repo);
+        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
+        write_file(&direct_fifo, b"tracked before becoming a FIFO");
+        write_file(&symlink_fifo, b"tracked before becoming a FIFO symlink");
+        git_add(
+            &repo,
+            &[
+                Path::new(".gitattributes"),
+                Path::new("asset/direct.bin"),
+                Path::new("asset/symlink.bin"),
+            ],
+        );
+        fs::remove_file(&direct_fifo).expect("tracked file should be removable");
+        fs::remove_file(&symlink_fifo).expect("tracked file should be removable");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&direct_fifo)
+                .status()
+                .expect("mkfifo should start")
+                .success(),
+            "direct FIFO should be created"
+        );
+        assert!(
+            Command::new("mkfifo")
+                .arg(&symlink_target)
+                .status()
+                .expect("mkfifo should start")
+                .success(),
+            "symlink target FIFO should be created"
+        );
+        std::os::unix::fs::symlink(&symlink_target, &symlink_fifo)
+            .expect("tracked FIFO symlink should be created");
+        write_file(
+            &layout.object_path(&object),
+            b"unreferenced FIFO cache object",
+        );
+        layout
+            .register_worktree(
+                LocalCacheWorktreeRegistration::new(
+                    "github-main:owner/repo",
+                    &repo,
+                    repo.join(".git"),
+                )
+                .expect("registration should validate"),
+            )
+            .expect("worktree should register");
+
+        let collection_layout = layout.clone();
+        let (collection_done_tx, collection_done_rx) = mpsc::channel();
+        let collection = thread::spawn(move || {
+            collection_done_tx
+                .send(collection_layout.garbage_collect(false, false))
+                .expect("test should receive collection result");
+        });
+        let (timed_out, report) = match collection_done_rx.recv_timeout(Duration::from_millis(250))
+        {
+            Ok(report) => (false, report),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _direct_unblocker = rustix::fs::openat(
+                    rustix::fs::CWD,
+                    &direct_fifo,
+                    rustix::fs::OFlags::RDWR
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(File::from)
+                .expect("direct FIFO should open for test cleanup");
+                let _symlink_unblocker = rustix::fs::openat(
+                    rustix::fs::CWD,
+                    &symlink_target,
+                    rustix::fs::OFlags::RDWR
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(File::from)
+                .expect("symlink target FIFO should open for test cleanup");
+                let report = collection_done_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("garbage collection should finish after test cleanup");
+                (true, report)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("garbage collection worker disconnected")
+            }
+        };
+        collection
+            .join()
+            .expect("garbage collection worker should not panic");
+
+        assert!(
+            !timed_out,
+            "garbage collection must not wait for FIFO writers"
+        );
+        let report = report.expect("garbage collection should succeed");
+        assert_eq!(report.unreferenced_objects.len(), 1);
+        assert_eq!(report.unreferenced_objects[0].oid, object.oid);
+        assert!(!layout.object_path(&object).exists());
     }
 
     #[test]
