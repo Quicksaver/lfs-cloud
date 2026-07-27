@@ -604,26 +604,15 @@ fn request_personal_access_token_lfs_session(
         },
     )?;
     let login_url = github_personal_access_token_login_url_for_server(server_url)?;
-    let client = Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .map_err(|source| CliError::Io {
-            context: "failed to create GitHub PAT login client".to_owned(),
-            source: io::Error::other(source),
-        })?;
-    let response = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            client
-                .post(login_url)
-                .bearer_auth(personal_access_token)
-                .timeout(SESSION_REVOCATION_TIMEOUT)
-                .send(),
-        )
-    })
-    .map_err(|source| CliError::Io {
-        context: "failed to exchange GitHub personal access token".to_owned(),
-        source: io::Error::other(source),
-    })?;
+    let client = redirect_free_http_client("failed to create GitHub PAT login client")?;
+    let response = run_blocking_http_request(
+        client
+            .post(login_url)
+            .bearer_auth(personal_access_token)
+            .timeout(SESSION_REVOCATION_TIMEOUT)
+            .send(),
+        "failed to exchange GitHub personal access token",
+    )?;
     if !response.status().is_success() {
         return Err(CliError::ExternalCommandOutput {
             command: "GitHub personal access token login".to_owned(),
@@ -633,14 +622,10 @@ fn request_personal_access_token_lfs_session(
             )),
         });
     }
-    let response = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(response.json::<PersonalAccessTokenLoginResponse>())
-    })
-    .map_err(|source| CliError::Io {
-        context: "failed to read GitHub PAT login response".to_owned(),
-        source: io::Error::other(source),
-    })?;
+    let response = run_blocking_http_request(
+        response.json::<PersonalAccessTokenLoginResponse>(),
+        "failed to read GitHub PAT login response",
+    )?;
 
     LfsSessionToken::from_secret(response.lfs_token).map_err(|_| CliError::ExternalCommandOutput {
         command: "GitHub personal access token login".to_owned(),
@@ -807,13 +792,11 @@ where
 
 fn session_revocation_url_for_server(server_url: &str) -> CliResult<String> {
     let mut url = crate::init::validate_server_url(server_url, true)?;
-    let mut segments = url
-        .path_segments_mut()
-        .map_err(|()| CliError::InvalidArguments {
-            message: "server URL cannot be used as a route base".to_owned(),
-        })?;
-    segments.extend(LFS_SESSION_REVOKE_PATH.trim_start_matches('/').split('/'));
-    drop(segments);
+    append_url_path_segments(
+        &mut url,
+        LFS_SESSION_REVOKE_PATH,
+        "server URL cannot be used as a route base",
+    )?;
 
     Ok(url.to_string())
 }
@@ -822,26 +805,15 @@ fn request_lfs_session_revocation(
     revoke_url: &str,
     token: &LfsSessionToken,
 ) -> CliResult<SessionRevocationStatus> {
-    let client = Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .map_err(|source| CliError::Io {
-            context: "failed to create LFS session revocation client".to_owned(),
-            source: io::Error::other(source),
-        })?;
-    let response = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            client
-                .delete(revoke_url)
-                .bearer_auth(token.as_str())
-                .timeout(SESSION_REVOCATION_TIMEOUT)
-                .send(),
-        )
-    })
-    .map_err(|source| CliError::Io {
-        context: "failed to request LFS session revocation".to_owned(),
-        source: io::Error::other(source),
-    })?;
+    let client = redirect_free_http_client("failed to create LFS session revocation client")?;
+    let response = run_blocking_http_request(
+        client
+            .delete(revoke_url)
+            .bearer_auth(token.as_str())
+            .timeout(SESSION_REVOCATION_TIMEOUT)
+            .send(),
+        "failed to request LFS session revocation",
+    )?;
 
     match response.status() {
         HttpStatusCode::NO_CONTENT => Ok(SessionRevocationStatus::Revoked),
@@ -3113,7 +3085,7 @@ fn read_current_checkout_pointer_candidate(path: &Path) -> CliResult<Option<LfsP
 }
 
 fn indexed_lfs_object_for_dehydration(worktree_root: &Path, path: &Path) -> CliResult<LfsObject> {
-    let relative_path = dehydration_relative_path(worktree_root, path)?;
+    let relative_path = dehydration_relative_path_from_contained_file(worktree_root, path)?;
     require_lfs_filter(worktree_root, &relative_path, path)?;
     let blob_oid = index_blob_oid(worktree_root, &relative_path, path)?;
     let pointer = read_index_lfs_pointer(worktree_root, &blob_oid, path)?;
@@ -3121,7 +3093,10 @@ fn indexed_lfs_object_for_dehydration(worktree_root: &Path, path: &Path) -> CliR
     Ok(pointer.object)
 }
 
-fn dehydration_relative_path(worktree_root: &Path, path: &Path) -> CliResult<PathBuf> {
+fn dehydration_relative_path_from_contained_file(
+    worktree_root: &Path,
+    contained_path: &Path,
+) -> CliResult<PathBuf> {
     let root = dunce::canonicalize(worktree_root).map_err(|source| CliError::Io {
         context: format!(
             "failed to resolve Git worktree root {}",
@@ -3129,13 +3104,13 @@ fn dehydration_relative_path(worktree_root: &Path, path: &Path) -> CliResult<Pat
         ),
         source,
     })?;
-    let path = contained_worktree_file_path(worktree_root, path, "dehydration")?;
-    path.strip_prefix(&root)
+    contained_path
+        .strip_prefix(&root)
         .map(Path::to_path_buf)
         .map_err(|_| CliError::InvalidArguments {
             message: format!(
                 "dehydration path must be contained in the current Git worktree: {}",
-                path.display()
+                contained_path.display()
             ),
         })
 }
@@ -3715,21 +3690,13 @@ async fn probe_authenticated_migration_target(
     token: &LfsSessionToken,
 ) -> CliResult<()> {
     let mut batch_url = crate::init::validate_server_url(lfs_url, allow_insecure_http)?;
-    let mut segments = batch_url
-        .path_segments_mut()
-        .map_err(|()| CliError::InvalidArguments {
-            message: "LFS URL cannot be used as a repository route".to_owned(),
-        })?;
-    segments.extend(["objects", "batch"]);
-    drop(segments);
+    append_url_path_segments(
+        &mut batch_url,
+        "objects/batch",
+        "LFS URL cannot be used as a repository route",
+    )?;
 
-    let client = Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .map_err(|source| CliError::Io {
-            context: "failed to create migration target probe client".to_owned(),
-            source: io::Error::other(source),
-        })?;
+    let client = redirect_free_http_client("failed to create migration target probe client")?;
     let response = client
         .post(batch_url)
         .bearer_auth(token.as_str())
@@ -3809,40 +3776,51 @@ fn validate_google_drive_status_storage(storage: &GoogleDriveStorageConfig) -> C
 }
 
 fn auth_url_for_server(server_url: &str, route_path: &str) -> CliResult<String> {
-    let mut login_url = Url::parse(server_url).map_err(|source| CliError::InvalidArguments {
-        message: format!("server URL is not valid: {source}"),
-    })?;
-    if !matches!(login_url.scheme(), "http" | "https") || login_url.host_str().is_none() {
-        return Err(CliError::InvalidArguments {
-            message: "server URL must be a valid http or https URL".to_owned(),
-        });
-    }
-    if !login_url.username().is_empty() || login_url.password().is_some() {
-        return Err(CliError::InvalidArguments {
-            message: "server URL must not include credentials".to_owned(),
-        });
-    }
-    if login_url.query().is_some() || login_url.fragment().is_some() {
-        return Err(CliError::InvalidArguments {
-            message: "server URL must not include a query string or fragment".to_owned(),
-        });
-    }
-    if login_url.path().ends_with('/') && login_url.path() != "/" {
-        return Err(CliError::InvalidArguments {
-            message: "server URL must not end with a trailing slash".to_owned(),
-        });
-    }
-    {
-        let mut segments =
-            login_url
-                .path_segments_mut()
-                .map_err(|()| CliError::InvalidArguments {
-                    message: "server URL cannot be used as a route base".to_owned(),
-                })?;
-        segments.extend(route_path.trim_start_matches('/').split('/'));
-    }
+    let mut login_url = crate::init::validate_server_url(server_url, true)?;
+    append_url_path_segments(
+        &mut login_url,
+        route_path,
+        "server URL cannot be used as a route base",
+    )?;
 
     Ok(login_url.to_string())
+}
+
+fn append_url_path_segments(
+    url: &mut Url,
+    route_path: &str,
+    invalid_base_message: &'static str,
+) -> CliResult<()> {
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|()| CliError::InvalidArguments {
+            message: invalid_base_message.to_owned(),
+        })?;
+    segments.extend(route_path.trim_start_matches('/').split('/'));
+
+    Ok(())
+}
+
+fn redirect_free_http_client(context: &'static str) -> CliResult<Client> {
+    Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .map_err(|source| CliError::Io {
+            context: context.to_owned(),
+            source: io::Error::other(source),
+        })
+}
+
+fn run_blocking_http_request<T>(
+    request: impl Future<Output = Result<T, reqwest::Error>>,
+    context: &'static str,
+) -> CliResult<T> {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(request)).map_err(
+        |source| CliError::Io {
+            context: context.to_owned(),
+            source: io::Error::other(source),
+        },
+    )
 }
 
 fn process_status_text(status: std::process::ExitStatus) -> String {
@@ -7806,10 +7784,17 @@ mod tests {
     #[test]
     fn login_url_rejects_unsafe_server_url_components() {
         for server_url in [
+            " https://lfs.example.com/custom/base",
             "https://lfs.example.com/custom/base/",
             "https://user:secret@lfs.example.com/custom/base",
             "https://lfs.example.com/custom/base?token=secret",
             "https://lfs.example.com/custom/base#fragment",
+            "https://lfs.example.com/custom base",
+            "https://lfs.example.com/custom\nbase",
+            "https://lfs.example.com\\custom\\base",
+            "https://lfs.example.com/custom/../base",
+            "https://lfs.example.com/custom/./base",
+            "https://lfs.example.com/custom/%2e%2e/base",
         ] {
             let error = github_personal_access_token_login_url_for_server(server_url)
                 .expect_err("unsafe server URL should be rejected");
