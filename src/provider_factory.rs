@@ -17,12 +17,21 @@ use crate::{
     google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
 };
 
+/// Provider-neutral behavior registered by each repository config variant.
+///
+/// Implementations keep config parsing exhaustive while preventing callers
+/// from matching concrete providers merely to construct adapters or validate
+/// repository mappings.
 trait RepositoryProviderRegistration {
+    /// Returns the provider ID embedded by validated configuration loading.
     fn id(&self) -> &str;
+    /// Returns the stable provider type stored in metadata.
     fn provider_type(&self) -> &'static str;
+    /// Builds the runtime repository-provider adapter.
     fn build_provider(&self) -> Arc<dyn RepositoryProvider + Send + Sync>;
-    fn github_pat_provider(&self) -> Option<&GitHubProviderConfig>;
+    /// Rejects mapping fields that violate provider-specific identity rules.
     fn validate_mapping(&self, repository: &RepositoryMapping, path: &str) -> ServerResult<()>;
+    /// Reports whether route uniqueness and mapping lookup ignore identity case.
     fn route_identity_is_case_insensitive(&self) -> bool;
 }
 
@@ -37,10 +46,6 @@ impl RepositoryProviderRegistration for GitHubProviderConfig {
 
     fn build_provider(&self) -> Arc<dyn RepositoryProvider + Send + Sync> {
         Arc::new(GitHubRepositoryProvider::new(self.clone()))
-    }
-
-    fn github_pat_provider(&self) -> Option<&GitHubProviderConfig> {
-        Some(self)
     }
 
     fn validate_mapping(&self, repository: &RepositoryMapping, path: &str) -> ServerResult<()> {
@@ -84,14 +89,12 @@ impl RepositoryProviderConfig {
         self.registration().provider_type()
     }
 
+    /// Builds the runtime repository-provider adapter.
     pub(crate) fn build_provider(&self) -> Arc<dyn RepositoryProvider + Send + Sync> {
         self.registration().build_provider()
     }
 
-    fn github_pat_provider(&self) -> Option<&GitHubProviderConfig> {
-        self.registration().github_pat_provider()
-    }
-
+    /// Validates provider-specific repository mapping fields.
     pub(crate) fn validate_mapping(
         &self,
         repository: &RepositoryMapping,
@@ -100,40 +103,58 @@ impl RepositoryProviderConfig {
         self.registration().validate_mapping(repository, path)
     }
 
+    /// Reports whether repository route identity is case-insensitive.
+    ///
+    /// Callers use this for both route uniqueness and mapping lookup so the
+    /// two operations cannot disagree about provider identity.
     pub(crate) fn route_identity_is_case_insensitive(&self) -> bool {
         self.registration().route_identity_is_case_insensitive()
     }
 }
 
 impl ServerConfig {
-    pub(crate) fn single_github_pat_provider(&self) -> ServerResult<Option<&GitHubProviderConfig>> {
+    /// Selects the only GitHub provider supported by one PAT-auth consumer.
+    ///
+    /// `consumer` keeps the startup diagnostic specific to the subsystem that
+    /// cannot yet compose multiple configured GitHub accounts.
+    pub(crate) fn single_github_pat_provider(
+        &self,
+        consumer: &str,
+    ) -> ServerResult<Option<&GitHubProviderConfig>> {
         let mut providers = self
             .repository_providers
             .values()
-            .filter_map(RepositoryProviderConfig::github_pat_provider);
+            .map(|provider| match provider {
+                RepositoryProviderConfig::GitHub(provider) => provider,
+            });
         let provider = providers.next();
         if providers.next().is_some() {
             return Err(ServerError::InvalidConfiguration {
-                message: "multiple GitHub repository providers are not yet supported by single-account PAT authentication".to_owned(),
+                message: format!(
+                    "multiple GitHub repository providers are not yet supported by {consumer}"
+                ),
             });
         }
         Ok(provider)
     }
 }
 
+/// Provider-neutral behavior registered by each storage config variant.
+///
+/// Runtime transfer concerns that require concrete dependencies stay with the
+/// concrete transfer path instead of leaking those types through this trait.
 trait StorageProviderRegistration {
+    /// Returns the provider ID embedded by validated configuration loading.
     fn id(&self) -> &str;
+    /// Returns the stable provider type stored in metadata.
     fn provider_type(&self) -> &'static str;
+    /// Returns the stable backend root recorded for config reconciliation.
     fn backend_root_id(&self) -> &str;
+    /// Returns the optional operator-facing provider label.
     fn display_name(&self) -> Option<&str>;
-    fn validate_local_readiness(&self) -> StorageResult<()>;
-    fn local_readiness_error_message(&self) -> String;
-    fn validate_runtime<'a>(
-        &'a self,
-        token_cache: &'a GoogleDriveAccessTokenCache,
-        token_source: &'a dyn GoogleDriveAccessTokenSource,
-        root_validator: &'a GoogleDriveRootValidator,
-    ) -> ProviderFuture<'a, ServerResult<()>>;
+    /// Checks local prerequisites and returns a safe operator-facing failure.
+    fn validate_local_readiness(&self) -> Result<(), String>;
+    /// Builds a readiness-checked repository-scoped storage adapter.
     fn build_provider(
         &self,
         repository_namespace: String,
@@ -158,28 +179,14 @@ impl StorageProviderRegistration for GoogleDriveStorageConfig {
         self.display_name.as_deref()
     }
 
-    fn validate_local_readiness(&self) -> StorageResult<()> {
+    fn validate_local_readiness(&self) -> Result<(), String> {
         GoogleDriveGcloudTokenProvider::new().validate_local_readiness(&self.id, &self.credentials)
-    }
-
-    fn local_readiness_error_message(&self) -> String {
-        format!(
-            "Google Drive credential for {} is not usable; check the configured gcloud ADC credentials directory",
-            self.id
-        )
-    }
-
-    fn validate_runtime<'a>(
-        &'a self,
-        token_cache: &'a GoogleDriveAccessTokenCache,
-        token_source: &'a dyn GoogleDriveAccessTokenSource,
-        root_validator: &'a GoogleDriveRootValidator,
-    ) -> ProviderFuture<'a, ServerResult<()>> {
-        Box::pin(async move {
-            let token = token_cache.get_or_refresh(self, token_source).await?;
-            root_validator.validate_root_folder(self, &token).await?;
-            Ok(())
-        })
+            .map_err(|_| {
+                format!(
+                    "Google Drive credential for {} is not usable; check the configured gcloud ADC credentials directory",
+                    self.id
+                )
+            })
     }
 
     fn build_provider(
@@ -205,7 +212,6 @@ impl StorageProviderRegistration for GoogleDriveStorageConfig {
                 token_source,
                 token_cache,
                 metadata,
-                None,
             )) as Arc<dyn StorageProvider + Send + Sync>)
         })
     }
@@ -230,33 +236,22 @@ impl StorageProviderConfig {
         self.registration().provider_type()
     }
 
+    /// Returns the stable backend root recorded in metadata.
     pub(crate) fn backend_root_id(&self) -> &str {
         self.registration().backend_root_id()
     }
 
+    /// Returns the optional operator-facing provider label.
     pub(crate) fn display_name(&self) -> Option<&str> {
         self.registration().display_name()
     }
 
-    pub(crate) fn validate_local_readiness(&self) -> StorageResult<()> {
+    /// Checks local prerequisites and returns a safe operator-facing failure.
+    pub(crate) fn validate_local_readiness(&self) -> Result<(), String> {
         self.registration().validate_local_readiness()
     }
 
-    pub(crate) fn local_readiness_error_message(&self) -> String {
-        self.registration().local_readiness_error_message()
-    }
-
-    pub(crate) async fn validate_runtime(
-        &self,
-        token_cache: &GoogleDriveAccessTokenCache,
-        token_source: &dyn GoogleDriveAccessTokenSource,
-        root_validator: &GoogleDriveRootValidator,
-    ) -> ServerResult<()> {
-        self.registration()
-            .validate_runtime(token_cache, token_source, root_validator)
-            .await
-    }
-
+    /// Builds a repository-scoped provider after credential and root checks.
     pub(crate) async fn build_provider(
         &self,
         repository_namespace: String,
@@ -268,6 +263,11 @@ impl StorageProviderConfig {
     }
 }
 
+/// Repository-scoped Google Drive adapter with idempotent upload locking.
+///
+/// The wrapper pins every operation to one repository namespace, coordinates
+/// lookup/upload through metadata-backed cross-process locks, and acquires
+/// Drive tokens only after lock admission so long waits cannot age them.
 pub(crate) struct GoogleDriveStorageProvider {
     storage: GoogleDriveStorageConfig,
     repository_namespace: String,
@@ -279,14 +279,13 @@ pub(crate) struct GoogleDriveStorageProvider {
 }
 
 impl GoogleDriveStorageProvider {
+    /// Builds the production adapter from provider-specific dependencies.
     fn with_dependencies(
         storage: GoogleDriveStorageConfig,
         repository_namespace: String,
         token_source: Arc<dyn GoogleDriveAccessTokenSource>,
         token_cache: GoogleDriveAccessTokenCache,
         metadata: Arc<MetadataDatabase>,
-        #[cfg(test)] api_base_url: Option<String>,
-        #[cfg(not(test))] _api_base_url: Option<String>,
     ) -> Self {
         Self {
             storage,
@@ -295,10 +294,11 @@ impl GoogleDriveStorageProvider {
             token_cache,
             metadata,
             #[cfg(test)]
-            api_base_url,
+            api_base_url: None,
         }
     }
 
+    /// Builds a deterministic adapter with injected Drive dependencies.
     #[cfg(test)]
     pub(crate) fn with_test_dependencies(
         storage: GoogleDriveStorageConfig,
@@ -308,14 +308,15 @@ impl GoogleDriveStorageProvider {
         metadata: Arc<MetadataDatabase>,
         api_base_url: Option<String>,
     ) -> Self {
-        Self::with_dependencies(
+        let mut provider = Self::with_dependencies(
             storage,
             repository_namespace.into(),
             token_source,
             token_cache,
             metadata,
-            api_base_url,
-        )
+        );
+        provider.api_base_url = api_base_url;
+        provider
     }
 
     async fn object_store(&self) -> StorageResult<GoogleDriveObjectStore> {
@@ -394,8 +395,11 @@ impl StorageProvider for GoogleDriveStorageProvider {
                     message: format!("provider upload lock failed: {error}"),
                 })?;
 
-            // Verify before waiting, but mint a fresh token after acquiring the
-            // cross-process lock so long lock waits cannot age the credential.
+            // Verify before waiting so cache-hit retries do not serialize
+            // large-file reads. Keep lookup and possible upload under the
+            // cross-process lock so a live server cannot create a duplicate
+            // Drive file, and mint the token after admission so long waits
+            // cannot age the credential.
             self.object_store()
                 .await?
                 .upload_verified_object_idempotent(object, source, verified_file)
@@ -437,3 +441,6 @@ impl StorageProvider for GoogleDriveStorageProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

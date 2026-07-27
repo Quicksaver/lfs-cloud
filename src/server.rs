@@ -322,7 +322,7 @@ fn production_session_store(
     config: &ServerConfig,
     metadata_database: Arc<MetadataDatabase>,
 ) -> ServerResult<LocalLfsSessionStore> {
-    match config.single_github_pat_provider()? {
+    match config.single_github_pat_provider("durable session storage")? {
         None => Ok(LocalLfsSessionStore::new()),
         Some(provider) => LocalLfsSessionStore::open_durable(
             metadata_database,
@@ -642,7 +642,7 @@ fn github_auth_router_with_client(
     session_store: LocalLfsSessionStore,
     user_client: crate::GitHubUserClient,
 ) -> ServerResult<Option<Router>> {
-    let provider = match config.single_github_pat_provider()? {
+    let provider = match config.single_github_pat_provider("the PAT login router")? {
         None => return Ok(None),
         Some(provider) => provider,
     };
@@ -730,8 +730,8 @@ impl ProviderBatchAuthorizer {
     fn from_config(config: &ServerConfig) -> Self {
         let providers = config
             .repository_providers
-            .values()
-            .map(|provider| (provider.id().to_owned(), provider.build_provider()))
+            .iter()
+            .map(|(id, provider)| (id.clone(), provider.build_provider()))
             .collect();
 
         Self { providers }
@@ -1061,12 +1061,13 @@ impl GoogleDriveTransferStore {
 
     async fn validate_storage_providers(&self) -> ServerResult<()> {
         for storage in self.storage_providers.values() {
-            storage
-                .validate_runtime(
-                    &self.token_cache,
-                    self.token_source.as_ref(),
-                    &self.root_validator,
-                )
+            let StorageProviderConfig::GoogleDrive(storage) = storage;
+            let token = self
+                .token_cache
+                .get_or_refresh(storage, self.token_source.as_ref())
+                .await?;
+            self.root_validator
+                .validate_root_folder(storage, &token)
                 .await?;
         }
 
@@ -3641,9 +3642,9 @@ mod tests {
         BASE64_STANDARD, BatchBodyGuardrails, GoogleDriveTransferStore, LFS_AUTH_CHALLENGE,
         LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsDownloadResponse, LfsObjectTransferStore,
         LfsRouteEndpoint, LfsRouteResolver, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES,
-        ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients, ServerShutdownOutcome,
-        UploadStagingCoordinator, UploadStagingGuardrails, advertised_server_urls,
-        authenticate_lfs_session, lfs_server_router_with_sessions,
+        ProviderBatchAuthorizer, ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients,
+        ServerShutdownOutcome, UploadStagingCoordinator, UploadStagingGuardrails,
+        advertised_server_urls, authenticate_lfs_session, lfs_server_router_with_sessions,
         lfs_server_router_with_sessions_authorizer_and_transfer_store,
         lfs_server_router_with_sessions_authorizer_transfer_store_and_batch_guardrails,
         production_session_store, render_server_startup_message, serve_with_graceful_shutdown,
@@ -3661,8 +3662,8 @@ mod tests {
         GitHubUserClient, GoogleDriveAccessToken, GoogleDriveRootValidator,
         GoogleDriveStorageConfig, LfsBatchOperation, LfsBatchResponse, LfsObject, LfsObjectSize,
         LfsOid, LfsSessionToken, LocalLfsSessionStore, MetadataDatabase, ProviderFuture,
-        RepositoryMapping, RepositoryPermission, RepositoryProviderError, RepositoryUser,
-        SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
+        RepositoryMapping, RepositoryPermission, RepositoryProviderConfig, RepositoryProviderError,
+        RepositoryUser, SanitizedMessage, ServerConfig, ServerError, ServerResult, StorageError,
         StorageProviderConfig, StorageResult, StoredObject,
         google_drive::{GoogleDriveAccessTokenCache, GoogleDriveAccessTokenSource},
     };
@@ -5255,6 +5256,51 @@ repositories:
                 .expect("GitHub PAT should be restored")
                 .as_str(),
             "github_pat_production_restart"
+        );
+    }
+
+    #[test]
+    fn provider_batch_authorizer_keys_adapters_by_config_map_identity() {
+        let mut config = test_config();
+        let RepositoryProviderConfig::GitHub(provider) = config
+            .repository_providers
+            .get_mut("github-main")
+            .expect("test GitHub provider should exist");
+        provider.id = "drifted-embedded-id".to_owned();
+
+        let authorizer = ProviderBatchAuthorizer::from_config(&config);
+
+        assert!(authorizer.providers.contains_key("github-main"));
+        assert!(!authorizer.providers.contains_key("drifted-embedded-id"));
+    }
+
+    #[test]
+    fn production_session_store_names_multiple_provider_consumer() {
+        let mut config = test_config();
+        let second = match &config.repository_providers["github-main"] {
+            RepositoryProviderConfig::GitHub(provider) => {
+                let mut provider = provider.clone();
+                provider.id = "github-secondary".to_owned();
+                RepositoryProviderConfig::GitHub(provider)
+            }
+        };
+        config
+            .repository_providers
+            .insert("github-secondary".to_owned(), second);
+        let database = Arc::new(
+            MetadataDatabase::open_in_memory().expect("test metadata database should open"),
+        );
+
+        let error = production_session_store(&config, database)
+            .expect_err("durable sessions should reject ambiguous GitHub providers");
+
+        assert!(
+            matches!(
+                error,
+                ServerError::InvalidConfiguration { ref message }
+                    if message.contains("durable session storage")
+            ),
+            "unexpected multiple-provider diagnostic: {error}"
         );
     }
 
@@ -7683,7 +7729,14 @@ repositories:
 
         let error = server_router_with_sessions(config, LocalLfsSessionStore::new())
             .expect_err("router should reject ambiguous GitHub providers");
-        assert!(matches!(error, ServerError::InvalidConfiguration { .. }));
+        assert!(
+            matches!(
+                error,
+                ServerError::InvalidConfiguration { ref message }
+                    if message.contains("the PAT login router")
+            ),
+            "unexpected multiple-provider diagnostic: {error}"
+        );
     }
 
     async fn assert_lfs_json_error(

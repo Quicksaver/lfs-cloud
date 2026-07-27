@@ -1255,7 +1255,7 @@ repositories:
     fn single_github_pat_provider_centralizes_authentication_composition() {
         let mut config = load_with_test_env(valid_yaml());
         let provider = config
-            .single_github_pat_provider()
+            .single_github_pat_provider("the test PAT consumer")
             .expect("one GitHub provider should compose")
             .expect("one GitHub provider should be selected");
         assert_eq!(provider.id, "github-main");
@@ -1272,11 +1272,11 @@ repositories:
             .insert("github-secondary".to_owned(), second);
 
         let error = config
-            .single_github_pat_provider()
+            .single_github_pat_provider("the test PAT consumer")
             .expect_err("single-account PAT composition must reject two GitHub providers");
         assert_error_contains(
             &error,
-            "multiple GitHub repository providers are not yet supported by single-account PAT authentication",
+            "multiple GitHub repository providers are not yet supported by the test PAT consumer",
         );
     }
 

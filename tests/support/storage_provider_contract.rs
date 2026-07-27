@@ -1,5 +1,5 @@
 // This file is both a normal integration-test module and included by
-// `src/cli.rs` unit tests. Keep parent-provided imports compatible with both
+// `src/provider_factory` unit tests. Keep parent-provided imports compatible with both
 // contexts; the `include!` also means this file must ship with crate sources.
 use super::{
     LfsObject, StorageDeleteOutcome, StorageError, StorageProvider, StoredObject, fs,
