@@ -29,37 +29,38 @@ Two project constraints were applied and materially changed several conclusions:
 | 7 | **[DONE / REVIEWED]** Mechanical duplication across modules | Deduplication | Shared contracts | Low | Completed |
 | 6.1 | **[DONE / REVIEWED]** `dispatch` test boilerplate | Test restructure | Same coverage | Low | Completed |
 | 8 | **[DONE / REVIEWED]** Dead public API | Public-surface cleanup | 24 lines removed | Low | Completed |
-| 1 | No provider factory; 8 concrete-variant matches | Design | Extensibility | Medium | Scoped separately |
+| 1 | **[DONE / REVIEWED]** Provider registration and construction | Design | Extensibility | Medium | Completed |
 | 2 | Server transfer path bypasses the plugin trait | Design | Extensibility | High | Scoped separately |
 | 9 | Deferred items | Design | Readability | High | After launch |
 
 ---
 
-## 1. No provider factory: eight sites construct providers by matching concrete variants
+## 1. **[DONE / REVIEWED]** Provider registration and construction
 
-Adding a provider today means editing eight call sites across three modules. Several are irrefutable `let` patterns that will only start failing to compile once a second variant exists.
+**Validity:** Valid design finding, but the eight-site inventory combined provider construction with two sites owned by the separately scoped production transfer-store design in §2. Six sites were current and actionable here; the two `GoogleDriveTransferStore` sites remain intentionally concrete until §2 can preserve indexed-ID repair, streaming downloads, metadata recording, and Drive startup token reuse through a generic production transfer abstraction.
 
-| Location               | Site                                                    |
-| ---------------------- | ------------------------------------------------------- |
-| `src/server.rs:330`    | `production_session_store`                              |
-| `src/server.rs:661`    | `github_auth_router_with_client`                        |
-| `src/server.rs:760`    | `ProviderBatchAuthorizer::from_config`                  |
-| `src/server.rs:1095`   | `GoogleDriveTransferStore::validate_storage_providers`  |
-| `src/server.rs:1113`   | `GoogleDriveTransferStore::object_store_for_repository` |
-| `src/cli.rs:1567`      | `migration_google_drive_storage`                        |
-| `src/cli.rs:3775`      | `validate_status_storage`                               |
-| `src/metadata.rs:1190` | `upsert_storage_provider`                               |
+| Original site | Current assessment and outcome |
+| --- | --- |
+| `production_session_store` | **Valid and addressed.** Uses centralized single-GitHub-PAT selection while retaining durable-session-specific diagnostics and the existing PAT-derived encryption secret. |
+| `github_auth_router_with_client` | **Valid and addressed.** Shares the same selection helper while retaining PAT-router-specific diagnostics and the single-account login contract. |
+| `ProviderBatchAuthorizer::from_config` | **Valid and addressed.** Builds trait-object adapters through `RepositoryProviderConfig::build_provider`; assessment restored the authoritative config-map key instead of trusting an embedded ID. |
+| `GoogleDriveTransferStore::validate_storage_providers` | **Valid coupling, deferred with §2.** Blast review proved that pushing Drive token-cache and root-validator types through the provider-neutral registration trait merely disguised the concrete production transfer boundary. |
+| `GoogleDriveTransferStore::object_store_for_repository` | **Valid coupling, deferred with §2.** Its return type and backend-ID/download methods are Drive-specific; changing it here would implement §2 rather than the provider factory. |
+| `migration_google_drive_storage` | **Valid and addressed.** Renamed to provider-neutral `migration_storage_provider`, constructs `dyn StorageProvider` through the storage registration, and maps readiness failures into the migration error domain. |
+| `validate_status_storage` | **Valid and addressed.** Delegates readiness validation and the safe operator diagnostic through the storage registration. |
+| `upsert_storage_provider` | **Valid and addressed.** Uses config accessors for ID, type, backend root, and display name rather than matching Drive fields. |
 
-`src/server_config.rs` is the natural home for `StorageProviderConfig::build_provider()` and `RepositoryProviderConfig::build_provider()` returning trait objects, plus `provider_type()` / `backend_root_id()` accessors for the metadata upsert. That collapses eight matches to two.
+**Factory and placement outcome:** `src/provider_factory.rs` now owns the two concrete config-variant registration points, adapter construction, provider-specific mapping validation, route-identity semantics, readiness behavior, and metadata descriptors. Keeping this runtime composition beside its `GoogleDriveStorageProvider` adapter avoids making the YAML-focused `server_config.rs` depend on token sources, metadata locks, and runtime clients. The former ~115-line `MigrationGoogleDriveStorage` implementation moved out of the CLI and became the repository-scoped Drive `StorageProvider` behind this boundary; its shared provider contract and upload-lock/token-ordering tests moved with it. Repository construction is currently infallible because the GitHub permission client is created lazily, so the proposed universal `ServerResult` signature was stale; readiness-checked storage construction deliberately returns `StorageResult`.
 
-Related placement problem: `src/cli.rs:1320-1434` defines `MigrationGoogleDriveStorage`, a ~115-line Drive-specific `StorageProvider` implementation living in the CLI layer, and `migration_google_drive_storage` (`src/cli.rs:1539`) hardcodes Drive construction. Both belong behind the same factory.
+**Authentication couplings:** The duplicate provider collection is removed, but the current product still composes at most one configured GitHub PAT account. `production_session_store` continues to derive the durable-session encryption key from `GitHubAuthenticationConfig::session_encryption_secret`; neither that secret nor `PAT_AUTHENTICATION_SESSION_MIGRATION` changed. A provider-neutral durable-session key remains a separately scoped blocker before a non-PAT repository provider can work, and changing it must include explicit session invalidation/migration semantics.
 
-Two couplings worth recording even if they are not addressed now:
+**Preserved boundaries:** GitHub and Google Drive remain the only implemented providers. The single-root package, public provider traits, single-account PAT login, durable-session behavior, Drive upload locking, root readiness, and §2/§9 scopes are unchanged. The registration boundary removes the six valid concrete call-site matches without claiming that future providers or the generic production transfer store already exist.
 
-- `production_session_store` (`src/server.rs:322`) derives the durable-session encryption key from the GitHub PAT via `session_encryption_secret`. A second repository provider has no PAT, so this core concern needs a provider-neutral key source before a second provider is possible. Note that changing the key source invalidates existing durable sessions, which is exactly what `PAT_AUTHENTICATION_SESSION_MIGRATION` in `src/metadata.rs:227` had to handle previously.
-- `production_session_store` and `github_auth_router_with_client` contain the identical "collect GitHub providers, match on slice, reject if more than one" block. It is duplicated today and is also the code that must change per-provider.
+**Assessment and commits:** The implementation was committed as `12f14e9668d3d75f1bf0510b792739a6158c09a6` against `a85325453053758d1de71e50ee07230a2a845c7d`. Initial CodeRabbit found no issues. Initial Codex found one valid P2: storage readiness failures had crossed from migration into the server error category; `ca4c0ec55e40b7c44e350a639d7ecd7517dbdb0f` restored `MigrationError::Storage` and added a regression. Blast then committed `5fc2681caad810c77047c421472933ce6c413ccb`, removing Drive runtime dependencies from the neutral registration trait, restoring config-map identity and subsystem-specific authentication diagnostics, tightening readiness assertions, restoring upload-lock rationale, and colocating provider tests. Claude Sonnet and Gemini Blast passes were quota-limited no-ops. Final CodeRabbit and final Codex found no actionable regressions.
 
-**Gain:** One place to register a provider. Eliminates the "did I update all eight?" failure mode, and removes a duplicated block. **Drawback:** Trait-object construction must return `ServerResult`, so the factory signature is slightly heavier than the current inline matches. The metadata upsert needs accessor methods rather than direct field reads.
+**Verification:** The implementation and assessment commits passed repository linting, `cargo fmt --all`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all-target tests (600 unit tests passed with expected helper/live-provider ignores, plus every integration target), and all 29 doc tests.
+
+**Reviewer quality:** The original review was high quality on six sites and correctly identified the CLI placement and authentication couplings, but it overcounted the two §2 production transfer sites as factory-only work and its universal fallible-factory claim was stale after lazy GitHub client construction. Initial CodeRabbit was clean and relevant. Initial Codex found one valid boundary regression. Blast was high value: Claude Opus 5 and Grok found real abstraction, identity, diagnostic, documentation, and test-placement issues; one ambient-credential concern was invalid and one documentation requirement was overstated. Final CodeRabbit and Codex were clean.
 
 ## 2. The server transfer path bypasses the generic storage trait
 
