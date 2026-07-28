@@ -31,7 +31,7 @@ Two project constraints were applied and materially changed several conclusions:
 | 8 | **[DONE / REVIEWED]** Dead public API | Public-surface cleanup | 24 lines removed | Low | Completed |
 | 1 | **[DONE / REVIEWED]** Provider registration and construction | Design | Extensibility | Medium | Completed |
 | 2 | **[DONE / REVIEWED]** Server transfer path bypasses the plugin trait | Design | Extensibility | High | Completed |
-| 9 | Deferred items | Design | Readability | High | After launch |
+| 9 | **[DONE / REVIEWED]** Deferred cleanup | Design | Builder completed; upload retained | Reviewed | Completed |
 
 ---
 
@@ -268,52 +268,38 @@ The coverage argument is the strongest reason to do this. `AGENTS.md` records th
 
 **Reviewer quality:** The original reviewer was high quality: all three API classifications were current and correctly distinguished redundant provider conveniences from an intentional embedder seam (three valid conclusions out of three). CodeRabbit and Codex were clean and relevant in both passes. Blast's available Claude Opus feedback was precise: it found one useful documentation improvement and correctly requested stale-reference verification; the quota-limited Sonnet and Gemini passes cannot be assessed.
 
-## 9. Deferred until after launch
+## 9. **[DONE / REVIEWED]** Deferred until after launch
 
-### 9.1 `handle_lfs_upload_request` is ~290 lines
+### 9.1 **[DONE / REVIEWED — RETAINED]** `handle_lfs_upload_request` is ~290 lines
 
-`src/server.rs:1904-2190`. Every error path repeats `finish_failed_transfer_attempt(...)`, then `tracing::debug!(repo_id, oid, error_category, ...)`, then `return git_lfs_storage_error_response(error)` — six times.
+**Validity and outcome:** Valid readability finding, but intentionally retained after a current-tree review. The handler remains approximately 288 lines. Six generic post-attempt failures still repeat `finish_failed_transfer_attempt(...)`, a category-only debug event, and `git_lfs_storage_error_response(error)`; four staging-specific failures deliberately record fixed secret-free messages before returning their distinct overload, size, space, or timeout responses.
 
-An inner `async fn` returning `Result<Response, (ServerError, &'static str)>` plus one epilogue at the call site would roughly halve it and make the actual sequence (authorize, attempt, lock, lookup, stage, upload) legible in one screen.
+The proposed inner async operation plus one generic failure epilogue remains technically plausible, but it is not behavior-preserving by construction. The handler distinguishes failures before an attempt exists, failures that must complete a started attempt, fixed staging diagnostics, and failures while recording success where another metadata write cannot be assumed to work. It also holds the in-process and durable upload locks across the final lookup and upload, and retains staging admission and byte reservations through backend completion.
 
-**Drawback:** The most safety-critical handler in the codebase, with several ordering invariants documented in `Learnings`. Restructuring risks subtly changing which failure paths record which attempt status. Defer.
+**Evidence and retained boundary:** Existing coverage proves route/session/size/permission validation ordering, successful and failed transfer lifecycles, existing-object metadata repair, staging response envelopes, global/per-user admission, same-object single flight, cross-state durable locking, backend completion, and secret-free diagnostics. It does not fault-inject every durable-lock acquisition, metadata-repair, attempt-completion, and handler-level staging failure branch. Building those seams solely to support a control-flow cleanup would expand the safety-critical test scaffold beyond the readability value. Under this group's requirement for exhaustive regression coverage, the finding is therefore valid but not actionable. No source change or future scheduling promise is recorded; reconsider only with a dedicated failure-injection harness or when a behavioral change already requires restructuring this sequence.
 
-### 9.2 Six-level telescoping router constructors
+### 9.2 **[DONE / REVIEWED]** Six-level telescoping router constructors
 
-`lfs_server_router` -> `lfs_server_router_with_sessions` -> `..._and_authorizer` -> `..._authorizer_and_transfer_store` -> `..._authorizer_transfer_store_and_batch_guardrails` -> `build_lfs_server_router` (`src/server.rs:347-609`). Names encode their parameter lists. `lfs_server_router_with_sessions_and_authorizer` has exactly one caller. `server_router_with_sessions` and `server_router_with_sessions_and_transfer_store` (`:360-417`) duplicate the same auth/session/LFS merge block verbatim.
+**Validity and outcome:** Valid and actionable after the provider factory and generic metadata-recording transfer store were complete. The current chain had grown from six to seven composition functions because optional metadata had added another axis, while the complete-server constructors still duplicated the auth/session/LFS merge and request-limit placement. Earlier consolidation had reduced the original roughly 40-call-site blast radius to a small set of internal helpers and focused tests, reversing the original cost/risk conclusion.
 
-A small `LfsRouterBuilder` collapses six functions to one and makes the roughly 40 test call sites read as intent rather than as an arity puzzle. A builder is also the right shape for plugin composition: adding an injection axis becomes a method rather than a seventh function name.
+`LfsRouterBuilder` now owns config, sessions, lazy production authorizer/transfer defaults, optional injected adapters, batch guardrails, and metadata. `build_lfs` applies one process-wide request-limit layer to the standalone LFS router; `build_server` applies one layer around the complete auth/session/LFS merge; and the explicitly named `build_unlimited_lfs_routes` exists only for intentional outer composition. The telescoping private constructors and duplicated merge block are gone. Public `lfs_server_router` remains the zero-setup Axum entry point, while the public session constructor and doc-hidden provider-adapter seam retain their behavior.
 
-**Drawback:** Roughly 40 test call sites change shape. Mechanical, but a wide diff. Consider pulling this forward if §1 is done, since the provider factory and the router builder touch the same composition code.
+**Code and test evidence:** Direct current-tree searches find no former telescoping constructor names. Dedicated tests cover the public zero-setup route, the complete session/LFS route merge, and request overload on both standalone and complete routers. Existing tests continue to cover route-before-auth privacy, post-auth batch parsing, Git LFS JSON envelopes, action size identity, provider concurrency, staging admission, transfer lifecycles, provider-adapter composition, production `ServerBuilder` wiring, and graceful shutdown.
+
+**Assessment and commits:** The implementation was committed as `dfdf0259db945e59cc5f8c0369cb0f256beafc88` against `38076f3236023f75c9872241c8ef47e8a5230d7e`. Initial CodeRabbit and Codex reviews found no actionable defects. Blast then committed `275144621b917f820d0b0e4c69955539274674e5`, making overridden provider defaults lazy, documenting limited versus unlayered build paths, and adding complete-server routing and admission coverage. Claude Opus supplied five valid comments; Grok supplied four valid comments out of five, while its metadata-helper regression claim was invalid because the base helper was already intentionally unlayered. Claude Sonnet and Gemini Blast passes were quota-limited no-ops. Final CodeRabbit and final Codex found no actionable defects.
+
+**Verification:** The implementation and assessment commits passed Yarn linting, `cargo fmt --all`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, all 641 automated test-target tests (12 expected helper/live-provider tests ignored), and all 29 doc tests.
+
+**Reviewer quality:** The original reviewer was high quality: both findings remained real, it correctly identified the upload handler's unusually high behavioral risk, and it correctly predicted that provider-factory completion would improve the router-builder trade-off. Its roughly 40-call-site estimate became stale after intervening consolidation, which made §9.2 safer rather than invalid. Initial and final CodeRabbit/Codex reviews were clean and relevant. Available Blast feedback was high value (nine valid comments out of ten); the quota-limited reviewers cannot be assessed.
 
 ---
 
-## Suggested sequencing
+## Sequencing outcome
 
-**Before launch, additive only, no behavior risk**
+Every cleanup item in this record now has a terminal review conclusion. Sections 3–8 and the provider-factory work in §1 were completed before the higher-blast-radius composition work. Section 2 then completed generic metadata-recording transfers, after which §9.2's reduced call-site surface justified the router builder. Section 9.1 is intentionally retained under its current safety and coverage constraints and is not a pending after-launch task.
 
-1. §3 `assert_storage_provider_contract` harness.
-2. §4 Repair the three scaffolding-tests-that-test-scaffolding.
-3. §5 `auth_url_for_server` validation consistency.
-
-**Before launch, mechanical and coverage-increasing**
-
-4. §6.4 process helpers, §6.5 `check-attr` pipelines.
-5. §7.3 metadata boilerplate, §6.2 credentials pipe variants, §7.4 small duplicates into a neutral module.
-6. §6.1 table-driven dispatch test, §7.5 error-mapping tables, §8 the two verified-dead items.
-7. §7.1, §7.2 Drive URL builders and validators, §6.3 local cache bodies.
-
-**Deliberate design work, scoped separately from cleanup**
-
-8. §1 provider factory.
-9. §2 generic metadata-recording transfer store. **Completed.**
-10. Provider-neutral session encryption key (blocks a second repository provider outright).
-
-**After launch**
-
-11. §9.1 upload handler restructure.
-12. §9.2 router builder, unless pulled forward with §1.
+The provider-neutral durable-session encryption key remains a separate product-design blocker for a second repository provider. It was not part of this cleanup review and is not implied to be addressed or scheduled here.
 
 ## Caveat
 
-The test suite is larger than the production code (~29k vs ~25k lines), and much of the scaffolding flagged here exists to serve it. Every consolidation will ripple into tests. Sequence by test blast radius rather than by lines saved.
+The test suite is larger than the production code, and much of the scaffolding flagged here exists to serve it. This review confirmed that test blast radius, behavioral fault coverage, and composition timing matter more than lines saved: those factors made the router builder worthwhile after consolidation and made the upload-handler rewrite inappropriate now.
