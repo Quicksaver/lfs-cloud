@@ -258,11 +258,10 @@ fn repo_relative_path_from_git_output(path: &str) -> MigrationResult<PathBuf> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod process_tests {
     use super::test_support::*;
 
-    #[cfg(unix)]
     #[test]
     fn bounded_git_output_stops_a_runaway_process_tree_on_overflow() {
         let mut command = Command::new("sh");
@@ -288,7 +287,6 @@ mod process_tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn bounded_git_output_drains_stdout_and_stderr_concurrently() {
         let mut command = Command::new("sh");
