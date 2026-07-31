@@ -392,7 +392,7 @@ pub(super) fn collect_pointer_oid_from_file_with_before_open(
     let file = match file {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source) if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) => {
+        Err(_source) if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) => {
             return Ok(true);
         }
         Err(source) => {
