@@ -15,11 +15,12 @@ function Write-Usage {
     @'
 Usage: pwsh ./scripts/release.ps1
 
-Continue one or more releases created by release.sh from a native Windows x64
-checkout. The script lists published semantic versions without successful
-local-checks/windows-x86_64 verification, prompts for multiple versions, checks
-out each tag, verifies and packages its exact executable, uploads the Windows
-assets, verifies them on GitHub, and restores the original checkout.
+Continue a release created by release.sh from a native Windows x64 checkout.
+The script lists published semantic versions without successful
+local-checks/windows-x86_64 verification, prompts for a version with an
+arrow-key menu, checks out its tag, verifies and packages its exact executable,
+uploads the Windows assets, verifies them on GitHub, and restores the original
+checkout.
 '@ | Write-Host
 }
 
@@ -115,73 +116,126 @@ function Get-WindowsReleaseCandidates {
     )
 }
 
-function ConvertTo-ReleaseSelection {
+function Format-WindowsReleaseMenu {
     param(
-        [AllowEmptyString()] [string] $Selection,
-        [Parameter(Mandatory = $true)] [ValidateRange(1, [int]::MaxValue)] [int] $CandidateCount
+        [Parameter(Mandatory = $true)] [object[]] $Candidates,
+        [Parameter(Mandatory = $true)] [int] $SelectedIndex
     )
 
-    if ([string]::IsNullOrWhiteSpace($Selection)) {
-        return @()
+    $visibleCount = [Math]::Min($Candidates.Count, 10)
+    $windowStart = [Math]::Max(0, $SelectedIndex - [Math]::Floor($visibleCount / 2))
+    $windowStart = [Math]::Min($windowStart, $Candidates.Count - $visibleCount)
+    $windowEnd = $windowStart + $visibleCount - 1
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($index in $windowStart..$windowEnd) {
+        $candidate = $Candidates[$index]
+        $marker = if ($index -eq $SelectedIndex) { '>' } else { ' ' }
+        [void] $lines.Add((
+                '{0} {1,-12} Windows status: {2}' -f $marker, $candidate.Tag, $candidate.Status
+            ))
     }
 
-    $normalized = $Selection.Trim().ToLowerInvariant()
-    if ($normalized -eq 'all') {
-        return @(0..($CandidateCount - 1))
+    [void] $lines.Add((
+            '  Showing {0}-{1} of {2}' -f ($windowStart + 1), ($windowEnd + 1), $Candidates.Count
+        ))
+    return @($lines)
+}
+
+function Write-WindowsReleaseMenu {
+    param(
+        [Parameter(Mandatory = $true)] [object[]] $Candidates,
+        [Parameter(Mandatory = $true)] [int] $SelectedIndex,
+        [switch] $Redraw
+    )
+
+    $lines = @(Format-WindowsReleaseMenu -Candidates $Candidates -SelectedIndex $SelectedIndex)
+    if ($Redraw) {
+        $menuTop = [Math]::Max(0, [Console]::CursorTop - $lines.Count)
+        [Console]::SetCursorPosition(0, $menuTop)
     }
 
-    $indices = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($rawToken in @($normalized -split ',')) {
-        $token = $rawToken.Trim()
-        if ($token -match '^(\d+)$') {
-            $start = [int] $Matches[1]
-            $end = $start
-        }
-        elseif ($token -match '^(\d+)\s*-\s*(\d+)$') {
-            $start = [int] $Matches[1]
-            $end = [int] $Matches[2]
-            if ($start -gt $end) {
-                throw "Invalid descending selection range: $token"
-            }
+    $lineWidth = 119
+    try {
+        $lineWidth = [Math]::Max(1, [Console]::BufferWidth - 1)
+    }
+    catch {
+        # Interactive hosts normally expose a buffer width. The fallback keeps
+        # the selector usable in less conventional Windows terminal hosts.
+    }
+
+    foreach ($line in $lines) {
+        $renderedLine = if ($line.Length -gt $lineWidth) {
+            $line.Substring(0, $lineWidth)
         }
         else {
-            throw "Invalid selection token: $token"
+            $line
         }
 
-        if ($start -lt 1 -or $end -gt $CandidateCount) {
-            throw "Selection $token is outside the available range 1-$CandidateCount."
-        }
-
-        foreach ($number in $start..$end) {
-            [void] $indices.Add($number - 1)
-        }
+        [Console]::Write($renderedLine.PadRight($lineWidth))
+        [Console]::WriteLine()
     }
-
-    return @($indices | Sort-Object)
 }
 
 function Read-WindowsReleaseSelection {
-    param([Parameter(Mandatory = $true)] [object[]] $Candidates)
+    param(
+        [Parameter(Mandatory = $true)] [object[]] $Candidates,
+        [scriptblock] $ReadKey,
+        [scriptblock] $Render
+    )
+
+    if ($Candidates.Count -eq 0) {
+        throw 'At least one Windows release candidate is required.'
+    }
+
+    if ($null -eq $ReadKey) {
+        if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+            throw 'Windows release selection requires an interactive terminal.'
+        }
+        $ReadKey = { return [Console]::ReadKey($true) }
+    }
+
+    if ($null -eq $Render) {
+        $Render = {
+            param($Items, $HighlightedIndex, $IsRedraw)
+            Write-WindowsReleaseMenu `
+                -Candidates $Items `
+                -SelectedIndex $HighlightedIndex `
+                -Redraw:$IsRedraw
+        }
+    }
 
     Write-Host ''
     Write-Host 'Published releases without successful Windows verification:'
-    for ($index = 0; $index -lt $Candidates.Count; $index++) {
-        $candidate = $Candidates[$index]
-        Write-Host ("  [{0}] {1}  Windows status: {2}" -f ($index + 1), $candidate.Tag, $candidate.Status)
-    }
-    Write-Host ''
+    Write-Host 'Use Up/Down to navigate, Enter to select, or Escape to cancel.'
+
+    $selectedIndex = 0
+    & $Render $Candidates $selectedIndex $false
 
     while ($true) {
-        $answer = Read-Host 'Select releases (for example 1,3-4 or all; blank cancels)'
-        try {
-            return @(
-                ConvertTo-ReleaseSelection `
-                    -Selection $answer `
-                    -CandidateCount $Candidates.Count
-            )
+        $keyInfo = & $ReadKey
+        $key = if ($keyInfo -is [System.ConsoleKeyInfo]) {
+            $keyInfo.Key
         }
-        catch {
-            Write-ReleaseWarning $_.Exception.Message
+        else {
+            [System.ConsoleKey] $keyInfo
+        }
+
+        if ($key -eq [System.ConsoleKey]::UpArrow) {
+            $selectedIndex = ($selectedIndex - 1 + $Candidates.Count) % $Candidates.Count
+            & $Render $Candidates $selectedIndex $true
+        }
+        elseif ($key -eq [System.ConsoleKey]::DownArrow) {
+            $selectedIndex = ($selectedIndex + 1) % $Candidates.Count
+            & $Render $Candidates $selectedIndex $true
+        }
+        elseif ($key -eq [System.ConsoleKey]::Enter) {
+            Write-Host ''
+            return @($selectedIndex)
+        }
+        elseif ($key -eq [System.ConsoleKey]::Escape) {
+            Write-Host ''
+            return @()
         }
     }
 }

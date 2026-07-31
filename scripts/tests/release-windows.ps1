@@ -50,25 +50,50 @@ function Invoke-Test {
 $continuationScript = Join-Path $PSScriptRoot '..' 'release.ps1'
 . $continuationScript
 
-Invoke-Test 'Multi-select accepts all candidates' {
-    $selection = @(ConvertTo-ReleaseSelection -Selection 'all' -CandidateCount 4)
-    Assert-Equal '0,1,2,3' ($selection -join ',') 'all selection'
+function Invoke-ReleaseSelectionKeys {
+    param([Parameter(Mandatory = $true)] [System.ConsoleKey[]] $Keys)
+
+    $keyQueue = [System.Collections.Generic.Queue[System.ConsoleKey]]::new()
+    foreach ($key in $Keys) {
+        $keyQueue.Enqueue($key)
+    }
+
+    $candidates = @(
+        [pscustomobject] @{ Tag = 'v3.0.0'; Status = 'missing' },
+        [pscustomobject] @{ Tag = 'v2.0.0'; Status = 'failure' },
+        [pscustomobject] @{ Tag = 'v1.0.0'; Status = 'pending' }
+    )
+    $readKey = { return $keyQueue.Dequeue() }.GetNewClosure()
+    $render = { param($Items, $SelectedIndex, $Redraw) }.GetNewClosure()
+
+    return @(
+        Read-WindowsReleaseSelection `
+            -Candidates $candidates `
+            -ReadKey $readKey `
+            -Render $render
+    )
 }
 
-Invoke-Test 'Multi-select combines ranges and removes duplicates' {
-    $selection = @(ConvertTo-ReleaseSelection -Selection '1, 3-5, 3' -CandidateCount 5)
-    Assert-Equal '0,2,3,4' ($selection -join ',') 'range selection'
+Invoke-Test 'Arrow-key selector chooses the highlighted release with Enter' {
+    $selection = @(Invoke-ReleaseSelectionKeys -Keys @(
+            [System.ConsoleKey]::DownArrow,
+            [System.ConsoleKey]::DownArrow,
+            [System.ConsoleKey]::Enter
+        ))
+    Assert-Equal '2' ($selection -join ',') 'selected release index'
 }
 
-Invoke-Test 'Multi-select rejects out-of-range choices' {
-    $threw = $false
-    try {
-        [void] @(ConvertTo-ReleaseSelection -Selection '1,4' -CandidateCount 3)
-    }
-    catch {
-        $threw = $true
-    }
-    Assert-True $threw 'out-of-range selection should fail'
+Invoke-Test 'Arrow-key selector wraps from the first release to the last' {
+    $selection = @(Invoke-ReleaseSelectionKeys -Keys @(
+            [System.ConsoleKey]::UpArrow,
+            [System.ConsoleKey]::Enter
+        ))
+    Assert-Equal '2' ($selection -join ',') 'wrapped release index'
+}
+
+Invoke-Test 'Arrow-key selector cancels with Escape' {
+    $selection = @(Invoke-ReleaseSelectionKeys -Keys @([System.ConsoleKey]::Escape))
+    Assert-Equal 0 $selection.Count 'cancelled selection count'
 }
 
 Invoke-Test 'Latest Windows status wins and unrelated contexts are ignored' {
