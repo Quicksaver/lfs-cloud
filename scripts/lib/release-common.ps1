@@ -154,7 +154,10 @@ function ConvertTo-GitHubRepositorySlug {
 }
 
 function Initialize-Release {
-    param([Parameter(Mandatory = $true)] [string] $StartDirectory)
+    param(
+        [Parameter(Mandatory = $true)] [string] $StartDirectory,
+        [switch] $AllowDetachedHead
+    )
 
     Assert-ReleaseCommand 'git'
     Assert-ReleaseCommand 'gh'
@@ -200,10 +203,14 @@ function Initialize-Release {
         '--short',
         'HEAD'
     )
-    if ($branchResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($branchResult.Output)) {
+    $script:RELEASE_BRANCH = ''
+    if (($branchResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($branchResult.Output)) -and
+        -not $AllowDetachedHead) {
         throw 'A local branch must be checked out; detached HEAD is not supported.'
     }
-    $script:RELEASE_BRANCH = $branchResult.Output
+    if ($branchResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($branchResult.Output)) {
+        $script:RELEASE_BRANCH = $branchResult.Output
+    }
 
     $shaResult = Invoke-NativeCapture 'git' @('-C', $script:RELEASE_REPO_ROOT, 'rev-parse', 'HEAD')
     if ($shaResult.ExitCode -ne 0 -or $shaResult.Output -notmatch '^[0-9a-f]{40}$') {
@@ -237,6 +244,96 @@ function Assert-ReleaseTrackedClean {
     if ($stagedResult.ExitCode -ne 0) {
         throw 'Staged changes must be committed before continuing.'
     }
+}
+
+function Assert-ReleaseFullyClean {
+    $statusResult = Invoke-NativeCapture 'git' @(
+        '-C',
+        $script:RELEASE_REPO_ROOT,
+        'status',
+        '--porcelain=v1',
+        '--untracked-files=all'
+    )
+    if ($statusResult.ExitCode -ne 0) {
+        throw 'Could not inspect the working tree.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($statusResult.Output)) {
+        throw 'The working tree must be completely clean before continuing.'
+    }
+}
+
+function Get-RemoteReleaseTagCommit {
+    param([Parameter(Mandatory = $true)] [string] $Tag)
+
+    $peeledReference = "refs/tags/{0}^{{}}" -f $Tag
+    $result = Invoke-NativeCapture 'git' @(
+        '-C',
+        $script:RELEASE_REPO_ROOT,
+        'ls-remote',
+        '--tags',
+        'origin',
+        "refs/tags/$Tag",
+        $peeledReference
+    )
+    if ($result.ExitCode -ne 0) {
+        throw "Could not read release tag $Tag from origin."
+    }
+
+    $directCommit = ''
+    $peeledCommit = ''
+    foreach ($line in @($result.Output -split "`n")) {
+        if ($line -notmatch '^([0-9a-f]{40})\s+(.+)$') {
+            continue
+        }
+
+        if ($Matches[2] -eq $peeledReference) {
+            $peeledCommit = $Matches[1]
+        }
+        elseif ($Matches[2] -eq "refs/tags/$Tag") {
+            $directCommit = $Matches[1]
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($peeledCommit)) {
+        return $peeledCommit
+    }
+    return $directCommit
+}
+
+function Assert-ReleaseCurrentCommitForTag {
+    param([Parameter(Mandatory = $true)] [string] $Tag)
+
+    $localResult = Invoke-NativeCapture 'git' @(
+        '-C',
+        $script:RELEASE_REPO_ROOT,
+        'rev-list',
+        '-n',
+        '1',
+        "refs/tags/$Tag"
+    )
+    if ($localResult.ExitCode -ne 0 -or $localResult.Output -ne $script:RELEASE_SHA) {
+        throw "Current commit $($script:RELEASE_SHA) is not local release tag $Tag."
+    }
+
+    $remoteCommit = Get-RemoteReleaseTagCommit -Tag $Tag
+    if ([string]::IsNullOrWhiteSpace($remoteCommit) -or $remoteCommit -ne $script:RELEASE_SHA) {
+        if ([string]::IsNullOrWhiteSpace($remoteCommit)) {
+            $remoteCommit = 'missing'
+        }
+        throw "Current commit $($script:RELEASE_SHA) is not origin release tag $Tag ($remoteCommit)."
+    }
+
+    $githubResult = Invoke-NativeCapture 'gh' @(
+        'api',
+        "repos/$($script:RELEASE_GITHUB_REPO)/commits/$($script:RELEASE_SHA)",
+        '--jq',
+        '.sha'
+    )
+    if ($githubResult.ExitCode -ne 0 -or $githubResult.Output -ne $script:RELEASE_SHA) {
+        throw "GitHub does not report release commit $($script:RELEASE_SHA) for $($script:RELEASE_GITHUB_REPO)."
+    }
+
+    Write-ReleasePass "Current commit is release tag $Tag on origin"
 }
 
 function Assert-ReleaseCurrentCommitOnOrigin {

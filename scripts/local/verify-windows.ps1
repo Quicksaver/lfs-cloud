@@ -2,8 +2,9 @@
 
 [CmdletBinding()]
 param(
-    [Alias('h')]
-    [switch] $Help
+    [Alias('h')] [switch] $Help,
+    [string] $ReleaseTag,
+    [switch] $DeferSuccessStatus
 )
 
 Set-StrictMode -Version Latest
@@ -15,10 +16,15 @@ $scriptDirectory = Split-Path -Parent $PSCommandPath
 function Write-Usage {
     @'
 Usage: pwsh ./scripts/local/verify-windows.ps1
+       pwsh ./scripts/local/verify-windows.ps1 -ReleaseTag vX.Y.Z
 
 Run the complete deterministic Windows x86-64 verification with the active
 system Rust toolchain and post the local-checks/windows-x86_64 status to the
 pushed commit.
+
+-ReleaseTag verifies a detached, published release-tag checkout instead of the
+current branch. -DeferSuccessStatus leaves the status pending for a caller that
+must publish and verify release assets before marking the commit successful.
 '@ | Write-Host
 }
 
@@ -104,6 +110,11 @@ function New-WindowsReleasePackage {
 }
 
 function Invoke-WindowsVerification {
+    param(
+        [string] $ReleaseTag,
+        [switch] $DeferSuccessStatus
+    )
+
     Initialize-ReleaseUi '[verify-windows]' 'Verify Windows x86-64 release'
 
     $statusStarted = $false
@@ -119,11 +130,23 @@ function Invoke-WindowsVerification {
         # status writes, dependency installation, and verification commands.
         Assert-WindowsX64Host
 
-        Initialize-Release -StartDirectory $scriptDirectory
+        Initialize-Release `
+            -StartDirectory $scriptDirectory `
+            -AllowDetachedHead:(-not [string]::IsNullOrWhiteSpace($ReleaseTag))
         Set-Location -LiteralPath $script:RELEASE_REPO_ROOT
 
         Assert-ReleaseTrackedClean
-        Assert-ReleaseCurrentCommitOnOrigin
+        if ([string]::IsNullOrWhiteSpace($ReleaseTag)) {
+            Assert-ReleaseCurrentCommitOnOrigin
+        }
+        else {
+            Assert-ReleaseCurrentCommitForTag -Tag $ReleaseTag
+        }
+
+        $version = Get-MatchingReleaseVersion -RepositoryRoot $script:RELEASE_REPO_ROOT
+        if (-not [string]::IsNullOrWhiteSpace($ReleaseTag) -and $ReleaseTag -ne "v$version") {
+            throw "Release tag $ReleaseTag does not match package version $version."
+        }
 
         Invoke-ReleaseActionStep 'Record local Windows verification as pending' {
             Set-ReleaseStatus `
@@ -181,7 +204,6 @@ function Invoke-WindowsVerification {
                 '.agents/skills/smoke-test/scripts/smoke-test.ts'
             )
 
-        $version = Get-MatchingReleaseVersion -RepositoryRoot $script:RELEASE_REPO_ROOT
         $binaryVersion = Invoke-NativeCapture $releaseBinary @('--version')
         if ($binaryVersion.ExitCode -ne 0 -or $binaryVersion.Output -ne "lfscloud $version") {
             throw "Release binary version does not match package version $version."
@@ -204,14 +226,16 @@ function Invoke-WindowsVerification {
         }
 
         $checksPassed = $true
-        Invoke-ReleaseActionStep 'Record local Windows verification as successful' {
-            Set-ReleaseStatus `
-                -Commit $script:RELEASE_SHA `
-                -Context $script:LOCAL_WINDOWS_STATUS_CONTEXT `
-                -State 'success' `
-                -Description "Local Windows $windowsVersion x86-64 checks passed"
+        if (-not $DeferSuccessStatus) {
+            Invoke-ReleaseActionStep 'Record local Windows verification as successful' {
+                Set-ReleaseStatus `
+                    -Commit $script:RELEASE_SHA `
+                    -Context $script:LOCAL_WINDOWS_STATUS_CONTEXT `
+                    -State 'success' `
+                    -Description "Local Windows $windowsVersion x86-64 checks passed"
+            }
+            $statusFinalized = $true
         }
-        $statusFinalized = $true
 
         Write-ReleasePass "Local Windows verification passed for $($script:RELEASE_SHA)"
         Write-ReleaseInfo "Artifact: $($package.Artifact)"
@@ -253,5 +277,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         exit 0
     }
 
-    exit (Invoke-WindowsVerification)
+    exit (Invoke-WindowsVerification `
+            -ReleaseTag $ReleaseTag `
+            -DeferSuccessStatus:$DeferSuccessStatus)
 }

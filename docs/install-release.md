@@ -154,6 +154,16 @@ The release script:
 6. Creates and pushes an annotated `vX.Y.Z` tag for the exact verified commit.
 7. Creates a draft GitHub release, uploads the three binary archives, checksums, and build manifests, verifies all assets, and only then publishes the release.
 
+After `release.sh` succeeds, continue the same published release from a clean native Windows x86-64 checkout:
+
+```powershell
+yarn release:windows
+```
+
+The Windows continuation inspects published semantic-version releases and offers a multi-select containing only versions whose latest `local-checks/windows-x86_64` status is not successful. Missing, failed, or interrupted checks remain selectable so publication can be retried. For every selection, it verifies that the local and remote tag identify the published release commit, checks out the tag in detached-HEAD mode, and runs the complete native Windows verifier against that exact source version.
+
+After verification, the continuation uploads the versioned Windows archive, SHA-256 checksum, and commit-bound build manifest to the existing GitHub release. It validates each remote asset's name, size, and GitHub-reported SHA-256 digest before recording the Windows status as successful. A build or publication failure records a failed status, leaves the version eligible for a retry, and continues with any other selected versions. The original branch and commit are restored before the command exits, including after failures.
+
 If an interruption occurs after the version commit or tag is pushed, do not increment the version again. Restore the required green local status and artifact if necessary, then continue safely:
 
 ```bash
@@ -162,7 +172,7 @@ yarn release:local resume
 
 ## Expected Release Artifact
 
-Successful manual CI jobs package tested executables in 14-day workflow artifacts. The local release path publishes tested macOS ARM64, Linux ARM64 musl, and Linux x86-64 musl archives with SHA-256 checksums and commit-bound build manifests as GitHub Release assets. The expected release artifact remains the compiled `lfscloud` binary plus documentation for:
+Successful manual CI jobs package tested executables in 14-day workflow artifacts. The first local release phase publishes tested macOS ARM64, Linux ARM64 musl, and Linux x86-64 musl archives with SHA-256 checksums and commit-bound build manifests as GitHub Release assets. The native Windows continuation adds the corresponding tested Windows x86-64 archive, checksum, and manifest to that published version. The expected release artifact remains the compiled `lfscloud` binary plus documentation for:
 
 - supported platform and architecture
 - config file schema
