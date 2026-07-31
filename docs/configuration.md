@@ -113,7 +113,24 @@ storage_providers:
     root_folder_id: 012345abcdef
 ```
 
-Install `gcloud`, create the directory, and generate the credentials once with the browser flow documented in the README. The directory must contain `application_default_credentials.json`. LFS Cloud invokes `gcloud` at runtime, so the executable must remain installed and accessible to the server user. When `credentials.executable` is omitted, LFS Cloud defaults to `gcloud.cmd` on Windows and `gcloud` on other platforms.
+Install `gcloud`, create a Desktop app OAuth client in a Google Cloud project with the Drive API enabled, and download its client JSON. Then generate the isolated ADC state with that project-specific client:
+
+```bash
+mkdir -p "$HOME/.config/lfscloud/gcloud-drive"
+chmod 700 "$HOME/.config/lfscloud/gcloud-drive"
+
+CLOUDSDK_CONFIG="$HOME/.config/lfscloud/gcloud-drive" \
+  gcloud auth application-default login \
+  --client-id-file="$HOME/Downloads/client_secret.json" \
+  --scopes="https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive.file"
+
+chmod 600 \
+  "$HOME/.config/lfscloud/gcloud-drive/application_default_credentials.json"
+```
+
+Keep `--client-id-file` when reauthorizing expired or revoked ADC. Omitting it can select the Google Cloud CLI's shared OAuth client instead of the project where you enabled Drive, causing Drive requests to fail with quota-project or `SERVICE_DISABLED` errors even though token minting succeeds.
+
+The directory must contain `application_default_credentials.json`. LFS Cloud invokes `gcloud` at runtime, so the executable must remain installed and accessible to the server user. When `credentials.executable` is omitted, LFS Cloud defaults to `gcloud.cmd` on Windows and `gcloud` on other platforms.
 
 On Windows, if `gcloud.cmd` cannot find an otherwise available Python installation, point the Google Cloud CLI at the global interpreter and open a new terminal:
 
@@ -125,7 +142,7 @@ On Windows, if `gcloud.cmd` cannot find an otherwise available Python installati
 )
 ```
 
-The MVP Drive scope is:
+Google Cloud CLI requires `cloud-platform` when explicit ADC scopes are provided; the additional MVP Drive scope is:
 
 ```text
 https://www.googleapis.com/auth/drive.file
