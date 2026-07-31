@@ -53,8 +53,15 @@ function New-WindowsReleasePackage {
     $manifest = Get-WindowsManifestPath -RepositoryRoot $RepositoryRoot -Version $Version
     $distDirectory = Split-Path -Parent $artifact
     [void][System.IO.Directory]::CreateDirectory($distDirectory)
+    $legacyArtifact = Join-Path $distDirectory "lfscloud-v$Version-windows-x86_64.tar.gz"
 
-    foreach ($existingPath in @($artifact, "$artifact.sha256", $manifest)) {
+    foreach ($existingPath in @(
+            $artifact,
+            "$artifact.sha256",
+            $manifest,
+            $legacyArtifact,
+            "$legacyArtifact.sha256"
+        )) {
         Remove-Item -LiteralPath $existingPath -Force -ErrorAction SilentlyContinue
     }
 
@@ -74,10 +81,14 @@ function New-WindowsReleasePackage {
         -LiteralPath (Join-Path $RepositoryRoot 'docs' 'install-release.md') `
         -Destination $docsDirectory
 
-    Invoke-ReleaseStep `
-        -Message 'Create the Windows release archive' `
-        -Command 'tar' `
-        -Arguments @('-czf', $artifact, '-C', $PackageStage.Value, $packageName)
+    Invoke-ReleaseActionStep 'Create the Windows release archive' {
+        [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $PackageStage.Value,
+            $artifact,
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $false
+        )
+    }
 
     Remove-Item -LiteralPath $PackageStage.Value -Recurse -Force
     $PackageStage.Value = ''
@@ -157,7 +168,7 @@ function Invoke-WindowsVerification {
         }
         $statusStarted = $true
 
-        foreach ($command in @('cargo', 'node', 'rustc', 'tar', 'yarn')) {
+        foreach ($command in @('cargo', 'node', 'rustc', 'yarn')) {
             Assert-ReleaseCommand $command
         }
 

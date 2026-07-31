@@ -101,12 +101,20 @@ Invoke-Test 'Cargo and package versions are read independently' {
     }
 }
 
+Invoke-Test 'Windows release artifact uses the ZIP format' {
+    $artifact = Get-WindowsArtifactPath -RepositoryRoot 'C:\fixture' -Version '1.2.3'
+    Assert-Equal `
+        'lfscloud-v1.2.3-windows-x86_64.zip' `
+        ([System.IO.Path]::GetFileName($artifact)) `
+        'Windows artifact name'
+}
+
 Invoke-Test 'Windows build manifest is bound to artifact, digest, version, and commit' {
     $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) "lfscloud-manifest-test-$([guid]::NewGuid().ToString('N'))"
     [void][System.IO.Directory]::CreateDirectory($fixtureRoot)
 
     try {
-        $artifact = Join-Path $fixtureRoot 'lfscloud-v1.2.3-windows-x86_64.tar.gz'
+        $artifact = Join-Path $fixtureRoot 'lfscloud-v1.2.3-windows-x86_64.zip'
         $manifest = Join-Path $fixtureRoot 'lfscloud-v1.2.3-windows-x86_64.build.json'
         [System.IO.File]::WriteAllText($artifact, 'verified artifact bytes')
         $digest = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -153,6 +161,11 @@ Invoke-Test 'Windows package contains the verified binary and documentation' {
             [System.IO.File]::WriteAllText($path, "fixture $file")
         }
 
+        $legacyArtifact = Join-Path $fixtureRoot 'dist/lfscloud-v1.2.3-windows-x86_64.tar.gz'
+        [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $legacyArtifact))
+        [System.IO.File]::WriteAllText($legacyArtifact, 'stale archive')
+        [System.IO.File]::WriteAllText("$legacyArtifact.sha256", 'stale checksum')
+
         $packageStage = ''
         $package = New-WindowsReleasePackage `
             -RepositoryRoot $fixtureRoot `
@@ -170,17 +183,24 @@ Invoke-Test 'Windows package contains the verified binary and documentation' {
                 -ManifestPath $package.Manifest `
                 -Version '1.2.3' `
                 -Commit 'abc123') 'manifest should validate'
+        Assert-True (-not (Test-Path -LiteralPath $legacyArtifact)) 'legacy tar archive should be removed'
+        Assert-True (-not (Test-Path -LiteralPath "$legacyArtifact.sha256")) 'legacy tar checksum should be removed'
 
-        $archiveListing = Invoke-NativeCapture 'tar' @('-tzf', $package.Artifact)
-        Assert-Equal 0 $archiveListing.ExitCode 'archive listing exit code'
-        foreach ($entry in @(
-                'lfscloud-v1.2.3-windows-x86_64/lfscloud.exe',
-                'lfscloud-v1.2.3-windows-x86_64/LICENSE',
-                'lfscloud-v1.2.3-windows-x86_64/README.md',
-                'lfscloud-v1.2.3-windows-x86_64/docs/configuration.md',
-                'lfscloud-v1.2.3-windows-x86_64/docs/install-release.md'
-            )) {
-            Assert-True ($archiveListing.Output -split "`n" -contains $entry) "archive should contain $entry"
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($package.Artifact)
+        try {
+            $archiveEntries = @($archive.Entries | ForEach-Object { $_.FullName })
+            foreach ($entry in @(
+                    'lfscloud-v1.2.3-windows-x86_64/lfscloud.exe',
+                    'lfscloud-v1.2.3-windows-x86_64/LICENSE',
+                    'lfscloud-v1.2.3-windows-x86_64/README.md',
+                    'lfscloud-v1.2.3-windows-x86_64/docs/configuration.md',
+                    'lfscloud-v1.2.3-windows-x86_64/docs/install-release.md'
+                )) {
+                Assert-True ($archiveEntries -contains $entry) "archive should contain $entry"
+            }
+        }
+        finally {
+            $archive.Dispose()
         }
         Assert-Equal '' $packageStage 'package staging directory should be cleared'
     }

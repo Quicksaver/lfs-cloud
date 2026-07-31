@@ -455,7 +455,7 @@ function Get-WindowsArtifactPath {
         [Parameter(Mandatory = $true)] [string] $Version
     )
 
-    return Join-Path $RepositoryRoot 'dist' "lfscloud-v$Version-windows-x86_64.tar.gz"
+    return Join-Path $RepositoryRoot 'dist' "lfscloud-v$Version-windows-x86_64.zip"
 }
 
 function Get-WindowsManifestPath {
