@@ -810,7 +810,7 @@ mod materialization_tests {
         use std::os::unix::fs::PermissionsExt;
 
         const UMASK_CHILD_ENV: &str = "LFS_CLOUD_MATERIALIZATION_UMASK_CHILD";
-        const TEST_NAME: &str = "local_cache::tests::materialize_object_respects_restrictive_process_umask_for_new_files";
+        const TEST_NAME: &str = "local_cache::materialization::materialization_tests::materialize_object_respects_restrictive_process_umask_for_new_files";
 
         if std::env::var_os(UMASK_CHILD_ENV).is_none() {
             let current_exe = std::env::current_exe().expect("test executable should resolve");
