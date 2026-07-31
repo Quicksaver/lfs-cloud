@@ -47,10 +47,19 @@ function Invoke-ReleaseStep {
         return
     }
 
+    $failureOutput = @(
+        ui_get_live_output_tail_lines |
+            ForEach-Object { ui_strip_ansi $_ }
+    )
     ui_set_live_task_state 'fail' $Message
     ui_clear_live_task
     fail $Message
-    throw "Verification step failed: $Message"
+
+    $failureMessage = "Verification step failed: $Message"
+    if ($failureOutput.Count -gt 0) {
+        $failureMessage += "`n$($failureOutput -join "`n")"
+    }
+    throw $failureMessage
 }
 
 function Invoke-ReleaseActionStep {

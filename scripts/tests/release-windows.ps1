@@ -96,6 +96,45 @@ Invoke-Test 'Arrow-key selector cancels with Escape' {
     Assert-Equal 0 $selection.Count 'cancelled selection count'
 }
 
+Invoke-Test 'Windows upload passes each asset path as a distinct argument' {
+    $assetPaths = @('archive.tar.gz', 'archive.tar.gz.sha256', 'archive.build.json')
+    $arguments = @(Get-WindowsReleaseUploadArguments `
+            -Tag 'v1.2.3' `
+            -AssetPaths $assetPaths `
+            -Repository 'owner/repository')
+
+    Assert-Equal 9 $arguments.Count 'upload argument count'
+    Assert-Equal 'archive.tar.gz' $arguments[3] 'archive argument'
+    Assert-Equal 'archive.tar.gz.sha256' $arguments[4] 'checksum argument'
+    Assert-Equal 'archive.build.json' $arguments[5] 'manifest argument'
+    Assert-Equal '--repo' $arguments[6] 'repository flag'
+}
+
+Invoke-Test 'Release step failure retains native command output' {
+    $originalRunner = (Get-Item Function:ui_run_with_live_stdout).ScriptBlock
+    try {
+        Set-Item Function:ui_run_with_live_stdout {
+            [void] $script:LIVE_OUTPUT_TAIL_LINES.Add('upload failed: fixture reason')
+            return $false
+        }
+
+        $message = ''
+        try {
+            Invoke-ReleaseStep -Message 'Upload fixture' -Command 'fixture'
+        }
+        catch {
+            $message = $_.Exception.Message
+        }
+
+        Assert-True `
+            ($message.Contains('upload failed: fixture reason')) `
+            'native failure output should be retained in the exception'
+    }
+    finally {
+        Set-Item Function:ui_run_with_live_stdout $originalRunner
+    }
+}
+
 Invoke-Test 'Latest Windows status wins and unrelated contexts are ignored' {
     $document = [pscustomobject] @{
         statuses = @(

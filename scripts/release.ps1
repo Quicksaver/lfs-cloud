@@ -373,6 +373,30 @@ function Assert-WindowsReleaseAssetsPublished {
     }
 }
 
+function Get-WindowsReleaseUploadArguments {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Tag,
+        [Parameter(Mandatory = $true)] [string[]] $AssetPaths,
+        [Parameter(Mandatory = $true)] [string] $Repository
+    )
+
+    # A nested array passed to a [string[]] PowerShell parameter is coerced to
+    # one space-joined string. Add each path independently so gh receives three
+    # file arguments rather than one nonexistent combined path.
+    $arguments = [System.Collections.Generic.List[string]]::new()
+    foreach ($argument in @('release', 'upload', $Tag)) {
+        [void] $arguments.Add($argument)
+    }
+    foreach ($assetPath in $AssetPaths) {
+        [void] $arguments.Add($assetPath)
+    }
+    foreach ($argument in @('--repo', $Repository, '--clobber')) {
+        [void] $arguments.Add($argument)
+    }
+
+    return @($arguments)
+}
+
 function Publish-WindowsReleaseAssets {
     param([Parameter(Mandatory = $true)] $Candidate)
 
@@ -408,15 +432,10 @@ function Publish-WindowsReleaseAssets {
         Invoke-ReleaseStep `
             -Message "Upload Windows assets to $($Candidate.Tag)" `
             -Command 'gh' `
-            -Arguments @(
-                'release',
-                'upload',
-                $Candidate.Tag,
-                $assets,
-                '--repo',
-                $script:RELEASE_GITHUB_REPO,
-                '--clobber'
-            )
+            -Arguments @(Get-WindowsReleaseUploadArguments `
+                -Tag $Candidate.Tag `
+                -AssetPaths $assets `
+                -Repository $script:RELEASE_GITHUB_REPO)
 
         Invoke-ReleaseActionStep 'Verify published Windows assets' {
             $publishedRelease = Get-GitHubReleaseDocument -Tag $Candidate.Tag
