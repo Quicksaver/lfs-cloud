@@ -5,6 +5,7 @@
 
 mod child_process;
 mod cli;
+mod config_edit;
 pub mod credentials;
 pub mod error;
 pub mod git;

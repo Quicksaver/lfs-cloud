@@ -87,6 +87,16 @@ repositories:
     storage_provider: drive-personal
 ```
 
+The same provider and repository entries can be added interactively:
+
+```bash
+lfscloud --config ./lfscloud.yml config repository add
+lfscloud --config ./lfscloud.yml config storage add
+lfscloud --config ./lfscloud.yml repository add
+```
+
+Create the file and its `server` section first. Passing no entry flags prompts for the complete entry; passing any entry flag makes `add` non-interactive. Existing IDs can be updated with only the fields that should change. See [Manage Configuration From The CLI](docs/configuration.md#manage-configuration-from-the-cli) for every flag plus `list` and `remove`.
+
 Get GitHub's stable numeric repository ID with:
 
 ```bash
@@ -154,6 +164,9 @@ Execution requires `--all-refs`; narrower current-checkout and `--ref` scopes re
 
 | Command                        | Purpose                                                         |
 | ------------------------------ | --------------------------------------------------------------- |
+| `lfscloud config repository`   | Add, update, list, or remove repository-provider configuration  |
+| `lfscloud config storage`      | Add, update, list, or remove storage-provider configuration     |
+| `lfscloud repository`          | Add, update, list, or remove served repository mappings         |
 | `lfscloud serve`               | Run the Git LFS-compatible server                               |
 | `lfscloud init`                | Configure the current repository's LFS Cloud endpoint           |
 | `lfscloud login`               | Create and store a repository-scoped local session              |

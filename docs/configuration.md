@@ -9,6 +9,89 @@ The committed repository-side `.lfsconfig` should contain only the LFS Cloud end
     url = http://127.0.0.1:8080/github.com/octo-org/assets.git/info/lfs
 ```
 
+## Manage Configuration From The CLI
+
+Create `lfscloud.yml` and its `server` section before using the configuration commands. The commands manage the three provider and routing sections:
+
+```text
+lfscloud config repository  -> repository_providers
+lfscloud config storage     -> storage_providers
+lfscloud repository         -> repositories
+```
+
+Each resource supports `add`, `list`, and `remove`. With no entry flags, `add` prompts for a complete new entry or all values of an existing entry:
+
+```bash
+lfscloud --config ./lfscloud.yml config repository add
+lfscloud --config ./lfscloud.yml config storage add
+lfscloud --config ./lfscloud.yml repository add
+```
+
+Press Enter to accept a displayed default or retain an existing value. PAT input is hidden when the prompt is attached to a terminal. If any entry flag is supplied, the command is non-interactive. A new entry then requires every required field, while an existing `--id` accepts only the fields to update. Replaying the same update succeeds without changing the file.
+
+The complete flag-based forms for the currently supported providers are:
+
+```bash
+lfscloud --config ./lfscloud.yml config repository add \
+  --id github-main \
+  --type github \
+  --api-url https://api.github.com \
+  --personal-access-token '${LFS_CLOUD_GITHUB_PAT}'
+
+lfscloud --config ./lfscloud.yml config storage add \
+  --id drive-personal \
+  --type google-drive \
+  --credentials-type gcloud \
+  --config-dir '${HOME}/.config/lfscloud/gcloud-drive' \
+  --executable gcloud \
+  --root-folder-id YOUR_DRIVE_FOLDER_ID \
+  --display-name 'Personal Drive LFS'
+
+lfscloud --config ./lfscloud.yml repository add \
+  --id github-main:OWNER/REPOSITORY \
+  --repo-provider github-main \
+  --host github.com \
+  --owner OWNER \
+  --name REPOSITORY \
+  --provider-repository-id 123456789 \
+  --storage-provider drive-personal
+```
+
+Single-quote environment references so the shell does not expand them before they are written. Supplying a literal PAT on a command line can expose it to local process inspection or shell history; prefer the quoted environment reference shown above.
+
+Every environment variable referenced anywhere in the config must be set while a changed document is validated, just as it must be set when the server loads that config.
+
+Partial updates identify the existing entry by its stable ID:
+
+```bash
+lfscloud --config ./lfscloud.yml config storage add \
+  --id drive-personal \
+  --display-name 'Archive Drive'
+
+lfscloud --config ./lfscloud.yml repository add \
+  --id github-main:OWNER/REPOSITORY \
+  --storage-provider drive-archive
+```
+
+List commands print tab-separated, script-friendly summaries. Repository provider lists report only whether authentication is configured and never print PAT values:
+
+```bash
+lfscloud --config ./lfscloud.yml config repository list
+lfscloud --config ./lfscloud.yml config storage list
+lfscloud --config ./lfscloud.yml repository list
+```
+
+Remove commands are idempotent: removing an absent ID succeeds and reports that it was not found. A provider cannot be removed while a repository mapping still references it, because every changed document is validated before it replaces the original:
+
+```bash
+lfscloud --config ./lfscloud.yml repository remove \
+  --id github-main:OWNER/REPOSITORY
+lfscloud --config ./lfscloud.yml config storage remove --id drive-personal
+lfscloud --config ./lfscloud.yml config repository remove --id github-main
+```
+
+Successful writes use a temporary file beside the config, preserve the original file permissions, and atomically replace it after validation. YAML values and environment references are preserved, but comments and custom formatting are normalized when a change is written.
+
 ## Migration Configuration
 
 `lfscloud migrate` uses the repository mapping and Google Drive provider from the private server config supplied through the global `--config` option. The running server, migration command, and any other writer for the same Drive root must use the same `server.metadata_path`; migration shares its object upload locks with the server to prevent duplicate backend files.

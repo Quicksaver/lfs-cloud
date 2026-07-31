@@ -250,6 +250,144 @@ async function initRepositorySmoke(): Promise<void> {
   assert(!(await pathExists(join(localRepo, '.lfsconfig'))), 'init --local created .lfsconfig');
 }
 
+async function configurationCommandsSmoke(): Promise<void> {
+  const configPath = join(sandbox, 'configuration-commands.yml');
+  await writeFile(configPath, 'server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n');
+
+  await command(binaryPath, [
+    '--config',
+    configPath,
+    'config',
+    'repository',
+    'add',
+    '--id',
+    'github-main',
+    '--type',
+    'github',
+    '--api-url',
+    'https://api.github.com',
+    '--personal-access-token',
+    'smoke-pat',
+  ]);
+  await command(binaryPath, [
+    '--config',
+    configPath,
+    'config',
+    'storage',
+    'add',
+    '--id',
+    'drive-main',
+    '--type',
+    'google-drive',
+    '--credentials-type',
+    'gcloud',
+    '--config-dir',
+    join(sandbox, 'configuration-gcloud'),
+    '--executable',
+    process.platform === 'win32' ? 'gcloud.cmd' : 'gcloud',
+    '--root-folder-id',
+    'smoke-root',
+    '--display-name',
+    'Smoke Drive',
+  ]);
+  await command(binaryPath, [
+    '--config',
+    configPath,
+    'repository',
+    'add',
+    '--id',
+    'github-main:smoke-owner/smoke-repo',
+    '--repo-provider',
+    'github-main',
+    '--host',
+    'github.com',
+    '--owner',
+    'smoke-owner',
+    '--name',
+    'smoke-repo',
+    '--provider-repository-id',
+    '123456789',
+    '--storage-provider',
+    'drive-main',
+  ]);
+
+  const updated = await command(binaryPath, [
+    '--config',
+    configPath,
+    'repository',
+    'add',
+    '--id',
+    'github-main:smoke-owner/smoke-repo',
+    '--name',
+    'smoke-renamed',
+  ]);
+  const unchanged = await command(binaryPath, [
+    '--config',
+    configPath,
+    'repository',
+    'add',
+    '--id',
+    'github-main:smoke-owner/smoke-repo',
+    '--name',
+    'smoke-renamed',
+  ]);
+  assert(updated.includes('updated repository'), 'partial repository add did not update the existing mapping');
+  assert(unchanged.includes('unchanged repository'), 'repeated repository add was not idempotent');
+
+  const repositoryProviders = await command(binaryPath, ['--config', configPath, 'config', 'repository', 'list']);
+  const storageProviders = await command(binaryPath, ['--config', configPath, 'config', 'storage', 'list']);
+  const repositories = await command(binaryPath, ['--config', configPath, 'repository', 'list']);
+  assert(repositoryProviders.includes('github-main'), 'repository-provider list omitted the configured provider');
+  assert(repositoryProviders.includes('configured'), 'repository-provider list omitted redacted auth state');
+  assert(!repositoryProviders.includes('smoke-pat'), 'repository-provider list leaked the configured PAT');
+  assert(storageProviders.includes('drive-main'), 'storage-provider list omitted the configured provider');
+  assert(storageProviders.includes('Smoke Drive'), 'storage-provider list omitted the display name');
+  assert(repositories.includes('smoke-renamed'), 'repository list omitted the partially updated mapping');
+
+  await command(binaryPath, [
+    '--config',
+    configPath,
+    'repository',
+    'remove',
+    '--id',
+    'github-main:smoke-owner/smoke-repo',
+  ]);
+  const repeatedRemove = await command(binaryPath, [
+    '--config',
+    configPath,
+    'repository',
+    'remove',
+    '--id',
+    'github-main:smoke-owner/smoke-repo',
+  ]);
+  assert(repeatedRemove.includes('not found repository'), 'repeated repository remove was not idempotent');
+  await command(binaryPath, ['--config', configPath, 'config', 'storage', 'remove', '--id', 'drive-main']);
+  await command(binaryPath, ['--config', configPath, 'config', 'repository', 'remove', '--id', 'github-main']);
+
+  const interactivePath = join(sandbox, 'interactive-configuration-commands.yml');
+  await writeFile(interactivePath, 'server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n');
+  const interactiveRepositoryProvider = await command(
+    binaryPath,
+    ['--config', interactivePath, 'config', 'repository', 'add'],
+    { input: 'github-interactive\n\n\ninteractive-secret-pat\n' },
+  );
+  assert(
+    !interactiveRepositoryProvider.includes('interactive-secret-pat'),
+    'interactive repository-provider add echoed its PAT',
+  );
+  await command(binaryPath, ['--config', interactivePath, 'config', 'storage', 'add'], {
+    input: `drive-interactive\n\n\n${join(sandbox, 'interactive-gcloud')}\n\ninteractive-root\nInteractive Drive\n`,
+  });
+  await command(binaryPath, ['--config', interactivePath, 'repository', 'add'], {
+    input: 'github-interactive:owner/repo\ngithub-interactive\n\nowner\nrepo\n987654321\ndrive-interactive\n',
+  });
+  const interactiveRepositories = await command(binaryPath, ['--config', interactivePath, 'repository', 'list']);
+  assert(
+    interactiveRepositories.includes('github-interactive:owner/repo'),
+    'interactive repository add did not create a listable mapping',
+  );
+}
+
 async function migrationDryRunSmoke(): Promise<void> {
   const migrationRepo = join(sandbox, 'existing-lfs');
   const cacheRoot = join(sandbox, 'migration-cache');
@@ -458,6 +596,8 @@ function tests(): SmokeTest[] {
         const help = await command(binaryPath, ['--help']);
         const version = await command(binaryPath, ['--version']);
         for (const subcommand of [
+          'config',
+          'repository',
           'serve',
           'login',
           'logout',
@@ -488,6 +628,7 @@ function tests(): SmokeTest[] {
         await command('cargo', ['test', '--doc'], { timeoutMs: 30 * 60 * 1000 });
       },
     },
+    { name: 'configuration command workflows', run: configurationCommandsSmoke },
     { name: 'repository initialization', run: initRepositorySmoke },
     { name: 'historical Git LFS migration planning', run: migrationDryRunSmoke },
     { name: 'Git credential approval', run: () => script('verify-git-credential-approve.sh') },

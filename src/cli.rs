@@ -19,13 +19,17 @@ use std::{
 };
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::{Client, StatusCode as HttpStatusCode, redirect::Policy};
 use url::Url;
 
 use crate::child_process::{
     ChildProcessError, ChildProcessOptions, ChildProcessOutput, PipeCapture,
     configure_process_tree, wait_for_child,
+};
+use crate::config_edit::{
+    EditOutcome, EditableServerConfig, RemoveOutcome, RepositoryProviderValues, RepositoryValues,
+    StorageProviderValues,
 };
 use crate::git_output::{GitPathOutputError, parse_lfs_filter_attribute_paths};
 use crate::{
@@ -60,6 +64,7 @@ const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
 const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
 const MAX_LOGIN_TOKEN_INPUT_BYTES: usize = 1024;
+const MAX_CONFIG_PROMPT_INPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "lfscloud", version, about, propagate_version = true)]
@@ -79,6 +84,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage repository-provider and storage-provider configuration.
+    Config(ConfigCommand),
+    /// Manage repositories served by this LFS Cloud instance.
+    Repository(RepositoryCommand),
     /// Run the local Git LFS-compatible HTTP server.
     Serve(ServeCommand),
     /// Authenticate with GitHub and store the local LFS token for this repo.
@@ -103,6 +112,183 @@ enum Command {
     Gc(GcCommand),
     /// Migrate objects from an existing Git LFS provider.
     Migrate(MigrateCommand),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ConfigurationCommand {
+    Config(ConfigCommand),
+    Repository(RepositoryCommand),
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+struct ConfigCommand {
+    #[command(subcommand)]
+    resource: ConfigResourceCommand,
+}
+
+#[derive(Debug, Subcommand, Eq, PartialEq)]
+enum ConfigResourceCommand {
+    /// Manage repository-provider configuration.
+    Repository(ConfigRepositoryCommand),
+    /// Manage storage-provider configuration.
+    Storage(ConfigStorageCommand),
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+struct ConfigRepositoryCommand {
+    #[command(subcommand)]
+    action: ConfigRepositoryAction,
+}
+
+#[derive(Debug, Subcommand, Eq, PartialEq)]
+enum ConfigRepositoryAction {
+    /// Add or update a repository provider.
+    Add(RepositoryProviderAddCommand),
+    /// Remove a repository provider.
+    Remove(ConfigEntryRemoveCommand),
+    /// List configured repository providers.
+    List,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RepositoryProviderKind {
+    /// GitHub repository provider.
+    #[value(name = "github")]
+    GitHub,
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+struct RepositoryProviderAddCommand {
+    /// Configured repository-provider ID.
+    #[arg(long)]
+    id: Option<String>,
+
+    /// Repository-provider type.
+    #[arg(long = "type", value_enum)]
+    provider_type: Option<RepositoryProviderKind>,
+
+    /// GitHub REST API base URL.
+    #[arg(long, value_name = "URL")]
+    api_url: Option<String>,
+
+    /// GitHub personal access token or environment reference.
+    #[arg(long, value_name = "TOKEN_OR_ENV_REFERENCE")]
+    personal_access_token: Option<String>,
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+struct ConfigStorageCommand {
+    #[command(subcommand)]
+    action: ConfigStorageAction,
+}
+
+#[derive(Debug, Subcommand, Eq, PartialEq)]
+enum ConfigStorageAction {
+    /// Add or update a storage provider.
+    Add(StorageProviderAddCommand),
+    /// Remove a storage provider.
+    Remove(ConfigEntryRemoveCommand),
+    /// List configured storage providers.
+    List,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum StorageProviderKind {
+    /// Google Drive storage provider.
+    #[value(name = "google_drive", alias = "google-drive")]
+    GoogleDrive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum StorageCredentialKind {
+    /// Google Cloud CLI Application Default Credentials.
+    #[value(name = "gcloud")]
+    Gcloud,
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+struct StorageProviderAddCommand {
+    /// Configured storage-provider ID.
+    #[arg(long)]
+    id: Option<String>,
+
+    /// Storage-provider type.
+    #[arg(long = "type", value_enum)]
+    provider_type: Option<StorageProviderKind>,
+
+    /// Storage credential type.
+    #[arg(long, value_enum)]
+    credentials_type: Option<StorageCredentialKind>,
+
+    /// Isolated gcloud configuration directory containing ADC.
+    #[arg(long, value_name = "PATH")]
+    config_dir: Option<PathBuf>,
+
+    /// Google Cloud CLI executable name or path.
+    #[arg(long, value_name = "PATH")]
+    executable: Option<PathBuf>,
+
+    /// Google Drive root folder ID.
+    #[arg(long)]
+    root_folder_id: Option<String>,
+
+    /// Optional operator-facing storage label.
+    #[arg(long)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+struct ConfigEntryRemoveCommand {
+    /// Configured entry ID.
+    #[arg(long)]
+    id: String,
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+struct RepositoryCommand {
+    #[command(subcommand)]
+    action: RepositoryAction,
+}
+
+#[derive(Debug, Subcommand, Eq, PartialEq)]
+enum RepositoryAction {
+    /// Add or update a served repository mapping.
+    Add(RepositoryAddCommand),
+    /// Remove a served repository mapping.
+    Remove(ConfigEntryRemoveCommand),
+    /// List served repository mappings.
+    List,
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+struct RepositoryAddCommand {
+    /// Stable repository mapping ID.
+    #[arg(long)]
+    id: Option<String>,
+
+    /// Configured repository-provider ID.
+    #[arg(long)]
+    repo_provider: Option<String>,
+
+    /// Repository host, such as github.com.
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Repository owner or namespace.
+    #[arg(long)]
+    owner: Option<String>,
+
+    /// Repository name without the .git suffix.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Provider-stable repository ID.
+    #[arg(long)]
+    provider_repository_id: Option<String>,
+
+    /// Configured storage-provider ID.
+    #[arg(long)]
+    storage_provider: Option<String>,
 }
 
 #[derive(Debug, Args, Eq, PartialEq)]
@@ -269,6 +455,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     dispatch(
         cli,
         crate::serve,
+        run_configuration_to_stdio,
         run_init_to_stdout,
         run_login_to_stdio,
         run_logout_to_stdout,
@@ -286,9 +473,10 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     clippy::too_many_arguments,
     reason = "command dispatch keeps per-subcommand side effects injectable for focused tests"
 )]
-async fn dispatch<F, Fut, I, L, O, S, P, H, D, G, M>(
+async fn dispatch<F, Fut, C, I, L, O, S, P, H, D, G, M>(
     cli: Cli,
     serve: F,
+    configure: C,
     init: I,
     login: L,
     logout: O,
@@ -302,6 +490,7 @@ async fn dispatch<F, Fut, I, L, O, S, P, H, D, G, M>(
 where
     F: FnOnce(ServeOptions) -> Fut,
     Fut: Future<Output = crate::ServerResult<()>>,
+    C: FnOnce(ConfigurationCommand, Option<PathBuf>) -> anyhow::Result<()>,
     I: FnOnce(InitCommand) -> anyhow::Result<()>,
     L: FnOnce(LoginCommand) -> anyhow::Result<()>,
     O: FnOnce(LogoutCommand) -> anyhow::Result<()>,
@@ -316,6 +505,12 @@ where
     // subcommand should add its own runner here rather than hiding side effects
     // in parser code.
     match cli.command {
+        Command::Config(command) => configure(ConfigurationCommand::Config(command), cli.config)
+            .context("failed to edit lfscloud configuration"),
+        Command::Repository(command) => {
+            configure(ConfigurationCommand::Repository(command), cli.config)
+                .context("failed to edit lfscloud repository mappings")
+        }
         Command::Serve(command) => serve(command.serve_options(cli.config))
             .await
             .context("failed to run lfscloud server"),
@@ -346,6 +541,665 @@ impl ServeCommand {
     fn serve_options(self, config_path: Option<PathBuf>) -> ServeOptions {
         ServeOptions::new(config_path, self.host, self.port)
     }
+}
+
+fn run_configuration_to_stdio(
+    command: ConfigurationCommand,
+    config_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut output = io::stdout().lock();
+
+    if stdin.is_terminal() {
+        run_configuration_with_input(command, config_path, &mut input, &mut output, |_| {
+            read_hidden_config_value_from_terminal()
+        })
+    } else {
+        run_configuration_with_input(
+            command,
+            config_path,
+            &mut input,
+            &mut output,
+            read_config_prompt_value,
+        )
+    }
+    .map_err(anyhow::Error::from)
+}
+
+fn run_configuration_with_input<R, W, S>(
+    command: ConfigurationCommand,
+    config_path: Option<PathBuf>,
+    input: &mut R,
+    output: &mut W,
+    mut read_secret: S,
+) -> CliResult<()>
+where
+    R: BufRead,
+    W: Write,
+    S: FnMut(&mut R) -> CliResult<String>,
+{
+    let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
+    let mut config = EditableServerConfig::load(config_path)?;
+
+    match command {
+        ConfigurationCommand::Config(ConfigCommand {
+            resource: ConfigResourceCommand::Repository(ConfigRepositoryCommand { action }),
+        }) => match action {
+            ConfigRepositoryAction::Add(command) => {
+                let values = if command.is_interactive() {
+                    prompt_repository_provider(&config, input, output, &mut read_secret)?
+                } else {
+                    command.into_values()?
+                };
+                let id = values.id.clone();
+                let outcome = config.upsert_repository_provider(values)?;
+                save_and_report_edit(&config, outcome, "repository provider", &id, output)
+            }
+            ConfigRepositoryAction::Remove(command) => {
+                let outcome = config.remove_repository_provider(&command.id)?;
+                save_and_report_remove(&config, outcome, "repository provider", &command.id, output)
+            }
+            ConfigRepositoryAction::List => write_repository_provider_list(&config, output),
+        },
+        ConfigurationCommand::Config(ConfigCommand {
+            resource: ConfigResourceCommand::Storage(ConfigStorageCommand { action }),
+        }) => match action {
+            ConfigStorageAction::Add(command) => {
+                let values = if command.is_interactive() {
+                    prompt_storage_provider(&config, input, output)?
+                } else {
+                    command.into_values()?
+                };
+                let id = values.id.clone();
+                let outcome = config.upsert_storage_provider(values)?;
+                save_and_report_edit(&config, outcome, "storage provider", &id, output)
+            }
+            ConfigStorageAction::Remove(command) => {
+                let outcome = config.remove_storage_provider(&command.id)?;
+                save_and_report_remove(&config, outcome, "storage provider", &command.id, output)
+            }
+            ConfigStorageAction::List => write_storage_provider_list(&config, output),
+        },
+        ConfigurationCommand::Repository(RepositoryCommand { action }) => match action {
+            RepositoryAction::Add(command) => {
+                let values = if command.is_interactive() {
+                    prompt_repository(&config, input, output)?
+                } else {
+                    command.into_values()?
+                };
+                let id = values.id.clone();
+                let outcome = config.upsert_repository(values)?;
+                save_and_report_edit(&config, outcome, "repository", &id, output)
+            }
+            RepositoryAction::Remove(command) => {
+                let outcome = config.remove_repository(&command.id)?;
+                save_and_report_remove(&config, outcome, "repository", &command.id, output)
+            }
+            RepositoryAction::List => write_repository_list(&config, output),
+        },
+    }
+}
+
+impl RepositoryProviderAddCommand {
+    fn is_interactive(&self) -> bool {
+        self.id.is_none()
+            && self.provider_type.is_none()
+            && self.api_url.is_none()
+            && self.personal_access_token.is_none()
+    }
+
+    fn into_values(self) -> CliResult<RepositoryProviderValues> {
+        Ok(RepositoryProviderValues {
+            id: required_flag(self.id, "--id")?,
+            provider_type: self.provider_type.map(|kind| match kind {
+                RepositoryProviderKind::GitHub => "github".to_owned(),
+            }),
+            api_url: self.api_url,
+            personal_access_token: self.personal_access_token,
+        })
+    }
+}
+
+impl StorageProviderAddCommand {
+    fn is_interactive(&self) -> bool {
+        self.id.is_none()
+            && self.provider_type.is_none()
+            && self.credentials_type.is_none()
+            && self.config_dir.is_none()
+            && self.executable.is_none()
+            && self.root_folder_id.is_none()
+            && self.display_name.is_none()
+    }
+
+    fn into_values(self) -> CliResult<StorageProviderValues> {
+        Ok(StorageProviderValues {
+            id: required_flag(self.id, "--id")?,
+            provider_type: self.provider_type.map(|kind| match kind {
+                StorageProviderKind::GoogleDrive => "google_drive".to_owned(),
+            }),
+            credentials_type: self.credentials_type.map(|kind| match kind {
+                StorageCredentialKind::Gcloud => "gcloud".to_owned(),
+            }),
+            config_dir: optional_path_string(self.config_dir, "--config-dir")?,
+            executable: optional_path_string(self.executable, "--executable")?,
+            root_folder_id: self.root_folder_id,
+            display_name: self.display_name,
+        })
+    }
+}
+
+impl RepositoryAddCommand {
+    fn is_interactive(&self) -> bool {
+        self.id.is_none()
+            && self.repo_provider.is_none()
+            && self.host.is_none()
+            && self.owner.is_none()
+            && self.name.is_none()
+            && self.provider_repository_id.is_none()
+            && self.storage_provider.is_none()
+    }
+
+    fn into_values(self) -> CliResult<RepositoryValues> {
+        Ok(RepositoryValues {
+            id: required_flag(self.id, "--id")?,
+            repo_provider: self.repo_provider,
+            host: self.host,
+            owner: self.owner,
+            name: self.name,
+            provider_repository_id: self.provider_repository_id,
+            storage_provider: self.storage_provider,
+        })
+    }
+}
+
+fn prompt_repository_provider<R, W, S>(
+    config: &EditableServerConfig,
+    input: &mut R,
+    output: &mut W,
+    read_secret: &mut S,
+) -> CliResult<RepositoryProviderValues>
+where
+    R: BufRead,
+    W: Write,
+    S: FnMut(&mut R) -> CliResult<String>,
+{
+    let id = prompt_value(input, output, "Repository provider ID", None, true)?
+        .expect("required prompt returns a value");
+    let existing = config.repository_provider(&id)?.unwrap_or_default();
+    let provider_type = prompt_value(
+        input,
+        output,
+        "Type",
+        existing.provider_type.as_deref().or(Some("github")),
+        true,
+    )?;
+    if provider_type.as_deref() != Some("github") {
+        return Err(CliError::InvalidArguments {
+            message: "repository provider type must be github".to_owned(),
+        });
+    }
+    let api_url = prompt_value(
+        input,
+        output,
+        "GitHub API URL",
+        existing
+            .api_url
+            .as_deref()
+            .or(Some("https://api.github.com")),
+        true,
+    )?;
+    let personal_access_token = prompt_secret_value(
+        input,
+        output,
+        "GitHub personal access token or environment reference",
+        existing.personal_access_token,
+        read_secret,
+    )?;
+
+    Ok(RepositoryProviderValues {
+        id,
+        provider_type,
+        api_url,
+        personal_access_token: Some(personal_access_token),
+    })
+}
+
+fn prompt_storage_provider<R, W>(
+    config: &EditableServerConfig,
+    input: &mut R,
+    output: &mut W,
+) -> CliResult<StorageProviderValues>
+where
+    R: BufRead,
+    W: Write,
+{
+    let id = prompt_value(input, output, "Storage provider ID", None, true)?
+        .expect("required prompt returns a value");
+    let existing = config.storage_provider(&id)?.unwrap_or_default();
+    let provider_type = prompt_value(
+        input,
+        output,
+        "Type",
+        existing.provider_type.as_deref().or(Some("google_drive")),
+        true,
+    )?;
+    if provider_type.as_deref() != Some("google_drive") {
+        return Err(CliError::InvalidArguments {
+            message: "storage provider type must be google_drive".to_owned(),
+        });
+    }
+    let credentials_type = prompt_value(
+        input,
+        output,
+        "Credentials type",
+        existing.credentials_type.as_deref().or(Some("gcloud")),
+        true,
+    )?;
+    if credentials_type.as_deref() != Some("gcloud") {
+        return Err(CliError::InvalidArguments {
+            message: "storage credentials type must be gcloud".to_owned(),
+        });
+    }
+    let config_dir = prompt_value(
+        input,
+        output,
+        "gcloud config directory",
+        existing.config_dir.as_deref(),
+        true,
+    )?;
+    let executable = prompt_value(
+        input,
+        output,
+        "gcloud executable",
+        existing
+            .executable
+            .as_deref()
+            .or(Some(default_gcloud_executable())),
+        true,
+    )?;
+    let root_folder_id = prompt_value(
+        input,
+        output,
+        "Google Drive root folder ID",
+        existing.root_folder_id.as_deref(),
+        true,
+    )?;
+    let display_name = prompt_value(
+        input,
+        output,
+        "Display name",
+        existing.display_name.as_deref(),
+        false,
+    )?;
+
+    Ok(StorageProviderValues {
+        id,
+        provider_type,
+        credentials_type,
+        config_dir,
+        executable,
+        root_folder_id,
+        display_name,
+    })
+}
+
+fn prompt_repository<R, W>(
+    config: &EditableServerConfig,
+    input: &mut R,
+    output: &mut W,
+) -> CliResult<RepositoryValues>
+where
+    R: BufRead,
+    W: Write,
+{
+    let id = prompt_value(input, output, "Repository ID", None, true)?
+        .expect("required prompt returns a value");
+    let existing = config.repository(&id)?.unwrap_or_default();
+
+    Ok(RepositoryValues {
+        id,
+        repo_provider: prompt_value(
+            input,
+            output,
+            "Repository provider ID",
+            existing.repo_provider.as_deref(),
+            true,
+        )?,
+        host: prompt_value(
+            input,
+            output,
+            "Repository host",
+            existing.host.as_deref().or(Some("github.com")),
+            true,
+        )?,
+        owner: prompt_value(
+            input,
+            output,
+            "Repository owner",
+            existing.owner.as_deref(),
+            true,
+        )?,
+        name: prompt_value(
+            input,
+            output,
+            "Repository name",
+            existing.name.as_deref(),
+            true,
+        )?,
+        provider_repository_id: prompt_value(
+            input,
+            output,
+            "Provider repository ID",
+            existing.provider_repository_id.as_deref(),
+            true,
+        )?,
+        storage_provider: prompt_value(
+            input,
+            output,
+            "Storage provider ID",
+            existing.storage_provider.as_deref(),
+            true,
+        )?,
+    })
+}
+
+fn prompt_value<R, W>(
+    input: &mut R,
+    output: &mut W,
+    label: &str,
+    default: Option<&str>,
+    required: bool,
+) -> CliResult<Option<String>>
+where
+    R: BufRead,
+    W: Write,
+{
+    write!(output, "{label}").map_err(output_error)?;
+    if let Some(default) = default {
+        write!(output, " [{default}]").map_err(output_error)?;
+    } else if !required {
+        write!(output, " [optional]").map_err(output_error)?;
+    }
+    write!(output, ": ").map_err(output_error)?;
+    output.flush().map_err(output_error)?;
+
+    let value = read_config_prompt_value(input)?;
+    if value.is_empty() {
+        if let Some(default) = default {
+            return Ok(Some(default.to_owned()));
+        }
+        if required {
+            return Err(CliError::InvalidArguments {
+                message: format!("{label} is required"),
+            });
+        }
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+fn prompt_secret_value<R, W, S>(
+    input: &mut R,
+    output: &mut W,
+    label: &str,
+    existing: Option<String>,
+    read_secret: &mut S,
+) -> CliResult<String>
+where
+    R: BufRead,
+    W: Write,
+    S: FnMut(&mut R) -> CliResult<String>,
+{
+    write!(output, "{label}").map_err(output_error)?;
+    if existing.is_some() {
+        write!(output, " [configured; Enter to keep]").map_err(output_error)?;
+    }
+    write!(output, ": ").map_err(output_error)?;
+    output.flush().map_err(output_error)?;
+    let value = read_secret(input)?;
+    writeln!(output).map_err(output_error)?;
+    if value.is_empty() {
+        return existing.ok_or_else(|| CliError::InvalidArguments {
+            message: format!("{label} is required"),
+        });
+    }
+    Ok(value)
+}
+
+fn read_config_prompt_value<R>(input: &mut R) -> CliResult<String>
+where
+    R: BufRead + ?Sized,
+{
+    let maximum_line_bytes = MAX_CONFIG_PROMPT_INPUT_BYTES + 2;
+    let mut bytes = Vec::with_capacity(maximum_line_bytes + 1);
+    input
+        .take((maximum_line_bytes + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|source| CliError::Io {
+            context: "failed to read interactive configuration input".to_owned(),
+            source,
+        })?;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > MAX_CONFIG_PROMPT_INPUT_BYTES {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "interactive configuration input must not exceed {MAX_CONFIG_PROMPT_INPUT_BYTES} bytes"
+            ),
+        });
+    }
+    String::from_utf8(bytes)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| CliError::InvalidArguments {
+            message: "interactive configuration input must be valid UTF-8".to_owned(),
+        })
+}
+
+fn read_hidden_config_value_from_terminal() -> CliResult<String> {
+    let mut terminal = terminal_prompt::Terminal::open().map_err(|source| CliError::Io {
+        context: "failed to open terminal for hidden configuration input".to_owned(),
+        source,
+    })?;
+    let echo_was_enabled = terminal
+        .is_echo_enabled()
+        .map_err(|source| config_terminal_echo_error("inspect", source))?;
+    if echo_was_enabled {
+        terminal
+            .set_echo_enabled(false)
+            .map_err(|source| config_terminal_echo_error("disable", source))?;
+    }
+    let read_result = read_config_prompt_value(&mut terminal);
+    let restore_result = if echo_was_enabled {
+        terminal
+            .set_echo_enabled(true)
+            .map_err(|source| config_terminal_echo_error("restore", source))
+    } else {
+        Ok(())
+    };
+    match (read_result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn config_terminal_echo_error(action: &str, source: io::Error) -> CliError {
+    CliError::Io {
+        context: format!("failed to {action} terminal echo for secret configuration input"),
+        source,
+    }
+}
+
+fn save_and_report_edit<W>(
+    config: &EditableServerConfig,
+    outcome: EditOutcome,
+    kind: &str,
+    id: &str,
+    output: &mut W,
+) -> CliResult<()>
+where
+    W: Write,
+{
+    if outcome != EditOutcome::Unchanged {
+        config.save()?;
+    }
+    let action = match outcome {
+        EditOutcome::Added => "added",
+        EditOutcome::Updated => "updated",
+        EditOutcome::Unchanged => "unchanged",
+    };
+    writeln!(
+        output,
+        "{action} {kind} {id:?} in {}",
+        config.path().display()
+    )
+    .map_err(output_error)
+}
+
+fn save_and_report_remove<W>(
+    config: &EditableServerConfig,
+    outcome: RemoveOutcome,
+    kind: &str,
+    id: &str,
+    output: &mut W,
+) -> CliResult<()>
+where
+    W: Write,
+{
+    if outcome == RemoveOutcome::Removed {
+        config.save()?;
+    }
+    let action = match outcome {
+        RemoveOutcome::Removed => "removed",
+        RemoveOutcome::NotFound => "not found",
+    };
+    writeln!(
+        output,
+        "{action} {kind} {id:?} in {}",
+        config.path().display()
+    )
+    .map_err(output_error)
+}
+
+fn write_repository_provider_list<W>(config: &EditableServerConfig, output: &mut W) -> CliResult<()>
+where
+    W: Write,
+{
+    writeln!(output, "ID\tTYPE\tAPI URL\tAUTH").map_err(output_error)?;
+    for provider in config.repository_providers()? {
+        writeln!(
+            output,
+            "{}\t{}\t{}\t{}",
+            one_line(&provider.id),
+            optional_cell(provider.provider_type.as_deref()),
+            optional_cell(provider.api_url.as_deref()),
+            if provider.personal_access_token.is_some() {
+                "configured"
+            } else {
+                "-"
+            }
+        )
+        .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+fn write_storage_provider_list<W>(config: &EditableServerConfig, output: &mut W) -> CliResult<()>
+where
+    W: Write,
+{
+    writeln!(
+        output,
+        "ID\tTYPE\tCREDENTIALS\tCONFIG DIR\tEXECUTABLE\tROOT FOLDER ID\tDISPLAY NAME"
+    )
+    .map_err(output_error)?;
+    for storage in config.storage_providers()? {
+        writeln!(
+            output,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            one_line(&storage.id),
+            optional_cell(storage.provider_type.as_deref()),
+            optional_cell(storage.credentials_type.as_deref()),
+            optional_cell(storage.config_dir.as_deref()),
+            optional_cell(storage.executable.as_deref()),
+            optional_cell(storage.root_folder_id.as_deref()),
+            optional_cell(storage.display_name.as_deref()),
+        )
+        .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+fn write_repository_list<W>(config: &EditableServerConfig, output: &mut W) -> CliResult<()>
+where
+    W: Write,
+{
+    writeln!(
+        output,
+        "ID\tREPOSITORY PROVIDER\tHOST\tOWNER\tNAME\tPROVIDER REPOSITORY ID\tSTORAGE PROVIDER"
+    )
+    .map_err(output_error)?;
+    for repository in config.repositories()? {
+        writeln!(
+            output,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            one_line(&repository.id),
+            optional_cell(repository.repo_provider.as_deref()),
+            optional_cell(repository.host.as_deref()),
+            optional_cell(repository.owner.as_deref()),
+            optional_cell(repository.name.as_deref()),
+            optional_cell(repository.provider_repository_id.as_deref()),
+            optional_cell(repository.storage_provider.as_deref()),
+        )
+        .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+fn one_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\n' | '\r' | '\t' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+fn optional_cell(value: Option<&str>) -> String {
+    value.map(one_line).unwrap_or_else(|| "-".to_owned())
+}
+
+fn required_flag<T>(value: Option<T>, flag: &str) -> CliResult<T> {
+    value.ok_or_else(|| CliError::InvalidArguments {
+        message: format!("{flag} is required when using flag-based add"),
+    })
+}
+
+fn optional_path_string(path: Option<PathBuf>, flag: &str) -> CliResult<Option<String>> {
+    path.map(|path| {
+        path.into_os_string()
+            .into_string()
+            .map_err(|_| CliError::InvalidArguments {
+                message: format!("{flag} must be valid UTF-8"),
+            })
+    })
+    .transpose()
+}
+
+#[cfg(not(windows))]
+fn default_gcloud_executable() -> &'static str {
+    "gcloud"
+}
+
+#[cfg(windows)]
+fn default_gcloud_executable() -> &'static str {
+    "gcloud.cmd"
 }
 
 fn run_init<W>(command: InitCommand, output: &mut W) -> anyhow::Result<()>
@@ -3519,16 +4373,20 @@ mod tests {
     #[cfg(unix)]
     use super::run_bounded_child_command;
     use super::{
-        Cli, DehydrateCommand, GcCommand, HydrateCommand, InitCommand, LoginCommand, LoginTerminal,
-        LogoutCommand, MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, PullCommand,
-        SessionRevocationStatus, StatusCommand, current_checkout_lfs_pointer_files,
+        Cli, ConfigCommand, ConfigRepositoryAction, ConfigRepositoryCommand, ConfigResourceCommand,
+        ConfigStorageAction, ConfigStorageCommand, ConfigurationCommand, DehydrateCommand,
+        GcCommand, HydrateCommand, InitCommand, LoginCommand, LoginTerminal, LogoutCommand,
+        MAX_LOGIN_TOKEN_INPUT_BYTES, MigrateCommand, PullCommand, RepositoryAction,
+        RepositoryCommand, RepositoryProviderKind, SessionRevocationStatus, StatusCommand,
+        StorageCredentialKind, StorageProviderKind, current_checkout_lfs_pointer_files,
         current_checkout_lfs_pointer_scan, dispatch, execute_migration_with_storage,
         github_personal_access_token_login_url_for_server, is_git_worktree_discovery_error,
         migration_storage_provider, prepare_migration_execution,
         probe_authenticated_migration_target, probe_server_reachable, read_bounded_login_token,
-        read_hidden_login_token, run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir,
-        run_init_from_dir, run_login_from_dir, run_logout_from_dir, run_migrate_from_dir,
-        run_pull_from_dir, run_status_from_dir, session_revocation_url_for_server, tracing_config,
+        read_config_prompt_value, read_hidden_login_token, run_configuration_with_input,
+        run_dehydrate_from_dir, run_gc_from_dir, run_hydrate_from_dir, run_init_from_dir,
+        run_login_from_dir, run_logout_from_dir, run_migrate_from_dir, run_pull_from_dir,
+        run_status_from_dir, session_revocation_url_for_server, tracing_config,
         validate_status_storage, write_init_change,
     };
     use crate::{
@@ -3536,8 +4394,8 @@ mod tests {
         GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitRepository,
         GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
         LocalCacheError, LocalCacheLayout, LocalCacheWorktreeRegistration, ProviderFuture,
-        RepositoryMapping, SanitizedMessage, ServeOptions, StorageDeleteOutcome, StorageError,
-        StorageProvider, StorageProviderConfig, StorageResult, StoredObject,
+        RepositoryMapping, SanitizedMessage, ServeOptions, ServerConfig, StorageDeleteOutcome,
+        StorageError, StorageProvider, StorageProviderConfig, StorageResult, StoredObject,
     };
 
     struct RecordingMigrationStorage {
@@ -3678,6 +4536,374 @@ mod tests {
 
         assert!(rendered.contains("Usage: lfscloud"));
         assert!(rendered.contains("Commands:"));
+    }
+
+    #[test]
+    fn config_repository_add_accepts_every_config_field() {
+        let cli = Cli::try_parse_from([
+            "lfscloud",
+            "--config",
+            "custom-lfscloud.yml",
+            "config",
+            "repository",
+            "add",
+            "--id",
+            "github-main",
+            "--type",
+            "github",
+            "--api-url",
+            "https://api.github.com",
+            "--personal-access-token",
+            "${LFS_CLOUD_GITHUB_PAT}",
+        ])
+        .expect("repository-provider add command should parse");
+
+        let super::Command::Config(ConfigCommand {
+            resource:
+                ConfigResourceCommand::Repository(ConfigRepositoryCommand {
+                    action: ConfigRepositoryAction::Add(command),
+                }),
+        }) = cli.command
+        else {
+            panic!("config repository add command should parse");
+        };
+
+        assert_eq!(cli.config, Some("custom-lfscloud.yml".into()));
+        assert_eq!(command.id.as_deref(), Some("github-main"));
+        assert_eq!(command.provider_type, Some(RepositoryProviderKind::GitHub));
+        assert_eq!(command.api_url.as_deref(), Some("https://api.github.com"));
+        assert_eq!(
+            command.personal_access_token.as_deref(),
+            Some("${LFS_CLOUD_GITHUB_PAT}")
+        );
+    }
+
+    #[test]
+    fn config_storage_add_accepts_every_config_field() {
+        let cli = Cli::try_parse_from([
+            "lfscloud",
+            "config",
+            "storage",
+            "add",
+            "--id",
+            "drive-main",
+            "--type",
+            "google-drive",
+            "--credentials-type",
+            "gcloud",
+            "--config-dir",
+            "/var/lib/lfscloud/gcloud",
+            "--executable",
+            "/usr/local/bin/gcloud",
+            "--root-folder-id",
+            "drive-root",
+            "--display-name",
+            "Main Drive",
+        ])
+        .expect("storage-provider add command should parse");
+
+        let super::Command::Config(ConfigCommand {
+            resource:
+                ConfigResourceCommand::Storage(ConfigStorageCommand {
+                    action: ConfigStorageAction::Add(command),
+                }),
+        }) = cli.command
+        else {
+            panic!("config storage add command should parse");
+        };
+
+        assert_eq!(command.id.as_deref(), Some("drive-main"));
+        assert_eq!(
+            command.provider_type,
+            Some(StorageProviderKind::GoogleDrive)
+        );
+        assert_eq!(
+            command.credentials_type,
+            Some(StorageCredentialKind::Gcloud)
+        );
+        assert_eq!(
+            command.config_dir.as_deref(),
+            Some(Path::new("/var/lib/lfscloud/gcloud"))
+        );
+        assert_eq!(
+            command.executable.as_deref(),
+            Some(Path::new("/usr/local/bin/gcloud"))
+        );
+        assert_eq!(command.root_folder_id.as_deref(), Some("drive-root"));
+        assert_eq!(command.display_name.as_deref(), Some("Main Drive"));
+    }
+
+    #[test]
+    fn repository_add_and_all_remove_and_list_commands_parse() {
+        let repository = Cli::try_parse_from([
+            "lfscloud",
+            "repository",
+            "add",
+            "--id",
+            "github-main:owner/repo",
+            "--repo-provider",
+            "github-main",
+            "--host",
+            "github.com",
+            "--owner",
+            "owner",
+            "--name",
+            "repo",
+            "--provider-repository-id",
+            "123456789",
+            "--storage-provider",
+            "drive-main",
+        ])
+        .expect("repository add command should parse");
+        let super::Command::Repository(RepositoryCommand {
+            action: RepositoryAction::Add(command),
+        }) = repository.command
+        else {
+            panic!("repository add command should parse");
+        };
+        assert_eq!(command.id.as_deref(), Some("github-main:owner/repo"));
+        assert_eq!(command.repo_provider.as_deref(), Some("github-main"));
+        assert_eq!(command.host.as_deref(), Some("github.com"));
+        assert_eq!(command.owner.as_deref(), Some("owner"));
+        assert_eq!(command.name.as_deref(), Some("repo"));
+        assert_eq!(command.provider_repository_id.as_deref(), Some("123456789"));
+        assert_eq!(command.storage_provider.as_deref(), Some("drive-main"));
+
+        for args in [
+            vec![
+                "lfscloud",
+                "config",
+                "repository",
+                "remove",
+                "--id",
+                "github-main",
+            ],
+            vec!["lfscloud", "config", "repository", "list"],
+            vec![
+                "lfscloud",
+                "config",
+                "storage",
+                "remove",
+                "--id",
+                "drive-main",
+            ],
+            vec!["lfscloud", "config", "storage", "list"],
+            vec![
+                "lfscloud",
+                "repository",
+                "remove",
+                "--id",
+                "github-main:owner/repo",
+            ],
+            vec!["lfscloud", "repository", "list"],
+        ] {
+            Cli::try_parse_from(&args)
+                .unwrap_or_else(|error| panic!("{args:?} should parse: {error}"));
+        }
+    }
+
+    #[test]
+    fn add_commands_accept_zero_flags_for_interactive_mode() {
+        for args in [
+            vec!["lfscloud", "config", "repository", "add"],
+            vec!["lfscloud", "config", "storage", "add"],
+            vec!["lfscloud", "repository", "add"],
+        ] {
+            Cli::try_parse_from(&args)
+                .unwrap_or_else(|error| panic!("{args:?} should parse: {error}"));
+        }
+    }
+
+    #[test]
+    fn zero_flag_add_commands_prompt_for_complete_configuration_without_echoing_secrets() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(
+            &config_path,
+            "server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n",
+        )
+        .expect("base config should be written");
+        let path = config_path.to_str().expect("test path should be UTF-8");
+
+        let repository_provider_output = run_configuration_test_command(
+            &["lfscloud", "--config", path, "config", "repository", "add"],
+            "github-main\n\n\nsuper-secret-pat\n",
+        );
+        assert!(repository_provider_output.contains("added repository provider"));
+        assert!(!repository_provider_output.contains("super-secret-pat"));
+
+        let storage_output = run_configuration_test_command(
+            &["lfscloud", "--config", path, "config", "storage", "add"],
+            "drive-main\n\n\n./gcloud\n\nroot-folder\nMain Drive\n",
+        );
+        assert!(storage_output.contains("added storage provider"));
+
+        let repository_output = run_configuration_test_command(
+            &["lfscloud", "--config", path, "repository", "add"],
+            "github-main:owner/repo\ngithub-main\n\nowner\nrepo\n123456789\ndrive-main\n",
+        );
+        assert!(repository_output.contains("added repository"));
+
+        let config =
+            ServerConfig::load_from_path(&config_path).expect("interactive config should be valid");
+        assert!(config.repository_providers.contains_key("github-main"));
+        assert!(config.storage_providers.contains_key("drive-main"));
+        assert_eq!(config.repositories[0].id, "github-main:owner/repo");
+        assert_eq!(config.repositories[0].host, "github.com");
+    }
+
+    #[test]
+    fn flag_add_partial_update_list_and_idempotent_remove_work_end_to_end() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(
+            &config_path,
+            r#"
+server:
+  host: 127.0.0.1
+  port: 8080
+  public_url: http://127.0.0.1:8080
+repository_providers:
+  github-main:
+    type: github
+    api_url: https://api.github.com
+    personal_access_token: test-pat
+storage_providers:
+  drive-main:
+    type: google_drive
+    credentials:
+      type: gcloud
+      config_dir: ./gcloud
+    root_folder_id: root-folder
+"#,
+        )
+        .expect("base config should be written");
+        let path = config_path.to_str().expect("test path should be UTF-8");
+
+        let added = run_configuration_test_command(
+            &[
+                "lfscloud",
+                "--config",
+                path,
+                "repository",
+                "add",
+                "--id",
+                "github-main:owner/repo",
+                "--repo-provider",
+                "github-main",
+                "--host",
+                "github.com",
+                "--owner",
+                "owner",
+                "--name",
+                "repo",
+                "--provider-repository-id",
+                "123456789",
+                "--storage-provider",
+                "drive-main",
+            ],
+            "",
+        );
+        assert!(added.contains("added repository"));
+
+        let updated = run_configuration_test_command(
+            &[
+                "lfscloud",
+                "--config",
+                path,
+                "repository",
+                "add",
+                "--id",
+                "github-main:owner/repo",
+                "--name",
+                "renamed",
+            ],
+            "",
+        );
+        assert!(updated.contains("updated repository"));
+        let unchanged = run_configuration_test_command(
+            &[
+                "lfscloud",
+                "--config",
+                path,
+                "repository",
+                "add",
+                "--id",
+                "github-main:owner/repo",
+                "--name",
+                "renamed",
+            ],
+            "",
+        );
+        assert!(unchanged.contains("unchanged repository"));
+
+        let repositories = run_configuration_test_command(
+            &["lfscloud", "--config", path, "repository", "list"],
+            "",
+        );
+        assert!(repositories.contains("PROVIDER REPOSITORY ID"));
+        assert!(repositories.contains("github-main:owner/repo"));
+        assert!(repositories.contains("renamed"));
+        let repository_providers = run_configuration_test_command(
+            &["lfscloud", "--config", path, "config", "repository", "list"],
+            "",
+        );
+        assert!(repository_providers.contains("github-main"));
+        assert!(repository_providers.contains("configured"));
+        assert!(!repository_providers.contains("test-pat"));
+        let storage_providers = run_configuration_test_command(
+            &["lfscloud", "--config", path, "config", "storage", "list"],
+            "",
+        );
+        assert!(storage_providers.contains("drive-main"));
+        assert!(storage_providers.contains("root-folder"));
+
+        let removed = run_configuration_test_command(
+            &[
+                "lfscloud",
+                "--config",
+                path,
+                "repository",
+                "remove",
+                "--id",
+                "github-main:owner/repo",
+            ],
+            "",
+        );
+        assert!(removed.contains("removed repository"));
+        let repeated = run_configuration_test_command(
+            &[
+                "lfscloud",
+                "--config",
+                path,
+                "repository",
+                "remove",
+                "--id",
+                "github-main:owner/repo",
+            ],
+            "",
+        );
+        assert!(repeated.contains("not found repository"));
+    }
+
+    fn run_configuration_test_command(args: &[&str], input: &str) -> String {
+        let cli = Cli::try_parse_from(args).expect("configuration command should parse");
+        let command = match cli.command {
+            super::Command::Config(command) => ConfigurationCommand::Config(command),
+            super::Command::Repository(command) => ConfigurationCommand::Repository(command),
+            _ => panic!("test command should edit configuration"),
+        };
+        let mut input = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+        run_configuration_with_input(
+            command,
+            cli.config,
+            &mut input,
+            &mut output,
+            read_config_prompt_value,
+        )
+        .expect("configuration command should succeed");
+        String::from_utf8(output).expect("configuration output should be UTF-8")
     }
 
     #[test]
@@ -4045,6 +5271,7 @@ mod tests {
 
     #[derive(Debug, Eq, PartialEq)]
     enum Invoked {
+        Configuration(ConfigurationCommand, Option<PathBuf>),
         Serve(ServeOptions),
         Init(InitCommand),
         Login(LoginCommand),
@@ -4071,6 +5298,33 @@ mod tests {
     #[tokio::test]
     async fn dispatches_every_subcommand_to_its_matching_runner() {
         let cases = [
+            (
+                vec![
+                    "lfscloud",
+                    "--config",
+                    "lfscloud.test.yml",
+                    "config",
+                    "repository",
+                    "list",
+                ],
+                Invoked::Configuration(
+                    ConfigurationCommand::Config(ConfigCommand {
+                        resource: ConfigResourceCommand::Repository(ConfigRepositoryCommand {
+                            action: ConfigRepositoryAction::List,
+                        }),
+                    }),
+                    Some("lfscloud.test.yml".into()),
+                ),
+            ),
+            (
+                vec!["lfscloud", "repository", "list"],
+                Invoked::Configuration(
+                    ConfigurationCommand::Repository(RepositoryCommand {
+                        action: RepositoryAction::List,
+                    }),
+                    None,
+                ),
+            ),
             (
                 vec![
                     "lfscloud",
@@ -4251,6 +5505,10 @@ mod tests {
                 cli,
                 |options| async move {
                     record_invocation(recorder, Invoked::Serve(options));
+                    Ok(())
+                },
+                |command, config| {
+                    record_invocation(recorder, Invoked::Configuration(command, config));
                     Ok(())
                 },
                 |command| {
