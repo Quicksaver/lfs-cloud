@@ -39,6 +39,55 @@ assert_eq "1.0.0" "$(release_next_version "0.9.4" major)" "major increment"
 assert_eq "0.10.0" "$(release_next_version "0.9.4" minor)" "minor increment"
 assert_eq "0.9.5" "$(release_next_version "0.9.4" patch)" "patch increment"
 
+release_info "Test changelog release rollover and note extraction"
+changelog_fixture="$fixture_root/CHANGELOG.md"
+release_notes_fixture="$fixture_root/release-notes.md"
+cat > "$changelog_fixture" <<'EOF'
+# Changelog
+
+## [Unreleased]
+
+- [added]: Publish changelog-backed release notes.
+- [fixed]: Preserve existing release history.
+
+## [0.1.0] - 2026-01-01
+
+- [added]: Initial release.
+EOF
+
+release_roll_changelog "$changelog_fixture" "0.2.0" "2026-07-31"
+assert_eq "$(cat <<'EOF'
+# Changelog
+
+## [Unreleased]
+
+## [0.2.0] - 2026-07-31
+
+- [added]: Publish changelog-backed release notes.
+- [fixed]: Preserve existing release history.
+
+## [0.1.0] - 2026-01-01
+
+- [added]: Initial release.
+EOF
+)" "$(cat "$changelog_fixture")" "changelog release rollover"
+
+release_extract_changelog_notes "$changelog_fixture" "0.2.0" "$release_notes_fixture"
+assert_eq "$(cat <<'EOF'
+- [added]: Publish changelog-backed release notes.
+- [fixed]: Preserve existing release history.
+EOF
+)" "$(cat "$release_notes_fixture")" "release note extraction"
+
+cat > "$changelog_fixture" <<'EOF'
+# Changelog
+
+## [Unreleased]
+EOF
+release_roll_changelog "$changelog_fixture" "0.1.0" "2026-07-31"
+release_extract_changelog_notes "$changelog_fixture" "0.1.0" "$release_notes_fixture"
+assert_eq "Version bump only." "$(cat "$release_notes_fixture")" "empty release note fallback"
+
 release_info "Test terminal UI command status propagation"
 set +e
 (release_run_step "Expected command failure" bash -c 'exit 7') >/dev/null 2>&1

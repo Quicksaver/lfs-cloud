@@ -319,6 +319,100 @@ EOF
   printf '%s.%s.%s\n' "$major" "$minor" "$patch"
 }
 
+release_roll_changelog() {
+  local changelog_path="$1"
+  local version="$2"
+  local release_date="$3"
+
+  node - "$changelog_path" "$version" "$release_date" <<'NODE'
+const fs = require("node:fs");
+
+const changelogPath = process.argv[2];
+const version = process.argv[3];
+const releaseDate = process.argv[4];
+const unreleasedHeadingPattern = /^ {0,3}## \[Unreleased\][ \t]*$/gm;
+const releaseHeadingPattern = /^ {0,3}## \[(?!Unreleased\])[^\]]+\][^\n]*$/m;
+
+const changelog = fs.readFileSync(changelogPath, "utf8").replace(/\r\n?/g, "\n");
+const unreleasedHeadings = [...changelog.matchAll(unreleasedHeadingPattern)];
+
+if (unreleasedHeadings.length !== 1 || unreleasedHeadings[0].index === undefined) {
+  throw new Error("CHANGELOG.md must contain exactly one '## [Unreleased]' heading");
+}
+
+const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const existingReleasePattern = new RegExp(
+  `^ {0,3}## \\[${escapedVersion}\\][^\\n]*$`,
+  "m",
+);
+if (existingReleasePattern.test(changelog)) {
+  throw new Error(`CHANGELOG.md already contains a release section for ${version}`);
+}
+
+const unreleasedStart = unreleasedHeadings[0].index;
+const unreleasedLineEnd = changelog.indexOf("\n", unreleasedStart);
+const unreleasedBodyStart =
+  unreleasedLineEnd === -1 ? changelog.length : unreleasedLineEnd + 1;
+const nextRelease = releaseHeadingPattern.exec(changelog.slice(unreleasedBodyStart));
+const unreleasedEnd =
+  nextRelease === null
+    ? changelog.length
+    : unreleasedBodyStart + nextRelease.index;
+
+const preamble = changelog.slice(0, unreleasedStart);
+const unreleasedBody = changelog.slice(unreleasedBodyStart, unreleasedEnd).trim();
+const releaseBody = unreleasedBody.length === 0 ? "Version bump only." : unreleasedBody;
+const releaseHistory = changelog.slice(unreleasedEnd).replace(/^\n+|\n+$/g, "");
+
+let updated = `${preamble}## [Unreleased]\n\n## [${version}] - ${releaseDate}\n\n${releaseBody}`;
+if (releaseHistory.length > 0) {
+  updated += `\n\n${releaseHistory}`;
+}
+
+fs.writeFileSync(changelogPath, `${updated}\n`);
+NODE
+}
+
+release_extract_changelog_notes() {
+  local changelog_path="$1"
+  local version="$2"
+  local output_path="$3"
+
+  node - "$changelog_path" "$version" "$output_path" <<'NODE'
+const fs = require("node:fs");
+
+const changelogPath = process.argv[2];
+const version = process.argv[3];
+const outputPath = process.argv[4];
+const changelog = fs.readFileSync(changelogPath, "utf8").replace(/\r\n?/g, "\n");
+const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const releaseHeadingPattern = new RegExp(
+  `^ {0,3}## \\[${escapedVersion}\\] - \\d{4}-\\d{2}-\\d{2}[ \\t]*$`,
+  "m",
+);
+const nextReleaseHeadingPattern = /^ {0,3}## \[(?!Unreleased\])[^\]]+\][^\n]*$/m;
+const releaseHeading = releaseHeadingPattern.exec(changelog);
+
+if (releaseHeading === null || releaseHeading.index === undefined) {
+  throw new Error(`Missing dated CHANGELOG.md release section for ${version}`);
+}
+
+const releaseLineEnd = changelog.indexOf("\n", releaseHeading.index);
+const releaseBodyStart =
+  releaseLineEnd === -1 ? changelog.length : releaseLineEnd + 1;
+const nextRelease = nextReleaseHeadingPattern.exec(changelog.slice(releaseBodyStart));
+const releaseEnd =
+  nextRelease === null ? changelog.length : releaseBodyStart + nextRelease.index;
+const releaseBody = changelog.slice(releaseBodyStart, releaseEnd).trim();
+
+if (releaseBody.length === 0) {
+  throw new Error(`CHANGELOG.md release notes for ${version} are empty`);
+}
+
+fs.writeFileSync(outputPath, `${releaseBody}\n`);
+NODE
+}
+
 release_macos_artifact_path() {
   local version="$1"
   printf '%s/dist/lfscloud-v%s-macos-arm64.tar.gz\n' "$RELEASE_REPO_ROOT" "$version"

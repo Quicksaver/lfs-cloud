@@ -148,11 +148,11 @@ The release script:
 
 1. Requires a completely clean worktree and a current commit exactly matching the current branch on `origin`.
 2. Requires the latest macOS, Linux ARM64 Docker, and Linux x86-64 Docker statuses to be successful and created by the currently authenticated GitHub user.
-3. Updates the matching versions in `Cargo.toml`, `Cargo.lock`, and `package.json`, commits `Release vX.Y.Z`, and pushes that commit without force.
+3. Updates the matching versions in `Cargo.toml`, `Cargo.lock`, and `package.json`; moves the current `CHANGELOG.md` entries from `Unreleased` into a dated `[X.Y.Z] - YYYY-MM-DD` section; adds a fresh `Unreleased` section; then commits `Release vX.Y.Z` and pushes that commit without force.
 4. Reruns all three deterministic local verifiers and requires their new commit statuses to be green.
 5. Verifies that the packaged macOS binary reports the new version and that every platform archive's SHA-256 checksum and build manifest match the exact commit.
 6. Creates and pushes an annotated `vX.Y.Z` tag for the exact verified commit.
-7. Creates a draft GitHub release, uploads the three binary archives, checksums, and build manifests, verifies all assets, and only then publishes the release.
+7. Creates a draft GitHub release using the matching `CHANGELOG.md` section as its description, uploads the three binary archives, checksums, and build manifests, verifies all assets, and only then publishes the release. Resuming an existing draft refreshes its description from that same committed section.
 
 After `release.sh` succeeds, continue the same published release from a clean native Windows x86-64 checkout:
 

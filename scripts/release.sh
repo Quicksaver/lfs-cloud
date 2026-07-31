@@ -43,7 +43,14 @@ case "$mode" in
 esac
 
 release_ui_initialize "[release]" "Publish an LFS Cloud release"
-trap 'release_ui_finalize' EXIT
+release_notes_file=""
+finalize_release() {
+  if [[ -n "$release_notes_file" ]] && [[ -f "$release_notes_file" ]]; then
+    rm -f -- "$release_notes_file"
+  fi
+  release_ui_finalize
+}
+trap finalize_release EXIT
 
 release_initialize "$SCRIPT_DIR"
 cd "$RELEASE_REPO_ROOT"
@@ -125,7 +132,8 @@ ensure_release_tag() {
 
 publish_release() {
   local tag="$1"
-  shift
+  local notes_file="$2"
+  shift 2
   local assets=("$@")
   local asset
   local asset_name
@@ -143,6 +151,12 @@ publish_release() {
     fi
 
     release_run_step \
+      "Update notes on the existing draft release $tag" \
+      gh release edit "$tag" \
+      --repo "$RELEASE_GITHUB_REPO" \
+      --notes-file "$notes_file"
+
+    release_run_step \
       "Replace assets on the existing draft release $tag" \
       gh release upload "$tag" "${assets[@]}" \
       --repo "$RELEASE_GITHUB_REPO" \
@@ -154,7 +168,7 @@ publish_release() {
       --repo "$RELEASE_GITHUB_REPO" \
       --draft \
       --verify-tag \
-      --generate-notes \
+      --notes-file "$notes_file" \
       --title "LFS Cloud $tag"
   fi
 
@@ -235,19 +249,26 @@ if [[ "$mode" != "resume" ]]; then
     "$next_version"
 
   release_run_step \
+    "Roll Unreleased changelog entries into $next_version" \
+    release_roll_changelog \
+    "$RELEASE_REPO_ROOT/CHANGELOG.md" \
+    "$next_version" \
+    "$(date '+%Y-%m-%d')"
+
+  release_run_step \
     "Validate locked Cargo metadata" \
     validate_locked_cargo_metadata
   release_run_step "Validate Yarn install state" yarn install --immutable
 
   changed_files="$(git diff --name-only | LC_ALL=C sort)"
-  expected_files="$(printf '%s\n' Cargo.lock Cargo.toml package.json | LC_ALL=C sort)"
+  expected_files="$(printf '%s\n' CHANGELOG.md Cargo.lock Cargo.toml package.json | LC_ALL=C sort)"
   if [[ "$changed_files" != "$expected_files" ]]; then
     ui_log_persistent_raw_batch "Changed files:
 $changed_files" "$YELLOW"
     release_die "Version update changed files outside the expected package metadata."
   fi
 
-  git add -- Cargo.toml Cargo.lock package.json
+  git add -- CHANGELOG.md Cargo.toml Cargo.lock package.json
   release_run_step \
     "Commit release v$next_version" \
     git commit --message "Release v$next_version"
@@ -268,6 +289,14 @@ else
   tag="v$current_version"
   release_pass "Resuming release $tag from $RELEASE_SHA"
 fi
+
+release_notes_file="$(mktemp "${TMPDIR:-/tmp}/lfscloud-release-notes.XXXXXX")"
+release_run_step \
+  "Extract release notes for $current_version" \
+  release_extract_changelog_notes \
+  "$RELEASE_REPO_ROOT/CHANGELOG.md" \
+  "$current_version" \
+  "$release_notes_file"
 
 artifact="$(release_macos_artifact_path "$current_version")"
 manifest="$(release_macos_manifest_path "$current_version")"
@@ -325,4 +354,4 @@ fi
 
 release_require_local_statuses_green "$RELEASE_SHA"
 ensure_release_tag "$tag" "$RELEASE_SHA"
-publish_release "$tag" "${release_assets[@]}"
+publish_release "$tag" "$release_notes_file" "${release_assets[@]}"
