@@ -103,6 +103,9 @@ set -euo pipefail
 
 case "${1:-}" in
   info)
+    if [[ "${PREFLIGHT_DOCKER_RUNNABLE:-1}" != "1" ]]; then
+      exit 1
+    fi
     printf '%s\n' "${PREFLIGHT_DOCKER_ENGINE_OS:-linux}"
     ;;
   buildx)
@@ -177,6 +180,67 @@ if [[ -e "$preflight_gh_marker" ]]; then
   fail_test "Docker platform preflight contacted GitHub"
 fi
 
+release_info "Test verify-all capability-based command selection"
+(
+  export PATH="$preflight_bin:$PATH"
+
+  export PREFLIGHT_UNAME_SYSTEM="Darwin"
+  export PREFLIGHT_DOCKER_RUNNABLE="1"
+  verify_all_configure_default_commands
+  assert_eq \
+    "macOS ARM64|Linux ARM64|Linux x86-64" \
+    "$(IFS='|'; printf '%s' "${VERIFY_ALL_LABELS[*]}")" \
+    "macOS with Docker verify-all selection"
+
+  export PREFLIGHT_UNAME_SYSTEM="MINGW64_NT-10.0"
+  verify_all_configure_default_commands
+  assert_eq \
+    "Windows x86-64|Linux ARM64|Linux x86-64" \
+    "$(IFS='|'; printf '%s' "${VERIFY_ALL_LABELS[*]}")" \
+    "Windows with Docker verify-all selection"
+  assert_eq \
+    "$REPO_ROOT/scripts/local/verify-windows.ps1" \
+    "${VERIFY_ALL_COMMANDS[0]}" \
+    "Windows verify-all command"
+
+  export PREFLIGHT_UNAME_SYSTEM="Linux"
+  verify_all_configure_default_commands
+  assert_eq \
+    "Linux ARM64|Linux x86-64" \
+    "$(IFS='|'; printf '%s' "${VERIFY_ALL_LABELS[*]}")" \
+    "Linux with Docker verify-all selection"
+
+  export PREFLIGHT_DOCKER_RUNNABLE="0"
+  verify_all_configure_default_commands
+  assert_eq "0" "${#VERIFY_ALL_COMMANDS[@]}" "Linux without Docker verify-all selection"
+
+  export PREFLIGHT_UNAME_SYSTEM="Darwin"
+  verify_all_configure_default_commands
+  assert_eq \
+    "macOS ARM64" \
+    "$(IFS='|'; printf '%s' "${VERIFY_ALL_LABELS[*]}")" \
+    "macOS without Docker verify-all selection"
+) >/dev/null
+
+rm -f -- "$preflight_gh_marker"
+set +e
+unsupported_verify_all_output="$(
+  PATH="$preflight_bin:$PATH" \
+    PREFLIGHT_DOCKER_RUNNABLE="0" \
+    PREFLIGHT_GH_MARKER="$preflight_gh_marker" \
+    PREFLIGHT_UNAME_SYSTEM="Linux" \
+    "$REPO_ROOT/scripts/local/verify-all.sh" 2>&1
+)"
+unsupported_verify_all_exit=$?
+set -e
+assert_eq "1" "$unsupported_verify_all_exit" "unsupported verify-all host exit status"
+if ! grep -q "supports no local verifiers" <<< "$unsupported_verify_all_output"; then
+  fail_test "unsupported verify-all host did not report its missing capability"
+fi
+if [[ -e "$preflight_gh_marker" ]]; then
+  fail_test "verify-all capability preflight contacted GitHub"
+fi
+
 release_info "Test parallel verifier orchestration and aggregate failures"
 parallel_fixture="$fixture_root/parallel"
 parallel_markers="$parallel_fixture/markers"
@@ -229,6 +293,37 @@ for verifier_name in verifier-one verifier-two verifier-fail; do
     fail_test "parallel output omitted $verifier_name"
   fi
 done
+
+release_info "Test PowerShell verifier dispatch"
+powershell_fixture="$fixture_root/powershell-dispatch"
+powershell_marker="$powershell_fixture/invoked"
+mkdir -p "$powershell_fixture/bin"
+cat > "$powershell_fixture/bin/pwsh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" != "-NoProfile" ]] || [[ "${2:-}" != "-File" ]] || [[ -z "${3:-}" ]]; then
+  exit 2
+fi
+touch "${VERIFY_ALL_POWERSHELL_MARKER:?}"
+EOF
+cat > "$powershell_fixture/verifier.ps1" <<'EOF'
+throw 'The fake PowerShell launcher should not evaluate this fixture.'
+EOF
+chmod +x "$powershell_fixture/bin/pwsh"
+
+VERIFY_ALL_LABELS=("Windows fixture")
+VERIFY_ALL_COMMANDS=("$powershell_fixture/verifier.ps1")
+set +e
+PATH="$powershell_fixture/bin:$PATH" \
+  VERIFY_ALL_POWERSHELL_MARKER="$powershell_marker" \
+  verify_all_run_parallel >/dev/null
+powershell_dispatch_exit=$?
+set -e
+assert_eq "0" "$powershell_dispatch_exit" "PowerShell verifier dispatch exit status"
+if [[ ! -e "$powershell_marker" ]]; then
+  fail_test "verify-all did not dispatch the Windows verifier through PowerShell"
+fi
 
 release_info "Test synchronized version metadata updates"
 version_fixture="$fixture_root/version"

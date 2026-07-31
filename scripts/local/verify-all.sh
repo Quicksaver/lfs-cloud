@@ -20,23 +20,66 @@ verify_all_usage() {
   cat <<'EOF'
 Usage: ./scripts/local/verify-all.sh
 
-Run the macOS ARM64, Linux ARM64, and Linux x86-64 deterministic local
-verifiers in parallel. Each verifier records its own local-checks/* commit
-status and release artifact.
+Run every deterministic local verifier supported by the current system in
+parallel. macOS runs the native macOS verifier, Windows runs the native Windows
+verifier, and a responsive Docker Linux engine runs both Linux verifiers. Each
+verifier records its own local-checks/* commit status and release artifact.
 EOF
 }
 
+verify_all_docker_is_runnable() {
+  command -v docker >/dev/null 2>&1 \
+    && [[ "$(docker info --format '{{.OSType}}' 2>/dev/null)" == "linux" ]]
+}
+
 verify_all_configure_default_commands() {
-  VERIFY_ALL_LABELS=(
-    "macOS ARM64"
-    "Linux ARM64"
-    "Linux x86-64"
-  )
-  VERIFY_ALL_COMMANDS=(
-    "$SCRIPT_DIR/verify-macos.sh"
-    "$SCRIPT_DIR/verify-linux-arm64.sh"
-    "$SCRIPT_DIR/verify-linux-x86-64.sh"
-  )
+  local system_name
+
+  VERIFY_ALL_LABELS=()
+  VERIFY_ALL_COMMANDS=()
+  system_name="$(uname -s)"
+
+  case "$system_name" in
+    Darwin)
+      VERIFY_ALL_LABELS+=("macOS ARM64")
+      VERIFY_ALL_COMMANDS+=("$SCRIPT_DIR/verify-macos.sh")
+      ;;
+    CYGWIN* | MINGW* | MSYS* | Windows_NT)
+      VERIFY_ALL_LABELS+=("Windows x86-64")
+      VERIFY_ALL_COMMANDS+=("$SCRIPT_DIR/verify-windows.ps1")
+      ;;
+  esac
+
+  if verify_all_docker_is_runnable; then
+    VERIFY_ALL_LABELS+=("Linux ARM64" "Linux x86-64")
+    VERIFY_ALL_COMMANDS+=(
+      "$SCRIPT_DIR/verify-linux-arm64.sh"
+      "$SCRIPT_DIR/verify-linux-x86-64.sh"
+    )
+  fi
+}
+
+verify_all_validate_command() {
+  local command_path="$1"
+
+  if [[ "$command_path" == *.ps1 ]]; then
+    [[ -f "$command_path" ]] \
+      || release_die "Verifier does not exist: $command_path"
+    command -v pwsh >/dev/null 2>&1 \
+      || release_die "PowerShell 7 is required to run verifier: $command_path"
+  elif [[ ! -x "$command_path" ]]; then
+    release_die "Verifier is not executable: $command_path"
+  fi
+}
+
+verify_all_run_command() {
+  local command_path="$1"
+
+  if [[ "$command_path" == *.ps1 ]]; then
+    pwsh -NoProfile -File "$command_path"
+  else
+    "$command_path"
+  fi
 }
 
 verify_all_child_pids() {
@@ -157,9 +200,7 @@ verify_all_run_parallel() {
   ui_enable_rolling_slots "$count" 3
   for ((idx = 0; idx < count; idx++)); do
     command_path="${VERIFY_ALL_COMMANDS[$idx]}"
-    if [[ ! -x "$command_path" ]]; then
-      release_die "Verifier is not executable: $command_path"
-    fi
+    verify_all_validate_command "$command_path"
 
     VERIFY_ALL_LOG_FILES[$idx]="$VERIFY_ALL_TEMP_DIR/verifier-$idx.log"
     VERIFY_ALL_STATUS_FILES[$idx]="$VERIFY_ALL_TEMP_DIR/verifier-$idx.status"
@@ -176,7 +217,7 @@ verify_all_run_parallel() {
     status_tmp="$status_file.tmp"
     (
       set +e
-      "$command_path" > "${VERIFY_ALL_LOG_FILES[$idx]}" 2>&1
+      verify_all_run_command "$command_path" > "${VERIFY_ALL_LOG_FILES[$idx]}" 2>&1
       exit_code=$?
       printf '\n' >> "${VERIFY_ALL_LOG_FILES[$idx]}"
       printf '%s\n' "$exit_code" > "$status_tmp"
@@ -250,6 +291,8 @@ verify_all_run_parallel() {
 }
 
 verify_all_main() {
+  local command_path
+
   if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     verify_all_usage
     return 0
@@ -264,12 +307,19 @@ verify_all_main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
+  verify_all_configure_default_commands
+  if ((${#VERIFY_ALL_COMMANDS[@]} == 0)); then
+    release_die "This system supports no local verifiers; use macOS, Windows, or a responsive Docker Linux engine."
+  fi
+  for command_path in "${VERIFY_ALL_COMMANDS[@]}"; do
+    verify_all_validate_command "$command_path"
+  done
+
   release_initialize "$SCRIPT_DIR"
   cd "$RELEASE_REPO_ROOT"
   release_require_tracked_clean
   release_require_current_commit_on_origin
 
-  verify_all_configure_default_commands
   if ! verify_all_run_parallel; then
     release_die "One or more local verifiers failed."
   fi

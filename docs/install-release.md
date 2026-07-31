@@ -40,13 +40,15 @@ On a Windows x86-64 machine, test the native verification automation with:
 yarn test:verify-windows
 ```
 
-After pushing a candidate commit from an ARM64 Mac, run all deterministic local verifiers in parallel:
+After pushing a candidate commit, run every deterministic local verifier supported by the current system in parallel:
 
 ```bash
 yarn verify:all
 ```
 
-The orchestrator requires a clean tracked worktree and proves that the checked-out commit is exactly the current branch on `origin`, then runs the macOS ARM64, Linux ARM64, and Linux x86-64 verifiers concurrently. Its terminal display keeps a bounded rolling output window for each environment, waits for every verifier even when one fails, and reports their results independently. Each verifier packages its verified binary, checksum, and commit-bound build manifest under `dist/`, then posts its own `local-checks/*` commit status through the authenticated GitHub CLI.
+The orchestrator detects host capabilities before repository or GitHub checks. On macOS it selects the macOS ARM64 verifier; on Windows it selects the Windows x86-64 verifier. Whenever a responsive Docker Linux engine is available, it also selects both Linux Docker verifiers. The selected checks run concurrently. If the host supports no verifier, the command fails before contacting GitHub.
+
+The orchestrator requires a clean tracked worktree and proves that the checked-out commit is exactly the current branch on `origin`. Its terminal display keeps a bounded rolling output window for each environment, waits for every selected verifier even when one fails, and reports their results independently. Each verifier packages its verified binary, checksum, and commit-bound build manifest under `dist/`, then posts its own `local-checks/*` commit status through the authenticated GitHub CLI.
 
 Run one environment independently when needed:
 
@@ -64,7 +66,7 @@ yarn verify:windows
 
 The macOS verifier first requires a Darwin ARM64 host, then uses the active system Rust toolchain to run formatting, Clippy, all Cargo targets, documentation tests, the pinned RustSec audit, repository formatting, and smoke tests against the exact release executable. Its status is `local-checks/macos-arm64`. The Windows verifier requires a Windows x86-64 host and enforces the same active-toolchain checks, clean pushed-commit boundary, exact release-binary smoke tests, and artifact integrity checks. It writes a Windows archive, checksum, and commit-bound build manifest under `dist/`; its status is `local-checks/windows-x86_64`. The Linux scripts first require a responsive Docker Linux engine whose active Buildx builder advertises the requested platform, then enforce the same clean, pushed commit boundary and build the exact `package.rust-version` toolchain inside a parameterized image. Their distinct statuses are `local-checks/linux-arm64-docker` and `local-checks/linux-x86_64-docker`. Platform preflights run before GitHub authentication, origin checks, commit-status writes, image builds, or verification commands.
 
-`yarn verify:all` remains the ARM64 Mac orchestrator for the macOS and two Docker environments. Run `yarn verify:windows` on the Windows machine for the separate native status and artifact.
+`yarn verify:all` selects from all four verifiers. Run an individual `yarn verify:*` command when only one environment should be checked.
 
 Docker resources are deliberately stable and persist after a check:
 
