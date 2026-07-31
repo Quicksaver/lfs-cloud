@@ -1865,6 +1865,7 @@ if [ "$1" = "config" ]; then
   exit 0
 fi
 if [ "$1" = "credential" ] && [ "$2" = "approve" ]; then
+  cat >/dev/null
   touch '{}'
 fi
 "#,
@@ -1898,6 +1899,7 @@ fi
 if [ "$1" = "config" ]; then
   exit 0
 fi
+cat >/dev/null
 echo "helper rejected local-lfs-token" >&2
 exit 42
 "#,
@@ -1933,6 +1935,7 @@ fi
 if [ "$1" = "config" ]; then
   exit 0
 fi
+cat >/dev/null
 printf 'first line\nsecond local-lfs-token line\n' >&2
 exit 42
 "#,
@@ -1948,7 +1951,10 @@ exit 42
             .expect_err("fake git should fail");
         let display = error.to_string();
 
-        assert!(display.contains("first line second <redacted> line"));
+        assert!(
+            display.contains("first line second <redacted> line"),
+            "unexpected sanitized command error: {display:?}"
+        );
         assert!(!display.contains('\n'));
         assert!(!display.contains("local-lfs-token"));
     }
