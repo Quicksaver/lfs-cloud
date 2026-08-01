@@ -83,6 +83,8 @@ Docker resources are deliberately stable and persist after a check:
 
 Both containers share the architecture-independent `lfscloud-checks-cargo-cache` registry volume. Source is bind-mounted from the current checkout, while compiled targets stay isolated from macOS and the other Linux architecture. Repeated runs rebuild the named image with Docker's cache and restart the matching stopped container rather than creating anonymous images, containers, or volumes. If `.env.local` points at readable Google Drive ADC configuration, the same directory is mounted into the container so eligible live-provider smoke checks remain enabled.
 
+Linux verification disables Cargo incremental compilation because the persistent target volumes already retain reusable dependency and final build artifacts; retaining per-edit incremental compiler sessions adds several gigabytes per architecture without helping the pushed-commit verification workflow.
+
 GitHub Actions `CI` is manual-only and installs the toolchain declared by `package.rust-version` in `Cargo.toml`, including the matrix target and required components. Local verification continues to use the active system Rust toolchain. One workflow dispatch runs formatting, linting, all Cargo targets, documentation tests, release builds, and smoke tests for all four native targets:
 
 | Artifact                     | Rust target                  | Runner architecture |

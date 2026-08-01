@@ -667,6 +667,10 @@ if (
 fi
 
 release_info "Test script syntax and non-destructive help entrypoints"
+if ! grep -Fqx 'export CARGO_INCREMENTAL="0"' \
+  "$REPO_ROOT/scripts/docker/run-linux-verification.sh"; then
+  fail_test "Linux Docker verification should disable Cargo incremental compilation"
+fi
 bash -n \
   "$REPO_ROOT/scripts/docker/run-linux-verification.sh" \
   "$REPO_ROOT/scripts/lib/release-common.sh" \

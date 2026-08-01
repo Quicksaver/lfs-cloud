@@ -65,6 +65,7 @@ fi
 cd "$repo_root"
 export CARGO_BUILD_TARGET="$rust_target"
 export CARGO_TARGET_DIR="/target"
+export CARGO_INCREMENTAL="0"
 export CARGO_TERM_COLOR="never"
 export LFS_CLOUD_SMOKE_BINARY="$CARGO_TARGET_DIR/$rust_target/release/lfscloud"
 export LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS="1"
