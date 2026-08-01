@@ -667,6 +667,10 @@ if (
 fi
 
 release_info "Test script syntax and non-destructive help entrypoints"
+if ! grep -Fqx 'RELEASE_REPO_ROOT="$repo_root"' \
+  "$REPO_ROOT/scripts/docker/run-linux-verification.sh"; then
+  fail_test "Linux Docker verification should initialize shared artifact paths from /workspace"
+fi
 if ! grep -Fqx 'export CARGO_INCREMENTAL="0"' \
   "$REPO_ROOT/scripts/docker/run-linux-verification.sh"; then
   fail_test "Linux Docker verification should disable Cargo incremental compilation"
