@@ -2,7 +2,7 @@
 
 LFS Cloud is a self-hosted Git LFS server and companion CLI that stores large files in Google Drive while keeping the Git repository on GitHub.
 
-> LFS Cloud is preparing for its first release. Install it from source for now; published binaries, installers, checksums, and signatures are not available yet.
+> LFS Cloud is preparing for its first release. The release tooling now builds checksummed binaries, direct installers, Homebrew and APT packages, and WinGet manifests, but those channels will not resolve until the first release is published. Binary signatures and macOS notarization are not available yet.
 
 ## What It Does
 
@@ -46,6 +46,18 @@ Install LFS Cloud from this checkout:
 cargo install --locked --path .
 git lfs install
 ```
+
+After the first release is published, a direct install or update will be available with:
+
+```bash
+curl -fsSL https://github.com/Quicksaver/lfs-cloud/releases/latest/download/lfscloud-installer.sh | sh
+```
+
+```powershell
+irm https://github.com/Quicksaver/lfs-cloud/releases/latest/download/lfscloud-installer.ps1 | iex
+```
+
+The direct installers verify the release checksum and executable version, install into `~/.local/bin` by default, and do not modify `PATH` or invoke elevated privileges. Homebrew, WinGet, and APT commands are documented in [Install, build, and release details](docs/install-release.md).
 
 ### 2. Prepare Google Drive Access
 
@@ -185,7 +197,7 @@ Run `lfscloud <command> --help` for all options.
 - GitHub and Google Drive are the only implemented providers.
 - Authentication represents one configured GitHub account, not independent users.
 - Uploads and downloads are proxied through the LFS Cloud process, so the host must support long-lived large-file transfers.
-- Published and signed release packages are not available yet.
+- The package channels will remain unavailable until the first release is published; release binaries are not signed or notarized yet.
 
 Use HTTPS for every non-loopback deployment. Plaintext LAN mode is an explicit development-only opt-in and exposes credentials and object bytes to network observers.
 

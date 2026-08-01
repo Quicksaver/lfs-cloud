@@ -4,6 +4,9 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot 'terminal-ui.ps1')
 
+$script:LOCAL_MACOS_STATUS_CONTEXT = 'local-checks/macos-arm64'
+$script:LOCAL_LINUX_X86_64_STATUS_CONTEXT = 'local-checks/linux-x86_64-docker'
+$script:LOCAL_LINUX_ARM64_STATUS_CONTEXT = 'local-checks/linux-arm64-docker'
 $script:LOCAL_WINDOWS_STATUS_CONTEXT = 'local-checks/windows-x86_64'
 $script:RELEASE_REPO_ROOT = ''
 $script:RELEASE_BRANCH = ''

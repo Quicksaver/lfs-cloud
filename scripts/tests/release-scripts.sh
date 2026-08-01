@@ -502,6 +502,43 @@ if (
   fail_test "a Linux manifest for a different target should be rejected"
 fi
 
+deb_artifact="$fixture_root/lfscloud_0.2.0_arm64.deb"
+deb_manifest="$fixture_root/lfscloud_0.2.0_arm64.build.json"
+printf 'verified Debian package\n' > "$deb_artifact"
+deb_digest="$(shasum -a 256 "$deb_artifact" | awk 'NR == 1 { print $1 }')"
+jq -n \
+  --arg artifact "$(basename "$deb_artifact")" \
+  --arg digest "$deb_digest" \
+  '{
+    schema_version: 1,
+    artifact: $artifact,
+    commit: "abc123",
+    version: "0.2.0",
+    target: "aarch64-unknown-linux-musl",
+    architecture: "arm64",
+    package_format: "deb",
+    rustc: "rustc fixture",
+    sha256: $digest
+  }' > "$deb_manifest"
+release_verify_linux_deb_manifest \
+  "$deb_artifact" \
+  "$deb_manifest" \
+  "0.2.0" \
+  "abc123" \
+  "aarch64-unknown-linux-musl" \
+  "arm64"
+if (
+  release_verify_linux_deb_manifest \
+    "$deb_artifact" \
+    "$deb_manifest" \
+    "0.2.0" \
+    "abc123" \
+    "aarch64-unknown-linux-musl" \
+    "amd64"
+) >/dev/null 2>&1; then
+  fail_test "a Debian manifest for a different architecture should be rejected"
+fi
+
 release_info "Test exact pushed-commit and status guards"
 bare_repo="$fixture_root/origin.git"
 work_repo="$fixture_root/work"
@@ -639,8 +676,11 @@ bash -n \
   "$REPO_ROOT/scripts/local/verify-linux-arm64.sh" \
   "$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" \
   "$REPO_ROOT/scripts/local/verify-macos.sh" \
+  "$REPO_ROOT/scripts/install.sh" \
   "$REPO_ROOT/scripts/release.sh" \
+  "$REPO_ROOT/scripts/tests/install-scripts.sh" \
   "$REPO_ROOT/scripts/tests/release-scripts.sh"
+"$REPO_ROOT/scripts/install.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-linux-arm64.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-macos.sh" --help >/dev/null

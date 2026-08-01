@@ -16,7 +16,7 @@ Usage:
 
 major, minor, patch
   Require a clean pushed commit with green local checks, increment the version,
-  commit and push it, rerun local checks, tag it, and publish its release.
+  commit and push it, rerun local checks, tag it, and prepare its draft release.
 
 resume
   Continue an interrupted release from the current pushed version commit
@@ -42,7 +42,7 @@ case "$mode" in
     ;;
 esac
 
-release_ui_initialize "[release]" "Publish an LFS Cloud release"
+release_ui_initialize "[release]" "Prepare an LFS Cloud draft release"
 release_notes_file=""
 finalize_release() {
   if [[ -n "$release_notes_file" ]] && [[ -f "$release_notes_file" ]]; then
@@ -130,7 +130,7 @@ ensure_release_tag() {
   release_pass "Tag $tag points to $sha on origin"
 }
 
-publish_release() {
+prepare_release_draft() {
   local tag="$1"
   local notes_file="$2"
   shift 2
@@ -138,7 +138,6 @@ publish_release() {
   local asset
   local asset_name
   local release_json
-  local release_url
 
   if release_json="$(
     gh release view "$tag" \
@@ -191,24 +190,7 @@ publish_release() {
     fi
   done
 
-  release_run_step \
-    "Publish release $tag" \
-    gh release edit "$tag" \
-    --repo "$RELEASE_GITHUB_REPO" \
-    --draft=false \
-    --latest
-
-  release_json="$(
-    gh release view "$tag" \
-      --repo "$RELEASE_GITHUB_REPO" \
-      --json isDraft,url
-  )"
-  if [[ "$(printf '%s' "$release_json" | jq -r '.isDraft')" != "false" ]]; then
-    release_die "Release $tag was not published."
-  fi
-
-  release_url="$(printf '%s' "$release_json" | jq -r '.url')"
-  release_pass "Published $release_url"
+  release_pass "Prepared draft $(printf '%s' "$release_json" | jq -r '.url')"
 }
 
 run_all_local_verifiers() {
@@ -219,7 +201,7 @@ run_all_local_verifiers() {
   "$SCRIPT_DIR/local/verify-all.sh"
   verify_exit=$?
   set -e
-  ui_set_live_section_running "Publish an LFS Cloud release"
+  ui_set_live_section_running "Prepare an LFS Cloud draft release"
 
   if ((verify_exit != 0)); then
     release_die "Local release verification failed."
@@ -310,6 +292,10 @@ linux_x86_artifact="$(
 linux_x86_manifest="$(
   release_linux_manifest_path "$current_version" "linux-x86_64-musl"
 )"
+linux_x86_deb="$(release_linux_deb_artifact_path "$current_version" "amd64")"
+linux_x86_deb_manifest="$(
+  release_linux_deb_manifest_path "$current_version" "amd64"
+)"
 release_verify_checksum "$linux_x86_artifact"
 release_verify_linux_manifest \
   "$linux_x86_artifact" \
@@ -323,12 +309,29 @@ release_assets+=(
   "$linux_x86_artifact.sha256"
   "$linux_x86_manifest"
 )
+release_verify_checksum "$linux_x86_deb"
+release_verify_linux_deb_manifest \
+  "$linux_x86_deb" \
+  "$linux_x86_deb_manifest" \
+  "$current_version" \
+  "$RELEASE_SHA" \
+  "x86_64-unknown-linux-musl" \
+  "amd64"
+release_assets+=(
+  "$linux_x86_deb"
+  "$linux_x86_deb.sha256"
+  "$linux_x86_deb_manifest"
+)
 
 linux_arm_artifact="$(
   release_linux_artifact_path "$current_version" "linux-arm64-musl"
 )"
 linux_arm_manifest="$(
   release_linux_manifest_path "$current_version" "linux-arm64-musl"
+)"
+linux_arm_deb="$(release_linux_deb_artifact_path "$current_version" "arm64")"
+linux_arm_deb_manifest="$(
+  release_linux_deb_manifest_path "$current_version" "arm64"
 )"
 release_verify_checksum "$linux_arm_artifact"
 release_verify_linux_manifest \
@@ -343,6 +346,52 @@ release_assets+=(
   "$linux_arm_artifact.sha256"
   "$linux_arm_manifest"
 )
+release_verify_checksum "$linux_arm_deb"
+release_verify_linux_deb_manifest \
+  "$linux_arm_deb" \
+  "$linux_arm_deb_manifest" \
+  "$current_version" \
+  "$RELEASE_SHA" \
+  "aarch64-unknown-linux-musl" \
+  "arm64"
+release_assets+=(
+  "$linux_arm_deb"
+  "$linux_arm_deb.sha256"
+  "$linux_arm_deb_manifest"
+)
+
+stage_direct_installer() {
+  local source_path="$1"
+  local destination_path="$2"
+
+  cp "$source_path" "$destination_path"
+  (
+    cd "$(dirname "$destination_path")"
+    shasum -a 256 "$(basename "$destination_path")" \
+      > "$(basename "$destination_path").sha256"
+  )
+  release_verify_checksum "$destination_path"
+}
+
+mkdir -p "$RELEASE_REPO_ROOT/dist"
+shell_installer="$RELEASE_REPO_ROOT/dist/lfscloud-installer.sh"
+powershell_installer="$RELEASE_REPO_ROOT/dist/lfscloud-installer.ps1"
+release_run_step \
+  "Stage the direct-install scripts" \
+  stage_direct_installer \
+  "$SCRIPT_DIR/install.sh" \
+  "$shell_installer"
+release_run_step \
+  "Stage the PowerShell direct installer" \
+  stage_direct_installer \
+  "$SCRIPT_DIR/install.ps1" \
+  "$powershell_installer"
+release_assets+=(
+  "$shell_installer"
+  "$shell_installer.sha256"
+  "$powershell_installer"
+  "$powershell_installer.sha256"
+)
 
 release_binary="$RELEASE_REPO_ROOT/target/aarch64-apple-darwin/release/lfscloud"
 if [[ ! -x "$release_binary" ]]; then
@@ -354,4 +403,4 @@ fi
 
 release_require_local_statuses_green "$RELEASE_SHA"
 ensure_release_tag "$tag" "$RELEASE_SHA"
-publish_release "$tag" "$release_notes_file" "${release_assets[@]}"
+prepare_release_draft "$tag" "$release_notes_file" "${release_assets[@]}"

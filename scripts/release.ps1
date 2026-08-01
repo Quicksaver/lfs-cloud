@@ -15,12 +15,12 @@ function Write-Usage {
     @'
 Usage: pwsh ./scripts/release.ps1
 
-Continue a release created by release.sh from a native Windows x64 checkout.
-The script lists published semantic versions without successful
+Complete a draft created by release.sh from a native Windows x64 checkout.
+The script lists draft semantic versions without successful
 local-checks/windows-x86_64 verification, prompts for a version with an
 arrow-key menu, checks out its tag, verifies and packages its exact executable,
-uploads the Windows assets, verifies them on GitHub, and restores the original
-checkout.
+uploads the Windows assets to the draft, verifies them on GitHub, and restores
+the original checkout. It never publishes the release.
 '@ | Write-Host
 }
 
@@ -66,14 +66,13 @@ function Get-WindowsReleaseCandidates {
         'list',
         '--repo',
         $script:RELEASE_GITHUB_REPO,
-        '--exclude-drafts',
         '--limit',
         '1000',
         '--json',
         'tagName,isDraft,isPrerelease,publishedAt'
     )
     if ($result.ExitCode -ne 0) {
-        throw 'Could not list published GitHub releases.'
+        throw 'Could not list GitHub draft releases.'
     }
 
     try {
@@ -86,13 +85,15 @@ function Get-WindowsReleaseCandidates {
     $candidates = [System.Collections.Generic.List[object]]::new()
     foreach ($release in $releases) {
         $tag = [string] $release.tagName
-        if ([bool] $release.isDraft -or $tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+        if (-not [bool] $release.isDraft -or
+            [bool] $release.isPrerelease -or
+            $tag -notmatch '^v(\d+\.\d+\.\d+)$') {
             continue
         }
 
         $commit = Get-RemoteReleaseTagCommit -Tag $tag
         if ([string]::IsNullOrWhiteSpace($commit)) {
-            throw "Published release $tag does not have a matching tag on origin."
+            throw "Draft release $tag does not have a matching tag on origin."
         }
 
         $status = Get-WindowsVerificationStatusState -Commit $commit
@@ -206,7 +207,7 @@ function Read-WindowsReleaseSelection {
     }
 
     Write-Host ''
-    Write-Host 'Published releases without successful Windows verification:'
+    Write-Host 'Draft releases without successful Windows verification:'
     Write-Host 'Use Up/Down to navigate, Enter to select, or Escape to cancel.'
 
     $selectedIndex = 0
@@ -397,7 +398,7 @@ function Get-WindowsReleaseUploadArguments {
     return @($arguments)
 }
 
-function Publish-WindowsReleaseAssets {
+function Complete-WindowsDraftAssets {
     param([Parameter(Mandatory = $true)] $Candidate)
 
     $artifact = Get-WindowsArtifactPath `
@@ -420,24 +421,24 @@ function Publish-WindowsReleaseAssets {
     }
 
     $release = Get-GitHubReleaseDocument -Tag $Candidate.Tag
-    if ([bool] $release.isDraft -or $release.tagName -ne $Candidate.Tag) {
-        throw "GitHub release $($Candidate.Tag) is not published for the selected tag."
+    if (-not [bool] $release.isDraft -or $release.tagName -ne $Candidate.Tag) {
+        throw "GitHub release $($Candidate.Tag) is not a draft for the selected tag."
     }
     if ([bool] $release.isImmutable) {
         throw "GitHub release $($Candidate.Tag) is immutable and cannot accept Windows assets."
     }
 
-    Initialize-ReleaseUi '[release-windows]' "Publish Windows release $($Candidate.Tag)"
+    Initialize-ReleaseUi '[release-windows]' "Complete Windows draft $($Candidate.Tag)"
     try {
         Invoke-ReleaseStep `
-            -Message "Upload Windows assets to $($Candidate.Tag)" `
+            -Message "Upload Windows assets to draft $($Candidate.Tag)" `
             -Command 'gh' `
             -Arguments @(Get-WindowsReleaseUploadArguments `
                 -Tag $Candidate.Tag `
                 -AssetPaths $assets `
                 -Repository $script:RELEASE_GITHUB_REPO)
 
-        Invoke-ReleaseActionStep 'Verify published Windows assets' {
+        Invoke-ReleaseActionStep 'Verify draft Windows assets' {
             $publishedRelease = Get-GitHubReleaseDocument -Tag $Candidate.Tag
             Assert-WindowsReleaseAssetsPublished `
                 -Release $publishedRelease `
@@ -449,10 +450,10 @@ function Publish-WindowsReleaseAssets {
                 -Commit $Candidate.Commit `
                 -Context $script:LOCAL_WINDOWS_STATUS_CONTEXT `
                 -State 'success' `
-                -Description "Windows $($Candidate.VersionText) x86-64 release published"
+                -Description "Windows $($Candidate.VersionText) x86-64 draft is complete"
         }
 
-        Write-ReleasePass "Published Windows assets to $($release.url)"
+        Write-ReleasePass "Completed Windows assets in draft $($release.url)"
     }
     catch {
         $failureMessage = $_.Exception.Message
@@ -461,7 +462,7 @@ function Publish-WindowsReleaseAssets {
                 -Commit $Candidate.Commit `
                 -Context $script:LOCAL_WINDOWS_STATUS_CONTEXT `
                 -State 'failure' `
-                -Description "Windows $($Candidate.VersionText) x86-64 release publication failed"
+                -Description "Windows $($Candidate.VersionText) x86-64 draft completion failed"
         }
         catch {
             Write-ReleaseWarning "Failed to record Windows publication failure for $($Candidate.Tag)."
@@ -500,7 +501,7 @@ function Invoke-WindowsReleaseContinuation {
 
         $candidates = @(Get-WindowsReleaseCandidates)
         if ($candidates.Count -eq 0) {
-            Write-ReleasePass 'Every published semantic release already has successful Windows verification.'
+            Write-ReleasePass 'Every draft semantic release already has successful Windows verification.'
         }
         else {
             $selectedIndices = @(Read-WindowsReleaseSelection -Candidates $candidates)
@@ -519,7 +520,7 @@ function Invoke-WindowsReleaseContinuation {
                             throw "Windows verification failed for $($candidate.Tag)."
                         }
 
-                        Publish-WindowsReleaseAssets -Candidate $candidate
+                        Complete-WindowsDraftAssets -Candidate $candidate
                     }
                     catch {
                         [void] $failedTags.Add($candidate.Tag)

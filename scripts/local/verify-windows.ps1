@@ -22,7 +22,7 @@ Run the complete deterministic Windows x86-64 verification with the active
 system Rust toolchain and post the local-checks/windows-x86_64 status to the
 pushed commit.
 
--ReleaseTag verifies a detached, published release-tag checkout instead of the
+-ReleaseTag verifies a detached draft-release tag checkout instead of the
 current branch. -DeferSuccessStatus leaves the status pending for a caller that
 must publish and verify release assets before marking the commit successful.
 '@ | Write-Host

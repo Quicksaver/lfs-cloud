@@ -1,6 +1,6 @@
 # Install, Build, And Release Shape
 
-LFS Cloud is currently a single Rust package with a library target and a small CLI binary. There is no published package, installer, or signed release artifact yet.
+LFS Cloud is currently a single Rust package with a library target and a small CLI binary. Its local release tooling produces checksummed platform archives, Debian packages, and direct installers, then publishes Homebrew, APT, and WinGet metadata from an interactive maintainer command. No release package is signed or notarized yet, and none of these channels will resolve until the first release is published.
 
 ## Prerequisites
 
@@ -11,6 +11,12 @@ LFS Cloud is currently a single Rust package with a library target and a small C
 - PowerShell 7 (`pwsh`) for the native Windows verifier.
 - `cargo-audit` 0.22.2 for local RustSec scans. Install the same pinned version used by CI with `cargo install cargo-audit --locked --version 0.22.2`.
 - Node.js/Yarn for repository formatting checks and the one-shot smoke runner.
+
+The final local publisher additionally requires:
+
+- Homebrew, for formula validation and publication to the configured tap.
+- the authenticated Cloudsmith CLI, for Debian repository uploads.
+- GitHub CLI access with repository administration permission to enable release immutability, plus permission to publish releases, push the Homebrew tap and WinGet fork, and open WinGet pull requests.
 
 For real GitHub and Google Drive operation you also need:
 
@@ -152,17 +158,17 @@ The release script:
 4. Reruns all three deterministic local verifiers and requires their new commit statuses to be green.
 5. Verifies that the packaged macOS binary reports the new version and that every platform archive's SHA-256 checksum and build manifest match the exact commit.
 6. Creates and pushes an annotated `vX.Y.Z` tag for the exact verified commit.
-7. Creates a draft GitHub release using the matching `CHANGELOG.md` section as its description, uploads the three binary archives, checksums, and build manifests, verifies all assets, and only then publishes the release. Resuming an existing draft refreshes its description from that same committed section.
+7. Creates or refreshes a draft GitHub release using the matching `CHANGELOG.md` section as its description. It uploads the three platform archives, both Debian packages, direct installers, checksums, and commit-bound manifests, verifies those draft assets, and leaves the release editable for the Windows continuation.
 
-After `release.sh` succeeds, continue the same published release from a clean native Windows x86-64 checkout:
+After `release.sh` succeeds, continue the same draft release from a clean native Windows x86-64 checkout:
 
 ```powershell
 yarn release:windows
 ```
 
-The Windows continuation inspects published semantic-version releases and offers an arrow-key menu containing only versions whose latest `local-checks/windows-x86_64` status is not successful. Use Up/Down to highlight a version and Enter to select it; Escape cancels. Missing, failed, or interrupted checks remain selectable so publication can be retried. For the selected version, it verifies that the local and remote tag identify the published release commit, checks out the tag in detached-HEAD mode, and runs the complete native Windows verifier against that exact source version.
+The Windows continuation inspects draft semantic-version releases and offers an arrow-key menu containing only versions whose latest `local-checks/windows-x86_64` status is not successful. Use Up/Down to highlight a version and Enter to select it; Escape cancels. Missing, failed, or interrupted checks remain selectable so completion can be retried. For the selected version, it verifies that the local and remote tag identify the draft release commit, checks out the tag in detached-HEAD mode, and runs the complete native Windows verifier against that exact source version.
 
-After verification, the continuation uploads the versioned Windows ZIP archive, SHA-256 checksum, and commit-bound build manifest to the existing GitHub release. It validates each remote asset's name, size, and GitHub-reported SHA-256 digest before recording the Windows status as successful. A build or publication failure records a failed status and leaves the version eligible for a retry. The original branch and commit are restored before the command exits, including after failures.
+After verification, the continuation uploads the versioned Windows ZIP archive, SHA-256 checksum, and commit-bound build manifest to the existing draft. It validates each remote asset's name, size, and GitHub-reported SHA-256 digest before recording the Windows status as successful. A build or upload failure records a failed status and leaves the version eligible for a retry. The original branch and commit are restored before the command exits, including after failures. It never publishes the GitHub release.
 
 If an interruption occurs after the version commit or tag is pushed, do not increment the version again. Restore the required green local status and artifact if necessary, then continue safely:
 
@@ -170,9 +176,80 @@ If an interruption occurs after the version commit or tag is pushed, do not incr
 yarn release:local resume
 ```
 
+## Final Publication And Distribution
+
+Run final publication locally rather than through GitHub Actions. On a clean checkout with PowerShell 7, Homebrew, Cloudsmith, Git, and GitHub CLI available, configure the Debian destination and invoke:
+
+```bash
+export LFS_CLOUD_APT_CLOUDSMITH_TARGET=OWNER/REPOSITORY/DISTRO/VERSION
+# Optional; defaults to Quicksaver/homebrew-tap
+export LFS_CLOUD_HOMEBREW_TAP_REPO=OWNER/homebrew-TAP
+yarn release:publish
+```
+
+The publisher lists semantic draft releases only when the latest macOS ARM64, Linux x86-64, Linux ARM64, and Windows x86-64 statuses are all successful and were created by the authenticated GitHub user. Its arrow-key selector also lists already-published immutable releases whose distribution statuses are incomplete, allowing a failed channel to be resumed without editing the release.
+
+Before asking for the exact `publish vX.Y.Z` confirmation, the command downloads every draft asset and revalidates its GitHub-reported digest, checksum, build manifest, version, target, architecture, and commit. It generates the Homebrew formula and WinGet manifests from those verified bytes. The confirmation then enables immutable releases for the repository and publishes the draft as the latest immutable release. It verifies GitHub's generated release attestation before distributing anything. All release assets must therefore be present before this point; published release tags and assets cannot be replaced.
+
+Distribution proceeds independently and records one commit status per channel:
+
+| Status | Publication |
+| --- | --- |
+| `distribution/direct-installer` | Downloads the now-public shell and PowerShell installer assets and verifies their digests. |
+| `distribution/homebrew` | Validates the generated formula, commits it to `Formula/lfscloud.rb` in the configured tap, and pushes the tap. |
+| `distribution/apt` | Uploads the `amd64` and `arm64` Debian packages to the configured Cloudsmith distribution. |
+| `distribution/winget-submitted` | Pushes versioned portable manifests to the authenticated user's `winget-pkgs` fork and opens the upstream pull request. |
+
+A channel failure does not make the immutable GitHub release editable. Rerun `yarn release:publish`; successful statuses are skipped and only incomplete channels require their corresponding local tool and configuration. WinGet's status means the Community repository pull request was submitted, not that Microsoft has merged it.
+
+No GitHub Actions workflow creates or publishes these releases or distribution entries.
+
+## Installing A Published Release
+
+Direct installation and later updates use the same command. The installer resolves the latest release unless given a pinned semantic version, verifies the archive checksum and executable-reported version, and writes an ownership receipt beside the installed binary. It refuses to replace a binary owned by another installation method unless explicitly forced.
+
+macOS ARM64 or Linux x86-64/ARM64:
+
+```bash
+curl -fsSL https://github.com/Quicksaver/lfs-cloud/releases/latest/download/lfscloud-installer.sh | sh
+
+# Pin a version or choose another directory:
+curl -fsSL https://github.com/Quicksaver/lfs-cloud/releases/latest/download/lfscloud-installer.sh \
+  | sh -s -- --version 1.2.3 --install-dir "$HOME/.local/bin"
+```
+
+Windows x86-64:
+
+```powershell
+irm https://github.com/Quicksaver/lfs-cloud/releases/latest/download/lfscloud-installer.ps1 | iex
+
+# Pin a version while retaining the script for inspection:
+irm https://github.com/Quicksaver/lfs-cloud/releases/latest/download/lfscloud-installer.ps1 -OutFile install-lfscloud.ps1
+./install-lfscloud.ps1 -Version 1.2.3 -InstallDir "$HOME/.local/bin"
+```
+
+Neither installer elevates privileges or edits `PATH`; the default destination is `~/.local/bin`. Use `--force` or `-Force` only when deliberately replacing an unmanaged executable.
+
+Once the corresponding repository entry exists, package-manager installation is:
+
+```bash
+brew install Quicksaver/tap/lfscloud
+```
+
+```powershell
+winget install --exact --id Quicksaver.LFSCloud
+```
+
+For APT, first follow the generated setup instructions for the configured Cloudsmith Debian repository, then run:
+
+```bash
+sudo apt update
+sudo apt install lfscloud
+```
+
 ## Expected Release Artifact
 
-Successful manual CI jobs package tested executables in 14-day workflow artifacts. The first local release phase publishes tested macOS ARM64, Linux ARM64 musl, and Linux x86-64 musl archives with SHA-256 checksums and commit-bound build manifests as GitHub Release assets. The native Windows continuation adds the corresponding tested Windows x86-64 archive, checksum, and manifest to that published version. The expected release artifact remains the compiled `lfscloud` binary plus documentation for:
+Successful manual CI jobs package tested executables in 14-day workflow artifacts. The first local release phase places tested macOS ARM64, Linux ARM64 musl, and Linux x86-64 musl archives, Debian packages, direct installers, SHA-256 checksums, and commit-bound build manifests in a GitHub draft. The native Windows continuation adds its tested Windows x86-64 archive, checksum, and manifest. The expected release artifact remains the compiled `lfscloud` binary plus documentation for:
 
 - supported platform and architecture
 - config file schema
@@ -181,12 +258,7 @@ Successful manual CI jobs package tested executables in 14-day workflow artifact
 - manual verification scripts that were run
 - known MVP limitations
 
-The current repository still does not define:
-
-- installer scripts
-- binary signatures or macOS notarization
-- automated CI release publishing
-- Homebrew, Cargo registry, or OS package distribution
+The current repository still does not define binary signatures, macOS notarization, Cargo registry publication, or automated CI release publishing. Homebrew, APT, WinGet, and direct-installer publication are deliberately initiated by the local interactive publisher.
 
 ## Licensing
 
@@ -194,7 +266,7 @@ LFS Cloud source is licensed under the [MIT License](../LICENSE). The Rust and r
 
 The current locked Rust dependency graph declares only permissive license terms, or multi-license expressions with a permissive option. Prettier, the only JavaScript development dependency, is also MIT-licensed and is not part of the compiled artifact. Before distributing a release, regenerate the dependency inventory from the final lockfiles and preserve any notices required by dependencies whose terms include Apache-2.0, BSD, ISC, Unicode, CDLA-Permissive, or other notice-bearing licenses.
 
-The deterministic local verifiers run the complete verification set before publishing:
+The deterministic local verifiers run the complete verification set before assembling the draft:
 
 ```bash
 yarn verify:all

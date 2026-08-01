@@ -441,6 +441,20 @@ release_linux_manifest_path() {
     "$artifact_platform"
 }
 
+release_linux_deb_artifact_path() {
+  local version="$1"
+  local architecture="$2"
+  printf '%s/dist/lfscloud_%s_%s.deb\n' \
+    "$RELEASE_REPO_ROOT" "$version" "$architecture"
+}
+
+release_linux_deb_manifest_path() {
+  local version="$1"
+  local architecture="$2"
+  printf '%s/dist/lfscloud_%s_%s.build.json\n' \
+    "$RELEASE_REPO_ROOT" "$version" "$architecture"
+}
+
 release_verify_checksum() {
   local artifact="$1"
   local checksum="$artifact.sha256"
@@ -523,5 +537,42 @@ release_verify_linux_manifest() {
     ' \
     "$manifest" >/dev/null; then
     release_die "Linux build manifest does not match the verified commit and artifact."
+  fi
+}
+
+release_verify_linux_deb_manifest() {
+  local artifact="$1"
+  local manifest="$2"
+  local version="$3"
+  local sha="$4"
+  local target="$5"
+  local architecture="$6"
+  local digest
+
+  if [[ ! -s "$manifest" ]]; then
+    release_die "Missing Debian build manifest: $(basename "$manifest")"
+  fi
+
+  digest="$(shasum -a 256 "$artifact" | awk 'NR == 1 { print $1 }')"
+  if ! jq -e \
+    --arg architecture "$architecture" \
+    --arg artifact "$(basename "$artifact")" \
+    --arg commit "$sha" \
+    --arg digest "$digest" \
+    --arg target "$target" \
+    --arg version "$version" \
+    '
+      .schema_version == 1 and
+      .artifact == $artifact and
+      .commit == $commit and
+      .sha256 == $digest and
+      .target == $target and
+      .architecture == $architecture and
+      .package_format == "deb" and
+      .version == $version and
+      (.rustc | type == "string" and length > 0)
+    ' \
+    "$manifest" >/dev/null; then
+    release_die "Debian build manifest does not match the verified commit and artifact."
   fi
 }
