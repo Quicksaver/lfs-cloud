@@ -160,7 +160,7 @@ The release script:
 4. Reruns all three deterministic local verifiers and requires their new commit statuses to be green.
 5. Verifies that the packaged macOS binary reports the new version and that every platform archive's SHA-256 checksum and build manifest match the exact commit.
 6. Creates and pushes an annotated `vX.Y.Z` tag for the exact verified commit.
-7. Creates or refreshes a draft GitHub release using the matching `CHANGELOG.md` section as its description. It uploads the three platform archives, both Debian packages, direct installers, checksums, and commit-bound manifests, verifies those draft assets, and leaves the release editable for the Windows continuation.
+7. Creates or refreshes a draft GitHub release using every `CHANGELOG.md` section newer than the highest successfully published stable release, through the candidate version, as its description. Failed, interrupted, or unpublished draft versions therefore keep rolling into later release notes until a release is published. It uploads the three platform archives, both Debian packages, direct installers, checksums, and commit-bound manifests, verifies those draft assets, and leaves the release editable for the Windows continuation.
 
 After `release.sh` succeeds, continue the same draft release from a clean native Windows x86-64 checkout:
 
@@ -177,6 +177,8 @@ If an interruption occurs after the version commit or tag is pushed, do not incr
 ```bash
 yarn release:local resume
 ```
+
+Running `major`, `minor`, or `patch` again from an untagged `Release vX.Y.Z` commit also resumes that version automatically. If `HEAD` is already tagged as the current version, the release command refuses another increment until a new commit exists, preventing an accidental consecutive version-only release.
 
 ## Final Publication And Distribution
 

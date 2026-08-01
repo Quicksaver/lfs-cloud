@@ -39,6 +39,70 @@ assert_eq "1.0.0" "$(release_next_version "0.9.4" major)" "major increment"
 assert_eq "0.10.0" "$(release_next_version "0.9.4" minor)" "minor increment"
 assert_eq "0.9.5" "$(release_next_version "0.9.4" patch)" "patch increment"
 
+release_info "Test repeated release action classification"
+assert_eq "increment" "$(
+  release_classify_version_action \
+    "patch" \
+    "0.2.0" \
+    "Implement pending changes" \
+    "head-sha" \
+    "" \
+    ""
+)" "ordinary release increment action"
+assert_eq "resume" "$(
+  release_classify_version_action \
+    "patch" \
+    "0.2.0" \
+    "Release v0.2.0" \
+    "head-sha" \
+    "" \
+    ""
+)" "untagged release commit resume action"
+assert_eq "already-released" "$(
+  release_classify_version_action \
+    "patch" \
+    "0.2.0" \
+    "Release v0.2.0" \
+    "head-sha" \
+    "head-sha" \
+    "head-sha"
+)" "tagged release commit rejection action"
+assert_eq "conflict" "$(
+  release_classify_version_action \
+    "patch" \
+    "0.2.0" \
+    "Release v0.2.0" \
+    "head-sha" \
+    "different-sha" \
+    ""
+)" "conflicting release tag action"
+assert_eq "resume" "$(
+  release_classify_version_action \
+    "resume" \
+    "0.2.0" \
+    "Implement pending changes" \
+    "head-sha" \
+    "" \
+    ""
+)" "explicit resume action"
+
+release_info "Test latest published semantic release selection"
+published_release_fixture='[
+  {"tagName":"v0.2.0","isDraft":false,"isPrerelease":false},
+  {"tagName":"v0.3.0","isDraft":true,"isPrerelease":false},
+  {"tagName":"v0.4.0-beta.1","isDraft":false,"isPrerelease":true},
+  {"tagName":"not-semantic","isDraft":false,"isPrerelease":false},
+  {"tagName":"v0.1.9","isDraft":false,"isPrerelease":false}
+]'
+assert_eq \
+  "0.2.0" \
+  "$(release_latest_published_version_from_json "$published_release_fixture")" \
+  "latest published semantic version"
+assert_eq \
+  "" \
+  "$(release_latest_published_version_from_json '[]')" \
+  "missing published semantic version"
+
 release_info "Test changelog release rollover and note extraction"
 changelog_fixture="$fixture_root/CHANGELOG.md"
 release_notes_fixture="$fixture_root/release-notes.md"
@@ -87,6 +151,49 @@ EOF
 release_roll_changelog "$changelog_fixture" "0.1.0" "2026-07-31"
 release_extract_changelog_notes "$changelog_fixture" "0.1.0" "$release_notes_fixture"
 assert_eq "Version bump only." "$(cat "$release_notes_fixture")" "empty release note fallback"
+
+cat > "$changelog_fixture" <<'EOF'
+# Changelog
+
+## [Unreleased]
+
+## [0.1.3] - 2026-08-01
+
+- [fixed]: Current candidate change.
+
+## [0.1.2] - 2026-08-01
+
+- [added]: Unpublished draft change.
+
+## [0.1.0] - 2026-07-01
+
+- [added]: Already published change.
+EOF
+release_extract_cumulative_changelog_notes \
+  "$changelog_fixture" \
+  "0.1.3" \
+  "0.1.1" \
+  "$release_notes_fixture"
+assert_eq "$(cat <<'EOF'
+## [0.1.3] - 2026-08-01
+
+- [fixed]: Current candidate change.
+
+## [0.1.2] - 2026-08-01
+
+- [added]: Unpublished draft change.
+EOF
+)" "$(cat "$release_notes_fixture")" "cumulative unpublished release notes"
+
+release_extract_cumulative_changelog_notes \
+  "$changelog_fixture" \
+  "0.1.3" \
+  "0.1.2" \
+  "$release_notes_fixture"
+assert_eq \
+  "- [fixed]: Current candidate change." \
+  "$(cat "$release_notes_fixture")" \
+  "single unpublished release note compatibility"
 
 release_info "Test terminal UI command status propagation"
 set +e
@@ -667,6 +774,14 @@ if (
 fi
 
 release_info "Test script syntax and non-destructive help entrypoints"
+if ! grep -Fq 'release_classify_version_action' "$REPO_ROOT/scripts/release.sh"; then
+  fail_test "Local release should classify repeated version actions before incrementing"
+fi
+if ! grep -Fq 'release_latest_published_version' "$REPO_ROOT/scripts/release.sh" \
+  || ! grep -Fq 'release_extract_cumulative_changelog_notes' \
+    "$REPO_ROOT/scripts/release.sh"; then
+  fail_test "Local release should build notes from every version after the latest published release"
+fi
 if ! grep -Fqx 'RELEASE_REPO_ROOT="$repo_root"' \
   "$REPO_ROOT/scripts/docker/run-linux-verification.sh"; then
   fail_test "Linux Docker verification should initialize shared artifact paths from /workspace"

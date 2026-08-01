@@ -319,6 +319,70 @@ EOF
   printf '%s.%s.%s\n' "$major" "$minor" "$patch"
 }
 
+release_classify_version_action() {
+  if (($# != 6)); then
+    return 2
+  fi
+
+  local requested_mode="$1"
+  local current_version="$2"
+  local head_subject="$3"
+  local head_sha="$4"
+  local local_tag_sha="$5"
+  local remote_tag_sha="$6"
+
+  if [[ "$requested_mode" == "resume" ]]; then
+    printf '%s\n' "resume"
+    return
+  fi
+
+  if [[ "$head_subject" != "Release v$current_version" ]]; then
+    printf '%s\n' "increment"
+    return
+  fi
+
+  if [[ -n "$local_tag_sha" ]] && [[ "$local_tag_sha" != "$head_sha" ]] \
+    || [[ -n "$remote_tag_sha" ]] && [[ "$remote_tag_sha" != "$head_sha" ]]; then
+    printf '%s\n' "conflict"
+  elif [[ "$local_tag_sha" == "$head_sha" ]] \
+    || [[ "$remote_tag_sha" == "$head_sha" ]]; then
+    printf '%s\n' "already-released"
+  else
+    printf '%s\n' "resume"
+  fi
+}
+
+release_latest_published_version_from_json() {
+  local releases_json="$1"
+
+  printf '%s' "$releases_json" \
+    | jq -r '
+      [
+        .[]
+        | select(.isDraft == false and .isPrerelease == false)
+        | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+        | {
+            text: (.tagName | ltrimstr("v")),
+            parts: (.tagName | ltrimstr("v") | split(".") | map(tonumber))
+          }
+      ]
+      | sort_by(.parts)
+      | if length == 0 then "" else .[-1].text end
+    '
+}
+
+release_latest_published_version() {
+  local releases_json
+
+  releases_json="$(
+    gh release list \
+      --repo "$RELEASE_GITHUB_REPO" \
+      --limit 1000 \
+      --json tagName,isDraft,isPrerelease
+  )"
+  release_latest_published_version_from_json "$releases_json"
+}
+
 release_roll_changelog() {
   local changelog_path="$1"
   local version="$2"
@@ -410,6 +474,92 @@ if (releaseBody.length === 0) {
 }
 
 fs.writeFileSync(outputPath, `${releaseBody}\n`);
+NODE
+}
+
+release_extract_cumulative_changelog_notes() {
+  local changelog_path="$1"
+  local version="$2"
+  local published_version="$3"
+  local output_path="$4"
+
+  node - "$changelog_path" "$version" "$published_version" "$output_path" <<'NODE'
+const fs = require("node:fs");
+
+const changelogPath = process.argv[2];
+const version = process.argv[3];
+const publishedVersion = process.argv[4];
+const outputPath = process.argv[5];
+const semanticVersionPattern = /^\d+\.\d+\.\d+$/;
+
+if (!semanticVersionPattern.test(version)) {
+  throw new Error(`Invalid candidate semantic version: ${version}`);
+}
+if (publishedVersion.length > 0 && !semanticVersionPattern.test(publishedVersion)) {
+  throw new Error(`Invalid published semantic version: ${publishedVersion}`);
+}
+
+const parseVersion = (value) => value.split(".").map((part) => Number(part));
+const compareVersions = (left, right) => {
+  const leftParts = parseVersion(left);
+  const rightParts = parseVersion(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) {
+      return leftParts[index] - rightParts[index];
+    }
+  }
+  return 0;
+};
+
+const changelog = fs.readFileSync(changelogPath, "utf8").replace(/\r\n?/g, "\n");
+const headingPattern =
+  /^ {0,3}(## \[(\d+\.\d+\.\d+)\] - \d{4}-\d{2}-\d{2})[ \t]*$/gm;
+const headings = [];
+let match;
+while ((match = headingPattern.exec(changelog)) !== null) {
+  headings.push({
+    heading: match[1],
+    version: match[2],
+    start: match.index,
+    bodyStart: headingPattern.lastIndex + 1,
+  });
+}
+
+if (!headings.some((heading) => heading.version === version)) {
+  throw new Error(`Missing dated CHANGELOG.md release section for ${version}`);
+}
+
+const selected = headings
+  .map((heading, index) => {
+    const end = index + 1 < headings.length ? headings[index + 1].start : changelog.length;
+    return {
+      ...heading,
+      body: changelog.slice(heading.bodyStart, end).trim(),
+    };
+  })
+  .filter(
+    (heading) =>
+      compareVersions(heading.version, version) <= 0 &&
+      (publishedVersion.length === 0 ||
+        compareVersions(heading.version, publishedVersion) > 0),
+  );
+
+if (selected.length === 0) {
+  throw new Error(
+    `No unpublished CHANGELOG.md release sections found through ${version}`,
+  );
+}
+for (const section of selected) {
+  if (section.body.length === 0) {
+    throw new Error(`CHANGELOG.md release notes for ${section.version} are empty`);
+  }
+}
+
+const notes =
+  selected.length === 1
+    ? selected[0].body
+    : selected.map((section) => `${section.heading}\n\n${section.body}`).join("\n\n");
+fs.writeFileSync(outputPath, `${notes}\n`);
 NODE
 }
 

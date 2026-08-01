@@ -17,6 +17,8 @@ Usage:
 major, minor, patch
   Require a clean pushed commit with green local checks, increment the version,
   commit and push it, rerun local checks, tag it, and prepare its draft release.
+  An untagged current-version release commit resumes without another increment;
+  an already-tagged HEAD requires a new commit before another release can start.
 
 resume
   Continue an interrupted release from the current pushed version commit
@@ -209,6 +211,41 @@ run_all_local_verifiers() {
   release_pass "All local release environments passed"
 }
 
+current_tag="v$current_version"
+head_subject="$(git log -1 --format=%s "$RELEASE_SHA")"
+local_current_tag_sha="$(git rev-list -n 1 "$current_tag" 2>/dev/null || true)"
+remote_current_tag_sha="$(remote_tag_commit "$current_tag")"
+version_action="$(
+  release_classify_version_action \
+    "$mode" \
+    "$current_version" \
+    "$head_subject" \
+    "$RELEASE_SHA" \
+    "$local_current_tag_sha" \
+    "$remote_current_tag_sha"
+)"
+case "$version_action" in
+  increment) ;;
+  resume)
+    if [[ "$mode" != "resume" ]]; then
+      release_pass \
+        "Detected untagged release commit $current_tag; resume without another version increment"
+      mode="resume"
+    fi
+    ;;
+  already-released)
+    release_die \
+      "Current HEAD is already released as $current_tag; commit new changes before requesting another version increment."
+    ;;
+  conflict)
+    release_die \
+      "Release tag $current_tag does not consistently identify current HEAD $RELEASE_SHA."
+    ;;
+  *)
+    release_die "Unsupported release version action: $version_action"
+    ;;
+esac
+
 if [[ "$mode" != "resume" ]]; then
   next_version="$(release_next_version "$current_version" "$mode")"
   tag="v$next_version"
@@ -272,12 +309,19 @@ else
   release_pass "Resuming release $tag from $RELEASE_SHA"
 fi
 
+published_version="$(release_latest_published_version)"
+if [[ -n "$published_version" ]]; then
+  release_pass "Latest published semantic release is v$published_version"
+else
+  release_pass "No published semantic release exists; include all recorded release notes"
+fi
 release_notes_file="$(mktemp "${TMPDIR:-/tmp}/lfscloud-release-notes.XXXXXX")"
 release_run_step \
-  "Extract release notes for $current_version" \
-  release_extract_changelog_notes \
+  "Extract cumulative unpublished release notes through $current_version" \
+  release_extract_cumulative_changelog_notes \
   "$RELEASE_REPO_ROOT/CHANGELOG.md" \
   "$current_version" \
+  "$published_version" \
   "$release_notes_file"
 
 artifact="$(release_macos_artifact_path "$current_version")"
