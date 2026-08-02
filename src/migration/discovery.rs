@@ -302,7 +302,10 @@ fn source_endpoint_is_excluded(candidate: &str, excluded_endpoint: Option<&str>)
     let Some(excluded_endpoint) = excluded_endpoint else {
         return false;
     };
-    match (Url::parse(candidate), Url::parse(excluded_endpoint)) {
+    match (
+        validated_migration_source_endpoint(candidate, true),
+        validated_migration_source_endpoint(excluded_endpoint, true),
+    ) {
         (Ok(candidate), Ok(excluded)) => candidate == excluded,
         _ => candidate == excluded_endpoint,
     }
@@ -777,6 +780,50 @@ mod discovery_tests {
 
         assert_eq!(endpoint.url, "https://github.com/owner/repo.git/info/lfs");
         assert_eq!(endpoint.source, GitLfsSourceEndpointSource::RemoteUrlDefault);
+    }
+
+    #[test]
+    fn target_endpoint_with_trailing_slash_is_ignored_in_favor_of_legacy_endpoint() {
+        let repo = TempRepo::new();
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+        let target = "https://cloud.example/github.com/owner/repo.git/info/lfs";
+        repo.git([
+            "config",
+            "--local",
+            "remote.origin.lfsurl",
+            &format!("{target}/"),
+        ]);
+        repo.write_file(
+            ".lfsconfig",
+            concat!(
+                "[remote \"origin\"]\n",
+                "    lfsurl = https://legacy.example/owner/repo.git/info/lfs\n",
+            ),
+        );
+
+        let discovery = discover_git_lfs_migration_from_remote_excluding_endpoint(
+            repo.path(),
+            "origin",
+            Some(target),
+        )
+        .expect("migration discovery should skip an equivalent target endpoint");
+        let endpoint = discovery
+            .source_endpoint
+            .expect("the committed legacy endpoint should be selected");
+
+        assert_eq!(
+            endpoint.url,
+            "https://legacy.example/owner/repo.git/info/lfs"
+        );
+        assert_eq!(
+            endpoint.source,
+            GitLfsSourceEndpointSource::WorktreeRemoteConfig
+        );
     }
 
     #[test]

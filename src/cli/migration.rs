@@ -1,6 +1,7 @@
 //! Git LFS migration planning, readiness checks, execution, and reporting.
 
 use super::*;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 const MIGRATION_TARGET_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const MIGRATION_TARGET_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -671,7 +672,12 @@ fn migration_action_headers(
             command: "migration target upload batch".to_owned(),
             message: SanitizedMessage::new("server returned an invalid upload action header"),
         })?;
-        let expected = HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
+        let credentials = BASE64_STANDARD.encode(format!(
+            "{}:{}",
+            crate::DEFAULT_GIT_CREDENTIAL_USERNAME,
+            token.as_str()
+        ));
+        let expected = HeaderValue::from_str(&format!("Basic {credentials}"))
             .expect("validated session tokens always form a valid authorization header");
         if value != expected {
             return Err(CliError::ExternalCommandOutput {
@@ -1602,7 +1608,7 @@ mod tests {
             ),
             header: BTreeMap::from([(
                 "Authorization".to_owned(),
-                "Bearer migration-session-token".to_owned(),
+                "Basic bGZzY2xvdWQ6bWlncmF0aW9uLXNlc3Npb24tdG9rZW4=".to_owned(),
             )]),
             expires_at: None,
             expires_in: None,
@@ -1625,7 +1631,7 @@ mod tests {
         let wrong_token = LfsBatchAction {
             header: BTreeMap::from([(
                 "Authorization".to_owned(),
-                "Bearer another-session".to_owned(),
+                "Basic bGZzY2xvdWQ6YW5vdGhlci1zZXNzaW9u".to_owned(),
             )]),
             ..valid
         };
@@ -1678,7 +1684,7 @@ mod tests {
                                         "upload": {
                                             "href": upload_href,
                                             "header": {
-                                                "Authorization": "Bearer migration-session-token"
+                                                "Authorization": "Basic bGZzY2xvdWQ6bWlncmF0aW9uLXNlc3Npb24tdG9rZW4="
                                             }
                                         }
                                     }
@@ -1744,7 +1750,7 @@ mod tests {
                 .expect("migration upload record should not poison")
                 .clone(),
             Some((
-                Some("Bearer migration-session-token".to_owned()),
+                Some("Basic bGZzY2xvdWQ6bWlncmF0aW9uLXNlc3Npb24tdG9rZW4=".to_owned()),
                 missing_bytes.to_vec()
             ))
         );
@@ -1794,7 +1800,7 @@ mod tests {
                                         "upload": {
                                             "href": format!("{server_base}{target_route}/objects/{oid}?size={size}"),
                                             "header": {
-                                                "Authorization": "Bearer migration-session-token"
+                                                "Authorization": "Basic bGZzY2xvdWQ6bWlncmF0aW9uLXNlc3Npb24tdG9rZW4="
                                             }
                                         }
                                     }
