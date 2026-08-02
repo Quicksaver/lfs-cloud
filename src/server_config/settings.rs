@@ -191,7 +191,7 @@ pub struct ServerSessionEncryptionSecret(String);
 
 impl ServerSessionEncryptionSecret {
     fn new(value: String) -> ServerResult<Self> {
-        if value.len() < 32
+        if value.chars().count() < 32
             || value.trim().len() != value.len()
             || value.chars().any(|character| character.is_control())
         {

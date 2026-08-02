@@ -681,14 +681,14 @@ mod tests {
         let config_path = temp.path().join("lfscloud.yml");
         fs::write(
             &config_path,
-            "server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n",
+            "server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n  session_encryption_secret: interactive-session-secret-at-least-32-characters\n",
         )
         .expect("base config should be written");
         let path = config_path.to_str().expect("test path should be UTF-8");
 
         let repository_provider_output = run_configuration_test_command(
             &["lfscloud", "--config", path, "config", "repository", "add"],
-            "github-main\n\n\nsuper-secret-pat\n",
+            "github-main\n\n\n",
         );
         assert!(repository_provider_output.contains("added repository provider"));
         assert!(!repository_provider_output.contains("super-secret-pat"));

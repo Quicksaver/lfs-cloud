@@ -117,15 +117,9 @@ impl GitHubAuthenticationConfig {
         Ok(Self { token })
     }
 
-    /// Returns the deprecated configured personal access token, or an empty string.
-    #[must_use]
-    pub fn personal_access_token(&self) -> &str {
-        self.token.as_deref().unwrap_or("")
-    }
-
     /// Returns the deprecated configured token, when retained for compatibility.
     #[must_use]
-    pub(crate) fn configured_personal_access_token(&self) -> Option<&str> {
+    pub fn personal_access_token(&self) -> Option<&str> {
         self.token.as_deref()
     }
 }

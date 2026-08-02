@@ -166,8 +166,25 @@ impl ServerConfig {
             storage_providers,
             repositories,
         };
+        config.validate_session_encryption_secret()?;
         config.validate_references()?;
         Ok(config)
+    }
+
+    fn validate_session_encryption_secret(&self) -> ServerResult<()> {
+        if self.server.session_encryption_secret.is_some() {
+            return Ok(());
+        }
+        for provider in self.repository_providers.values() {
+            let RepositoryProviderConfig::GitHub(provider) = provider;
+            if provider.authentication.personal_access_token().is_none() {
+                return invalid_config(
+                    "server.session_encryption_secret",
+                    "is required when GitHub authentication is configured",
+                );
+            }
+        }
+        Ok(())
     }
 
     fn validate_references(&self) -> ServerResult<()> {
@@ -367,7 +384,10 @@ repositories:
                 ..
             }) => {
                 assert_eq!(api_url, "https://api.github.com");
-                assert_eq!(authentication.personal_access_token(), "github_pat_secret");
+                assert_eq!(
+                    authentication.personal_access_token(),
+                    Some("github_pat_secret")
+                );
             }
         }
 
@@ -403,6 +423,28 @@ repositories:
         assert!(rendered.contains("session_encryption_secret"));
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("test-session-encryption-secret-at-least-32-bytes"));
+
+        let unicode = valid_yaml().replace("${SESSION_ENCRYPTION_SECRET}", &"é".repeat(32));
+        ServerConfig::load_from_str_with_env(&unicode, "<test>", test_env)
+            .expect("32 Unicode characters should satisfy the documented minimum");
+    }
+
+    #[test]
+    fn github_provider_requires_durable_session_encryption_material_at_load_time() {
+        let contents = valid_yaml()
+            .replace(
+                "  session_encryption_secret: ${SESSION_ENCRYPTION_SECRET}\n",
+                "",
+            )
+            .replace("    personal_access_token: ${GITHUB_PAT}\n", "");
+
+        let error = ServerConfig::load_from_str_with_env(&contents, "<test>", test_env)
+            .expect_err("GitHub config without session encryption material should be rejected");
+
+        assert_error_contains(
+            &error,
+            "server.session_encryption_secret is required when GitHub authentication is configured",
+        );
     }
 
     #[test]
@@ -413,7 +455,7 @@ repositories:
 
         assert_eq!(
             provider.authentication.personal_access_token(),
-            "github_pat_secret"
+            Some("github_pat_secret")
         );
     }
 
@@ -490,12 +532,7 @@ repositories:
             .expect("GitHub provider should use each login caller's PAT");
         let RepositoryProviderConfig::GitHub(provider) =
             &config.repository_providers["github-main"];
-        assert!(
-            provider
-                .authentication
-                .configured_personal_access_token()
-                .is_none()
-        );
+        assert!(provider.authentication.personal_access_token().is_none());
     }
 
     #[test]
@@ -702,7 +739,10 @@ storage_providers:
         let config = load_with_test_env(valid_yaml());
         let RepositoryProviderConfig::GitHub(provider) =
             &config.repository_providers["github-main"];
-        let configured_secret = provider.authentication.personal_access_token();
+        let configured_secret = provider
+            .authentication
+            .personal_access_token()
+            .expect("legacy PAT should be configured");
         let rendered = format!("{config:?}");
 
         assert!(rendered.contains("GitHubProviderConfig"));

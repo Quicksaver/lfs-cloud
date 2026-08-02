@@ -119,6 +119,15 @@ pub fn discover_git_lfs_migration_from_remote(
     start_dir: impl AsRef<Path>,
     source_remote: impl AsRef<str>,
 ) -> MigrationResult<GitLfsMigrationDiscovery> {
+    discover_git_lfs_migration_from_remote_excluding_endpoint(start_dir, source_remote, None)
+}
+
+/// Discovers migration inputs while ignoring one endpoint that is already the target.
+pub(crate) fn discover_git_lfs_migration_from_remote_excluding_endpoint(
+    start_dir: impl AsRef<Path>,
+    source_remote: impl AsRef<str>,
+    excluded_endpoint: Option<&str>,
+) -> MigrationResult<GitLfsMigrationDiscovery> {
     let start_dir = start_dir.as_ref();
     let worktree_root = detect_worktree_root(start_dir)?;
     let source_remote = validate_source_remote_name(source_remote.as_ref())?;
@@ -127,7 +136,11 @@ pub fn discover_git_lfs_migration_from_remote(
         installation: detect_git_lfs_installation(&worktree_root),
         filters: discover_lfs_filters(&worktree_root)?,
         tracked_patterns: discover_lfs_tracked_patterns(&worktree_root)?,
-        source_endpoint: discover_source_endpoint(&worktree_root, &source_remote)?,
+        source_endpoint: discover_source_endpoint(
+            &worktree_root,
+            &source_remote,
+            excluded_endpoint,
+        )?,
         worktree_root,
         source_remote,
     })
@@ -186,6 +199,7 @@ fn discover_lfs_filters(worktree_root: &Path) -> MigrationResult<GitLfsFilterCon
 fn discover_source_endpoint(
     worktree_root: &Path,
     source_remote: &str,
+    excluded_endpoint: Option<&str>,
 ) -> MigrationResult<Option<GitLfsSourceEndpoint>> {
     let remote_lfsurl_key = format!("remote.{source_remote}.lfsurl");
     if let Some(url) = git_config_get_os(
@@ -197,7 +211,9 @@ fn discover_source_endpoint(
             OsStr::new(&remote_lfsurl_key),
         ],
         &format!("git config --local --get remote.{source_remote}.lfsurl"),
-    )? {
+    )?
+        && !source_endpoint_is_excluded(&url, excluded_endpoint)
+    {
         return Ok(Some(GitLfsSourceEndpoint {
             url,
             source: GitLfsSourceEndpointSource::RemoteGitConfig,
@@ -221,6 +237,7 @@ fn discover_source_endpoint(
                 "git config --no-includes --file .lfsconfig --get remote.{source_remote}.lfsurl"
             ),
         )?
+        && !source_endpoint_is_excluded(&url, excluded_endpoint)
     {
         return Ok(Some(GitLfsSourceEndpoint {
             url,
@@ -228,7 +245,9 @@ fn discover_source_endpoint(
         }));
     }
 
-    if let Some(url) = git_config_get(worktree_root, ["config", "--local", "--get", "lfs.url"])? {
+    if let Some(url) = git_config_get(worktree_root, ["config", "--local", "--get", "lfs.url"])?
+        && !source_endpoint_is_excluded(&url, excluded_endpoint)
+    {
         return Ok(Some(GitLfsSourceEndpoint {
             url,
             source: GitLfsSourceEndpointSource::LocalGitConfig,
@@ -248,6 +267,7 @@ fn discover_source_endpoint(
             ],
             "git config --no-includes --file .lfsconfig --get lfs.url",
         )?
+        && !source_endpoint_is_excluded(&url, excluded_endpoint)
     {
         return Ok(Some(GitLfsSourceEndpoint {
             url,
@@ -270,12 +290,22 @@ fn discover_source_endpoint(
         return Ok(None);
     };
 
-    Ok(
-        default_lfs_endpoint_for_remote_url(&remote_url).map(|url| GitLfsSourceEndpoint {
+    Ok(default_lfs_endpoint_for_remote_url(&remote_url)
+        .filter(|url| !source_endpoint_is_excluded(url, excluded_endpoint))
+        .map(|url| GitLfsSourceEndpoint {
             url,
             source: GitLfsSourceEndpointSource::RemoteUrlDefault,
-        }),
-    )
+        }))
+}
+
+fn source_endpoint_is_excluded(candidate: &str, excluded_endpoint: Option<&str>) -> bool {
+    let Some(excluded_endpoint) = excluded_endpoint else {
+        return false;
+    };
+    match (Url::parse(candidate), Url::parse(excluded_endpoint)) {
+        (Ok(candidate), Ok(excluded)) => candidate == excluded,
+        _ => candidate == excluded_endpoint,
+    }
 }
 
 fn validate_source_remote_name(source_remote: &str) -> MigrationResult<String> {
@@ -437,6 +467,7 @@ fn git_attributes_files(worktree_root: &Path) -> MigrationResult<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod discovery_tests {
+    use super::discover_git_lfs_migration_from_remote_excluding_endpoint;
     use super::test_support::*;
 
     #[test]
@@ -720,6 +751,32 @@ mod discovery_tests {
             endpoint.source,
             GitLfsSourceEndpointSource::WorktreeRemoteConfig
         );
+    }
+
+    #[test]
+    fn target_endpoint_is_ignored_in_favor_of_remote_default() {
+        let repo = TempRepo::new();
+        repo.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+        let target = "https://cloud.example/github.com/owner/repo.git/info/lfs";
+        repo.write_file(".lfsconfig", &format!("[lfs]\n    url = {target}\n"));
+
+        let discovery = discover_git_lfs_migration_from_remote_excluding_endpoint(
+            repo.path(),
+            "origin",
+            Some(target),
+        )
+        .expect("migration discovery should skip the target endpoint");
+        let endpoint = discovery
+            .source_endpoint
+            .expect("the selected remote should supply the legacy default");
+
+        assert_eq!(endpoint.url, "https://github.com/owner/repo.git/info/lfs");
+        assert_eq!(endpoint.source, GitLfsSourceEndpointSource::RemoteUrlDefault);
     }
 
     #[test]

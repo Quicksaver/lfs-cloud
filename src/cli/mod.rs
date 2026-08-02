@@ -37,6 +37,7 @@ use crate::config_edit::{
     StorageProviderValues,
 };
 use crate::git_output::{GitPathOutputError, parse_lfs_filter_attribute_paths};
+use crate::migration::discover_git_lfs_migration_from_remote_excluding_endpoint;
 use crate::{
     CliError, CliResult, SanitizedMessage,
     git::redacted_url_for_display,
@@ -54,10 +55,9 @@ use crate::{
     LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
     LocalMigrationObjectAvailability, MigrationError, MigrationFetchMode, MigrationSourceFetch,
     ServeOptions, ServerConfig, StorageProviderConfig, TracingConfig,
-    check_local_migration_objects, discover_git_lfs_migration_from_remote,
-    enumerate_current_checkout_lfs_pointers, enumerate_fetched_ref_lfs_pointers_for_remote,
-    enumerate_selected_ref_lfs_pointers, fetch_migration_git_refs,
-    fetch_missing_migration_objects_from_remote,
+    check_local_migration_objects, enumerate_current_checkout_lfs_pointers,
+    enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
+    fetch_migration_git_refs, fetch_missing_migration_objects_from_remote,
     fetch_missing_migration_objects_from_remote_at_endpoint, init_tracing,
 };
 

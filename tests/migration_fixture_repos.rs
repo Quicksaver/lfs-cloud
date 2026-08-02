@@ -260,7 +260,6 @@ fn fixture_repo_migrate_dry_run_leaves_repo_and_cache_untouched() {
     let temp = tempfile::tempdir().expect("temporary migration fixture should be created");
     let repo = initialized_migration_repo();
     let cache_root = temp.path().join("cache");
-    let config_path = temp.path().join("lfscloud.yml");
     let object = lfs_object_for_bytes(b"dry-run fixture object");
 
     repo.write_file(".gitattributes", "asset/*.bin filter=lfs\n");
@@ -271,15 +270,10 @@ fn fixture_repo_migrate_dry_run_leaves_repo_and_cache_untouched() {
         object.size.bytes(),
     );
     repo.commit_all("add dry-run pointer");
-    fs::write(&config_path, server_config(SERVER_URL)).expect("fixture config should be written");
     let before_status = git_status(repo.path());
 
     let output = Command::new(env!("CARGO_BIN_EXE_lfscloud"))
         .args([
-            "--config",
-            config_path
-                .to_str()
-                .expect("fixture config path should be valid UTF-8"),
             "migrate",
             "--server",
             SERVER_URL,
@@ -394,43 +388,4 @@ fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
         .expect("git output should be UTF-8")
         .trim()
         .to_owned()
-}
-
-fn server_config(public_url: &str) -> String {
-    let public_url = yaml_single_quoted(public_url);
-    format!(
-        r#"
-server:
-  host: 127.0.0.1
-  port: 8080
-  public_url: {public_url}
-
-repository_providers:
-  github-main:
-    type: github
-    api_url: https://api.github.com
-    personal_access_token: github-pat
-
-storage_providers:
-  drive-user-a:
-    type: google_drive
-    credentials:
-      type: gcloud
-      config_dir: .gcloud-drive
-    root_folder_id: root-folder
-
-repositories:
-  - id: github-main:owner/repo
-    repo_provider: github-main
-    host: github.com
-    owner: owner
-    name: repo
-    provider_repository_id: "8675309"
-    storage_provider: drive-user-a
-        "#
-    )
-}
-
-fn yaml_single_quoted(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }

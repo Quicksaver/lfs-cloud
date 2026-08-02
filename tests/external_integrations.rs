@@ -71,6 +71,14 @@ struct LegacyLfsSourceState {
     objects: Arc<BTreeMap<String, Vec<u8>>>,
 }
 
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn legacy_lfs_batch(
     State(state): State<LegacyLfsSourceState>,
     Json(request): Json<Value>,
@@ -311,7 +319,7 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
     );
     let lfscloud::RepositoryProviderConfig::GitHub(provider) =
         &config.repository_providers[LIVE_GITHUB_PROVIDER_ID];
-    assert_eq!(provider.authentication.personal_access_token(), "");
+    assert_eq!(provider.authentication.personal_access_token(), None);
     assert!(config.server.session_encryption_secret.is_some());
     assert!(
         config
@@ -945,11 +953,11 @@ async fn git_lfs_historical_migration_round_trip(
         .route("/legacy/objects/batch", post(legacy_lfs_batch))
         .route("/legacy/objects/{oid}", get(legacy_lfs_object))
         .with_state(legacy_state);
-    let legacy_server = tokio::spawn(async move {
+    let _legacy_server = AbortTaskOnDrop(tokio::spawn(async move {
         axum::serve(legacy_listener, legacy_router)
             .await
             .expect("legacy LFS fixture should run");
-    });
+    }));
     git.run(None, "migration Git remote rewrite setup", |command| {
         command.args([
             "config",
@@ -1163,14 +1171,12 @@ async fn git_lfs_historical_migration_round_trip(
     git.run(Some(&checkout), "historical migrated LFS pull", |command| {
         command.args(["lfs", "pull"]);
     })?;
-    let historical_checkout = require_equal(
+    require_equal(
         fs::read(checkout.join("assets/model.bin"))
             .map_err(|error| format!("historical migrated asset should be readable: {error}"))?,
         first_bytes.to_vec(),
         "historical migrated checkout bytes",
-    );
-    legacy_server.abort();
-    historical_checkout
+    )
 }
 
 fn require_command_success(

@@ -194,9 +194,11 @@ git commit -m "Route Git LFS through LFS Cloud"
 
 Execution authenticates a write request to the repository's LFS Cloud route, refreshes the selected source remote's branches and tags, and inventories every historical LFS pointer. It asks the server which objects are already present before fetching source bytes, fetches only the target-missing subset, and uploads those bytes through server-issued Git LFS actions. The client never reads the private server config or accesses Google Drive directly. Repository configuration is updated only after the complete target inventory succeeds.
 
-If any target object fails, neither target config location is changed. A retry safely asks LFS Cloud again, so objects completed by an earlier user or interrupted run are skipped. If `.lfsconfig` already names the target, rerun the same migration command; the committed legacy remote URL still supplies the source for any remaining target-missing objects.
+If any target object fails, neither target config location is changed. A retry safely asks LFS Cloud again, so objects completed by an earlier user or interrupted run are skipped. If `.lfsconfig` already names the target, rerun the same migration command; migration ignores that target as a source and falls through to the committed legacy remote URL or the selected Git remote's default LFS endpoint for any remaining target-missing objects.
 
 Migration writes the target to both `.lfsconfig` and repository-local `lfs.url`. Before switching, it also records the old endpoint as the standard `remote.<source>.lfsurl` field in `.lfsconfig`; follow-up users can therefore migrate their local-only objects without private server configuration. The repository-wide target remains active for normal Git LFS traffic, while migration applies the legacy URL only to its source fetch command. Git history and LFS pointers are not rewritten, and URLs containing credentials are never committed.
+
+Follow-up migration fetches request only the target-missing object IDs. Git LFS currently resolves those through one bounded `smudge` invocation per object, so source recovery time scales with the number of missing objects rather than the complete repository inventory.
 
 Execution requires `--all-refs`; narrower current-checkout and `--ref` scopes remain available for dry-run investigation only. `--source-remote` defaults to `origin`. Use `--allow-cross-remote` only for an intentional copy between different repository identities. `--purge-source-lfs` reports cleanup guidance but never automatically deletes source objects.
 

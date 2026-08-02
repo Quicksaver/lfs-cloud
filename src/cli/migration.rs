@@ -3,12 +3,24 @@
 use super::*;
 
 const MIGRATION_TARGET_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const MIGRATION_TARGET_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MIGRATION_TARGET_BATCH_SIZE: usize = 100;
 const MIGRATION_TARGET_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 const MIGRATION_TARGET_UPLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
 const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
+
+fn reject_migration_server_config_path(config_path: Option<&Path>) -> CliResult<()> {
+    if config_path.is_none() {
+        return Ok(());
+    }
+    Err(CliError::InvalidArguments {
+        message: "migrate no longer reads --config; authenticate with `lfscloud login --server URL` and rerun without --config"
+            .to_owned(),
+    })
+}
+
 pub(super) fn run_migrate_to_stdout(
     command: MigrateCommand,
     config_path: Option<PathBuf>,
@@ -49,7 +61,7 @@ pub(super) fn run_migrate_to_stdout(
 
 fn run_migrate_from_dir<W, P, A>(
     command: MigrateCommand,
-    _config_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
     start_dir: impl AsRef<Path>,
     output: &mut W,
     mut probe_server: P,
@@ -60,6 +72,7 @@ where
     P: FnMut(&str) -> CliResult<()>,
     A: FnMut(&str) -> CliResult<()>,
 {
+    reject_migration_server_config_path(config_path.as_deref())?;
     if !command.dry_run {
         return Err(CliError::InvalidArguments {
             message: "the migration planning runner requires --dry-run".to_owned(),
@@ -87,7 +100,11 @@ where
         &repository.remote,
         command.allow_insecure_http,
     )?;
-    let discovery = discover_git_lfs_migration_from_remote(start_dir, &command.source_remote)?;
+    let discovery = discover_git_lfs_migration_from_remote_excluding_endpoint(
+        start_dir,
+        &command.source_remote,
+        Some(&route.lfs_url),
+    )?;
     let scan = migration_pointer_scan(start_dir, &command, &command.source_remote)?;
     let cache_layout = Some(local_cache_layout(command.cache_root.clone())?);
     let availability =
@@ -184,7 +201,7 @@ struct MigrationTargetPlan {
 
 async fn run_migrate_execution_from_dir<W, P, A>(
     command: MigrateCommand,
-    _config_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
     start_dir: impl AsRef<Path>,
     output: &mut W,
     mut probe_server: P,
@@ -195,6 +212,7 @@ where
     P: FnMut(&str) -> CliResult<()>,
     A: FnMut(&str) -> CliResult<LfsSessionToken>,
 {
+    reject_migration_server_config_path(config_path.as_deref())?;
     let preparation = prepare_migration_execution(command, start_dir.as_ref())?;
 
     // Prove the endpoint is usable before fetching source bytes or creating
@@ -254,7 +272,11 @@ fn prepare_migration_execution(
         &repository.remote,
         command.allow_insecure_http,
     )?;
-    let discovery = discover_git_lfs_migration_from_remote(start_dir, &command.source_remote)?;
+    let discovery = discover_git_lfs_migration_from_remote_excluding_endpoint(
+        start_dir,
+        &command.source_remote,
+        Some(&route.lfs_url),
+    )?;
     if !discovery.installation.installed {
         return Err(CliError::InvalidArguments {
             message: "migration execution requires Git LFS; install it and run `git lfs install` before retrying"
@@ -407,7 +429,7 @@ async fn request_migration_target_plan(
             .header("Accept", "application/vnd.git-lfs+json")
             .header("Content-Type", "application/vnd.git-lfs+json")
             .json(&request)
-            .timeout(MIGRATION_TARGET_PROBE_TIMEOUT)
+            .timeout(MIGRATION_TARGET_RECONCILIATION_TIMEOUT)
             .send()
             .await
             .map_err(|source| CliError::Io {
@@ -530,9 +552,13 @@ async fn upload_migration_objects_through_server(
             })?;
         let source = crate::migration::verified_migration_upload_source_path(local_object)?;
         crate::migration::verify_migration_upload_source(source, &object).await?;
-        let upload_url =
-            validated_migration_upload_action_url(&target_url, &action.href, allow_insecure_http)?;
-        let headers = migration_action_headers(&action)?;
+        let upload_url = validated_migration_upload_action_url(
+            &target_url,
+            &action.href,
+            allow_insecure_http,
+            &object,
+        )?;
+        let headers = migration_action_headers(&action, token)?;
         let file = tokio::fs::File::open(source)
             .await
             .map_err(|source_error| CliError::Io {
@@ -541,7 +567,6 @@ async fn upload_migration_objects_through_server(
             })?;
         let response = client
             .put(upload_url)
-            .bearer_auth(token.as_str())
             .headers(headers)
             .header(CONTENT_LENGTH, object.size.bytes())
             .body(ReqwestBody::wrap_stream(ReaderStream::new(file)))
@@ -589,6 +614,7 @@ fn validated_migration_upload_action_url(
     target_url: &Url,
     action_url: &str,
     allow_insecure_http: bool,
+    object: &LfsObject,
 ) -> CliResult<Url> {
     let parsed = Url::parse(action_url).map_err(|_| CliError::ExternalCommandOutput {
         command: "migration target upload batch".to_owned(),
@@ -598,9 +624,14 @@ fn validated_migration_upload_action_url(
         && parsed.host() == target_url.host()
         && parsed.port_or_known_default() == target_url.port_or_known_default();
     let target_path = target_url.path().trim_end_matches('/');
-    let expected_prefix = format!("{target_path}/objects/");
+    let expected_path = format!("{target_path}/objects/{}", object.oid);
+    let query = parsed.query_pairs().collect::<Vec<_>>();
+    let expected_size = object.size.bytes().to_string();
     if !same_origin
-        || !parsed.path().starts_with(&expected_prefix)
+        || parsed.path() != expected_path
+        || query.len() != 1
+        || query[0].0 != "size"
+        || query[0].1 != expected_size
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.fragment().is_some()
@@ -616,7 +647,10 @@ fn validated_migration_upload_action_url(
     Ok(parsed)
 }
 
-fn migration_action_headers(action: &LfsBatchAction) -> CliResult<ReqwestHeaderMap> {
+fn migration_action_headers(
+    action: &LfsBatchAction,
+    token: &LfsSessionToken,
+) -> CliResult<ReqwestHeaderMap> {
     let mut headers = ReqwestHeaderMap::new();
     for (name, value) in &action.header {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
@@ -625,17 +659,35 @@ fn migration_action_headers(action: &LfsBatchAction) -> CliResult<ReqwestHeaderM
                 message: SanitizedMessage::new("server returned an invalid upload action header"),
             }
         })?;
-        if name == CONTENT_LENGTH || name == reqwest::header::HOST {
+        if name != reqwest::header::AUTHORIZATION {
             return Err(CliError::ExternalCommandOutput {
                 command: "migration target upload batch".to_owned(),
-                message: SanitizedMessage::new("server returned a forbidden upload action header"),
+                message: SanitizedMessage::new(
+                    "server returned an unsupported upload action header",
+                ),
             });
         }
         let value = HeaderValue::from_str(value).map_err(|_| CliError::ExternalCommandOutput {
             command: "migration target upload batch".to_owned(),
             message: SanitizedMessage::new("server returned an invalid upload action header"),
         })?;
+        let expected = HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
+            .expect("validated session tokens always form a valid authorization header");
+        if value != expected {
+            return Err(CliError::ExternalCommandOutput {
+                command: "migration target upload batch".to_owned(),
+                message: SanitizedMessage::new(
+                    "server returned upload authorization that does not match the active session",
+                ),
+            });
+        }
         headers.insert(name, value);
+    }
+    if !headers.contains_key(reqwest::header::AUTHORIZATION) {
+        return Err(CliError::ExternalCommandOutput {
+            command: "migration target upload batch".to_owned(),
+            message: SanitizedMessage::new("server omitted upload action authorization"),
+        });
     }
     Ok(headers)
 }
@@ -917,8 +969,8 @@ where
 
     checks.push(MigrationReadinessCheck {
         name: "storage",
-        level: StatusLevel::Ok,
-        message: "storage is server-owned and will be checked through the authenticated LFS route"
+        level: StatusLevel::Warning,
+        message: "storage is server-owned and was not probed; execution checks it through the authenticated LFS route"
             .to_owned(),
     });
 
@@ -1328,7 +1380,7 @@ where
             )?;
             writeln!(
                 output,
-                "    requirement: generate purge input only from a durable, integrity-verified migration receipt; planned objects are not proof of upload."
+                "    requirement: generate purge input only after successful execution and independent destination verification; planned objects are not proof of upload."
             )?;
         }
         MigrationSourcePurgeReport::NotConfigured => {
@@ -1506,6 +1558,80 @@ mod tests {
         assert_eq!(observed.1["objects"], serde_json::json!([]));
     }
 
+    #[test]
+    fn migrate_rejects_the_obsolete_server_config_argument() {
+        let mut output = Vec::new();
+        let error = run_migrate_from_dir(
+            MigrateCommand {
+                server: "http://127.0.0.1:8080".to_owned(),
+                allow_insecure_http: false,
+                cache_root: None,
+                source_remote: "origin".to_owned(),
+                allow_cross_remote: false,
+                refs: Vec::new(),
+                all_refs: false,
+                dry_run: true,
+                purge_source_lfs: false,
+            },
+            Some(PathBuf::from("legacy-lfscloud.yml")),
+            ".",
+            &mut output,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect_err("migrate must not silently ignore --config");
+
+        assert!(matches!(error, CliError::InvalidArguments { message }
+            if message.contains("migrate no longer reads --config")));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn migration_upload_action_must_match_object_and_session() {
+        let object = object_for_bytes(b"validated action identity");
+        let target = Url::parse("https://cloud.example/github.com/owner/repo.git/info/lfs")
+            .expect("target URL should parse");
+        let token = LfsSessionToken::from_secret("migration-session-token")
+            .expect("session token should parse");
+        let valid = LfsBatchAction {
+            href: format!(
+                "{}/objects/{}?size={}",
+                target.as_str().trim_end_matches('/'),
+                object.oid,
+                object.size.bytes()
+            ),
+            header: BTreeMap::from([(
+                "Authorization".to_owned(),
+                "Bearer migration-session-token".to_owned(),
+            )]),
+            expires_at: None,
+            expires_in: None,
+        };
+
+        validated_migration_upload_action_url(&target, &valid.href, false, &object)
+            .expect("matching action identity should be accepted");
+        migration_action_headers(&valid, &token)
+            .expect("matching action authorization should be accepted");
+
+        let wrong_oid = LfsBatchAction {
+            href: valid.href.replace(object.oid.as_hex(), &"f".repeat(64)),
+            ..valid.clone()
+        };
+        assert!(
+            validated_migration_upload_action_url(&target, &wrong_oid.href, false, &object)
+                .is_err()
+        );
+
+        let wrong_token = LfsBatchAction {
+            header: BTreeMap::from([(
+                "Authorization".to_owned(),
+                "Bearer another-session".to_owned(),
+            )]),
+            ..valid
+        };
+        assert!(migration_action_headers(&wrong_token, &token).is_err());
+    }
+
     #[tokio::test]
     async fn migration_reconciles_and_uploads_only_server_missing_objects() {
         require_git();
@@ -1550,7 +1676,10 @@ mod tests {
                                     "authenticated": true,
                                     "actions": {
                                         "upload": {
-                                            "href": upload_href
+                                            "href": upload_href,
+                                            "header": {
+                                                "Authorization": "Bearer migration-session-token"
+                                            }
                                         }
                                     }
                                 }
@@ -1619,6 +1748,129 @@ mod tests {
                 missing_bytes.to_vec()
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn failed_server_upload_leaves_both_target_config_locations_unchanged() {
+        require_git();
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let first_bytes = b"first migration object";
+        let second_bytes = b"second migration object";
+        let first = object_for_bytes(first_bytes);
+        let second = object_for_bytes(second_bytes);
+        write_git_lfs_source_object(&repo, &first, first_bytes);
+        write_git_lfs_source_object(&repo, &second, second_bytes);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("migration server listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("migration server address should resolve");
+        let target_route = "/github.com/owner/repo.git/info/lfs";
+        let server_base = format!("http://{address}");
+        let server_base_for_batch = server_base.clone();
+        let upload_count = Arc::new(Mutex::new(0_usize));
+        let upload_count_for_route = Arc::clone(&upload_count);
+        let app = Router::new()
+            .route(
+                &format!("{target_route}/objects/batch"),
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let server_base = server_base_for_batch.clone();
+                    async move {
+                        let objects = body["objects"]
+                            .as_array()
+                            .expect("batch objects should be an array")
+                            .iter()
+                            .map(|object| {
+                                let oid = object["oid"].as_str().expect("OID should be present");
+                                let size = object["size"].as_u64().expect("size should be present");
+                                serde_json::json!({
+                                    "oid": oid,
+                                    "size": size,
+                                    "actions": {
+                                        "upload": {
+                                            "href": format!("{server_base}{target_route}/objects/{oid}?size={size}"),
+                                            "header": {
+                                                "Authorization": "Bearer migration-session-token"
+                                            }
+                                        }
+                                    }
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        Json(serde_json::json!({ "transfer": "basic", "objects": objects }))
+                    }
+                }),
+            )
+            .route(
+                &format!("{target_route}/objects/{{oid}}"),
+                put(move || {
+                    let upload_count = Arc::clone(&upload_count_for_route);
+                    async move {
+                        let mut count = upload_count
+                            .lock()
+                            .expect("migration upload count should not poison");
+                        *count += 1;
+                        if *count == 1 {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("migration server should run");
+        });
+
+        let repository = GitRepository::discover(&repo).expect("repository should be discovered");
+        let route = LfsInitRoute::resolve(&server_base, &repository.remote)
+            .expect("migration route should resolve");
+        let discovery = crate::discover_git_lfs_migration_from_remote(&repo, "origin")
+            .expect("migration inputs should be discovered");
+        let context = MigrationExecutionContext {
+            source_remote: repository.remote.clone(),
+            repository,
+            route,
+            discovery,
+            scan: MigrationPointerScan {
+                mode: MigrationScanMode::AllFetchedRefs,
+                refs_scanned: vec!["refs/heads/main".to_owned()],
+                pointer_file_count: 2,
+                objects: vec![first, second],
+            },
+            cache_layout: local_cache_layout(Some(temp.path().join("cache")))
+                .expect("cache layout should resolve"),
+            purge_source_lfs: false,
+            allow_insecure_http: false,
+        };
+        let token = LfsSessionToken::from_secret("migration-session-token")
+            .expect("migration token should parse");
+
+        let error = execute_migration_through_server(&context, &token)
+            .await
+            .expect_err("second upload should fail migration");
+        server.abort();
+
+        assert!(matches!(error, CliError::MigrationUploadFailed { .. }));
+        assert_eq!(
+            *upload_count
+                .lock()
+                .expect("migration upload count should not poison"),
+            2
+        );
+        assert!(!repo.join(".lfsconfig").exists());
+        let local_lfs_url = ProcessCommand::new("git")
+            .args(["config", "--local", "--get", "lfs.url"])
+            .current_dir(&repo)
+            .output()
+            .expect("local Git config should be readable");
+        assert!(!local_lfs_url.status.success());
     }
 
     #[tokio::test]
@@ -1715,9 +1967,6 @@ mod tests {
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
         write_git_lfs_source_object(&repo, &object, b"migration object already local");
-        let config_path = temp.path().join("lfscloud.yml");
-        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
-            .expect("status config should be written");
         let mut output = Vec::new();
 
         run_migrate_from_dir(
@@ -1732,7 +1981,7 @@ mod tests {
                 dry_run: true,
                 purge_source_lfs: false,
             },
-            Some(config_path),
+            None,
             &repo,
             &mut output,
             |_| Ok(()),
@@ -1794,7 +2043,7 @@ mod tests {
         assert!(rendered.contains("storage"));
         assert!(rendered.contains("source repository access not probed"));
         assert!(rendered.contains("server authentication and repository access not probed"));
-        assert!(rendered.contains("storage is server-owned"));
+        assert!(rendered.contains("storage is server-owned and was not probed"));
         assert!(rendered.contains("warnings:"));
         assert!(rendered.contains("repository permissions were not probed"));
         assert!(rendered.contains("storage quota and free capacity were not probed"));
@@ -1841,7 +2090,7 @@ mod tests {
 
         let error = run_migrate_from_dir(
             command(false),
-            Some(temp.path().join("missing-config.yml")),
+            None,
             &repo,
             &mut denied_output,
             |_| Ok(()),
@@ -1858,7 +2107,7 @@ mod tests {
         let mut allowed_output = Vec::new();
         run_migrate_from_dir(
             command(true),
-            Some(temp.path().join("missing-config.yml")),
+            None,
             &repo,
             &mut allowed_output,
             |_| Ok(()),
@@ -1890,9 +2139,6 @@ mod tests {
             LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
-        let config_path = temp.path().join("lfscloud.yml");
-        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
-            .expect("status config should be written");
         let mut output = Vec::new();
 
         run_migrate_from_dir(
@@ -1907,7 +2153,7 @@ mod tests {
                 dry_run: true,
                 purge_source_lfs: false,
             },
-            Some(config_path),
+            None,
             &repo,
             &mut output,
             |_| {
@@ -1957,9 +2203,6 @@ mod tests {
             LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
-        let config_path = temp.path().join("lfscloud.yml");
-        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
-            .expect("status config should be written");
         let mut output = Vec::new();
 
         run_migrate_from_dir(
@@ -1974,7 +2217,7 @@ mod tests {
                 dry_run: true,
                 purge_source_lfs: true,
             },
-            Some(config_path),
+            None,
             &repo,
             &mut output,
             |_| Ok(()),
@@ -2000,7 +2243,7 @@ mod tests {
         assert!(rendered.contains("planned candidates: 1"));
         assert!(rendered.contains("upload not verified"));
         assert!(rendered.contains("purge manifest: unavailable during dry-run planning"));
-        assert!(rendered.contains("durable, integrity-verified migration receipt"));
+        assert!(rendered.contains("successful execution and independent destination verification"));
         assert!(
             !rendered
                 .lines()
@@ -2034,9 +2277,6 @@ mod tests {
             LfsPointer::new(object).to_pointer_file().as_bytes(),
         );
         run_git(&repo, &["add", ".gitattributes", "asset/model.bin"]);
-        let config_path = temp.path().join("lfscloud.yml");
-        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
-            .expect("status config should be written");
         let mut output = Vec::new();
 
         run_migrate_from_dir(
@@ -2051,7 +2291,7 @@ mod tests {
                 dry_run: true,
                 purge_source_lfs: true,
             },
-            Some(config_path),
+            None,
             &repo,
             &mut output,
             |_| Ok(()),
@@ -2086,9 +2326,6 @@ mod tests {
             );
         }
         run_git(&repo, &["add", "."]);
-        let config_path = temp.path().join("lfscloud.yml");
-        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
-            .expect("status config should be written");
         let mut output = Vec::new();
 
         run_migrate_from_dir(
@@ -2103,7 +2340,7 @@ mod tests {
                 dry_run: true,
                 purge_source_lfs: false,
             },
-            Some(config_path),
+            None,
             &repo,
             &mut output,
             |_| Ok(()),
@@ -2139,9 +2376,6 @@ mod tests {
             );
         }
         run_git(&repo, &["add", "."]);
-        let config_path = temp.path().join("lfscloud.yml");
-        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
-            .expect("status config should be written");
         let mut output = Vec::new();
 
         run_migrate_from_dir(
@@ -2156,7 +2390,7 @@ mod tests {
                 dry_run: true,
                 purge_source_lfs: true,
             },
-            Some(config_path),
+            None,
             &repo,
             &mut output,
             |_| Ok(()),

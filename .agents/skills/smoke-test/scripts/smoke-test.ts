@@ -217,8 +217,15 @@ async function gitWithEnv(cwd: string, env: NodeJS.ProcessEnv, ...args: string[]
 }
 
 async function requestBody(request: IncomingMessage): Promise<Buffer> {
+  const maxBytes = 4 * 1024 * 1024;
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  let totalBytes = 0;
+  for await (const chunk of request) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += bytes.length;
+    if (totalBytes > maxBytes) throw new Error(`smoke request body exceeded ${maxBytes} bytes`);
+    chunks.push(bytes);
+  }
   return Buffer.concat(chunks);
 }
 
@@ -463,7 +470,7 @@ async function migrationDryRunSmoke(): Promise<void> {
   assert(!(await pathExists(cacheRoot)), 'migration dry-run created cache state');
 }
 
-async function serverMediatedFollowUpMigrationSmoke(): Promise<void> {
+async function mockServerMediatedFollowUpMigrationSmoke(): Promise<void> {
   const remoteUrl = 'https://github.com/smoke-owner/followup.git';
   const targetRoute = '/github.com/smoke-owner/followup.git/info/lfs';
   const sourceObjects = new Map<string, Buffer>();
@@ -995,7 +1002,7 @@ function tests(): SmokeTest[] {
       name: 'server-mediated migration contract',
       run: () => script('verify-migration-history-execution.sh'),
     },
-    { name: 'two-user follow-up migration', run: serverMediatedFollowUpMigrationSmoke },
+    { name: 'two-user follow-up migration mock contract', run: mockServerMediatedFollowUpMigrationSmoke },
     {
       name: 'secret redaction regressions',
       run: () => script('verify-secret-redaction.sh', 45 * 60 * 1000),

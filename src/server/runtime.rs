@@ -254,7 +254,7 @@ fn production_session_store(
 
     match config.single_github_provider("durable session storage")? {
         None => Ok(LocalLfsSessionStore::new()),
-        Some(provider) => match provider.authentication.configured_personal_access_token() {
+        Some(provider) => match provider.authentication.personal_access_token() {
             Some(legacy_secret) => {
                 tracing::warn!(
                     "repository provider personal_access_token is deprecated; configure server.session_encryption_secret"
