@@ -178,7 +178,7 @@ fn prompt_repository_provider<R, W, S>(
     config: &EditableServerConfig,
     input: &mut R,
     output: &mut W,
-    read_secret: &mut S,
+    _read_secret: &mut S,
 ) -> CliResult<RepositoryProviderValues>
 where
     R: BufRead,
@@ -210,19 +210,11 @@ where
             .or(Some("https://api.github.com")),
         true,
     )?;
-    let personal_access_token = prompt_secret_value(
-        input,
-        output,
-        "GitHub personal access token or environment reference",
-        existing.personal_access_token,
-        read_secret,
-    )?;
-
     Ok(RepositoryProviderValues {
         id,
         provider_type,
         api_url,
-        personal_access_token: Some(personal_access_token),
+        personal_access_token: existing.personal_access_token,
     })
 }
 
@@ -400,34 +392,6 @@ where
     Ok(Some(value))
 }
 
-fn prompt_secret_value<R, W, S>(
-    input: &mut R,
-    output: &mut W,
-    label: &str,
-    existing: Option<String>,
-    read_secret: &mut S,
-) -> CliResult<String>
-where
-    R: BufRead,
-    W: Write,
-    S: FnMut(&mut R) -> CliResult<String>,
-{
-    write!(output, "{label}").map_err(output_error)?;
-    if existing.is_some() {
-        write!(output, " [configured; Enter to keep]").map_err(output_error)?;
-    }
-    write!(output, ": ").map_err(output_error)?;
-    output.flush().map_err(output_error)?;
-    let value = read_secret(input)?;
-    writeln!(output).map_err(output_error)?;
-    if value.is_empty() {
-        return existing.ok_or_else(|| CliError::InvalidArguments {
-            message: format!("{label} is required"),
-        });
-    }
-    Ok(value)
-}
-
 fn read_config_prompt_value<R>(input: &mut R) -> CliResult<String>
 where
     R: BufRead + ?Sized,
@@ -551,7 +515,7 @@ fn write_repository_provider_list<W>(config: &EditableServerConfig, output: &mut
 where
     W: Write,
 {
-    writeln!(output, "ID\tTYPE\tAPI URL\tAUTH").map_err(output_error)?;
+    writeln!(output, "ID\tTYPE\tAPI URL\tLEGACY SESSION SECRET").map_err(output_error)?;
     for provider in config.repository_providers()? {
         writeln!(
             output,

@@ -74,6 +74,8 @@ pub enum GitLfsSourceEndpointSource {
     LocalGitConfig,
     /// Repository-local remote-scoped `remote.<name>.lfsurl`.
     RemoteGitConfig,
+    /// Remote-scoped `remote.<name>.lfsurl` committed in `.lfsconfig`.
+    WorktreeRemoteConfig,
     /// Worktree `.lfsconfig`.
     WorktreeLfsConfig,
     /// Endpoint derived from the selected Git remote URL.
@@ -185,13 +187,6 @@ fn discover_source_endpoint(
     worktree_root: &Path,
     source_remote: &str,
 ) -> MigrationResult<Option<GitLfsSourceEndpoint>> {
-    if let Some(url) = git_config_get(worktree_root, ["config", "--local", "--get", "lfs.url"])? {
-        return Ok(Some(GitLfsSourceEndpoint {
-            url,
-            source: GitLfsSourceEndpointSource::LocalGitConfig,
-        }));
-    }
-
     let remote_lfsurl_key = format!("remote.{source_remote}.lfsurl");
     if let Some(url) = git_config_get_os(
         worktree_root,
@@ -210,7 +205,37 @@ fn discover_source_endpoint(
     }
 
     let lfsconfig_path = worktree_root.join(".lfsconfig");
-    if is_regular_file_without_following_symlinks(&lfsconfig_path)?
+    let has_lfsconfig = is_regular_file_without_following_symlinks(&lfsconfig_path)?;
+    if has_lfsconfig
+        && let Some(url) = git_config_get_os(
+            worktree_root,
+            [
+                OsStr::new("config"),
+                OsStr::new("--no-includes"),
+                OsStr::new("--file"),
+                lfsconfig_path.as_os_str(),
+                OsStr::new("--get"),
+                OsStr::new(&remote_lfsurl_key),
+            ],
+            &format!(
+                "git config --no-includes --file .lfsconfig --get remote.{source_remote}.lfsurl"
+            ),
+        )?
+    {
+        return Ok(Some(GitLfsSourceEndpoint {
+            url,
+            source: GitLfsSourceEndpointSource::WorktreeRemoteConfig,
+        }));
+    }
+
+    if let Some(url) = git_config_get(worktree_root, ["config", "--local", "--get", "lfs.url"])? {
+        return Ok(Some(GitLfsSourceEndpoint {
+            url,
+            source: GitLfsSourceEndpointSource::LocalGitConfig,
+        }));
+    }
+
+    if has_lfsconfig
         && let Some(url) = git_config_get_os(
             worktree_root,
             [
@@ -666,6 +691,35 @@ mod discovery_tests {
 
         assert_eq!(endpoint.url, "https://source.example/local.git/info/lfs");
         assert_eq!(endpoint.source, GitLfsSourceEndpointSource::LocalGitConfig);
+    }
+
+    #[test]
+    fn committed_remote_endpoint_remains_the_source_after_lfscloud_configuration() {
+        let repo = TempRepo::new();
+        repo.write_file(
+            ".lfsconfig",
+            concat!(
+                "[lfs]\n",
+                "    url = https://cloud.example/github.com/owner/repo.git/info/lfs\n",
+                "[remote \"origin\"]\n",
+                "    lfsurl = https://legacy.example/owner/repo.git/info/lfs\n",
+            ),
+        );
+
+        let discovery =
+            discover_git_lfs_migration(repo.path()).expect("migration discovery should succeed");
+        let endpoint = discovery
+            .source_endpoint
+            .expect("committed legacy endpoint should be detected");
+
+        assert_eq!(
+            endpoint.url,
+            "https://legacy.example/owner/repo.git/info/lfs"
+        );
+        assert_eq!(
+            endpoint.source,
+            GitLfsSourceEndpointSource::WorktreeRemoteConfig
+        );
     }
 
     #[test]

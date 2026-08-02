@@ -292,6 +292,7 @@ server:
   host: 127.0.0.1
   port: 8081
   public_url: http://127.0.0.1:8081
+  session_encryption_secret: ${SESSION_ENCRYPTION_SECRET}
 
 repository_providers:
   github-main:
@@ -320,9 +321,15 @@ repositories:
     }
 
     fn test_env(name: &str) -> Option<String> {
-        BTreeMap::from([("GITHUB_PAT", "github_pat_secret")])
-            .get(name)
-            .map(ToString::to_string)
+        BTreeMap::from([
+            ("GITHUB_PAT", "github_pat_secret"),
+            (
+                "SESSION_ENCRYPTION_SECRET",
+                "test-session-encryption-secret-at-least-32-bytes",
+            ),
+        ])
+        .get(name)
+        .map(ToString::to_string)
     }
 
     fn load_with_test_env(contents: &str) -> ServerConfig {
@@ -338,6 +345,7 @@ repositories:
         assert_eq!(config.server.port, 8081);
         assert_eq!(config.server.public_url, "http://127.0.0.1:8081");
         assert!(!config.server.allow_insecure_http);
+        assert!(config.server.session_encryption_secret.is_some());
         assert_eq!(config.server.max_batch_objects, 100);
         assert_eq!(config.server.max_provider_calls, 16);
         assert_eq!(config.server.max_concurrent_requests, 64);
@@ -381,6 +389,23 @@ repositories:
     }
 
     #[test]
+    fn session_encryption_secret_is_required_to_be_long_and_debug_redacted() {
+        let short = valid_yaml().replace("${SESSION_ENCRYPTION_SECRET}", "too-short");
+        let error = ServerConfig::load_from_str_with_env(&short, "<test>", test_env)
+            .expect_err("short session encryption secret should be rejected");
+        assert_error_contains(
+            &error,
+            "server.session_encryption_secret must contain at least 32",
+        );
+
+        let config = load_with_test_env(valid_yaml());
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("session_encryption_secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("test-session-encryption-secret-at-least-32-bytes"));
+    }
+
+    #[test]
     fn parses_github_personal_access_token_authentication() {
         let config = load_with_test_env(valid_yaml());
         let RepositoryProviderConfig::GitHub(provider) =
@@ -409,10 +434,10 @@ repositories:
     }
 
     #[test]
-    fn single_github_pat_provider_centralizes_authentication_composition() {
+    fn single_github_provider_centralizes_authentication_composition() {
         let mut config = load_with_test_env(valid_yaml());
         let provider = config
-            .single_github_pat_provider("the test PAT consumer")
+            .single_github_provider("the test authentication consumer")
             .expect("one GitHub provider should compose")
             .expect("one GitHub provider should be selected");
         assert_eq!(provider.id, "github-main");
@@ -429,11 +454,11 @@ repositories:
             .insert("github-secondary".to_owned(), second);
 
         let error = config
-            .single_github_pat_provider("the test PAT consumer")
-            .expect_err("single-account PAT composition must reject two GitHub providers");
+            .single_github_provider("the test authentication consumer")
+            .expect_err("authentication composition must reject two GitHub providers");
         assert_error_contains(
             &error,
-            "multiple GitHub repository providers are not yet supported by the test PAT consumer",
+            "multiple GitHub repository providers are not yet supported by the test authentication consumer",
         );
     }
 
@@ -459,14 +484,17 @@ repositories:
     }
 
     #[test]
-    fn requires_github_personal_access_token() {
+    fn accepts_github_provider_without_server_owned_personal_access_token() {
         let contents = valid_yaml().replace("    personal_access_token: ${GITHUB_PAT}\n", "");
-        let error = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", test_env)
-            .expect_err("missing GitHub PAT should be rejected");
-
-        assert_error_contains(
-            &error,
-            "repository_providers.github-main.personal_access_token is required",
+        let config = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", test_env)
+            .expect("GitHub provider should use each login caller's PAT");
+        let RepositoryProviderConfig::GitHub(provider) =
+            &config.repository_providers["github-main"];
+        assert!(
+            provider
+                .authentication
+                .configured_personal_access_token()
+                .is_none()
         );
     }
 
@@ -685,7 +713,12 @@ storage_providers:
 
     #[test]
     fn literal_github_personal_access_token_is_redacted() {
-        let contents = valid_yaml().replace("${GITHUB_PAT}", "github_pat_configured_secret");
+        let contents = valid_yaml()
+            .replace("${GITHUB_PAT}", "github_pat_configured_secret")
+            .replace(
+                "${SESSION_ENCRYPTION_SECRET}",
+                "server-session-encryption-secret-at-least-32-bytes",
+            );
         let config = ServerConfig::load_from_str_with_env(contents.as_str(), "<test>", |_| None)
             .expect("PAT config should load");
         let rendered = format!("{config:?}");
@@ -985,7 +1018,7 @@ server:
 
         assert_error_contains(
             &error,
-            "repository_providers.github-main.personal_access_token references unset environment variable GITHUB_PAT",
+            "server.session_encryption_secret references unset environment variable SESSION_ENCRYPTION_SECRET",
         );
     }
 

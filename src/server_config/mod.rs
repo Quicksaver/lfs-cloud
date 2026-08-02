@@ -17,7 +17,7 @@ pub use providers::{
     GoogleDriveStorageConfig, RepositoryProviderConfig, StorageProviderConfig,
 };
 pub use repository::RepositoryMapping;
-pub use settings::ServerSettings;
+pub use settings::{ServerSessionEncryptionSecret, ServerSettings};
 
 /// Default server config path used when no explicit path is supplied.
 pub const DEFAULT_CONFIG_PATH: &str = "lfscloud.yml";

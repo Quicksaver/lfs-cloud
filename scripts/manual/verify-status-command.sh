@@ -70,12 +70,12 @@ server:
   host: 127.0.0.1
   port: $port
   public_url: $server_url
+  session_encryption_secret: status-smoke-session-secret-at-least-32-characters
 
 repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    personal_access_token: github-pat
 
 storage_providers:
   drive-user-a:

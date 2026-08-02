@@ -85,7 +85,8 @@ pub use migration::{
     enumerate_all_fetched_ref_lfs_pointers, enumerate_current_checkout_lfs_pointers,
     enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
     fetch_migration_git_refs, fetch_missing_migration_objects,
-    fetch_missing_migration_objects_from_remote, upload_migration_objects_to_storage,
+    fetch_missing_migration_objects_from_remote,
+    fetch_missing_migration_objects_from_remote_at_endpoint, upload_migration_objects_to_storage,
     upload_migration_objects_to_storage_with_options,
 };
 pub use providers::{
@@ -104,7 +105,7 @@ pub use server_config::{
     DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR,
     GitHubAuthenticationConfig, GitHubProviderConfig, GoogleDriveGcloudCredentialsConfig,
     GoogleDriveStorageConfig, RepositoryMapping, RepositoryProviderConfig, ServerConfig,
-    ServerSettings, StorageProviderConfig,
+    ServerSessionEncryptionSecret, ServerSettings, StorageProviderConfig,
 };
 pub use sessions::{
     DEFAULT_LFS_SESSION_TTL, IssuedLfsSession, LfsSessionMetadata, LfsSessionToken,

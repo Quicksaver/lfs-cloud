@@ -228,13 +228,13 @@ server:
   port: $port
   public_url: $public_url
   allow_insecure_http: true
+  session_encryption_secret: lan-smoke-session-secret-at-least-32-characters
   metadata_path: $tmp_dir/metadata.sqlite3
 
 repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    personal_access_token: lan-smoke-pat
 
 storage_providers:
   drive-user-a:

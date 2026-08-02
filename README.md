@@ -22,10 +22,10 @@ It also provides a shared local object cache. On supported filesystems, checked 
 | ------------------- | ---------------------------------------- |
 | Repository provider | GitHub                                   |
 | Storage provider    | Google Drive                             |
-| Authentication      | One configured GitHub account using PAT  |
+| Authentication      | Per-user GitHub PAT with repository ACLs |
 | Server deployment   | Self-hosted process with SQLite metadata |
 
-LFS Cloud is best suited to a private, single-operator installation. It is not currently a multi-user identity service.
+Each user logs in with their own GitHub PAT. LFS Cloud verifies that identity with GitHub and checks the user's current permission on every configured repository: read access permits LFS downloads, while write access permits uploads and migration.
 
 ## Quick Start
 
@@ -102,12 +102,12 @@ server:
   host: 127.0.0.1
   port: 8080
   public_url: http://127.0.0.1:8080
+  session_encryption_secret: ${LFS_CLOUD_SESSION_SECRET}
 
 repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    personal_access_token: ${LFS_CLOUD_GITHUB_PAT}
 
 storage_providers:
   drive-personal:
@@ -147,10 +147,10 @@ See the [configuration guide](docs/configuration.md) for the full schema, securi
 
 ### 4. Start The Server
 
-Export the same PAT referenced by the configuration and start LFS Cloud:
+Export the server-owned session encryption secret and start LFS Cloud:
 
 ```bash
-export LFS_CLOUD_GITHUB_PAT="your-personal-access-token"
+export LFS_CLOUD_SESSION_SECRET="replace-with-at-least-32-random-characters"
 lfscloud serve --config ./lfscloud.yml
 ```
 
@@ -166,7 +166,7 @@ lfscloud login --server http://127.0.0.1:8080
 lfscloud --config /path/to/lfscloud.yml status
 ```
 
-`init` writes the repository-specific endpoint to `.lfsconfig`. Use `--local` to write only repository-local Git config instead. `login` exchanges the configured GitHub PAT for a short-lived LFS Cloud token and stores only that local token through Git's credential helper.
+`init` writes the repository-specific endpoint to `.lfsconfig`. Use `--local` to write only repository-local Git config instead. `login` verifies your GitHub PAT, creates a short-lived LFS Cloud session, and stores only the opaque local token through Git's credential helper. The PAT stays encrypted on the server for current GitHub permission checks.
 
 After setup, normal Git and Git LFS pushes and fetches use LFS Cloud. For a new LFS pattern, configure Git LFS as usual:
 
@@ -181,24 +181,24 @@ Use a non-shallow clone with all source branches and tags available. Keep the so
 
 ```bash
 lfscloud login --server http://127.0.0.1:8080
-lfscloud --config /path/to/lfscloud.yml migrate \
+lfscloud migrate \
   --server http://127.0.0.1:8080 \
   --all-refs \
   --dry-run
-lfscloud --config /path/to/lfscloud.yml migrate \
+lfscloud migrate \
   --server http://127.0.0.1:8080 \
   --all-refs
 git add .lfsconfig
 git commit -m "Route Git LFS through LFS Cloud"
 ```
 
-Execution authenticates a repository-scoped request to the target, refreshes the selected source remote's branches and tags, inventories every historical LFS pointer, fetches missing bytes from the source provider, and uploads each verified object to the configured Google Drive backend. Every successful destination check is synchronized to a durable JSON Lines receipt; an interrupted run revalidates recorded objects against the active Drive target before resuming them. Repository configuration is updated only after the complete object inventory succeeds.
+Execution authenticates a write request to the repository's LFS Cloud route, refreshes the selected source remote's branches and tags, and inventories every historical LFS pointer. It asks the server which objects are already present before fetching source bytes, fetches only the target-missing subset, and uploads those bytes through server-issued Git LFS actions. The client never reads the private server config or accesses Google Drive directly. Repository configuration is updated only after the complete target inventory succeeds.
 
-If any target object fails, neither repository config location is changed and a retry resumes from the durable receipt. If a later repository-config write itself fails, the uploaded objects and receipt remain safe. When `.lfsconfig` still names the source endpoint, rerun the same migration command. When `.lfsconfig` names the target but `git config --local --get lfs.url` is missing or stale, repair the local override with `lfscloud init --server URL --local`. Verify both locations before removing or purging source LFS data.
+If any target object fails, neither target config location is changed. A retry safely asks LFS Cloud again, so objects completed by an earlier user or interrupted run are skipped. If `.lfsconfig` already names the target, rerun the same migration command; the committed legacy remote URL still supplies the source for any remaining target-missing objects.
 
-Migration writes both `.lfsconfig` and a repository-local `lfs.url`. The local override keeps this checkout on LFS Cloud when checking out commits older than the new `.lfsconfig`. In a fresh clone, run `lfscloud init --server URL --local` before checking out such older commits. Git history and LFS pointers are not rewritten.
+Migration writes the target to both `.lfsconfig` and repository-local `lfs.url`. Before switching, it also records the old endpoint as the standard `remote.<source>.lfsurl` field in `.lfsconfig`; follow-up users can therefore migrate their local-only objects without private server configuration. The repository-wide target remains active for normal Git LFS traffic, while migration applies the legacy URL only to its source fetch command. Git history and LFS pointers are not rewritten, and URLs containing credentials are never committed.
 
-Execution requires `--all-refs`; narrower current-checkout and `--ref` scopes remain available for dry-run investigation only. `--source-remote` defaults to `origin`. Use `--allow-cross-remote` only for an intentional copy between different repository identities. `--purge-source-lfs` reports cleanup guidance and the verified receipt but never automatically deletes source objects.
+Execution requires `--all-refs`; narrower current-checkout and `--ref` scopes remain available for dry-run investigation only. `--source-remote` defaults to `origin`. Use `--allow-cross-remote` only for an intentional copy between different repository identities. `--purge-source-lfs` reports cleanup guidance but never automatically deletes source objects.
 
 ## Commands
 
@@ -223,7 +223,7 @@ Run `lfscloud <command> --help` for all options.
 ## Current Limitations
 
 - GitHub and Google Drive are the only implemented providers.
-- Authentication represents one configured GitHub account, not independent users.
+- Users supply their own GitHub PATs; OAuth/device-flow login is not implemented.
 - Uploads and downloads are proxied through the LFS Cloud process, so the host must support long-lived large-file transfers.
 - The package channels will remain unavailable until the first release is published; release binaries are not signed or notarized yet.
 

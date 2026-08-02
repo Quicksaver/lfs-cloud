@@ -107,11 +107,11 @@ impl LfsRouteResolver {
     ///     r#"
     /// server:
     ///   public_url: http://127.0.0.1:8080
+    ///   session_encryption_secret: a-test-session-secret-at-least-32-characters
     /// repository_providers:
     ///   github-main:
     ///     type: github
     ///     api_url: https://api.github.com
-    ///     personal_access_token: github-pat
     /// storage_providers:
     ///   drive-user-a:
     ///     type: google_drive

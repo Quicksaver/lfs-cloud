@@ -107,8 +107,8 @@ pub(super) struct RepositoryProviderAddCommand {
     #[arg(long, value_name = "URL")]
     pub(super) api_url: Option<String>,
 
-    /// GitHub personal access token or environment reference.
-    #[arg(long, value_name = "TOKEN_OR_ENV_REFERENCE")]
+    /// Deprecated server-session encryption fallback.
+    #[arg(long, value_name = "TOKEN_OR_ENV_REFERENCE", hide = true)]
     pub(super) personal_access_token: Option<String>,
 }
 

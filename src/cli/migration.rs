@@ -3,6 +3,9 @@
 use super::*;
 
 const MIGRATION_TARGET_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const MIGRATION_TARGET_BATCH_SIZE: usize = 100;
+const MIGRATION_TARGET_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+const MIGRATION_TARGET_UPLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MIGRATION_OBJECT_REPORT_LIMIT: usize = 100;
 const SOURCE_ENDPOINT_UNSET_LABEL: &str = "<unset>";
 const SOURCE_PROVIDER_UNKNOWN_LABEL: &str = "unknown";
@@ -24,7 +27,6 @@ pub(super) fn run_migrate_to_stdout(
                 GitCredentialLookup::new_with_insecure_http(lfs_url, true)
                     .and_then(|lookup| lookup.lookup().map(|_| ()))
             },
-            validate_status_storage,
         )
         .map_err(anyhow::Error::from);
     }
@@ -45,20 +47,18 @@ pub(super) fn run_migrate_to_stdout(
     .map_err(anyhow::Error::from)
 }
 
-fn run_migrate_from_dir<W, P, A, S>(
+fn run_migrate_from_dir<W, P, A>(
     command: MigrateCommand,
-    config_path: Option<PathBuf>,
+    _config_path: Option<PathBuf>,
     start_dir: impl AsRef<Path>,
     output: &mut W,
     mut probe_server: P,
     mut lookup_credential: A,
-    mut validate_storage: S,
 ) -> CliResult<()>
 where
     W: Write,
     P: FnMut(&str) -> CliResult<()>,
     A: FnMut(&str) -> CliResult<()>,
-    S: FnMut(&StorageProviderConfig) -> CliResult<()>,
 {
     if !command.dry_run {
         return Err(CliError::InvalidArguments {
@@ -92,10 +92,7 @@ where
     let cache_layout = Some(local_cache_layout(command.cache_root.clone())?);
     let availability =
         check_local_migration_objects(start_dir, scan.objects.iter(), cache_layout.as_ref())?;
-    let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
     let readiness_checks = migration_readiness_checks(
-        &config_path,
-        &repository,
         MigrationTargetReadiness {
             server_url: &command.server,
             lfs_url: &route.lfs_url,
@@ -103,7 +100,6 @@ where
         &discovery,
         &mut probe_server,
         &mut lookup_credential,
-        &mut validate_storage,
     );
     let source_purge = migration_source_purge_report(&discovery, command.purge_source_lfs);
     let report = MigrationDryRunReport {
@@ -113,7 +109,6 @@ where
         scan,
         availability,
         route,
-        config_path,
         readiness_checks,
         would_touch_files: migration_dry_run_touched_files(&repository)?,
         source_purge,
@@ -150,6 +145,7 @@ impl MigrationExecutionPreparation {
             scan,
             cache_layout: self.cache_layout,
             purge_source_lfs: self.purge_source_lfs,
+            allow_insecure_http: self.allow_insecure_http,
         })
     }
 }
@@ -163,18 +159,32 @@ struct MigrationExecutionContext {
     scan: MigrationPointerScan,
     cache_layout: LocalCacheLayout,
     purge_source_lfs: bool,
+    allow_insecure_http: bool,
 }
 
 #[derive(Debug)]
 struct MigrationExecutionResult {
     source_fetch: MigrationSourceFetch,
-    storage_upload: MigrationStorageUpload,
+    server_upload: MigrationServerUpload,
     config_changes: Vec<GitLfsConfigChange>,
+    legacy_source_configured: bool,
+}
+
+#[derive(Debug)]
+struct MigrationServerUpload {
+    uploaded_objects: Vec<LfsObject>,
+    already_present_objects: Vec<LfsObject>,
+}
+
+#[derive(Debug)]
+struct MigrationTargetPlan {
+    uploads: Vec<(LfsObject, LfsBatchAction)>,
+    already_present_objects: Vec<LfsObject>,
 }
 
 async fn run_migrate_execution_from_dir<W, P, A>(
     command: MigrateCommand,
-    config_path: Option<PathBuf>,
+    _config_path: Option<PathBuf>,
     start_dir: impl AsRef<Path>,
     output: &mut W,
     mut probe_server: P,
@@ -199,16 +209,13 @@ where
     )
     .await?;
 
-    let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
-    let (mapping, storage) =
-        migration_storage_provider(&config_path, &preparation.repository).await?;
     fetch_migration_git_refs(
         &preparation.repository.worktree_root,
         &preparation.source_remote.remote_name,
     )?;
     let context = preparation.scan_fetched_refs()?;
-    let result = execute_migration_with_storage(&context, &mapping, storage.as_ref()).await?;
-    write_migration_execution_report(output, &context, &mapping, &result).map_err(output_error)
+    let result = execute_migration_through_server(&context, &token).await?;
+    write_migration_execution_report(output, &context, &result).map_err(output_error)
 }
 
 fn prepare_migration_execution(
@@ -254,16 +261,6 @@ fn prepare_migration_execution(
                 .to_owned(),
         });
     }
-    if discovery
-        .source_endpoint
-        .as_ref()
-        .is_some_and(|source| source.url == route.lfs_url)
-    {
-        return Err(CliError::InvalidArguments {
-            message: "source Git LFS endpoint already points at the requested LFS Cloud target"
-                .to_owned(),
-        });
-    }
     Ok(MigrationExecutionPreparation {
         repository,
         source_remote: source_repository.remote,
@@ -275,62 +272,54 @@ fn prepare_migration_execution(
     })
 }
 
-async fn migration_storage_provider(
-    config_path: &Path,
-    repository: &GitRepository,
-) -> CliResult<(RepositoryMapping, Arc<dyn StorageProvider + Send + Sync>)> {
-    let config = ServerConfig::load_from_path(config_path)?;
-    let mapping = config
-        .repository_mapping_for_identity(
-            &repository.remote.host,
-            &repository.remote.owner,
-            &repository.remote.name,
-        )
-        .cloned()
-        .ok_or_else(|| CliError::InvalidArguments {
-            message: format!(
-                "server config has no repository mapping for {}",
-                repository.remote.repository_label()
-            ),
-        })?;
-    let storage = config
-        .storage_providers
-        .get(&mapping.storage_provider)
-        .cloned()
-        .ok_or_else(|| CliError::InvalidArguments {
-            message: format!(
-                "repository mapping {} references unknown storage provider {}",
-                mapping.id, mapping.storage_provider
-            ),
-        })?;
-    let metadata = Arc::new(MetadataDatabase::open(&config.server.metadata_path)?);
-    metadata.sync_config(&config)?;
-    let provider = storage
-        .build_provider(mapping.id.clone(), metadata)
-        .await
-        .map_err(MigrationError::from)?;
-    Ok((mapping, provider))
-}
-
-async fn execute_migration_with_storage(
+async fn execute_migration_through_server(
     context: &MigrationExecutionContext,
-    mapping: &RepositoryMapping,
-    storage: &dyn StorageProvider,
+    token: &LfsSessionToken,
 ) -> CliResult<MigrationExecutionResult> {
-    let repository_namespace = storage_namespace_for_context(context, mapping)?;
     if context.scan.objects.is_empty() {
         return Err(CliError::InvalidArguments {
             message: "migration found no non-empty Git LFS objects across the selected history"
                 .to_owned(),
         });
     }
-    let source_fetch = fetch_missing_migration_objects_from_remote(
+    let target_plan = request_migration_target_plan(
+        &context.route.lfs_url,
+        context.allow_insecure_http,
+        token,
+        &context.scan.objects,
+    )
+    .await?;
+    let needed_objects = target_plan
+        .uploads
+        .iter()
+        .map(|(object, _)| object)
+        .collect::<Vec<_>>();
+    let before = check_local_migration_objects(
         &context.repository.worktree_root,
-        context.scan.objects.iter(),
+        needed_objects.iter().copied(),
         Some(&context.cache_layout),
-        &context.source_remote.remote_name,
-        MigrationFetchMode::AllFetchedRefs,
     )?;
+    if !before.unavailable_objects().is_empty() && context.discovery.source_endpoint.is_none() {
+        return Err(MigrationError::SourceEndpointMissing.into());
+    }
+    let source_fetch = match context.discovery.source_endpoint.as_ref() {
+        Some(source) => fetch_missing_migration_objects_from_remote_at_endpoint(
+            &context.repository.worktree_root,
+            needed_objects.iter().copied(),
+            Some(&context.cache_layout),
+            &context.source_remote.remote_name,
+            &source.url,
+            context.allow_insecure_http,
+            MigrationFetchMode::AllFetchedRefs,
+        )?,
+        None => fetch_missing_migration_objects_from_remote(
+            &context.repository.worktree_root,
+            needed_objects.iter().copied(),
+            Some(&context.cache_layout),
+            &context.source_remote.remote_name,
+            MigrationFetchMode::AllFetchedRefs,
+        )?,
+    };
     if let Some(object) = source_fetch.unavailable_objects.first() {
         return Err(MigrationError::SourceObjectMissing {
             oid: object.oid.as_hex().to_owned(),
@@ -339,20 +328,34 @@ async fn execute_migration_with_storage(
         .into());
     }
 
-    let storage_upload =
-        upload_migration_objects_to_storage(&source_fetch.after, storage, repository_namespace)
-            .await?;
-    if let Some(first) = storage_upload.failed_objects.first() {
-        return Err(CliError::MigrationUploadFailed {
-            failures: storage_upload.failed_objects.len(),
-            oid: first.object.oid.as_hex().to_owned(),
-            message: first.message.clone(),
-        });
-    }
+    let server_upload = upload_migration_objects_through_server(
+        &context.route.lfs_url,
+        context.allow_insecure_http,
+        &source_fetch.after,
+        target_plan,
+    )
+    .await?;
 
-    // Persist both forms after every object has a synchronized successful
-    // checkpoint record. The local override keeps historical commits working
-    // even when they predate the newly committed `.lfsconfig` file.
+    let legacy_source_configured = if let Some(source) = context
+        .discovery
+        .source_endpoint
+        .as_ref()
+        .filter(|source| source.url != context.route.lfs_url)
+    {
+        let source_url = crate::migration::validated_migration_source_endpoint(
+            &source.url,
+            context.allow_insecure_http,
+        )?;
+        context
+            .repository
+            .write_worktree_remote_lfs_url(&context.source_remote.remote_name, source_url)?;
+        true
+    } else {
+        false
+    };
+
+    // Persist both target forms only after every server-mediated upload has
+    // completed. The local override keeps commits predating `.lfsconfig` usable.
     let config_changes = [
         GitLfsConfigTarget::WorktreeFile,
         GitLfsConfigTarget::LocalRepository,
@@ -367,41 +370,286 @@ async fn execute_migration_with_storage(
 
     Ok(MigrationExecutionResult {
         source_fetch,
-        storage_upload,
+        server_upload,
         config_changes,
+        legacy_source_configured,
     })
 }
 
-fn storage_namespace_for_context<'a>(
-    context: &MigrationExecutionContext,
-    mapping: &'a RepositoryMapping,
-) -> CliResult<&'a str> {
-    if mapping
-        .host
-        .eq_ignore_ascii_case(&context.repository.remote.host)
-        && mapping
-            .owner
-            .eq_ignore_ascii_case(&context.repository.remote.owner)
-        && mapping
-            .name
-            .eq_ignore_ascii_case(&context.repository.remote.name)
+async fn request_migration_target_plan(
+    lfs_url: &str,
+    allow_insecure_http: bool,
+    token: &LfsSessionToken,
+    objects: &[LfsObject],
+) -> CliResult<MigrationTargetPlan> {
+    let mut batch_url = crate::init::validate_server_url(lfs_url, allow_insecure_http)?;
+    append_url_path_segments(&mut batch_url, "objects/batch")?;
+    let client = redirect_free_http_client("failed to create migration batch client")?;
+    let mut uploads = Vec::new();
+    let mut already_present_objects = Vec::new();
+
+    let mut pending_batches = objects
+        .chunks(MIGRATION_TARGET_BATCH_SIZE)
+        .map(<[LfsObject]>::to_vec)
+        .collect::<std::collections::VecDeque<_>>();
+    while let Some(chunk) = pending_batches.pop_front() {
+        let request = LfsBatchRequest {
+            operation: LfsBatchOperation::Upload,
+            transfers: vec![LFS_BASIC_TRANSFER.to_owned()],
+            ref_context: None,
+            hash_algo: LfsBatchHashAlgorithm::Sha256,
+            objects: chunk.clone(),
+        };
+        let response = client
+            .post(batch_url.clone())
+            .bearer_auth(token.as_str())
+            .header("Accept", "application/vnd.git-lfs+json")
+            .header("Content-Type", "application/vnd.git-lfs+json")
+            .json(&request)
+            .timeout(MIGRATION_TARGET_PROBE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|source| CliError::Io {
+                context: "failed to reconcile migration objects with LFS Cloud".to_owned(),
+                source: io::Error::other(source),
+            })?;
+        let status = response.status();
+        let body = crate::http_transport::read_bounded_lossy_response_body(
+            response,
+            MIGRATION_TARGET_RESPONSE_LIMIT,
+        )
+        .await
+        .map_err(|source| CliError::Io {
+            context: "failed to read the LFS Cloud batch response".to_owned(),
+            source: io::Error::other(source),
+        })?;
+        if status == HttpStatusCode::PAYLOAD_TOO_LARGE && chunk.len() > 1 {
+            let split = chunk.len() / 2;
+            pending_batches.push_front(chunk[split..].to_vec());
+            pending_batches.push_front(chunk[..split].to_vec());
+            continue;
+        }
+        if !status.is_success() {
+            return Err(CliError::ExternalCommandOutput {
+                command: "migration target upload batch".to_owned(),
+                message: SanitizedMessage::new(format!(
+                    "server returned HTTP status {}: {}",
+                    status.as_u16(),
+                    sanitized_migration_http_body(&body)
+                )),
+            });
+        }
+        let response: LfsBatchResponse =
+            serde_json::from_str(&body).map_err(|source| CliError::ExternalCommandOutput {
+                command: "migration target upload batch".to_owned(),
+                message: SanitizedMessage::new(format!(
+                    "server returned invalid Git LFS batch JSON: {source}"
+                )),
+            })?;
+        if response.transfer != LFS_BASIC_TRANSFER {
+            return Err(CliError::ExternalCommandOutput {
+                command: "migration target upload batch".to_owned(),
+                message: SanitizedMessage::new(
+                    "server selected an unsupported Git LFS transfer adapter",
+                ),
+            });
+        }
+
+        let mut expected = chunk.iter().cloned().collect::<BTreeSet<_>>();
+        for result in response.objects {
+            let object = LfsObject::new(result.oid, result.size);
+            if !expected.remove(&object) {
+                return Err(CliError::ExternalCommandOutput {
+                    command: "migration target upload batch".to_owned(),
+                    message: SanitizedMessage::new(
+                        "server returned an unexpected or duplicate migration object",
+                    ),
+                });
+            }
+            if let Some(error) = result.error {
+                return Err(CliError::MigrationUploadFailed {
+                    failures: 1,
+                    oid: object.oid.as_hex().to_owned(),
+                    message: SanitizedMessage::new(format!(
+                        "server rejected the object with code {}: {}",
+                        error.code, error.message
+                    )),
+                });
+            }
+            match result.actions.get("upload") {
+                Some(action) => uploads.push((object, action.clone())),
+                None if result.actions.is_empty() => already_present_objects.push(object),
+                None => {
+                    return Err(CliError::ExternalCommandOutput {
+                        command: "migration target upload batch".to_owned(),
+                        message: SanitizedMessage::new(
+                            "server returned migration actions without an upload action",
+                        ),
+                    });
+                }
+            }
+        }
+        if !expected.is_empty() {
+            return Err(CliError::ExternalCommandOutput {
+                command: "migration target upload batch".to_owned(),
+                message: SanitizedMessage::new(
+                    "server omitted one or more requested migration objects",
+                ),
+            });
+        }
+    }
+
+    Ok(MigrationTargetPlan {
+        uploads,
+        already_present_objects,
+    })
+}
+
+async fn upload_migration_objects_through_server(
+    lfs_url: &str,
+    allow_insecure_http: bool,
+    availability: &LocalMigrationObjectAvailability,
+    plan: MigrationTargetPlan,
+) -> CliResult<MigrationServerUpload> {
+    let target_url = Url::parse(lfs_url).map_err(|_| CliError::InvalidArguments {
+        message: "migration target LFS URL is invalid".to_owned(),
+    })?;
+    let client = redirect_free_http_client("failed to create migration upload client")?;
+    let mut uploaded_objects = Vec::new();
+
+    for (object, action) in plan.uploads {
+        let local_object = availability
+            .objects
+            .iter()
+            .find(|local| local.object == object)
+            .ok_or_else(|| MigrationError::SourceObjectMissing {
+                oid: object.oid.as_hex().to_owned(),
+                size: object.size.bytes(),
+            })?;
+        let source = crate::migration::verified_migration_upload_source_path(local_object)?;
+        crate::migration::verify_migration_upload_source(source, &object).await?;
+        let upload_url =
+            validated_migration_upload_action_url(&target_url, &action.href, allow_insecure_http)?;
+        let headers = migration_action_headers(&action)?;
+        let file = tokio::fs::File::open(source)
+            .await
+            .map_err(|source_error| CliError::Io {
+                context: format!("failed to open migration object sha256:{}", object.oid),
+                source: source_error,
+            })?;
+        let response = client
+            .put(upload_url)
+            .headers(headers)
+            .header(CONTENT_LENGTH, object.size.bytes())
+            .body(ReqwestBody::wrap_stream(ReaderStream::new(file)))
+            .timeout(MIGRATION_TARGET_UPLOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(|source| CliError::Io {
+                context: format!(
+                    "failed to upload migration object sha256:{} through LFS Cloud",
+                    object.oid
+                ),
+                source: io::Error::other(source),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = crate::http_transport::read_bounded_lossy_response_body(
+                response,
+                MIGRATION_TARGET_RESPONSE_LIMIT,
+            )
+            .await
+            .map_err(|source| CliError::Io {
+                context: "failed to read the LFS Cloud upload response".to_owned(),
+                source: io::Error::other(source),
+            })?;
+            return Err(CliError::MigrationUploadFailed {
+                failures: 1,
+                oid: object.oid.as_hex().to_owned(),
+                message: SanitizedMessage::new(format!(
+                    "server returned HTTP status {}: {}",
+                    status.as_u16(),
+                    sanitized_migration_http_body(&body)
+                )),
+            });
+        }
+        uploaded_objects.push(object);
+    }
+
+    Ok(MigrationServerUpload {
+        uploaded_objects,
+        already_present_objects: plan.already_present_objects,
+    })
+}
+
+fn validated_migration_upload_action_url(
+    target_url: &Url,
+    action_url: &str,
+    allow_insecure_http: bool,
+) -> CliResult<Url> {
+    let parsed = Url::parse(action_url).map_err(|_| CliError::ExternalCommandOutput {
+        command: "migration target upload batch".to_owned(),
+        message: SanitizedMessage::new("server returned an invalid upload action URL"),
+    })?;
+    let same_origin = parsed.scheme() == target_url.scheme()
+        && parsed.host() == target_url.host()
+        && parsed.port_or_known_default() == target_url.port_or_known_default();
+    let target_path = target_url.path().trim_end_matches('/');
+    let expected_prefix = format!("{target_path}/objects/");
+    if !same_origin
+        || !parsed.path().starts_with(&expected_prefix)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || (!allow_insecure_http && !crate::http_transport::uses_protected_http_transport(&parsed))
     {
-        Ok(&mapping.id)
-    } else {
-        Err(CliError::InvalidArguments {
-            message: format!(
-                "repository mapping {} does not match migration target {}",
-                mapping.id,
-                context.repository.remote.repository_label()
+        return Err(CliError::ExternalCommandOutput {
+            command: "migration target upload batch".to_owned(),
+            message: SanitizedMessage::new(
+                "server returned an unsafe or out-of-scope upload action URL",
             ),
-        })
+        });
+    }
+    Ok(parsed)
+}
+
+fn migration_action_headers(action: &LfsBatchAction) -> CliResult<ReqwestHeaderMap> {
+    let mut headers = ReqwestHeaderMap::new();
+    for (name, value) in &action.header {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            CliError::ExternalCommandOutput {
+                command: "migration target upload batch".to_owned(),
+                message: SanitizedMessage::new("server returned an invalid upload action header"),
+            }
+        })?;
+        if name == CONTENT_LENGTH || name == reqwest::header::HOST {
+            return Err(CliError::ExternalCommandOutput {
+                command: "migration target upload batch".to_owned(),
+                message: SanitizedMessage::new("server returned a forbidden upload action header"),
+            });
+        }
+        let value = HeaderValue::from_str(value).map_err(|_| CliError::ExternalCommandOutput {
+            command: "migration target upload batch".to_owned(),
+            message: SanitizedMessage::new("server returned an invalid upload action header"),
+        })?;
+        headers.insert(name, value);
+    }
+    Ok(headers)
+}
+
+fn sanitized_migration_http_body(body: &str) -> String {
+    let normalized = body.replace(['\r', '\n'], " ");
+    let normalized = normalized.trim();
+    if normalized.is_empty() {
+        "<no response body>".to_owned()
+    } else {
+        normalized.chars().take(1024).collect()
     }
 }
 
 fn write_migration_execution_report<W>(
     output: &mut W,
     context: &MigrationExecutionContext,
-    mapping: &RepositoryMapping,
     result: &MigrationExecutionResult,
 ) -> io::Result<()>
 where
@@ -426,7 +674,11 @@ where
         "  target: {}",
         redacted_url_for_display(&context.route.lfs_url)
     )?;
-    writeln!(output, "  repository namespace: {}", mapping.id)?;
+    writeln!(
+        output,
+        "  repository route: {}",
+        context.repository.remote.repository_label()
+    )?;
     writeln!(
         output,
         "  refs scanned: {}",
@@ -447,13 +699,8 @@ where
     writeln!(
         output,
         "  target objects: {} uploaded, {} already present",
-        result.storage_upload.uploaded_objects.len(),
-        result.storage_upload.already_present_objects.len()
-    )?;
-    writeln!(
-        output,
-        "  durable receipt: {}",
-        result.storage_upload.checkpoint_path.display()
+        result.server_upload.uploaded_objects.len(),
+        result.server_upload.already_present_objects.len()
     )?;
     writeln!(output, "  repository configuration:")?;
     for change in &result.config_changes {
@@ -462,6 +709,13 @@ where
             "    {}: {}",
             change.target.label(),
             change.path.display()
+        )?;
+    }
+    if result.legacy_source_configured {
+        writeln!(
+            output,
+            "    .lfsconfig: remote.{}.lfsurl (legacy migration source)",
+            context.source_remote.remote_name
         )?;
     }
     writeln!(
@@ -478,7 +732,7 @@ where
         )?;
         writeln!(
             output,
-            "    use the durable receipt above with the source provider's supported cleanup process"
+            "    confirm the destination inventory independently before using the source provider's cleanup process"
         )?;
     }
     Ok(())
@@ -536,7 +790,6 @@ struct MigrationDryRunReport {
     scan: MigrationPointerScan,
     availability: LocalMigrationObjectAvailability,
     route: LfsInitRoute,
-    config_path: PathBuf,
     readiness_checks: Vec<MigrationReadinessCheck>,
     would_touch_files: Vec<PathBuf>,
     source_purge: Option<MigrationSourcePurgeReport>,
@@ -627,19 +880,15 @@ fn dedupe_lfs_objects<'a>(objects: impl IntoIterator<Item = &'a LfsObject>) -> V
         .collect()
 }
 
-fn migration_readiness_checks<P, A, S>(
-    config_path: &Path,
-    repository: &GitRepository,
+fn migration_readiness_checks<P, A>(
     target: MigrationTargetReadiness<'_>,
     discovery: &GitLfsMigrationDiscovery,
     probe_server: &mut P,
     lookup_credential: &mut A,
-    validate_storage: &mut S,
 ) -> Vec<MigrationReadinessCheck>
 where
     P: FnMut(&str) -> CliResult<()>,
     A: FnMut(&str) -> CliResult<()>,
-    S: FnMut(&StorageProviderConfig) -> CliResult<()>,
 {
     let mut checks = Vec::new();
     checks.push(migration_git_lfs_readiness_check(discovery));
@@ -663,21 +912,12 @@ where
         },
     });
 
-    match ServerConfig::load_from_path(config_path) {
-        Ok(config) => {
-            checks.push(MigrationReadinessCheck {
-                name: "config",
-                level: StatusLevel::Ok,
-                message: format!("loaded {}", config_path.display()),
-            });
-            migration_config_readiness_checks(&mut checks, &config, repository, validate_storage);
-        }
-        Err(error) => checks.push(MigrationReadinessCheck {
-            name: "config",
-            level: StatusLevel::Warning,
-            message: format!("{error}"),
-        }),
-    }
+    checks.push(MigrationReadinessCheck {
+        name: "storage",
+        level: StatusLevel::Ok,
+        message: "storage is server-owned and will be checked through the authenticated LFS route"
+            .to_owned(),
+    });
 
     checks
 }
@@ -789,66 +1029,6 @@ fn migration_source_readiness_check(
     }
 }
 
-fn migration_config_readiness_checks<S>(
-    checks: &mut Vec<MigrationReadinessCheck>,
-    config: &ServerConfig,
-    repository: &GitRepository,
-    validate_storage: &mut S,
-) where
-    S: FnMut(&StorageProviderConfig) -> CliResult<()>,
-{
-    let Some(mapping) = config.repository_mapping_for_identity(
-        &repository.remote.host,
-        &repository.remote.owner,
-        &repository.remote.name,
-    ) else {
-        checks.push(MigrationReadinessCheck {
-            name: "mapping",
-            level: StatusLevel::Warning,
-            message: format!(
-                "no server config entry for {}",
-                repository.remote.repository_label()
-            ),
-        });
-        return;
-    };
-
-    checks.push(MigrationReadinessCheck {
-        name: "mapping",
-        level: StatusLevel::Ok,
-        message: format!("{} -> {}", mapping.id, mapping.storage_provider),
-    });
-
-    let Some(storage) = config.storage_providers.get(&mapping.storage_provider) else {
-        checks.push(MigrationReadinessCheck {
-            name: "storage-credential",
-            level: StatusLevel::Warning,
-            message: format!(
-                "mapping {} references unknown storage provider {}",
-                mapping.id, mapping.storage_provider
-            ),
-        });
-        return;
-    };
-
-    checks.push(match validate_storage(storage) {
-        Ok(()) => MigrationReadinessCheck {
-            name: "storage-credential",
-            level: StatusLevel::Ok,
-            message: format!(
-                "{} {} credential loads locally; Drive root access not probed",
-                storage.provider_type(),
-                storage.id()
-            ),
-        },
-        Err(error) => MigrationReadinessCheck {
-            name: "storage-credential",
-            level: StatusLevel::Warning,
-            message: format!("{error}"),
-        },
-    });
-}
-
 fn migration_dry_run_touched_files(repository: &GitRepository) -> CliResult<Vec<PathBuf>> {
     Ok(vec![
         repository.worktree_root.join(".lfsconfig"),
@@ -956,7 +1136,6 @@ where
             tracked.attributes.join(" ")
         )?;
     }
-    writeln!(output, "  config: {}", report.config_path.display())?;
     writeln!(output, "  refs scanned: {}", report.scan.refs_scanned.len())?;
     for ref_name in &report.scan.refs_scanned {
         writeln!(output, "    {ref_name}")?;
@@ -1020,7 +1199,7 @@ where
     )?;
     writeln!(
         output,
-        "    target storage not probed during dry-run; execution checks existence before upload"
+        "    target storage not probed during dry-run; execution reconciles through LFS Cloud before fetching source bytes"
     )?;
     writeln!(
         output,
@@ -1084,7 +1263,7 @@ where
     )?;
     writeln!(
         output,
-        "    warning: target storage quota and free capacity were not probed"
+        "    warning: target storage quota and free capacity were not probed; the server owns those checks"
     )?;
     if let Some(MigrationSourcePurgeReport::NotConfigured) = &report.source_purge {
         writeln!(
@@ -1172,6 +1351,7 @@ fn source_endpoint_source_label(source: GitLfsSourceEndpointSource) -> &'static 
     match source {
         GitLfsSourceEndpointSource::LocalGitConfig => "local Git config",
         GitLfsSourceEndpointSource::RemoteGitConfig => "remote Git config",
+        GitLfsSourceEndpointSource::WorktreeRemoteConfig => "remote-scoped committed .lfsconfig",
         GitLfsSourceEndpointSource::WorktreeLfsConfig => ".lfsconfig",
         GitLfsSourceEndpointSource::RemoteUrlDefault => "remote URL default",
     }
@@ -1241,8 +1421,9 @@ mod tests {
     #[allow(unused_imports)]
     use axum::{
         Json, Router,
+        body::Bytes,
         http::{HeaderMap, StatusCode},
-        routing::post,
+        routing::{post, put},
     };
     #[allow(unused_imports)]
     use clap::{CommandFactory, Parser};
@@ -1258,127 +1439,9 @@ mod tests {
     #[allow(unused_imports)]
     use crate::{
         CliError, DEFAULT_LOG_ENV_VAR, DEFAULT_LOG_FILTER, GitCredentialApproval,
-        GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitRepository,
-        GoogleDriveStorageConfig, LfsObject, LfsObjectSize, LfsOid, LfsPointer, LfsSessionToken,
-        LocalCacheError, LocalCacheLayout, LocalCacheWorktreeRegistration, ProviderFuture,
-        RepositoryMapping, SanitizedMessage, ServeOptions, ServerConfig, StorageDeleteOutcome,
-        StorageError, StorageProvider, StorageProviderConfig, StorageResult, StoredObject,
+        GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitRepository, LfsObject,
+        LfsPointer, LfsSessionToken, LocalCacheLayout, SanitizedMessage,
     };
-
-    struct RecordingMigrationStorage {
-        provider_id: String,
-        objects: Mutex<BTreeMap<LfsObject, Vec<u8>>>,
-        failing_object: Option<LfsObject>,
-    }
-
-    impl RecordingMigrationStorage {
-        fn new(provider_id: impl Into<String>) -> Self {
-            Self {
-                provider_id: provider_id.into(),
-                objects: Mutex::new(BTreeMap::new()),
-                failing_object: None,
-            }
-        }
-
-        fn failing(mut self, object: LfsObject) -> Self {
-            self.failing_object = Some(object);
-            self
-        }
-
-        fn object_bytes(&self, object: &LfsObject) -> Option<Vec<u8>> {
-            self.objects
-                .lock()
-                .expect("recording migration storage lock should not poison")
-                .get(object)
-                .cloned()
-        }
-    }
-
-    impl StorageProvider for RecordingMigrationStorage {
-        fn provider_id(&self) -> &str {
-            &self.provider_id
-        }
-
-        fn lookup_object<'a>(
-            &'a self,
-            repository_namespace: &'a str,
-            object: &'a LfsObject,
-        ) -> ProviderFuture<'a, StorageResult<Option<StoredObject>>> {
-            Box::pin(async move {
-                Ok(self
-                    .objects
-                    .lock()
-                    .expect("recording migration storage lock should not poison")
-                    .contains_key(object)
-                    .then(|| {
-                        StoredObject::new(
-                            &self.provider_id,
-                            repository_namespace,
-                            object.clone(),
-                            format!("recorded-{}", object.oid.as_hex()),
-                        )
-                    }))
-            })
-        }
-
-        fn upload_object<'a>(
-            &'a self,
-            repository_namespace: &'a str,
-            object: &'a LfsObject,
-            source: &'a Path,
-        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
-            Box::pin(async move {
-                if self.failing_object.as_ref() == Some(object) {
-                    return Err(StorageError::Retryable {
-                        provider: self.provider_id.clone(),
-                        message: "simulated migration upload failure".to_owned(),
-                    });
-                }
-                let bytes = fs::read(source).map_err(|error| StorageError::StagedFileRead {
-                    provider: self.provider_id.clone(),
-                    path: source.to_path_buf(),
-                    source: error,
-                })?;
-                self.objects
-                    .lock()
-                    .expect("recording migration storage lock should not poison")
-                    .insert(object.clone(), bytes);
-                Ok(StoredObject::new(
-                    &self.provider_id,
-                    repository_namespace,
-                    object.clone(),
-                    format!("recorded-{}", object.oid.as_hex()),
-                ))
-            })
-        }
-
-        fn download_object<'a>(
-            &'a self,
-            _repository_namespace: &'a str,
-            object: &'a LfsObject,
-            _destination: &'a Path,
-        ) -> ProviderFuture<'a, StorageResult<StoredObject>> {
-            Box::pin(async move {
-                Err(StorageError::ObjectNotFound {
-                    provider: self.provider_id.clone(),
-                    oid: object.oid.as_hex().to_owned(),
-                    size: object.size.bytes(),
-                })
-            })
-        }
-
-        fn delete_or_mark_object<'a>(
-            &'a self,
-            _repository_namespace: &'a str,
-            _object: &'a LfsObject,
-        ) -> ProviderFuture<'a, StorageResult<StorageDeleteOutcome>> {
-            Box::pin(async {
-                Ok(StorageDeleteOutcome::Retained {
-                    reason: "test storage retains migration objects".to_owned(),
-                })
-            })
-        }
-    }
 
     #[tokio::test]
     async fn migration_target_probe_authenticates_the_repository_batch_route() {
@@ -1441,6 +1504,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_reconciles_and_uploads_only_server_missing_objects() {
+        require_git();
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        let existing = object_for_bytes(b"already on server");
+        let missing_bytes = b"upload through LFS Cloud";
+        let missing = object_for_bytes(missing_bytes);
+        write_git_lfs_source_object(&repo, &missing, missing_bytes);
+
+        let uploaded = Arc::new(Mutex::new(None));
+        let uploaded_for_route = Arc::clone(&uploaded);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("migration server listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("migration server address should be available");
+        let upload_href = format!(
+            "http://{address}/github.com/owner/repo.git/info/lfs/objects/{}?size={}",
+            missing.oid,
+            missing.size.bytes()
+        );
+        let existing_for_batch = existing.clone();
+        let missing_for_batch = missing.clone();
+        let app = Router::new()
+            .route(
+                "/github.com/owner/repo.git/info/lfs/objects/batch",
+                post(move || {
+                    let upload_href = upload_href.clone();
+                    let existing = existing_for_batch.clone();
+                    let missing = missing_for_batch.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "transfer": "basic",
+                            "objects": [
+                                {"oid": existing.oid, "size": existing.size},
+                                {
+                                    "oid": missing.oid,
+                                    "size": missing.size,
+                                    "authenticated": true,
+                                    "actions": {
+                                        "upload": {
+                                            "href": upload_href,
+                                            "header": {"Authorization": "Basic migration-action"}
+                                        }
+                                    }
+                                }
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                &format!(
+                    "/github.com/owner/repo.git/info/lfs/objects/{}",
+                    missing.oid
+                ),
+                put(move |headers: HeaderMap, body: Bytes| {
+                    let uploaded = Arc::clone(&uploaded_for_route);
+                    async move {
+                        *uploaded
+                            .lock()
+                            .expect("migration upload record should not poison") = Some((
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                            body.to_vec(),
+                        ));
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("migration server should run");
+        });
+        let lfs_url = format!("http://{address}/github.com/owner/repo.git/info/lfs");
+        let token = LfsSessionToken::from_secret("migration-session-token")
+            .expect("migration token should parse");
+
+        let plan = request_migration_target_plan(
+            &lfs_url,
+            false,
+            &token,
+            &[existing.clone(), missing.clone()],
+        )
+        .await
+        .expect("migration target should reconcile objects");
+        assert_eq!(plan.already_present_objects, vec![existing.clone()]);
+        assert_eq!(plan.uploads.len(), 1);
+        let availability = check_local_migration_objects(&repo, [&missing], None)
+            .expect("missing target object should be locally available");
+        let result = upload_migration_objects_through_server(&lfs_url, false, &availability, plan)
+            .await
+            .expect("migration should upload through the LFS server action");
+        server.abort();
+
+        assert_eq!(result.uploaded_objects, vec![missing]);
+        assert_eq!(result.already_present_objects, vec![existing]);
+        assert_eq!(
+            uploaded
+                .lock()
+                .expect("migration upload record should not poison")
+                .clone(),
+            Some((
+                Some("Basic migration-action".to_owned()),
+                missing_bytes.to_vec()
+            ))
+        );
+    }
+
+    #[tokio::test]
     async fn migration_target_probe_rejects_an_inactive_session() {
         let app = Router::new().route(
             "/github.com/owner/repo.git/info/lfs/objects/batch",
@@ -1490,47 +1668,6 @@ mod tests {
         .expect_err("non-loopback HTTP should require explicit opt-in");
 
         assert!(matches!(error, CliError::InvalidArguments { .. }));
-    }
-
-    #[tokio::test]
-    async fn migration_provider_readiness_failure_remains_in_migration_domain() {
-        require_git();
-
-        let temp = TempDir::new().expect("temporary directory should be created");
-        let repo = temp.path().join("repo");
-        init_git_repo_with_origin(&repo);
-        let config_path = temp.path().join("lfscloud.yml");
-        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
-            .expect("status config should be written");
-        assert!(
-            !temp.path().join(".gcloud-drive").exists(),
-            "fresh test config must use a deterministically absent ADC directory"
-        );
-        let repository =
-            GitRepository::discover(&repo).expect("temporary repository should be discovered");
-
-        let error = match migration_storage_provider(&config_path, &repository).await {
-            Ok(_) => panic!("missing Drive credentials should fail provider construction"),
-            Err(error) => error,
-        };
-
-        let CliError::Migration {
-            source:
-                crate::MigrationError::Storage {
-                    source:
-                        StorageError::CredentialLoad {
-                            provider,
-                            reference,
-                            message,
-                        },
-                },
-        } = error
-        else {
-            panic!("expected migration-wrapped Drive credential error");
-        };
-        assert_eq!(provider, "drive-user-a");
-        assert_eq!(reference, "gcloud");
-        assert!(message.as_str().contains("directory is missing"));
     }
 
     #[test]
@@ -1603,7 +1740,6 @@ mod tests {
                 );
                 Ok(())
             },
-            |_| Ok(()),
         )
         .expect("dry-run migration plan should be reported");
 
@@ -1652,201 +1788,14 @@ mod tests {
         assert!(rendered.contains("source-config"));
         assert!(rendered.contains("server-tcp"));
         assert!(rendered.contains("lfs-credential"));
-        assert!(rendered.contains("storage-credential"));
+        assert!(rendered.contains("storage"));
         assert!(rendered.contains("source repository access not probed"));
         assert!(rendered.contains("server authentication and repository access not probed"));
-        assert!(rendered.contains("Drive root access not probed"));
+        assert!(rendered.contains("storage is server-owned"));
         assert!(rendered.contains("warnings:"));
         assert!(rendered.contains("repository permissions were not probed"));
         assert!(rendered.contains("storage quota and free capacity were not probed"));
         assert!(rendered.contains(object.oid.as_hex()));
-    }
-
-    #[tokio::test]
-    async fn migrate_execution_uploads_every_historical_asset_version_before_reconfiguring() {
-        require_git();
-        require_git_lfs();
-
-        let temp = TempDir::new().expect("temporary directory should be created");
-        let repo = temp.path().join("repo");
-        init_git_repo_with_origin(&repo);
-        run_git(&repo, &["config", "user.name", "LFS Cloud Migration Test"]);
-        run_git(
-            &repo,
-            &["config", "user.email", "migration@example.invalid"],
-        );
-        run_git(&repo, &["config", "commit.gpgSign", "false"]);
-        run_git(&repo, &["lfs", "install", "--local"]);
-
-        let first_bytes = b"historical LFS asset version one\n";
-        let latest_bytes = b"latest LFS asset version two with different bytes\n";
-        let first_object = object_for_bytes(first_bytes);
-        let latest_object = object_for_bytes(latest_bytes);
-        write_file(
-            &repo.join(".gitattributes"),
-            b"assets/*.bin filter=lfs diff=lfs merge=lfs -text\n",
-        );
-        write_file(
-            &repo.join("assets/model.bin"),
-            LfsPointer::new(first_object.clone())
-                .to_pointer_file()
-                .as_bytes(),
-        );
-        write_git_lfs_source_object(&repo, &first_object, first_bytes);
-        run_git(&repo, &["add", ".gitattributes", "assets/model.bin"]);
-        run_git(&repo, &["commit", "-m", "Add first LFS asset version"]);
-        let first_commit = read_git_config(&repo, &["rev-parse", "HEAD"]);
-
-        write_file(
-            &repo.join("assets/model.bin"),
-            LfsPointer::new(latest_object.clone())
-                .to_pointer_file()
-                .as_bytes(),
-        );
-        write_git_lfs_source_object(&repo, &latest_object, latest_bytes);
-        run_git(&repo, &["add", "assets/model.bin"]);
-        run_git(&repo, &["commit", "-m", "Change LFS asset bytes"]);
-
-        let command = MigrateCommand {
-            server: "http://127.0.0.1:8080".to_owned(),
-            allow_insecure_http: false,
-            cache_root: Some(temp.path().join("cache")),
-            source_remote: "origin".to_owned(),
-            allow_cross_remote: false,
-            refs: Vec::new(),
-            all_refs: true,
-            dry_run: false,
-            purge_source_lfs: false,
-        };
-        let context = prepare_migration_execution(command, &repo)
-            .expect("historical migration execution should prepare")
-            .scan_fetched_refs()
-            .expect("historical migration execution should scan fetched refs");
-        let mapping = RepositoryMapping {
-            id: "github-main:owner/repo".to_owned(),
-            repo_provider: "github-main".to_owned(),
-            host: "github.com".to_owned(),
-            owner: "owner".to_owned(),
-            name: "repo".to_owned(),
-            provider_repository_id: "8675309".to_owned(),
-            storage_provider: "drive-user-a".to_owned(),
-        };
-        let storage = RecordingMigrationStorage::new("drive-user-a");
-
-        let result = execute_migration_with_storage(&context, &mapping, &storage)
-            .await
-            .expect("historical migration should complete");
-
-        assert_eq!(context.scan.objects.len(), 2);
-        assert_eq!(result.storage_upload.uploaded_objects.len(), 2);
-        assert!(result.storage_upload.failed_objects.is_empty());
-        assert_eq!(
-            storage.object_bytes(&first_object).as_deref(),
-            Some(first_bytes.as_slice())
-        );
-        assert_eq!(
-            storage.object_bytes(&latest_object).as_deref(),
-            Some(latest_bytes.as_slice())
-        );
-        let receipt = fs::read_to_string(&result.storage_upload.checkpoint_path)
-            .expect("durable migration receipt should be readable");
-        assert_eq!(receipt.lines().count(), 2);
-        assert!(receipt.contains(first_object.oid.as_hex()));
-        assert!(receipt.contains(latest_object.oid.as_hex()));
-
-        let target_url = "http://127.0.0.1:8080/github.com/owner/repo.git/info/lfs";
-        assert!(
-            fs::read_to_string(repo.join(".lfsconfig"))
-                .expect("migrated .lfsconfig should be readable")
-                .contains(target_url)
-        );
-        assert_eq!(
-            read_git_config(&repo, &["config", "--local", "--get", "lfs.url"]),
-            target_url
-        );
-
-        run_git(&repo, &["checkout", "--quiet", &first_commit]);
-        assert_eq!(
-            read_git_config(&repo, &["config", "--local", "--get", "lfs.url"]),
-            target_url,
-            "the local override must keep pre-.lfsconfig history on LFS Cloud"
-        );
-        assert_eq!(
-            fs::read(repo.join("assets/model.bin"))
-                .expect("historical LFS asset should remain materializable"),
-            first_bytes
-        );
-    }
-
-    #[tokio::test]
-    async fn migrate_execution_does_not_reconfigure_after_a_partial_upload() {
-        require_git();
-        require_git_lfs();
-
-        let temp = TempDir::new().expect("temporary directory should be created");
-        let repo = temp.path().join("repo");
-        init_git_repo_with_origin(&repo);
-        run_git(&repo, &["config", "user.name", "LFS Cloud Migration Test"]);
-        run_git(
-            &repo,
-            &["config", "user.email", "migration@example.invalid"],
-        );
-        run_git(&repo, &["config", "commit.gpgSign", "false"]);
-        run_git(&repo, &["lfs", "install", "--local"]);
-        let bytes = b"migration object that will fail at the target\n";
-        let object = object_for_bytes(bytes);
-        write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs -text\n");
-        write_file(
-            &repo.join("asset.bin"),
-            LfsPointer::new(object.clone()).to_pointer_file().as_bytes(),
-        );
-        write_git_lfs_source_object(&repo, &object, bytes);
-        run_git(&repo, &["add", ".gitattributes", "asset.bin"]);
-        run_git(&repo, &["commit", "-m", "Add LFS asset"]);
-        let context = prepare_migration_execution(
-            MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
-                allow_insecure_http: false,
-                cache_root: Some(temp.path().join("cache")),
-                source_remote: "origin".to_owned(),
-                allow_cross_remote: false,
-                refs: Vec::new(),
-                all_refs: true,
-                dry_run: false,
-                purge_source_lfs: false,
-            },
-            &repo,
-        )
-        .expect("migration execution should prepare")
-        .scan_fetched_refs()
-        .expect("migration execution should scan fetched refs");
-        let mapping = RepositoryMapping {
-            id: "github-main:owner/repo".to_owned(),
-            repo_provider: "github-main".to_owned(),
-            host: "github.com".to_owned(),
-            owner: "owner".to_owned(),
-            name: "repo".to_owned(),
-            provider_repository_id: "8675309".to_owned(),
-            storage_provider: "drive-user-a".to_owned(),
-        };
-        let storage = RecordingMigrationStorage::new("drive-user-a").failing(object.clone());
-
-        let error = execute_migration_with_storage(&context, &mapping, &storage)
-            .await
-            .expect_err("partial target upload should fail migration execution");
-
-        assert!(
-            matches!(error, CliError::MigrationUploadFailed { failures: 1, oid, .. }
-            if oid == object.oid.as_hex())
-        );
-        assert!(!repo.join(".lfsconfig").exists());
-        let local_url = ProcessCommand::new("git")
-            .args(["config", "--local", "--get", "lfs.url"])
-            .current_dir(&repo)
-            .output()
-            .expect("local Git config lookup should start");
-        assert_eq!(local_url.status.code(), Some(1));
-        assert!(local_url.stdout.is_empty());
     }
 
     #[test]
@@ -1894,7 +1843,6 @@ mod tests {
             &mut denied_output,
             |_| Ok(()),
             |_| Ok(()),
-            |_| Ok(()),
         )
         .expect_err("cross-repository migration should require explicit acknowledgement");
 
@@ -1910,7 +1858,6 @@ mod tests {
             Some(temp.path().join("missing-config.yml")),
             &repo,
             &mut allowed_output,
-            |_| Ok(()),
             |_| Ok(()),
             |_| Ok(()),
         )
@@ -1965,7 +1912,6 @@ mod tests {
                     message: "probe failed".to_owned(),
                 })
             },
-            |_| Ok(()),
             |_| Ok(()),
         )
         .expect("dry-run migration plan should be reported");
@@ -2028,7 +1974,6 @@ mod tests {
             Some(config_path),
             &repo,
             &mut output,
-            |_| Ok(()),
             |_| Ok(()),
             |_| Ok(()),
         )
@@ -2108,7 +2053,6 @@ mod tests {
             &mut output,
             |_| Ok(()),
             |_| Ok(()),
-            |_| Ok(()),
         )
         .expect("dry-run migration purge helper should be reported");
 
@@ -2159,7 +2103,6 @@ mod tests {
             Some(config_path),
             &repo,
             &mut output,
-            |_| Ok(()),
             |_| Ok(()),
             |_| Ok(()),
         )
@@ -2213,7 +2156,6 @@ mod tests {
             Some(config_path),
             &repo,
             &mut output,
-            |_| Ok(()),
             |_| Ok(()),
             |_| Ok(()),
         )

@@ -67,7 +67,7 @@ pub struct GitHubProviderConfig {
     pub id: String,
     /// GitHub API base URL, such as `https://api.github.com`.
     pub api_url: String,
-    /// Authentication used to obtain the GitHub identity and API token.
+    /// Deprecated configured authentication retained for config compatibility.
     pub authentication: GitHubAuthenticationConfig,
     /// Whether non-loopback plaintext HTTP was explicitly enabled.
     pub allow_insecure_http: bool,
@@ -85,22 +85,22 @@ impl fmt::Debug for GitHubProviderConfig {
     }
 }
 
-/// Personal-access-token authentication configured for one GitHub provider.
+/// Deprecated provider PAT retained only as a session-secret fallback.
 #[derive(Clone, Eq, PartialEq)]
 pub struct GitHubAuthenticationConfig {
-    /// Personal access token used for identity and repository API requests.
-    token: String,
+    /// Legacy configured token retained only as a session-encryption fallback.
+    token: Option<String>,
 }
 
 impl GitHubAuthenticationConfig {
-    /// Creates GitHub authentication from one personal access token.
+    /// Creates compatibility configuration from one personal access token.
     ///
-    /// This constructor is intended for programmatic configuration and test
-    /// adapters. Server startup validates the token before accepting logins.
+    /// This constructor is retained for programmatic compatibility and tests;
+    /// login authentication uses the PAT presented by each user.
     #[must_use]
     pub fn new(personal_access_token: impl Into<String>) -> Self {
         Self {
-            token: personal_access_token.into(),
+            token: Some(personal_access_token.into()),
         }
     }
 
@@ -109,24 +109,24 @@ impl GitHubAuthenticationConfig {
         base_path: &str,
         env: &mut impl FnMut(&str) -> Option<String>,
     ) -> ServerResult<Self> {
-        let token = resolve_required(
+        let token = resolve_optional(
             personal_access_token,
             format!("{base_path}.personal_access_token"),
             env,
         )?;
-        Ok(Self::new(token))
+        Ok(Self { token })
     }
 
-    /// Returns the configured personal access token.
+    /// Returns the deprecated configured personal access token, or an empty string.
     #[must_use]
     pub fn personal_access_token(&self) -> &str {
-        &self.token
+        self.token.as_deref().unwrap_or("")
     }
 
-    /// Returns the stable secret used to encrypt durable local sessions.
+    /// Returns the deprecated configured token, when retained for compatibility.
     #[must_use]
-    pub(crate) fn session_encryption_secret(&self) -> &[u8] {
-        self.token.as_bytes()
+    pub(crate) fn configured_personal_access_token(&self) -> Option<&str> {
+        self.token.as_deref()
     }
 }
 

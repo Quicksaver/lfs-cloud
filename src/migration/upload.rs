@@ -735,7 +735,7 @@ fn migration_checkpoint_io_error(
     }
 }
 
-fn verified_migration_upload_source_path(
+pub(crate) fn verified_migration_upload_source_path(
     local_object: &LocalMigrationObject,
 ) -> MigrationResult<&Path> {
     [
@@ -762,7 +762,10 @@ fn verified_migration_upload_source_path(
     })
 }
 
-async fn verify_migration_upload_source(path: &Path, object: &LfsObject) -> MigrationResult<()> {
+pub(crate) async fn verify_migration_upload_source(
+    path: &Path,
+    object: &LfsObject,
+) -> MigrationResult<()> {
     let path = path.to_path_buf();
     let object = object.clone();
     tokio::task::spawn_blocking(move || verify_migration_upload_source_blocking(&path, &object))

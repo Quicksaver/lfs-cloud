@@ -113,11 +113,11 @@ impl RepositoryProviderConfig {
 }
 
 impl ServerConfig {
-    /// Selects the only GitHub provider supported by one PAT-auth consumer.
+    /// Selects the only GitHub provider supported by one authentication consumer.
     ///
     /// `consumer` keeps the startup diagnostic specific to the subsystem that
     /// cannot yet compose multiple configured GitHub accounts.
-    pub(crate) fn single_github_pat_provider(
+    pub(crate) fn single_github_provider(
         &self,
         consumer: &str,
     ) -> ServerResult<Option<&GitHubProviderConfig>> {
@@ -348,12 +348,6 @@ trait StorageProviderRegistration {
     fn display_name(&self) -> Option<&str>;
     /// Checks local prerequisites and returns a safe operator-facing failure.
     fn validate_local_readiness(&self) -> Result<(), String>;
-    /// Builds a readiness-checked repository-scoped storage adapter.
-    fn build_provider(
-        &self,
-        repository_namespace: String,
-        metadata: Arc<MetadataDatabase>,
-    ) -> ProviderFuture<'static, StorageResult<Arc<dyn StorageProvider + Send + Sync>>>;
     /// Validates provider readiness before the production listener binds.
     fn validate_server_readiness<'a>(
         &'a self,
@@ -393,33 +387,6 @@ impl StorageProviderRegistration for GoogleDriveStorageConfig {
                     self.id
                 )
             })
-    }
-
-    fn build_provider(
-        &self,
-        repository_namespace: String,
-        metadata: Arc<MetadataDatabase>,
-    ) -> ProviderFuture<'static, StorageResult<Arc<dyn StorageProvider + Send + Sync>>> {
-        let storage = self.clone();
-        Box::pin(async move {
-            let token_source: Arc<dyn GoogleDriveAccessTokenSource> =
-                Arc::new(GoogleDriveGcloudTokenProvider::new());
-            let token_cache = GoogleDriveAccessTokenCache::default();
-            let token = token_cache
-                .get_or_refresh(&storage, token_source.as_ref())
-                .await?;
-            GoogleDriveRootValidator::new()?
-                .validate_root_folder(&storage, &token)
-                .await?;
-
-            Ok(Arc::new(GoogleDriveStorageProvider::with_dependencies(
-                storage,
-                repository_namespace,
-                token_source,
-                token_cache,
-                metadata,
-            )) as Arc<dyn StorageProvider + Send + Sync>)
-        })
     }
 
     fn validate_server_readiness<'a>(
@@ -498,17 +465,6 @@ impl StorageProviderConfig {
     pub(crate) fn validate_local_readiness(&self) -> Result<(), String> {
         self.registration().validate_local_readiness()
     }
-
-    /// Builds a repository-scoped provider after credential and root checks.
-    pub(crate) async fn build_provider(
-        &self,
-        repository_namespace: String,
-        metadata: Arc<MetadataDatabase>,
-    ) -> StorageResult<Arc<dyn StorageProvider + Send + Sync>> {
-        self.registration()
-            .build_provider(repository_namespace, metadata)
-            .await
-    }
 }
 
 /// Repository-scoped Google Drive adapter with idempotent upload locking.
@@ -522,9 +478,8 @@ pub(crate) struct GoogleDriveStorageProvider {
     token_source: Arc<dyn GoogleDriveAccessTokenSource>,
     token_cache: GoogleDriveAccessTokenCache,
     metadata: Arc<MetadataDatabase>,
-    // Migration uses this provider directly and therefore keeps provider-level
-    // locking enabled. The server disables it because its upload handler holds
-    // the same durable lock across both the final lookup and the upload.
+    // The server upload handler disables this provider-level lock because it
+    // holds the same durable lock across both the final lookup and the upload.
     acquire_upload_lock: bool,
     #[cfg(test)]
     api_base_url: Option<String>,

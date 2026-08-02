@@ -27,7 +27,7 @@ lfscloud --config ./lfscloud.yml config storage add
 lfscloud --config ./lfscloud.yml repository add
 ```
 
-Press Enter to accept a displayed default or retain an existing value. PAT input is hidden when the prompt is attached to a terminal. If any entry flag is supplied, the command is non-interactive. A new entry then requires every required field, while an existing `--id` accepts only the fields to update. Replaying the same update succeeds without changing the file.
+Press Enter to accept a displayed default or retain an existing value. If any entry flag is supplied, the command is non-interactive. A new entry then requires every required field, while an existing `--id` accepts only the fields to update. Replaying the same update succeeds without changing the file.
 
 The complete flag-based forms for the currently supported providers are:
 
@@ -35,8 +35,7 @@ The complete flag-based forms for the currently supported providers are:
 lfscloud --config ./lfscloud.yml config repository add \
   --id github-main \
   --type github \
-  --api-url https://api.github.com \
-  --personal-access-token '${LFS_CLOUD_GITHUB_PAT}'
+  --api-url https://api.github.com
 
 lfscloud --config ./lfscloud.yml config storage add \
   --id drive-personal \
@@ -57,7 +56,7 @@ lfscloud --config ./lfscloud.yml repository add \
   --storage-provider drive-personal
 ```
 
-Single-quote environment references so the shell does not expand them before they are written. Supplying a literal PAT on a command line can expose it to local process inspection or shell history; prefer the quoted environment reference shown above.
+Single-quote environment references so the shell does not expand them before they are written.
 
 Every environment variable referenced anywhere in the config must be set while a changed document is validated, just as it must be set when the server loads that config.
 
@@ -73,7 +72,7 @@ lfscloud --config ./lfscloud.yml repository add \
   --storage-provider drive-archive
 ```
 
-List commands print tab-separated, script-friendly summaries. Repository provider lists report only whether authentication is configured and never print PAT values:
+List commands print tab-separated, script-friendly summaries. A legacy session-secret fallback is reported only as configured or absent; its value is never printed:
 
 ```bash
 lfscloud --config ./lfscloud.yml config repository list
@@ -94,13 +93,11 @@ Successful writes use a temporary file beside the config, preserve the original 
 
 ## Migration Configuration
 
-`lfscloud migrate` uses the repository mapping and Google Drive provider from the private server config supplied through the global `--config` option. The running server, migration command, and any other writer for the same Drive root must use the same `server.metadata_path`; migration shares its object upload locks with the server to prevent duplicate backend files.
+`lfscloud migrate` is an LFS Cloud client and does not read the private server config or obtain Google Drive credentials. It authenticates to the repository-specific Git LFS route, requests an upload batch to reconcile the inventory, fetches legacy bytes only for objects the server reports missing, and uploads through the returned server actions. The server performs the GitHub write-permission check and owns all storage access, locking, verification, and metadata updates.
 
-Migration obtains short-lived Drive tokens from the configured gcloud ADC directory, refreshes them shortly before expiry throughout transfer work, and validates the root folder before fetching or uploading source LFS objects. It also requires an existing repository-scoped LFS Cloud login and proves the session plus repository authorization with an authenticated Git LFS batch request before the source repository is reconfigured.
+The completed migration writes the target URL to both `.lfsconfig` and local Git config. It also preserves the prior source as `remote.<source-remote>.lfsurl` in `.lfsconfig`. This is an allowed Git LFS config key and remains dormant for normal traffic while repository-wide `lfs.url` points to LFS Cloud; a later migration uses it as a command-scoped legacy fetch override. Source URLs with embedded credentials, query strings, or fragments are rejected rather than committed.
 
-Each completed destination check is synchronized to a durable receipt. A resumed migration revalidates every recorded object against the currently configured Drive target, so changing the root folder or deleting a Drive object causes that object to be uploaded again instead of trusting stale checkpoint state.
-
-The completed migration writes the target URL to both `.lfsconfig` and local Git config. `.lfsconfig` is the shareable setting for new clones; the local override preserves target routing while this clone checks out historical commits that predate `.lfsconfig`.
+This target-first protocol makes follow-up migrations idempotent. A second user can pull the committed `.lfsconfig`, log in to LFS Cloud, and run the same migration: server-present objects are skipped, and only remaining target-missing objects need local or legacy-source bytes.
 
 ## Minimal Local Config
 
@@ -109,6 +106,7 @@ server:
   host: 127.0.0.1
   port: 8080
   public_url: http://127.0.0.1:8080
+  session_encryption_secret: ${LFS_CLOUD_SESSION_SECRET}
   max_batch_objects: 100
   max_provider_calls: 16
   max_concurrent_requests: 64
@@ -120,7 +118,6 @@ repository_providers:
   github-main:
     type: github
     api_url: https://api.github.com
-    personal_access_token: ${LFS_CLOUD_GITHUB_PAT}
 
 storage_providers:
   drive-personal:
@@ -149,7 +146,9 @@ http://127.0.0.1:8080/github.com/octo-org/assets.git/info/lfs
 
 Repository `name` omits the `.git` suffix because the route adds it. `provider_repository_id` is GitHub's immutable numeric repository ID, available with `gh api repos/OWNER/REPOSITORY --jq .id`. LFS Cloud verifies this value before every permission check so a renamed, transferred, deleted, or reused `owner/name` cannot silently switch the mapping to another repository.
 
-`personal_access_token` is the only supported GitHub authentication mode. Prefer a fine-grained PAT limited to the listed repositories with repository Metadata read access, and run `lfscloud login --server URL` to exchange it for a short-lived local LFS token. The PAT is never written to Git's credential helper.
+Each user runs `lfscloud login --server URL` with their own GitHub PAT. Login calls GitHub's authenticated-user endpoint to establish identity; it does not grant repository access. For every LFS operation, the server uses that user's retained PAT to check the current GitHub permission on the configured repository. Read or stronger permits downloads; write or admin permits uploads and migration. Token scope, organization SSO policy, expiry, and revocation can still limit otherwise valid repository membership. The PAT is never written to Git's credential helper.
+
+`server.session_encryption_secret` is a server-owned value of at least 32 characters used only to protect durable session credentials. Keep it private and stable across restarts. For transition compatibility, an old repository-provider `personal_access_token` can supply this encryption material when the dedicated setting is absent, but it no longer selects or authenticates the users allowed to log in and should be removed after configuring the dedicated secret.
 
 ## LAN Config
 
@@ -169,7 +168,7 @@ The `serve` command can also override the bind address and port:
 lfscloud serve --config ./lfscloud.yml --host 0.0.0.0 --port 8080
 ```
 
-`public_url` is the URL embedded in Git LFS batch action responses. Set it to the address clients can actually reach. Plaintext LAN mode exposes the GitHub PAT, LFS credentials, and object bytes to the network, so it requires the explicit `allow_insecure_http: true` development opt-in. Prefer HTTPS through trusted TLS termination. Client commands using this LAN URL also require `--allow-insecure-http`.
+`public_url` is the URL embedded in Git LFS batch action responses. Set it to the address clients can actually reach. Plaintext LAN mode exposes users' GitHub PATs during login, LFS credentials, and object bytes to the network, so it requires the explicit `allow_insecure_http: true` development opt-in. Prefer HTTPS through trusted TLS termination. Client commands using this LAN URL also require `--allow-insecure-http`.
 
 ## Provider And Request Work Limits
 
@@ -239,7 +238,7 @@ The configured `root_folder_id` must be a folder that the app credential can acc
 
 Production `serve` processes persist unexpired local LFS sessions in the configured metadata database so Git credentials continue to work across server restarts. The database contains only the local token's SHA-256 digest. The private GitHub PAT and the session identity, scopes, and timestamps are authenticated together with AES-256-GCM before persistence.
 
-The dedicated encryption key is derived from the configured GitHub PAT; the PAT itself is never stored in SQLite. Keep it stable while sessions are active. Rotating it intentionally makes existing rows unreadable, so allow current sessions to expire or remove them first.
+The encryption key is derived from `server.session_encryption_secret`; the secret itself is never stored in SQLite. Keep it stable while sessions are active. Rotating it intentionally makes existing rows unreadable, so allow current sessions to expire or remove them first.
 
 ## Metadata Path
 

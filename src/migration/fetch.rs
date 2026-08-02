@@ -130,6 +130,46 @@ where
         objects,
         shared_cache,
         &source_remote,
+        None,
+        mode,
+        run_git_lfs_fetch_command,
+    )
+}
+
+/// Fetches missing migration objects from an explicit remote and legacy LFS endpoint.
+///
+/// This is used after a repository has committed an LFS Cloud `lfs.url`: the
+/// command-scoped override sends only this migration fetch to the legacy
+/// endpoint recorded as `remote.<name>.lfsurl` in `.lfsconfig`.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] when the endpoint is unsafe, the source remote or
+/// ref scope is invalid, or Git LFS cannot fetch the requested objects.
+pub fn fetch_missing_migration_objects_from_remote_at_endpoint<I, O>(
+    start_dir: impl AsRef<Path>,
+    objects: I,
+    shared_cache: Option<&LocalCacheLayout>,
+    source_remote: impl AsRef<str>,
+    source_endpoint: impl AsRef<str>,
+    allow_insecure_http: bool,
+    mode: MigrationFetchMode,
+) -> MigrationResult<MigrationSourceFetch>
+where
+    I: IntoIterator<Item = O>,
+    O: Borrow<LfsObject>,
+{
+    let source_remote = validate_source_remote_name(source_remote.as_ref())?;
+    let source_endpoint = validated_migration_source_endpoint(
+        source_endpoint.as_ref(),
+        allow_insecure_http,
+    )?;
+    fetch_missing_migration_objects_with_runner(
+        start_dir,
+        objects,
+        shared_cache,
+        &source_remote,
+        Some(&source_endpoint),
         mode,
         run_git_lfs_fetch_command,
     )
@@ -191,6 +231,7 @@ fn fetch_missing_migration_objects_with_runner<I, O, F>(
     objects: I,
     shared_cache: Option<&LocalCacheLayout>,
     source_remote: &str,
+    source_endpoint: Option<&str>,
     mode: MigrationFetchMode,
     mut runner: F,
 ) -> MigrationResult<MigrationSourceFetch>
@@ -218,7 +259,7 @@ where
         });
     }
 
-    let fetch_command = migration_source_fetch_command(source_remote, &mode)?;
+    let fetch_command = migration_source_fetch_command(source_remote, source_endpoint, &mode)?;
     runner(&worktree_root, &fetch_command)?;
     command = Some(fetch_command.display.clone());
 
@@ -250,6 +291,7 @@ struct MigrationSourceFetchCommand {
 
 fn migration_source_fetch_command(
     source_remote: &str,
+    source_endpoint: Option<&str>,
     mode: &MigrationFetchMode,
 ) -> MigrationResult<MigrationSourceFetchCommand> {
     let source_remote = validate_source_remote_name(source_remote)?;
@@ -266,9 +308,12 @@ fn migration_source_fetch_command(
         OsString::from("lfs.fetchrecentremoterefs=false"),
         OsString::from("-c"),
         OsString::from("lfs.fetchrecentcommitsdays=0"),
-        OsString::from("lfs"),
-        OsString::from("fetch"),
     ];
+    if let Some(source_endpoint) = source_endpoint {
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(format!("lfs.url={source_endpoint}")));
+    }
+    args.extend([OsString::from("lfs"), OsString::from("fetch")]);
 
     match mode {
         MigrationFetchMode::CurrentCheckout => {
@@ -305,6 +350,49 @@ fn migration_source_fetch_command(
 
     let display = display_git_command(&args);
     Ok(MigrationSourceFetchCommand { args, display })
+}
+
+pub(crate) fn validated_migration_source_endpoint(
+    source_endpoint: &str,
+    allow_insecure_http: bool,
+) -> MigrationResult<String> {
+    if source_endpoint.is_empty()
+        || source_endpoint
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control() || character == '\\')
+    {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new("legacy LFS endpoint contains unsafe characters"),
+        });
+    }
+    let parsed = Url::parse(source_endpoint).map_err(|_| MigrationError::InvalidInput {
+        message: SanitizedMessage::new("legacy LFS endpoint must be an absolute HTTP(S) URL"),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new("legacy LFS endpoint must be an absolute HTTP(S) URL"),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new("legacy LFS endpoint must not contain credentials"),
+        });
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new(
+                "legacy LFS endpoint must not contain a query string or fragment",
+            ),
+        });
+    }
+    if !allow_insecure_http && !crate::http_transport::uses_protected_http_transport(&parsed) {
+        return Err(MigrationError::InvalidInput {
+            message: SanitizedMessage::new(
+                "legacy LFS endpoint must use HTTPS unless it targets an exact loopback IP",
+            ),
+        });
+    }
+    Ok(parsed.to_string().trim_end_matches('/').to_owned())
 }
 
 fn run_git_lfs_fetch_command(
@@ -420,6 +508,7 @@ fn display_git_command_arg(arg: &OsStr) -> String {
 #[cfg(test)]
 mod fetch_tests {
     use super::test_support::*;
+    use super::validated_migration_source_endpoint;
 
     const PROCESS_TREE_HELPER_TEST: &str = "migration::fetch_tests::migration_process_tree_helper";
     const PROCESS_TREE_DESCENDANT_TEST: &str =
@@ -507,6 +596,7 @@ mod fetch_tests {
             [&object],
             None,
             "origin",
+            None,
             MigrationFetchMode::CurrentCheckout,
             |_, _| {
                 fetch_attempted = true;
@@ -542,6 +632,7 @@ mod fetch_tests {
             [&object],
             None,
             "origin",
+            None,
             MigrationFetchMode::selected_refs(["main"]),
             |worktree_root, command| {
                 observed_command = Some(command.clone());
@@ -597,6 +688,7 @@ mod fetch_tests {
             [&object],
             None,
             "origin",
+            None,
             MigrationFetchMode::AllFetchedRefs,
             |worktree_root, command| {
                 observed_command = Some(command.clone());
@@ -648,6 +740,7 @@ mod fetch_tests {
             [&object],
             None,
             "origin",
+            None,
             MigrationFetchMode::CurrentCheckout,
             |_, _| Ok(()),
         )
@@ -666,7 +759,7 @@ mod fetch_tests {
     #[test]
     fn source_fetch_commands_match_migration_scope() {
         let current =
-            migration_source_fetch_command("upstream", &MigrationFetchMode::CurrentCheckout)
+            migration_source_fetch_command("upstream", None, &MigrationFetchMode::CurrentCheckout)
                 .expect("current checkout fetch command should be built");
         assert_eq!(
             current.display,
@@ -675,6 +768,7 @@ mod fetch_tests {
 
         let selected = migration_source_fetch_command(
             "upstream",
+            None,
             &MigrationFetchMode::selected_refs(["main", "refs/tags/v1"]),
         )
         .expect("selected-ref fetch command should be built");
@@ -684,12 +778,43 @@ mod fetch_tests {
         );
 
         let all_refs =
-            migration_source_fetch_command("upstream", &MigrationFetchMode::AllFetchedRefs)
+            migration_source_fetch_command("upstream", None, &MigrationFetchMode::AllFetchedRefs)
                 .expect("all-ref fetch command should be built");
         assert_eq!(
             all_refs.display,
             "git -c lfs.fetchrecentalways=false -c lfs.fetchrecentrefsdays=0 -c lfs.fetchrecentremoterefs=false -c lfs.fetchrecentcommitsdays=0 lfs fetch --all upstream"
         );
+    }
+
+    #[test]
+    fn source_fetch_command_can_override_committed_lfscloud_target_with_legacy_url() {
+        let legacy = "https://legacy.example/owner/repo.git/info/lfs";
+        let command = migration_source_fetch_command(
+            "origin",
+            Some(legacy),
+            &MigrationFetchMode::AllFetchedRefs,
+        )
+        .expect("legacy source fetch command should be built");
+
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|window| window == [OsString::from("-c"), OsString::from(format!("lfs.url={legacy}"))])
+        );
+        assert!(command.display.contains("lfs.url=https://legacy.example"));
+    }
+
+    #[test]
+    fn legacy_source_endpoint_rejects_embedded_credentials() {
+        let error = validated_migration_source_endpoint(
+            "https://user:secret@legacy.example/owner/repo.git/info/lfs",
+            false,
+        )
+        .expect_err("credentialed source URL must not be committed or invoked");
+
+        assert!(matches!(error, MigrationError::InvalidInput { .. }));
+        assert!(!error.to_string().contains("secret"));
     }
 
     #[test]
@@ -699,7 +824,7 @@ mod fetch_tests {
             MigrationFetchMode::selected_refs(["main"]),
             MigrationFetchMode::AllFetchedRefs,
         ] {
-            let command = migration_source_fetch_command("origin", &mode)
+            let command = migration_source_fetch_command("origin", None, &mode)
                 .expect("migration source fetch command should be built");
 
             assert_eq!(
@@ -744,6 +869,7 @@ mod fetch_tests {
         assert!(matches!(
             migration_source_fetch_command(
                 "origin",
+                None,
                 &MigrationFetchMode::SelectedRefs { refs: Vec::new() }
             ),
             Err(MigrationError::InvalidInput { .. })
@@ -751,6 +877,7 @@ mod fetch_tests {
         assert!(matches!(
             migration_source_fetch_command(
                 "origin",
+                None,
                 &MigrationFetchMode::selected_refs(["main..feature"])
             ),
             Err(MigrationError::InvalidInput { .. })

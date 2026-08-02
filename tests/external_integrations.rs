@@ -17,6 +17,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use axum::{
+    Json, Router,
+    extract::{Path as AxumPath, State},
+    http::{StatusCode as AxumStatusCode, header::CONTENT_TYPE},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
 use lfscloud::{
     GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitHubAuthenticationConfig, GitHubPersonalAccessToken,
     GitHubProviderConfig, GitHubRepositoryPermissionClient, GitHubUserClient,
@@ -40,6 +47,8 @@ const DRIVE_API_URL: &str = "https://www.googleapis.com/drive/v3";
 const DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 const LIVE_GITHUB_PROVIDER_ID: &str = "github-live";
 const LIVE_DRIVE_PROVIDER_ID: &str = "drive-live";
+const LIVE_SESSION_ENCRYPTION_SECRET: &str =
+    "lfscloud-live-session-encryption-secret-at-least-32-characters";
 const LIVE_GITHUB_PAT_ENV: &str = "LFS_CLOUD_GITHUB_PAT";
 const LIVE_DRIVE_CONFIG_DIR_ENV: &str = "LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR";
 #[cfg(not(windows))]
@@ -54,6 +63,60 @@ struct GitHubPersonalAccessTokenLoginResponse {
 
 struct LiveGitHubCredentials {
     personal_access_token: String,
+}
+
+#[derive(Clone)]
+struct LegacyLfsSourceState {
+    base_url: String,
+    objects: Arc<BTreeMap<String, Vec<u8>>>,
+}
+
+async fn legacy_lfs_batch(
+    State(state): State<LegacyLfsSourceState>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    let operation = request["operation"].as_str().unwrap_or_default();
+    let objects = request["objects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|object| {
+            let oid = object["oid"].as_str().unwrap_or_default();
+            let size = object["size"].as_u64().unwrap_or_default();
+            match state.objects.get(oid) {
+                Some(_) if operation == "download" => json!({
+                    "oid": oid,
+                    "size": size,
+                    "actions": {
+                        "download": {
+                            "href": format!("{}/objects/{oid}", state.base_url),
+                            "header": {},
+                        }
+                    }
+                }),
+                Some(_) => json!({ "oid": oid, "size": size, "actions": {} }),
+                None => json!({
+                    "oid": oid,
+                    "size": size,
+                    "error": { "code": 404, "message": "missing legacy object" }
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Json(json!({ "transfer": "basic", "objects": objects }))
+}
+
+async fn legacy_lfs_object(
+    State(state): State<LegacyLfsSourceState>,
+    AxumPath(oid): AxumPath<String>,
+) -> Response {
+    match state.objects.get(&oid) {
+        Some(bytes) => {
+            ([(CONTENT_TYPE, "application/octet-stream")], bytes.clone()).into_response()
+        }
+        None => AxumStatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 impl LiveGitHubCredentials {
@@ -222,9 +285,6 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
         config_dir: test_dir.path().join("gcloud-drive"),
         executable: PathBuf::from(LIVE_GCLOUD_EXECUTABLE),
     };
-    let github_credentials = LiveGitHubCredentials {
-        personal_access_token: "github_pat_fixture".to_owned(),
-    };
     let repository_id = format!("{LIVE_GITHUB_PROVIDER_ID}:owner/repo");
     let config = live_server_config_json(LiveServerConfigFixture {
         server_url: "http://127.0.0.1:8080",
@@ -232,7 +292,6 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
         metadata_path: &metadata_path,
         github_api_url: GITHUB_API_URL,
         github_host: "github.com",
-        github_credentials: &github_credentials,
         repository: &repository,
         folder: &folder,
         gcloud_credentials: &gcloud_credentials,
@@ -252,7 +311,8 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
     );
     let lfscloud::RepositoryProviderConfig::GitHub(provider) =
         &config.repository_providers[LIVE_GITHUB_PROVIDER_ID];
-    assert_eq!(provider.authentication, github_credentials.authentication());
+    assert_eq!(provider.authentication.personal_access_token(), "");
+    assert!(config.server.session_encryption_secret.is_some());
     assert!(
         config
             .storage_providers
@@ -371,7 +431,6 @@ async fn exercise_black_box_git_lfs_transfer(
         metadata_path: &metadata_path,
         github_api_url,
         github_host,
-        github_credentials,
         repository,
         folder: drive.folder,
         gcloud_credentials: drive.gcloud_credentials,
@@ -446,7 +505,6 @@ async fn exercise_black_box_git_lfs_transfer(
         .await?;
         git_lfs_historical_migration_round_trip(
             test_dir.path(),
-            &config_path,
             &server_url,
             &lfs_url,
             session_token.as_str(),
@@ -469,7 +527,6 @@ struct LiveServerConfigFixture<'a> {
     metadata_path: &'a Path,
     github_api_url: &'a str,
     github_host: &'a str,
-    github_credentials: &'a LiveGitHubCredentials,
     repository: &'a GitHubCreatedRepo,
     folder: &'a DriveFolder,
     gcloud_credentials: &'a GoogleDriveGcloudCredentialsConfig,
@@ -482,7 +539,6 @@ fn live_server_config_json(fixture: LiveServerConfigFixture<'_>) -> Value {
         metadata_path,
         github_api_url,
         github_host,
-        github_credentials,
         repository,
         folder,
         gcloud_credentials,
@@ -497,12 +553,12 @@ fn live_server_config_json(fixture: LiveServerConfigFixture<'_>) -> Value {
             "port": port,
             "public_url": server_url,
             "metadata_path": metadata_path.to_string_lossy(),
+            "session_encryption_secret": LIVE_SESSION_ENCRYPTION_SECRET,
         },
         "repository_providers": {
             LIVE_GITHUB_PROVIDER_ID: {
                 "type": "github",
                 "api_url": github_api_url,
-                "personal_access_token": github_credentials.personal_access_token(),
             }
         },
         "storage_providers": {
@@ -836,7 +892,6 @@ fn git_lfs_push_fetch_round_trip(
 )]
 async fn git_lfs_historical_migration_round_trip(
     root: &Path,
-    config_path: &Path,
     server_url: &str,
     lfscloud_url: &str,
     session_token: &str,
@@ -853,26 +908,53 @@ async fn git_lfs_historical_migration_round_trip(
         .map_err(|error| format!("migration Git state directory should be created: {error}"))?;
     let git = IsolatedGit::initialize(&migration_git_root, &[session_token])?;
     let github_remote_url = format!(
-        "https://{github_host}/{}/{}.git",
+        "git@{github_host}:{}/{}.git",
         repository.owner.login, repository.name
     );
-    // Keep the raw remote URL on the GitHub identity authorized by the live
-    // LFS Cloud server, but route this fixture's Git transport to a local bare
-    // source. That exercises real Git LFS historical fetches without requiring
-    // the provider PAT to carry repository-contents write permission merely
-    // for smoke-test setup.
+    // Keep Git refs in a disposable local bare remote and source LFS bytes on a
+    // loopback HTTP fixture. Migration must use the legacy HTTP endpoint while
+    // every destination write still crosses the compiled LFS Cloud server and
+    // its real GitHub permission plus Drive storage boundaries.
     git.run(None, "migration source bare repository setup", |command| {
         command
             .args(["init", "--bare", "--initial-branch", "main"])
             .arg(&source_remote);
     })?;
-    let source_lfs_url = Url::from_file_path(&source_remote)
+    let source_git_url = Url::from_file_path(&source_remote)
         .map_err(|()| "migration source path should convert to a file URL".to_owned())?;
+    let first_bytes = b"historical live migration asset bytes\n";
+    let latest_bytes = b"latest live migration asset bytes with a changed payload\n";
+    let first_object = lfs_object_for_bytes(first_bytes)?;
+    let latest_object = lfs_object_for_bytes(latest_bytes)?;
+    let legacy_objects = Arc::new(BTreeMap::from([
+        (first_object.oid.as_hex().to_owned(), first_bytes.to_vec()),
+        (latest_object.oid.as_hex().to_owned(), latest_bytes.to_vec()),
+    ]));
+    let legacy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| format!("legacy LFS fixture should bind: {error}"))?;
+    let legacy_address = legacy_listener
+        .local_addr()
+        .map_err(|error| format!("legacy LFS fixture address should resolve: {error}"))?;
+    let source_lfs_url = format!("http://{legacy_address}/legacy");
+    let legacy_state = LegacyLfsSourceState {
+        base_url: source_lfs_url.clone(),
+        objects: legacy_objects,
+    };
+    let legacy_router = Router::new()
+        .route("/legacy/objects/batch", post(legacy_lfs_batch))
+        .route("/legacy/objects/{oid}", get(legacy_lfs_object))
+        .with_state(legacy_state);
+    let legacy_server = tokio::spawn(async move {
+        axum::serve(legacy_listener, legacy_router)
+            .await
+            .expect("legacy LFS fixture should run");
+    });
     git.run(None, "migration Git remote rewrite setup", |command| {
         command.args([
             "config",
             "--global",
-            &format!("url.{}.insteadOf", source_lfs_url.as_str()),
+            &format!("url.{}.insteadOf", source_git_url.as_str()),
             &github_remote_url,
         ]);
     })?;
@@ -896,7 +978,14 @@ async fn git_lfs_historical_migration_round_trip(
         Some(&source),
         "migration source LFS endpoint setup",
         |command| {
-            command.args(["config", "--local", "lfs.url", source_lfs_url.as_str()]);
+            command.args(["config", "--local", "lfs.url", &source_lfs_url]);
+        },
+    )?;
+    git.run(
+        Some(&source),
+        "migration source lock verification setup",
+        |command| {
+            command.args(["config", "--local", "lfs.locksverify", "false"]);
         },
     )?;
     for (name, value) in [
@@ -921,10 +1010,6 @@ async fn git_lfs_historical_migration_round_trip(
     fs::create_dir_all(source.join("assets"))
         .map_err(|error| format!("migration LFS fixture directory should be created: {error}"))?;
 
-    let first_bytes = b"historical live migration asset bytes\n";
-    let latest_bytes = b"latest live migration asset bytes with a changed payload\n";
-    let first_object = lfs_object_for_bytes(first_bytes)?;
-    let latest_object = lfs_object_for_bytes(latest_bytes)?;
     fs::write(source.join("assets/model.bin"), first_bytes)
         .map_err(|error| format!("first migration asset version should be written: {error}"))?;
     git.run(Some(&source), "first migration asset staging", |command| {
@@ -972,12 +1057,7 @@ async fn git_lfs_historical_migration_round_trip(
         &lfscloud_binary,
         "compiled historical migration",
         |command| {
-            command.arg("--config").arg(config_path).args([
-                "migrate",
-                "--server",
-                server_url,
-                "--all-refs",
-            ]);
+            command.args(["migrate", "--server", server_url, "--all-refs"]);
         },
     )?;
     let migration_output = String::from_utf8_lossy(&migration.stdout);
@@ -986,7 +1066,8 @@ async fn git_lfs_historical_migration_round_trip(
         "mode: all-refs",
         "objects discovered: 2",
         "target objects: 2 uploaded",
-        "durable receipt:",
+        "repository configuration:",
+        "remote.origin.lfsurl (legacy migration source)",
         "local Git config:",
     ] {
         if !migration_output.contains(marker) {
@@ -1082,12 +1163,14 @@ async fn git_lfs_historical_migration_round_trip(
     git.run(Some(&checkout), "historical migrated LFS pull", |command| {
         command.args(["lfs", "pull"]);
     })?;
-    require_equal(
+    let historical_checkout = require_equal(
         fs::read(checkout.join("assets/model.bin"))
             .map_err(|error| format!("historical migrated asset should be readable: {error}"))?,
         first_bytes.to_vec(),
         "historical migrated checkout bytes",
-    )
+    );
+    legacy_server.abort();
+    historical_checkout
 }
 
 fn require_command_success(

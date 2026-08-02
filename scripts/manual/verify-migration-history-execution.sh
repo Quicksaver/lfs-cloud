@@ -5,7 +5,9 @@ set -euo pipefail
 # are required, and the repository root is selected relative to this script.
 cd "$(dirname "$0")/../.."
 
-cargo test --lib cli::migration::tests::migrate_execution_uploads_every_historical_asset_version_before_reconfiguring -- --exact
-cargo test --lib cli::migration::tests::migrate_execution_does_not_reconfigure_after_a_partial_upload -- --exact
+cargo test --lib cli::migration::tests::migration_reconciles_and_uploads_only_server_missing_objects -- --exact
+cargo test --lib git::tests::worktree_config_preserves_target_and_remote_legacy_lfs_urls -- --exact
+cargo test --lib migration::discovery_tests::committed_remote_endpoint_remains_the_source_after_lfscloud_configuration -- --exact
+cargo test --lib migration::fetch_tests::source_fetch_command_can_override_committed_lfscloud_target_with_legacy_url -- --exact
 
-echo "Historical Git LFS migration execution and failure-safe reconfiguration verified"
+echo "Server-mediated migration reconciliation and follow-up source configuration verified"

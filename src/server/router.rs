@@ -280,7 +280,7 @@ fn github_auth_router_with_client(
     session_store: LocalLfsSessionStore,
     user_client: crate::GitHubUserClient,
 ) -> ServerResult<Option<Router>> {
-    let provider = match config.single_github_pat_provider("the PAT login router")? {
+    let provider = match config.single_github_provider("the GitHub login router")? {
         None => return Ok(None),
         Some(provider) => provider,
     };

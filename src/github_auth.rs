@@ -1,6 +1,6 @@
 //! GitHub personal-access-token authentication and repository authorization.
 //!
-//! LFS Cloud accepts one configured GitHub PAT, exchanges it for a short-lived
+//! LFS Cloud verifies each user's GitHub PAT, exchanges it for a short-lived
 //! local LFS session, and retains the PAT only in protected server-side session
 //! state for identity and repository-permission checks.
 
@@ -41,7 +41,7 @@ const GITHUB_SSO_HEADER: &str = "x-github-sso";
 
 static DEFAULT_GITHUB_API_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 
-/// Login path that exchanges the configured GitHub personal access token for a
+/// Login path that exchanges a user's GitHub personal access token for a
 /// short-lived local LFS Cloud session.
 pub const GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH: &str = "/auth/github/pat";
 
@@ -49,7 +49,6 @@ pub const GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH: &str = "/auth/github/pat";
 #[derive(Clone)]
 pub struct GitHubPersonalAccessTokenLoginRouteState {
     provider: GitHubProviderConfig,
-    configured_token: GitHubPersonalAccessToken,
     user_client: GitHubUserClient,
     session_store: LocalLfsSessionStore,
 }
@@ -60,19 +59,14 @@ impl GitHubPersonalAccessTokenLoginRouteState {
     ///
     /// # Errors
     ///
-    /// Returns ServerError when the configured PAT is malformed.
+    /// Returns ServerError when login state cannot be initialized.
     pub fn with_client_and_session_store(
         provider: GitHubProviderConfig,
         user_client: GitHubUserClient,
         session_store: LocalLfsSessionStore,
     ) -> ServerResult<Self> {
-        let configured_token = GitHubPersonalAccessToken::from_secret(
-            provider.authentication.personal_access_token().to_owned(),
-        )?;
-
         Ok(Self {
             provider,
-            configured_token,
             user_client,
             session_store,
         })
@@ -84,7 +78,6 @@ impl fmt::Debug for GitHubPersonalAccessTokenLoginRouteState {
         formatter
             .debug_struct("GitHubPersonalAccessTokenLoginRouteState")
             .field("provider_id", &self.provider.id)
-            .field("configured_token", &"<redacted>")
             .field("user_client", &"<redacted>")
             .field("session_store", &self.session_store)
             .finish()
@@ -162,18 +155,17 @@ async fn github_personal_access_token_login_route(
     headers: HeaderMap,
 ) -> Result<Json<GitHubLoginRouteResponse>, GitHubPersonalAccessTokenLoginRouteError> {
     let presented_token = bearer_token(&headers).ok_or_else(personal_access_token_denied)?;
-    if !constant_time_str_eq(presented_token, state.configured_token.as_str()) {
-        return Err(personal_access_token_denied());
-    }
+    let presented_token = GitHubPersonalAccessToken::from_secret(presented_token.to_owned())
+        .map_err(|_| personal_access_token_denied())?;
 
     let user = state
         .user_client
-        .fetch_authenticated_user(&state.provider, &state.configured_token)
+        .fetch_authenticated_user(&state.provider, &presented_token)
         .await?;
     let session = state.session_store.issue_session_with_github_pat(
         &user,
         ["personal_access_token"],
-        state.configured_token.clone(),
+        presented_token,
     )?;
 
     Ok(Json(GitHubLoginRouteResponse::new(
@@ -208,7 +200,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 fn personal_access_token_denied() -> GitHubPersonalAccessTokenLoginRouteError {
     GitHubPersonalAccessTokenLoginRouteError(ServerError::Unauthorized {
-        reason: "GitHub personal access token did not match the configured account".to_owned(),
+        reason: "a valid GitHub personal access token is required".to_owned(),
     })
 }
 
@@ -258,7 +250,7 @@ impl IntoResponse for GitHubPersonalAccessTokenLoginRouteError {
 pub struct GitHubPersonalAccessToken(String);
 
 impl GitHubPersonalAccessToken {
-    /// Restores a configured GitHub PAT secret.
+    /// Validates a GitHub PAT secret supplied for an authenticated user.
     ///
     /// # Errors
     ///
@@ -480,7 +472,7 @@ impl GitHubRepositoryPermissionClient {
 
     /// Creates a GitHub repository permission client from an existing client.
     ///
-    /// This is useful for tests and for server code that shares one configured
+    /// This is useful for tests and for server code that shares one
     /// GitHub API client across identity and authorization calls.
     #[must_use]
     pub fn with_client(client: Client) -> Self {
@@ -1104,19 +1096,6 @@ fn validate_sensitive_github_value(value: String, label: &str) -> ServerResult<S
 
     Ok(value)
 }
-fn constant_time_str_eq(candidate: &str, expected: &str) -> bool {
-    let candidate = candidate.as_bytes();
-    let expected = expected.as_bytes();
-    let mut diff = candidate.len() ^ expected.len();
-
-    for index in 0..MAX_GITHUB_SENSITIVE_VALUE_LEN {
-        let candidate_byte = candidate.get(index).copied().unwrap_or_default();
-        let expected_byte = expected.get(index).copied().unwrap_or_default();
-        diff |= usize::from(candidate_byte ^ expected_byte);
-    }
-
-    diff == 0
-}
 
 fn sanitize_github_diagnostic_value(value: &str) -> String {
     const MAX_LEN: usize = 200;
@@ -1283,7 +1262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn personal_access_token_login_issues_local_session_without_returning_pat() {
+    async fn personal_access_token_login_issues_local_session_for_presented_github_user() {
         let requests = Arc::new(Mutex::new(0_usize));
         let requests_for_route = Arc::clone(&requests);
         let api = Router::new().route(
@@ -1320,7 +1299,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH)
-                    .header(AUTHORIZATION, "Bearer github_pat_configured")
+                    .header(AUTHORIZATION, "Bearer github_pat_user_b")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -1333,7 +1312,7 @@ mod tests {
             .await
             .expect("body should read");
         let body_text = String::from_utf8(body.to_vec()).expect("body should be UTF-8");
-        assert!(!body_text.contains("github_pat_configured"));
+        assert!(!body_text.contains("github_pat_user_b"));
         let body: serde_json::Value =
             serde_json::from_str(&body_text).expect("body should be JSON");
         let local_token = LfsSessionToken::from_secret(
@@ -1351,31 +1330,8 @@ mod tests {
                 .github_personal_access_token()
                 .expect("PAT should remain server-side")
                 .as_str(),
-            "github_pat_configured"
+            "github_pat_user_b"
         );
-    }
-
-    #[tokio::test]
-    async fn personal_access_token_login_rejects_mismatch_without_calling_github() {
-        let state = GitHubPersonalAccessTokenLoginRouteState::with_client_and_session_store(
-            provider("http://127.0.0.1:9/api/v3"),
-            GitHubUserClient::new().expect("user client should build"),
-            LocalLfsSessionStore::new(),
-        )
-        .expect("PAT login state should build");
-        let response = github_personal_access_token_login_router(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH)
-                    .header(AUTHORIZATION, "Bearer github_pat_wrong")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

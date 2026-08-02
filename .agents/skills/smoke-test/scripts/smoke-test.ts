@@ -4,10 +4,11 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { type AddressInfo, createServer } from 'node:net';
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { type AddressInfo, createServer as createNetServer } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
 
 type CommandOptions = {
@@ -211,6 +212,35 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   });
 }
 
+async function gitWithEnv(cwd: string, env: NodeJS.ProcessEnv, ...args: string[]): Promise<string> {
+  return command('git', args, { cwd, env });
+}
+
+async function requestBody(request: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function jsonResponse(response: ServerResponse, status: number, body: unknown): void {
+  const bytes = Buffer.from(JSON.stringify(body));
+  response.writeHead(status, {
+    'Content-Length': bytes.length,
+    'Content-Type': 'application/vnd.git-lfs+json',
+  });
+  response.end(bytes);
+}
+
+function lfsMediaPath(repository: string, oid: string): string {
+  return join(repository, '.git', 'lfs', 'objects', oid.slice(0, 2), oid.slice(2, 4), oid);
+}
+
+async function writeLfsMediaObject(repository: string, oid: string, bytes: Buffer): Promise<void> {
+  const path = lfsMediaPath(repository, oid);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, bytes);
+}
+
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new SmokeFailure(message);
 }
@@ -252,7 +282,10 @@ async function initRepositorySmoke(): Promise<void> {
 
 async function configurationCommandsSmoke(): Promise<void> {
   const configPath = join(sandbox, 'configuration-commands.yml');
-  await writeFile(configPath, 'server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n');
+  await writeFile(
+    configPath,
+    'server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n  session_encryption_secret: smoke-session-secret-at-least-32-characters\n',
+  );
 
   await command(binaryPath, [
     '--config',
@@ -266,8 +299,6 @@ async function configurationCommandsSmoke(): Promise<void> {
     'github',
     '--api-url',
     'https://api.github.com',
-    '--personal-access-token',
-    'smoke-pat',
   ]);
   await command(binaryPath, [
     '--config',
@@ -338,8 +369,13 @@ async function configurationCommandsSmoke(): Promise<void> {
   const storageProviders = await command(binaryPath, ['--config', configPath, 'config', 'storage', 'list']);
   const repositories = await command(binaryPath, ['--config', configPath, 'repository', 'list']);
   assert(repositoryProviders.includes('github-main'), 'repository-provider list omitted the configured provider');
-  assert(repositoryProviders.includes('configured'), 'repository-provider list omitted redacted auth state');
-  assert(!repositoryProviders.includes('smoke-pat'), 'repository-provider list leaked the configured PAT');
+  assert(repositoryProviders.includes('LEGACY SESSION SECRET'), 'repository-provider list omitted legacy auth heading');
+  assert(
+    !repositoryProviders.includes('configured'),
+    'new repository provider unexpectedly configured a server-owned PAT',
+  );
+  const configuredYaml = await readFile(configPath, 'utf8');
+  assert(!configuredYaml.includes('personal_access_token'), 'configuration command wrote a server-owned GitHub PAT');
   assert(storageProviders.includes('drive-main'), 'storage-provider list omitted the configured provider');
   assert(storageProviders.includes('Smoke Drive'), 'storage-provider list omitted the display name');
   assert(repositories.includes('smoke-renamed'), 'repository list omitted the partially updated mapping');
@@ -365,15 +401,17 @@ async function configurationCommandsSmoke(): Promise<void> {
   await command(binaryPath, ['--config', configPath, 'config', 'repository', 'remove', '--id', 'github-main']);
 
   const interactivePath = join(sandbox, 'interactive-configuration-commands.yml');
-  await writeFile(interactivePath, 'server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n');
-  const interactiveRepositoryProvider = await command(
-    binaryPath,
-    ['--config', interactivePath, 'config', 'repository', 'add'],
-    { input: 'github-interactive\n\n\ninteractive-secret-pat\n' },
+  await writeFile(
+    interactivePath,
+    'server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n  session_encryption_secret: interactive-session-secret-at-least-32-characters\n',
   );
+  await command(binaryPath, ['--config', interactivePath, 'config', 'repository', 'add'], {
+    input: 'github-interactive\n\n\n',
+  });
+  const interactiveYaml = await readFile(interactivePath, 'utf8');
   assert(
-    !interactiveRepositoryProvider.includes('interactive-secret-pat'),
-    'interactive repository-provider add echoed its PAT',
+    !interactiveYaml.includes('personal_access_token'),
+    'interactive provider add wrote a server-owned GitHub PAT',
   );
   await command(binaryPath, ['--config', interactivePath, 'config', 'storage', 'add'], {
     input: `drive-interactive\n\n\n${join(sandbox, 'interactive-gcloud')}\n\ninteractive-root\nInteractive Drive\n`,
@@ -425,6 +463,301 @@ async function migrationDryRunSmoke(): Promise<void> {
   assert(!(await pathExists(cacheRoot)), 'migration dry-run created cache state');
 }
 
+async function serverMediatedFollowUpMigrationSmoke(): Promise<void> {
+  const remoteUrl = 'https://github.com/smoke-owner/followup.git';
+  const targetRoute = '/github.com/smoke-owner/followup.git/info/lfs';
+  const sourceObjects = new Map<string, Buffer>();
+  const targetObjects = new Map<string, Buffer>();
+  const sourceRequests = new Set<string>();
+  const loginUsers = new Set<string>();
+  const targetUploads: Array<{ actor: string; oid: string }> = [];
+  const targetBatches: Array<{ actor: string; oids: string[] }> = [];
+  let serverBase = '';
+  let serverFailure: string | undefined;
+
+  const server = createHttpServer((request, response) => {
+    void (async () => {
+      const url = new URL(request.url ?? '/', serverBase || 'http://127.0.0.1');
+      const authorization = request.headers.authorization ?? '';
+
+      if (request.method === 'POST' && url.pathname === '/auth/github/pat') {
+        const sessions: Record<string, { actor: string; token: string }> = {
+          'Bearer github_pat_smoke_user_a': { actor: 'user-a', token: 'lfs-session-user-a' },
+          'Bearer github_pat_smoke_user_b': { actor: 'user-b', token: 'lfs-session-user-b' },
+        };
+        const session = sessions[authorization];
+        if (session === undefined) {
+          jsonResponse(response, 401, { message: 'unknown smoke user' });
+          return;
+        }
+        loginUsers.add(session.actor);
+        jsonResponse(response, 200, { lfs_token: session.token });
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname === '/legacy/objects/batch') {
+        const body = JSON.parse((await requestBody(request)).toString('utf8')) as {
+          objects?: Array<{ oid: string; size: number }>;
+        };
+        const objects = (body.objects ?? []).map(object => {
+          sourceRequests.add(object.oid);
+          const bytes = sourceObjects.get(object.oid);
+          return bytes === undefined
+            ? { oid: object.oid, size: object.size, error: { code: 404, message: 'missing source object' } }
+            : {
+                oid: object.oid,
+                size: object.size,
+                actions: {
+                  download: {
+                    href: `${serverBase}/legacy/objects/${object.oid}`,
+                    header: {},
+                  },
+                },
+              };
+        });
+        jsonResponse(response, 200, { transfer: 'basic', objects });
+        return;
+      }
+
+      if (request.method === 'GET' && url.pathname.startsWith('/legacy/objects/')) {
+        const oid = url.pathname.slice('/legacy/objects/'.length);
+        const bytes = sourceObjects.get(oid);
+        if (bytes === undefined) {
+          response.writeHead(404).end();
+          return;
+        }
+        response.writeHead(200, { 'Content-Length': bytes.length, 'Content-Type': 'application/octet-stream' });
+        response.end(bytes);
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname === `${targetRoute}/objects/batch`) {
+        const actors: Record<string, string> = {
+          'Bearer lfs-session-user-a': 'user-a',
+          'Bearer lfs-session-user-b': 'user-b',
+        };
+        const actor = actors[authorization];
+        if (actor === undefined) {
+          jsonResponse(response, 403, { message: 'write access required' });
+          return;
+        }
+        const body = JSON.parse((await requestBody(request)).toString('utf8')) as {
+          objects?: Array<{ oid: string; size: number }>;
+        };
+        const requested = body.objects ?? [];
+        if (requested.length > 0) targetBatches.push({ actor, oids: requested.map(object => object.oid) });
+        const objects = requested.map(object => ({
+          oid: object.oid,
+          size: object.size,
+          actions: targetObjects.has(object.oid)
+            ? {}
+            : {
+                upload: {
+                  href: `${serverBase}${targetRoute}/objects/${object.oid}?size=${object.size}`,
+                  header: { Authorization: `Bearer lfs-session-${actor}` },
+                },
+              },
+        }));
+        jsonResponse(response, 200, { transfer: 'basic', objects });
+        return;
+      }
+
+      const targetObjectPrefix = `${targetRoute}/objects/`;
+      if (request.method === 'PUT' && url.pathname.startsWith(targetObjectPrefix)) {
+        const actors: Record<string, string> = {
+          'Bearer lfs-session-user-a': 'user-a',
+          'Bearer lfs-session-user-b': 'user-b',
+        };
+        const actor = actors[authorization];
+        if (actor === undefined) {
+          jsonResponse(response, 403, { message: 'write access required' });
+          return;
+        }
+        const oid = url.pathname.slice(targetObjectPrefix.length);
+        const bytes = await requestBody(request);
+        assert(
+          createHash('sha256').update(bytes).digest('hex') === oid,
+          'migration uploaded bytes under the wrong OID',
+        );
+        assert(Number(url.searchParams.get('size')) === bytes.length, 'migration upload size did not match its action');
+        targetObjects.set(oid, bytes);
+        targetUploads.push({ actor, oid });
+        response.writeHead(200, { 'Content-Length': 0 }).end();
+        return;
+      }
+
+      response.writeHead(404, { 'Content-Length': 0 }).end();
+    })().catch(error => {
+      serverFailure = error instanceof Error ? error.message : String(error);
+      if (!response.headersSent) jsonResponse(response, 500, { message: 'smoke server failure' });
+      else response.destroy();
+    });
+  });
+
+  await new Promise<void>((ready, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', ready);
+  });
+
+  try {
+    const address = server.address() as AddressInfo;
+    serverBase = `http://127.0.0.1:${address.port}`;
+    const sourceLfsUrl = `${serverBase}/legacy`;
+    const targetLfsUrl = `${serverBase}${targetRoute}`;
+    const central = join(sandbox, 'followup-central.git');
+    const centralUrl = pathToFileURL(central).toString();
+    const seed = join(sandbox, 'followup-seed');
+    const userA = join(sandbox, 'followup-user-a');
+    const userB = join(sandbox, 'followup-user-b');
+    const payloadA = Buffer.from('centrally migrated LFS object\n');
+    const payloadB = Buffer.from('follow-up user LFS object\n');
+    const oidA = createHash('sha256').update(payloadA).digest('hex');
+    const oidB = createHash('sha256').update(payloadB).digest('hex');
+    sourceObjects.set(oidA, payloadA);
+    sourceObjects.set(oidB, payloadB);
+
+    const userEnv = (name: string): NodeJS.ProcessEnv => ({
+      GIT_CONFIG_GLOBAL: join(sandbox, `${name}-gitconfig`),
+      GIT_CONFIG_NOSYSTEM: '1',
+    });
+    const seedEnv = userEnv('seed');
+    const userAEnv = userEnv('user-a');
+    const userBEnv = userEnv('user-b');
+    const configureEnvironment = async (env: NodeJS.ProcessEnv, credentialStore?: string): Promise<void> => {
+      await command('git', ['config', '--global', `url.${centralUrl}.insteadOf`, remoteUrl], { env });
+      await command('git', ['config', '--global', 'protocol.file.allow', 'always'], { env });
+      if (credentialStore !== undefined) {
+        await command('git', ['config', '--global', 'credential.helper', `store --file=${credentialStore}`], { env });
+      }
+    };
+    const initializeCheckout = async (directory: string, branch: string, env: NodeJS.ProcessEnv): Promise<void> => {
+      await mkdir(directory);
+      await gitWithEnv(directory, env, 'init', '--quiet');
+      await gitWithEnv(directory, env, 'config', 'user.name', 'LFS Cloud Smoke Test');
+      await gitWithEnv(directory, env, 'config', 'user.email', `${branch}@example.invalid`);
+      await gitWithEnv(directory, env, 'config', 'commit.gpgSign', 'false');
+      await gitWithEnv(directory, env, 'lfs', 'install', '--local', '--skip-smudge');
+      await gitWithEnv(directory, env, 'remote', 'add', 'origin', remoteUrl);
+      await gitWithEnv(directory, env, 'fetch', 'origin');
+      await gitWithEnv(directory, env, 'checkout', '--quiet', '-B', branch, 'origin/main');
+    };
+
+    await command('git', ['init', '--bare', '--quiet', '--initial-branch=main', central]);
+    await configureEnvironment(seedEnv);
+    await mkdir(seed);
+    await gitWithEnv(seed, seedEnv, 'init', '--quiet', '--initial-branch=main');
+    await gitWithEnv(seed, seedEnv, 'config', 'user.name', 'LFS Cloud Smoke Test');
+    await gitWithEnv(seed, seedEnv, 'config', 'user.email', 'seed@example.invalid');
+    await gitWithEnv(seed, seedEnv, 'config', 'commit.gpgSign', 'false');
+    await gitWithEnv(seed, seedEnv, 'lfs', 'install', '--local');
+    await gitWithEnv(seed, seedEnv, 'lfs', 'track', 'assets/*.bin');
+    await mkdir(join(seed, 'assets'));
+    await writeFile(join(seed, 'assets', 'central.bin'), payloadA);
+    await gitWithEnv(seed, seedEnv, 'add', '.gitattributes', 'assets/central.bin');
+    await gitWithEnv(seed, seedEnv, 'commit', '--quiet', '-m', 'Add central LFS object');
+    await gitWithEnv(seed, seedEnv, 'remote', 'add', 'origin', remoteUrl);
+    await gitWithEnv(seed, seedEnv, 'push', '--quiet', '--no-verify', 'origin', 'main');
+
+    await configureEnvironment(userBEnv, join(sandbox, 'user-b-credentials'));
+    await initializeCheckout(userB, 'private', userBEnv);
+    await writeFile(join(userB, 'assets', 'private.bin'), payloadB);
+    await gitWithEnv(userB, userBEnv, 'add', 'assets/private.bin');
+    await gitWithEnv(userB, userBEnv, 'commit', '--quiet', '-m', 'Add private LFS object');
+    await writeLfsMediaObject(userB, oidA, payloadA);
+
+    await configureEnvironment(userAEnv, join(sandbox, 'user-a-credentials'));
+    await initializeCheckout(userA, 'main', userAEnv);
+    await gitWithEnv(userA, userAEnv, 'config', '--local', 'remote.origin.lfsurl', sourceLfsUrl);
+    await command(binaryPath, ['login', '--server', serverBase], {
+      cwd: userA,
+      env: userAEnv,
+      input: 'github_pat_smoke_user_a\n',
+    });
+    const userAOutput = await command(
+      binaryPath,
+      ['migrate', '--server', serverBase, '--cache-root', join(sandbox, 'user-a-cache'), '--all-refs'],
+      { cwd: userA, env: userAEnv },
+    );
+    assert(
+      userAOutput.includes('target objects: 1 uploaded, 0 already present'),
+      'first migration did not upload its object',
+    );
+    assert(targetObjects.get(oidA)?.equals(payloadA), 'first migration did not pass object bytes through the server');
+    assert(
+      targetUploads.some(upload => upload.actor === 'user-a' && upload.oid === oidA),
+      'user A upload was not authenticated independently',
+    );
+    assert(
+      (await gitWithEnv(userA, userAEnv, 'config', '--file', '.lfsconfig', '--get', 'lfs.url')).trim() === targetLfsUrl,
+      'first migration did not commit the LFS Cloud target',
+    );
+    assert(
+      (await gitWithEnv(userA, userAEnv, 'config', '--file', '.lfsconfig', '--get', 'remote.origin.lfsurl')).trim() ===
+        sourceLfsUrl,
+      'first migration did not commit the legacy source endpoint',
+    );
+    await gitWithEnv(userA, userAEnv, 'add', '.lfsconfig');
+    await gitWithEnv(userA, userAEnv, 'commit', '--quiet', '-m', 'Route LFS through LFS Cloud');
+    await gitWithEnv(userA, userAEnv, 'push', '--quiet', '--no-verify', 'origin', 'main');
+
+    await gitWithEnv(userB, userBEnv, 'fetch', 'origin');
+    await gitWithEnv(userB, userBEnv, 'cherry-pick', '--quiet', 'origin/main');
+    assert(
+      (await gitWithEnv(userB, userBEnv, 'config', '--file', '.lfsconfig', '--get', 'remote.origin.lfsurl')).trim() ===
+        sourceLfsUrl,
+      'follow-up user did not receive the committed legacy source endpoint',
+    );
+    await rm(lfsMediaPath(userB, oidB), { force: true });
+    sourceRequests.clear();
+    await command(binaryPath, ['login', '--server', serverBase], {
+      cwd: userB,
+      env: userBEnv,
+      input: 'github_pat_smoke_user_b\n',
+    });
+    const userBOutput = await command(
+      binaryPath,
+      ['migrate', '--server', serverBase, '--cache-root', join(sandbox, 'user-b-cache'), '--all-refs'],
+      { cwd: userB, env: userBEnv },
+    );
+    assert(
+      userBOutput.includes('target objects: 1 uploaded, 1 already present'),
+      'follow-up migration did not reconcile existing and missing target objects',
+    );
+    assert(targetObjects.get(oidB)?.equals(payloadB), 'follow-up migration did not upload the remaining object');
+    assert(
+      targetUploads.filter(upload => upload.oid === oidA).length === 1,
+      'follow-up migration re-uploaded the central object',
+    );
+    assert(
+      targetUploads.some(upload => upload.actor === 'user-b' && upload.oid === oidB),
+      'user B upload did not use user B authentication',
+    );
+    assert(
+      sourceRequests.has(oidB),
+      'follow-up migration did not fetch its missing object from the committed legacy URL',
+    );
+    assert(
+      !sourceRequests.has(oidA),
+      'follow-up migration fetched an object that was already local and present remotely',
+    );
+    assert(
+      targetBatches.some(batch => batch.actor === 'user-b' && batch.oids.includes(oidA) && batch.oids.includes(oidB)),
+      'follow-up migration did not reconcile the complete inventory through the server',
+    );
+    assert(
+      loginUsers.has('user-a') && loginUsers.has('user-b'),
+      'both users did not authenticate with independent PATs',
+    );
+    const lfsEnvironment = await gitWithEnv(userB, userBEnv, 'lfs', 'env');
+    assert(lfsEnvironment.includes(`Endpoint=${targetLfsUrl}`), 'legacy source overrode normal LFS Cloud traffic');
+    assert(!(await pathExists(join(userA, 'lfscloud.yml'))), 'migration created private server config for user A');
+    assert(!(await pathExists(join(userB, 'lfscloud.yml'))), 'migration created private server config for user B');
+    assert(serverFailure === undefined, `migration smoke server failed: ${serverFailure ?? ''}`);
+  } finally {
+    await new Promise<void>(closed => server.close(() => closed()));
+  }
+}
+
 async function statusSmoke(): Promise<void> {
   const repo = join(sandbox, 'status-repo');
   const cacheRoot = join(sandbox, 'status-cache');
@@ -439,7 +772,7 @@ async function statusSmoke(): Promise<void> {
   await git(repo, 'init', '--quiet');
   await git(repo, 'remote', 'add', 'origin', 'git@github.com:smoke-owner/status.git');
 
-  const server = createServer(socket => socket.end());
+  const server = createNetServer(socket => socket.end());
   await new Promise<void>((ready, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', ready);
@@ -451,7 +784,7 @@ async function statusSmoke(): Promise<void> {
     const lfsUrl = `${serverUrl}/github.com/smoke-owner/status.git/info/lfs`;
     await writeFile(
       configPath,
-      `server:\n  host: 127.0.0.1\n  port: ${address.port}\n  public_url: ${serverUrl}\n\nrepository_providers:\n  github-main:\n    type: github\n    api_url: https://api.github.com\n    personal_access_token: smoke-pat\n\nstorage_providers:\n  drive-smoke:\n    type: google_drive\n    credentials:\n      type: gcloud\n      config_dir: ${JSON.stringify(gcloudConfigDir)}\n      executable: ${JSON.stringify(process.execPath)}\n    root_folder_id: smoke-root\n\nrepositories:\n  - id: github-main:smoke-owner/status\n    repo_provider: github-main\n    host: github.com\n    owner: smoke-owner\n    name: status\n    provider_repository_id: "8675309"\n    storage_provider: drive-smoke\n`,
+      `server:\n  host: 127.0.0.1\n  port: ${address.port}\n  public_url: ${serverUrl}\n  session_encryption_secret: smoke-status-session-secret-at-least-32-characters\n\nrepository_providers:\n  github-main:\n    type: github\n    api_url: https://api.github.com\n\nstorage_providers:\n  drive-smoke:\n    type: google_drive\n    credentials:\n      type: gcloud\n      config_dir: ${JSON.stringify(gcloudConfigDir)}\n      executable: ${JSON.stringify(process.execPath)}\n    root_folder_id: smoke-root\n\nrepositories:\n  - id: github-main:smoke-owner/status\n    repo_provider: github-main\n    host: github.com\n    owner: smoke-owner\n    name: status\n    provider_repository_id: "8675309"\n    storage_provider: drive-smoke\n`,
     );
 
     const gitEnv = {
@@ -637,6 +970,10 @@ function tests(): SmokeTest[] {
       run: () => script('verify-git-credential-helper-fallback.sh'),
     },
     { name: 'login workflow', run: () => script('verify-login-command.sh') },
+    {
+      name: 'per-user GitHub repository authorization',
+      run: () => script('verify-github-repository-authorization.sh'),
+    },
     { name: 'logout workflow', run: () => script('verify-logout-command.sh') },
     { name: 'repository status workflow', run: statusSmoke },
     { name: 'hydrate and dehydrate workflows', run: () => script('verify-local-cache-cli.sh') },
@@ -655,9 +992,10 @@ function tests(): SmokeTest[] {
       run: () => script('verify-migration-upload-simulation.sh'),
     },
     {
-      name: 'historical Git LFS migration execution',
+      name: 'server-mediated migration contract',
       run: () => script('verify-migration-history-execution.sh'),
     },
+    { name: 'two-user follow-up migration', run: serverMediatedFollowUpMigrationSmoke },
     {
       name: 'secret redaction regressions',
       run: () => script('verify-secret-redaction.sh', 45 * 60 * 1000),

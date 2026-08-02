@@ -163,7 +163,6 @@ impl EditableServerConfig {
         if !existed {
             require_some(&values.provider_type, "--type")?;
             require_some(&values.api_url, "--api-url")?;
-            require_some(&values.personal_access_token, "--personal-access-token")?;
         }
 
         let before = self.document.clone();

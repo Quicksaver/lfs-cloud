@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::{
-    resolution::{resolve_metadata_path, resolve_required},
+    resolution::{resolve_metadata_path, resolve_optional, resolve_required},
     validation::{invalid_config, validate_config_http_url},
 };
 use crate::ServerResult;
@@ -34,6 +34,11 @@ pub struct ServerSettings {
     /// untrusted network because those endpoints carry credentials and LFS
     /// object content.
     pub allow_insecure_http: bool,
+    /// Stable server-owned secret used to encrypt durable user sessions.
+    ///
+    /// This is independent of every user's GitHub credential and is redacted
+    /// from debug output.
+    pub session_encryption_secret: Option<ServerSessionEncryptionSecret>,
     /// Maximum number of object entries accepted in one Git LFS batch.
     ///
     /// Duplicate entries count toward this limit even though storage lookups
@@ -80,6 +85,13 @@ impl ServerSettings {
         let public_url = resolve_required(raw.public_url, "server.public_url", env)?;
         validate_config_http_url(&public_url, "server.public_url", raw.allow_insecure_http)?;
         let metadata_path = resolve_metadata_path(raw.metadata_path, metadata_base_dir, env)?;
+        let session_encryption_secret = resolve_optional(
+            raw.session_encryption_secret,
+            "server.session_encryption_secret",
+            env,
+        )?
+        .map(ServerSessionEncryptionSecret::new)
+        .transpose()?;
 
         if raw.port == 0 {
             return invalid_config("server.port", "must be greater than zero");
@@ -117,6 +129,7 @@ impl ServerSettings {
             port: raw.port,
             public_url,
             allow_insecure_http: raw.allow_insecure_http,
+            session_encryption_secret,
             max_batch_objects: raw.max_batch_objects,
             max_provider_calls: raw.max_provider_calls,
             max_concurrent_requests: raw.max_concurrent_requests,
@@ -138,6 +151,8 @@ pub(super) struct RawServerSettings {
     pub(super) public_url: Option<String>,
     #[serde(default)]
     pub(super) allow_insecure_http: bool,
+    #[serde(default)]
+    pub(super) session_encryption_secret: Option<String>,
     #[serde(default = "default_max_batch_objects")]
     pub(super) max_batch_objects: usize,
     #[serde(default = "default_max_provider_calls")]
@@ -159,6 +174,7 @@ impl Default for RawServerSettings {
             port: default_bind_port(),
             public_url: None,
             allow_insecure_http: false,
+            session_encryption_secret: None,
             max_batch_objects: default_max_batch_objects(),
             max_provider_calls: default_max_provider_calls(),
             max_concurrent_requests: default_max_concurrent_requests(),
@@ -166,6 +182,35 @@ impl Default for RawServerSettings {
             max_concurrent_uploads_per_user: default_max_concurrent_uploads_per_user(),
             metadata_path: None,
         }
+    }
+}
+
+/// Redacted server-owned secret used to protect durable LFS sessions.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ServerSessionEncryptionSecret(String);
+
+impl ServerSessionEncryptionSecret {
+    fn new(value: String) -> ServerResult<Self> {
+        if value.len() < 32
+            || value.trim().len() != value.len()
+            || value.chars().any(|character| character.is_control())
+        {
+            return invalid_config(
+                "server.session_encryption_secret",
+                "must contain at least 32 unpadded, non-control characters",
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for ServerSessionEncryptionSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
     }
 }
 

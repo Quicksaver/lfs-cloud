@@ -2177,7 +2177,7 @@ repositories:
     }
 
     #[test]
-    fn server_router_rejects_multiple_github_pat_providers() {
+    fn server_router_rejects_multiple_github_authentication_providers() {
         let config = ServerConfig::load_from_str(
             r#"
 server:
@@ -2216,7 +2216,7 @@ repositories:
             matches!(
                 error,
                 ServerError::InvalidConfiguration { ref message }
-                    if message.contains("the PAT login router")
+                    if message.contains("the GitHub login router")
             ),
             "unexpected multiple-provider diagnostic: {error}"
         );

@@ -248,12 +248,24 @@ fn production_session_store(
     config: &ServerConfig,
     metadata_database: Arc<MetadataDatabase>,
 ) -> ServerResult<LocalLfsSessionStore> {
-    match config.single_github_pat_provider("durable session storage")? {
+    if let Some(secret) = &config.server.session_encryption_secret {
+        return LocalLfsSessionStore::open_durable(metadata_database, secret.as_bytes());
+    }
+
+    match config.single_github_provider("durable session storage")? {
         None => Ok(LocalLfsSessionStore::new()),
-        Some(provider) => LocalLfsSessionStore::open_durable(
-            metadata_database,
-            provider.authentication.session_encryption_secret(),
-        ),
+        Some(provider) => match provider.authentication.configured_personal_access_token() {
+            Some(legacy_secret) => {
+                tracing::warn!(
+                    "repository provider personal_access_token is deprecated; configure server.session_encryption_secret"
+                );
+                LocalLfsSessionStore::open_durable(metadata_database, legacy_secret.as_bytes())
+            }
+            None => Err(ServerError::InvalidConfiguration {
+                message: "server.session_encryption_secret is required when GitHub authentication is configured"
+                    .to_owned(),
+            }),
+        },
     }
 }
 

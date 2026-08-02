@@ -203,6 +203,37 @@ impl GitRepository {
         })
     }
 
+    /// Writes a remote-scoped legacy LFS endpoint to `.lfsconfig`.
+    ///
+    /// The remote-scoped value is inert while the repository-wide `lfs.url`
+    /// points at LFS Cloud, but gives later clones enough committed information
+    /// to fetch legacy objects during follow-up migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git cannot persist the value.
+    pub fn write_worktree_remote_lfs_url(
+        &self,
+        remote_name: impl AsRef<str>,
+        lfs_url: impl AsRef<str>,
+    ) -> CliResult<()> {
+        let remote_name = remote_name.as_ref();
+        let lfs_url = lfs_url.as_ref();
+        let lfsconfig_path = self.lfsconfig_path();
+        let key = format!("remote.{remote_name}.lfsurl");
+        run_git_config(
+            &self.worktree_root,
+            [
+                OsStr::new("config"),
+                OsStr::new("--file"),
+                lfsconfig_path.as_os_str(),
+                OsStr::new(&key),
+                OsStr::new(lfs_url),
+            ],
+            &format!("git config --file .lfsconfig remote.{remote_name}.lfsurl"),
+        )
+    }
+
     fn read_lfs_url(&self, target: GitLfsConfigTarget) -> CliResult<Option<String>> {
         match target {
             GitLfsConfigTarget::WorktreeFile => {
@@ -1112,6 +1143,33 @@ mod tests {
         permissions.set_mode(0o600);
         fs::set_permissions(&lfsconfig, permissions).expect("test .lfsconfig should be unlocked");
         assert!(matches!(error, CliError::ExternalCommand { .. }));
+    }
+
+    #[test]
+    fn worktree_config_preserves_target_and_remote_legacy_lfs_urls() {
+        let repo = TempGitRepo::new();
+        repo.git(["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+        let repository = GitRepository::discover(repo.path())
+            .expect("temporary repository should be discovered");
+
+        repository
+            .write_worktree_remote_lfs_url(
+                "origin",
+                "https://legacy.example/owner/repo.git/info/lfs",
+            )
+            .expect("legacy source should be written");
+        repository
+            .write_lfs_url(
+                GitLfsConfigTarget::WorktreeFile,
+                "https://cloud.example/github.com/owner/repo.git/info/lfs",
+            )
+            .expect("target URL should be written");
+
+        let contents = fs::read_to_string(repo.path().join(".lfsconfig"))
+            .expect(".lfsconfig should be readable");
+        assert!(contents.contains("https://cloud.example/github.com/owner/repo.git/info/lfs"));
+        assert!(contents.contains("https://legacy.example/owner/repo.git/info/lfs"));
+        assert!(contents.contains("[remote \"origin\"]"));
     }
 
     #[test]

@@ -14,13 +14,18 @@ use std::{
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
-    sync::{Arc, mpsc},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use reqwest::{Client, StatusCode as HttpStatusCode, redirect::Policy};
+use reqwest::{
+    Body as ReqwestBody, Client, StatusCode as HttpStatusCode,
+    header::{CONTENT_LENGTH, HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue},
+    redirect::Policy,
+};
+use tokio_util::io::ReaderStream;
 use url::Url;
 
 use crate::child_process::{
@@ -41,18 +46,19 @@ use crate::{
     GITHUB_PERSONAL_ACCESS_TOKEN_LOGIN_PATH, GitCredentialApproval, GitCredentialLookup,
     GitCredentialRejection, GitLfsConfigChange, GitLfsConfigTarget, GitLfsHistoryPointers,
     GitLfsMigrationDiscovery, GitLfsSourceEndpointSource, GitRemote, GitRepository,
-    LFS_POINTER_SIZE_CUTOFF, LFS_SESSION_REVOKE_PATH, LfsInitRoute, LfsObject, LfsPointer,
-    LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
+    LFS_BASIC_TRANSFER, LFS_POINTER_SIZE_CUTOFF, LFS_SESSION_REVOKE_PATH, LfsBatchAction,
+    LfsBatchHashAlgorithm, LfsBatchOperation, LfsBatchRequest, LfsBatchResponse, LfsInitRoute,
+    LfsObject, LfsPointer, LfsSessionToken, LocalCacheDehydration, LocalCacheDehydrationStatus,
     LocalCacheGarbageCollection, LocalCacheGarbageCollectionObject, LocalCacheIngest,
     LocalCacheIngestStatus, LocalCacheLayout, LocalCacheMaterialization,
     LocalCacheMaterializationStatus, LocalCacheWorktreeRegistration,
-    LocalMigrationObjectAvailability, MetadataDatabase, MigrationError, MigrationFetchMode,
-    MigrationSourceFetch, MigrationStorageUpload, RepositoryMapping, ServeOptions, ServerConfig,
-    StorageProvider, StorageProviderConfig, TracingConfig, check_local_migration_objects,
-    discover_git_lfs_migration_from_remote, enumerate_current_checkout_lfs_pointers,
-    enumerate_fetched_ref_lfs_pointers_for_remote, enumerate_selected_ref_lfs_pointers,
-    fetch_migration_git_refs, fetch_missing_migration_objects_from_remote, init_tracing,
-    upload_migration_objects_to_storage,
+    LocalMigrationObjectAvailability, MigrationError, MigrationFetchMode, MigrationSourceFetch,
+    ServeOptions, ServerConfig, StorageProviderConfig, TracingConfig,
+    check_local_migration_objects, discover_git_lfs_migration_from_remote,
+    enumerate_current_checkout_lfs_pointers, enumerate_fetched_ref_lfs_pointers_for_remote,
+    enumerate_selected_ref_lfs_pointers, fetch_migration_git_refs,
+    fetch_missing_migration_objects_from_remote,
+    fetch_missing_migration_objects_from_remote_at_endpoint, init_tracing,
 };
 
 mod authentication;
