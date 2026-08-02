@@ -1,6 +1,6 @@
 # Install, Build, And Release Shape
 
-LFS Cloud is currently a single Rust package with a library target and a small CLI binary. Its local release tooling produces checksummed platform archives, Debian packages, and direct installers, then publishes Homebrew, APT, and WinGet metadata from an interactive maintainer command. No release package is signed or notarized yet, and none of these channels will resolve until the first release is published.
+LFS Cloud is currently a single Rust package with a library target and a small CLI binary. Its local release tooling produces checksummed platform archives, Debian packages, and direct installers, then publishes Homebrew and WinGet metadata plus optional APT metadata from an interactive maintainer command. No release package is signed or notarized yet, and none of these channels will resolve until the first release is published.
 
 ## Prerequisites
 
@@ -15,7 +15,7 @@ LFS Cloud is currently a single Rust package with a library target and a small C
 The final local publisher additionally requires:
 
 - Homebrew, for formula validation and publication to the configured tap.
-- the authenticated Cloudsmith CLI, for Debian repository uploads.
+- the authenticated Cloudsmith CLI only when opting into Debian repository uploads with `LFS_CLOUD_APT_CLOUDSMITH_TARGET`.
 - GitHub CLI access with repository administration permission to enable release immutability, plus permission to publish releases, push the Homebrew tap and WinGet fork, and open WinGet pull requests.
 
 For real GitHub and Google Drive operation you also need:
@@ -182,29 +182,32 @@ Running `major`, `minor`, or `patch` again from an untagged `Release vX.Y.Z` com
 
 ## Final Publication And Distribution
 
-Run final publication locally rather than through GitHub Actions. On a clean checkout with PowerShell 7, Homebrew, Cloudsmith, Git, and GitHub CLI available, configure the Debian destination and invoke:
+Run final publication locally rather than through GitHub Actions. On macOS with Bash, Homebrew, Git, and GitHub CLI available, invoke:
 
 ```bash
-export LFS_CLOUD_APT_CLOUDSMITH_TARGET=OWNER/REPOSITORY/DISTRO/VERSION
 # Optional; defaults to Quicksaver/homebrew-tap
 export LFS_CLOUD_HOMEBREW_TAP_REPO=OWNER/homebrew-TAP
+# Optional; enables Cloudsmith APT publication when set
+export LFS_CLOUD_APT_CLOUDSMITH_TARGET=OWNER/REPOSITORY/DISTRO/VERSION
 yarn release:publish
 ```
 
-The publisher lists semantic draft releases only when the latest macOS ARM64, Linux x86-64, Linux ARM64, and Windows x86-64 statuses are all successful and were created by the authenticated GitHub user. Its arrow-key selector also lists already-published immutable releases whose distribution statuses are incomplete, allowing a failed channel to be resumed without editing the release.
+The publisher lists semantic draft releases only when the latest macOS ARM64, Linux x86-64, Linux ARM64, and Windows x86-64 statuses are all successful and were created by the authenticated GitHub user. Its arrow-key selector also lists already-published immutable releases whose configured distribution statuses are incomplete, allowing a failed channel to be resumed without editing the release. When `LFS_CLOUD_APT_CLOUDSMITH_TARGET` is unset, the selector reports `apt:skipped`, Cloudsmith is not required, and APT does not participate in release completion.
 
-Before asking for the exact `publish vX.Y.Z` confirmation, the command downloads every draft asset and revalidates its GitHub-reported digest, checksum, build manifest, version, target, architecture, and commit. It generates the Homebrew formula and WinGet manifests from those verified bytes. The confirmation then enables immutable releases for the repository and publishes the draft as the latest immutable release. It verifies GitHub's generated release attestation before distributing anything. All release assets must therefore be present before this point; published release tags and assets cannot be replaced.
+The current checkout may contain staged, unstaged, or untracked work. Publication uses the selected release's remote tag, trusted verification statuses, and downloaded GitHub assets rather than rebuilding or publishing files from the worktree.
+
+After selection, the command downloads every draft asset and revalidates its GitHub-reported digest, checksum, build manifest, version, target, architecture, and commit. It generates the Homebrew formula and WinGet manifests from those verified bytes, then enables immutable releases for the repository and publishes the selected draft as the latest immutable release without another confirmation prompt. It verifies GitHub's generated release attestation before distributing anything. All release assets must therefore be present before this point; published release tags and assets cannot be replaced. Use Escape in the release selector to cancel before selecting a version.
 
 Distribution proceeds independently and records one commit status per channel:
 
 | Status | Publication |
 | --- | --- |
 | `distribution/direct-installer` | Downloads the now-public shell and PowerShell installer assets and verifies their digests. |
-| `distribution/homebrew` | Validates the generated formula, commits it to `Formula/lfscloud.rb` in the configured tap, and pushes the tap. |
-| `distribution/apt` | Uploads the `amd64` and `arm64` Debian packages to the configured Cloudsmith distribution. |
-| `distribution/winget-submitted` | Pushes versioned portable manifests to the authenticated user's `winget-pkgs` fork and opens the upstream pull request. |
+| `distribution/homebrew` | Trusts the configured tap locally, validates the generated formula, commits it to `Formula/lfscloud.rb`, and pushes the tap. A matching generated formula left by a failed validation is resumed safely. |
+| `distribution/apt` | When `LFS_CLOUD_APT_CLOUDSMITH_TARGET` is set, uploads the `amd64` and `arm64` Debian packages to that Cloudsmith distribution; otherwise skipped. |
+| `distribution/winget-submitted` | Pushes schema-declared portable manifests to the authenticated user's `winget-pkgs` fork and opens or updates the upstream pull request; fork cloning leaves upstream configuration to the publisher. |
 
-A channel failure does not make the immutable GitHub release editable. Rerun `yarn release:publish`; successful statuses are skipped and only incomplete channels require their corresponding local tool and configuration. WinGet's status means the Community repository pull request was submitted, not that Microsoft has merged it.
+A channel failure does not make the immutable GitHub release editable. Rerun `yarn release:publish`; successful statuses are skipped and only incomplete configured channels require their corresponding local tool and configuration. If Cloudsmith is configured later, an immutable release without `distribution/apt` becomes eligible for resumption so its existing Debian packages can be published. WinGet's status means the Community repository pull request was submitted, not that Microsoft has merged it.
 
 No GitHub Actions workflow creates or publishes these releases or distribution entries.
 
@@ -244,7 +247,7 @@ brew install Quicksaver/tap/lfscloud
 winget install --exact --id Quicksaver.LFSCloud
 ```
 
-For APT, first follow the generated setup instructions for the configured Cloudsmith Debian repository, then run:
+If the release maintainer opted into Cloudsmith publication, first follow the generated setup instructions for the configured Debian repository, then run:
 
 ```bash
 sudo apt update
@@ -262,7 +265,7 @@ Successful manual CI jobs package tested executables in 14-day workflow artifact
 - manual verification scripts that were run
 - known MVP limitations
 
-The current repository still does not define binary signatures, macOS notarization, Cargo registry publication, or automated CI release publishing. Homebrew, APT, WinGet, and direct-installer publication are deliberately initiated by the local interactive publisher.
+The current repository still does not define binary signatures, macOS notarization, Cargo registry publication, or automated CI release publishing. Homebrew, optional APT, WinGet, and direct-installer publication are deliberately initiated by the local interactive publisher.
 
 ## Licensing
 

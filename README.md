@@ -2,7 +2,7 @@
 
 LFS Cloud is a self-hosted Git LFS server and companion CLI that stores large files in Google Drive while keeping the Git repository on GitHub.
 
-> LFS Cloud is preparing for its first release. The release tooling now builds checksummed binaries, direct installers, Homebrew and APT packages, and WinGet manifests, but those channels will not resolve until the first release is published. Binary signatures and macOS notarization are not available yet.
+> LFS Cloud is preparing for its first release. The release tooling now builds checksummed binaries, direct installers, Debian packages, Homebrew metadata, and WinGet manifests; Cloudsmith APT publication is optional. These channels will not resolve until the first release is published. Binary signatures and macOS notarization are not available yet.
 
 ## What It Does
 
@@ -29,35 +29,63 @@ LFS Cloud is best suited to a private, single-operator installation. It is not c
 
 ## Quick Start
 
-### 1. Install The Prerequisites
+### 1. Install LFS Cloud And The Prerequisites
 
-You need:
+Every installation needs:
 
-- Rust 1.88 or newer
 - Git and Git LFS
 - Google Cloud CLI (`gcloud`)
 - a Git credential helper
 - a GitHub personal access token limited to the repositories you will serve
 - GitHub CLI (`gh`) for the repository ID lookup shown below (optional)
 
-Install LFS Cloud from this checkout:
+Choose one of the following installation methods.
 
-```bash
-cargo install --locked --path .
-git lfs install
-```
+#### Install Script
 
-After the first release is published, a direct install or update will be available with:
+On macOS ARM64 or Linux x86-64/ARM64:
 
 ```bash
 curl -fsSL https://github.com/Quicksaver/lfs-cloud/releases/latest/download/lfscloud-installer.sh | sh
 ```
 
+On Windows x86-64:
+
 ```powershell
 irm https://github.com/Quicksaver/lfs-cloud/releases/latest/download/lfscloud-installer.ps1 | iex
 ```
 
-The direct installers verify the release checksum and executable version, install into `~/.local/bin` by default, and do not modify `PATH` or invoke elevated privileges. Homebrew, WinGet, and APT commands are documented in [Install, build, and release details](docs/install-release.md).
+The install scripts verify the release checksum and executable version, install into `~/.local/bin` by default, and do not modify `PATH` or invoke elevated privileges. Version pinning and custom install directories are documented in [Install, build, and release details](docs/install-release.md#installing-a-published-release).
+
+#### macOS
+
+Install with Homebrew:
+
+```bash
+brew install Quicksaver/tap/lfscloud
+```
+
+#### Windows
+
+Install with WinGet:
+
+```powershell
+winget install --exact --id Quicksaver.LFSCloud
+```
+
+#### From This Checkout
+
+This option requires Rust 1.88 or newer:
+
+```bash
+cargo install --locked --path .
+```
+
+Initialize Git LFS after installing LFS Cloud:
+
+```bash
+git lfs install
+```
 
 ### 2. Prepare Google Drive Access
 
