@@ -310,14 +310,14 @@ async fn execute_migration_through_server(
             &context.source_remote.remote_name,
             &source.url,
             context.allow_insecure_http,
-            MigrationFetchMode::AllFetchedRefs,
+            MigrationFetchMode::ObjectIds,
         )?,
         None => fetch_missing_migration_objects_from_remote(
             &context.repository.worktree_root,
             needed_objects.iter().copied(),
             Some(&context.cache_layout),
             &context.source_remote.remote_name,
-            MigrationFetchMode::AllFetchedRefs,
+            MigrationFetchMode::ObjectIds,
         )?,
     };
     if let Some(object) = source_fetch.unavailable_objects.first() {
@@ -331,6 +331,7 @@ async fn execute_migration_through_server(
     let server_upload = upload_migration_objects_through_server(
         &context.route.lfs_url,
         context.allow_insecure_http,
+        token,
         &source_fetch.after,
         target_plan,
     )
@@ -508,6 +509,7 @@ async fn request_migration_target_plan(
 async fn upload_migration_objects_through_server(
     lfs_url: &str,
     allow_insecure_http: bool,
+    token: &LfsSessionToken,
     availability: &LocalMigrationObjectAvailability,
     plan: MigrationTargetPlan,
 ) -> CliResult<MigrationServerUpload> {
@@ -539,6 +541,7 @@ async fn upload_migration_objects_through_server(
             })?;
         let response = client
             .put(upload_url)
+            .bearer_auth(token.as_str())
             .headers(headers)
             .header(CONTENT_LENGTH, object.size.bytes())
             .body(ReqwestBody::wrap_stream(ReaderStream::new(file)))
@@ -1547,8 +1550,7 @@ mod tests {
                                     "authenticated": true,
                                     "actions": {
                                         "upload": {
-                                            "href": upload_href,
-                                            "header": {"Authorization": "Basic migration-action"}
+                                            "href": upload_href
                                         }
                                     }
                                 }
@@ -1599,9 +1601,10 @@ mod tests {
         assert_eq!(plan.uploads.len(), 1);
         let availability = check_local_migration_objects(&repo, [&missing], None)
             .expect("missing target object should be locally available");
-        let result = upload_migration_objects_through_server(&lfs_url, false, &availability, plan)
-            .await
-            .expect("migration should upload through the LFS server action");
+        let result =
+            upload_migration_objects_through_server(&lfs_url, false, &token, &availability, plan)
+                .await
+                .expect("migration should upload through the LFS server action");
         server.abort();
 
         assert_eq!(result.uploaded_objects, vec![missing]);
@@ -1612,7 +1615,7 @@ mod tests {
                 .expect("migration upload record should not poison")
                 .clone(),
             Some((
-                Some("Basic migration-action".to_owned()),
+                Some("Bearer migration-session-token".to_owned()),
                 missing_bytes.to_vec()
             ))
         );

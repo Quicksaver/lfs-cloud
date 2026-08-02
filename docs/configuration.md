@@ -150,6 +150,8 @@ Each user runs `lfscloud login --server URL` with their own GitHub PAT. Login ca
 
 `server.session_encryption_secret` is a server-owned value of at least 32 characters used only to protect durable session credentials. Keep it private and stable across restarts. For transition compatibility, an old repository-provider `personal_access_token` can supply this encryption material when the dedicated setting is absent, but it no longer selects or authenticates the users allowed to log in and should be removed after configuring the dedicated secret.
 
+The metadata upgrade that introduces the dedicated server secret invalidates sessions encrypted with the legacy provider PAT before loading durable session state. Existing users must log in again after that upgrade.
+
 ## LAN Config
 
 Use a LAN bind only on a trusted network:

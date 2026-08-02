@@ -13,6 +13,8 @@ pub enum MigrationFetchMode {
     },
     /// Fetch all objects reachable from fetched local refs.
     AllFetchedRefs,
+    /// Fetch only the supplied object identities from an explicit LFS endpoint.
+    ObjectIds,
 }
 
 impl MigrationFetchMode {
@@ -36,7 +38,7 @@ impl MigrationFetchMode {
     pub fn selected_ref_names(&self) -> Option<&[String]> {
         match self {
             Self::SelectedRefs { refs } => Some(refs),
-            Self::CurrentCheckout | Self::AllFetchedRefs => None,
+            Self::CurrentCheckout | Self::AllFetchedRefs | Self::ObjectIds => None,
         }
     }
 }
@@ -259,9 +261,24 @@ where
         });
     }
 
-    let fetch_command = migration_source_fetch_command(source_remote, source_endpoint, &mode)?;
-    runner(&worktree_root, &fetch_command)?;
-    command = Some(fetch_command.display.clone());
+    let fetch_commands = migration_source_fetch_commands(
+        source_remote,
+        source_endpoint,
+        &mode,
+        before.unavailable_objects(),
+    )?;
+    for fetch_command in &fetch_commands {
+        runner(&worktree_root, fetch_command)?;
+    }
+    command = match fetch_commands.as_slice() {
+        [] => None,
+        [fetch_command] => Some(fetch_command.display.clone()),
+        [first, ..] => Some(format!(
+            "{} (repeated for {} target-missing objects)",
+            first.display,
+            fetch_commands.len()
+        )),
+    };
 
     let after = check_local_migration_objects(
         &worktree_root,
@@ -287,6 +304,45 @@ where
 struct MigrationSourceFetchCommand {
     args: Vec<OsString>,
     display: String,
+    stdin: Option<Vec<u8>>,
+}
+
+fn migration_source_fetch_commands(
+    source_remote: &str,
+    source_endpoint: Option<&str>,
+    mode: &MigrationFetchMode,
+    unavailable_objects: Vec<&LocalMigrationObject>,
+) -> MigrationResult<Vec<MigrationSourceFetchCommand>> {
+    if *mode != MigrationFetchMode::ObjectIds {
+        return migration_source_fetch_command(source_remote, source_endpoint, mode)
+            .map(|command| vec![command]);
+    }
+
+    validate_source_remote_name(source_remote)?;
+    let source_endpoint = source_endpoint.ok_or_else(|| MigrationError::InvalidInput {
+        message: SanitizedMessage::new(
+            "object-ID migration fetch requires an explicit source LFS endpoint",
+        ),
+    })?;
+    let mut args = vec![
+        OsString::from("-c"),
+        OsString::from(format!("lfs.url={source_endpoint}")),
+        OsString::from("-c"),
+        OsString::from("lfs.fetchinclude="),
+        OsString::from("-c"),
+        OsString::from("lfs.fetchexclude="),
+    ];
+    args.extend([OsString::from("lfs"), OsString::from("smudge")]);
+    let display = display_git_command(&args);
+
+    Ok(unavailable_objects
+        .into_iter()
+        .map(|local| MigrationSourceFetchCommand {
+            args: args.clone(),
+            display: display.clone(),
+            stdin: Some(LfsPointer::new(local.object.clone()).to_pointer_file().into_bytes()),
+        })
+        .collect())
 }
 
 fn migration_source_fetch_command(
@@ -346,10 +402,21 @@ fn migration_source_fetch_command(
             args.push(OsString::from("--all"));
             args.push(OsString::from(&source_remote));
         }
+        MigrationFetchMode::ObjectIds => {
+            return Err(MigrationError::InvalidInput {
+                message: SanitizedMessage::new(
+                    "object-ID migration fetch requires explicit object metadata",
+                ),
+            });
+        }
     }
 
     let display = display_git_command(&args);
-    Ok(MigrationSourceFetchCommand { args, display })
+    Ok(MigrationSourceFetchCommand {
+        args,
+        display,
+        stdin: None,
+    })
 }
 
 pub(crate) fn validated_migration_source_endpoint(
@@ -403,7 +470,12 @@ fn run_git_lfs_fetch_command(
     process
         .args(&command.args)
         .current_dir(worktree_root)
-        .stdin(Stdio::null())
+        .env_remove("GIT_LFS_SKIP_SMUDGE")
+        .stdin(if command.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     configure_process_tree(&mut process);
@@ -411,6 +483,20 @@ fn run_git_lfs_fetch_command(
         context: "failed to start git lfs fetch".to_owned(),
         source,
     })?;
+    if let Some(input) = &command.stdin {
+        let write_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Git LFS stdin was not piped"))
+            .and_then(|mut stdin| stdin.write_all(input));
+        if let Err(source) = write_result {
+            let _ = terminate_process_tree(&mut child, &command.display);
+            return Err(MigrationError::Io {
+                context: "failed to write Git LFS pointer to smudge stdin".to_owned(),
+                source,
+            });
+        }
+    }
     let (status, stderr) =
         wait_for_git_command(&mut child, &command.display, MIGRATION_SOURCE_FETCH_TIMEOUT)?;
 
@@ -727,6 +813,56 @@ mod fetch_tests {
             )
         );
         assert_eq!(report.fetched_objects, vec![object]);
+        assert!(report.unavailable_objects.is_empty());
+    }
+
+    #[test]
+    fn source_fetch_by_object_id_requests_only_the_missing_object() {
+        let repo = TempRepo::new();
+        let available = test_lfs_object_from_bytes(b"already available source bytes");
+        let missing = test_lfs_object_from_bytes(b"target-missing source bytes");
+        write_git_lfs_source_object(&repo, &available, b"already available source bytes");
+        let missing_for_runner = missing.clone();
+        let mut observed_commands = Vec::new();
+
+        let report = fetch_missing_migration_objects_with_runner(
+            repo.path(),
+            [&available, &missing],
+            None,
+            "origin",
+            Some("https://legacy.example/owner/repo.git/info/lfs"),
+            MigrationFetchMode::ObjectIds,
+            |worktree_root, command| {
+                observed_commands.push(command.clone());
+                write_git_lfs_source_object_in(
+                    &worktree_root.join(".git/lfs/objects"),
+                    &missing_for_runner,
+                    b"target-missing source bytes",
+                );
+                Ok(())
+            },
+        )
+        .expect("object-ID source fetch should re-check requested objects");
+
+        assert_eq!(observed_commands.len(), 1);
+        assert_eq!(
+            observed_commands[0].args,
+            vec![
+                OsString::from("-c"),
+                OsString::from("lfs.url=https://legacy.example/owner/repo.git/info/lfs"),
+                OsString::from("-c"),
+                OsString::from("lfs.fetchinclude="),
+                OsString::from("-c"),
+                OsString::from("lfs.fetchexclude="),
+                OsString::from("lfs"),
+                OsString::from("smudge"),
+            ]
+        );
+        assert_eq!(
+            observed_commands[0].stdin.as_deref(),
+            Some(LfsPointer::new(missing.clone()).to_pointer_file().as_bytes())
+        );
+        assert_eq!(report.fetched_objects, vec![missing]);
         assert!(report.unavailable_objects.is_empty());
     }
 

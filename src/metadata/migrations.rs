@@ -14,7 +14,7 @@ use crate::{ServerError, ServerResult};
 use super::MetadataDatabase;
 
 /// Current metadata schema version installed by the migration runner.
-pub const METADATA_SCHEMA_VERSION: u32 = 5;
+pub const METADATA_SCHEMA_VERSION: u32 = 6;
 
 pub(super) const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_SCHEMA: &str = r#"
@@ -205,6 +205,15 @@ VALUES (5, 'invalidate_oauth_sessions_for_pat_authentication');
 PRAGMA user_version = 5;
 "#;
 
+const SESSION_ENCRYPTION_SECRET_MIGRATION: &str = r#"
+DELETE FROM sessions;
+
+INSERT OR IGNORE INTO schema_migrations(version, name)
+VALUES (6, 'invalidate_provider_pat_sessions_for_server_secret');
+
+PRAGMA user_version = 6;
+"#;
+
 const METADATA_MIGRATIONS: &[(u32, &str)] = &[
     (2, NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION),
     (3, PROTECTED_SESSION_TOKEN_MIGRATION),
@@ -212,6 +221,9 @@ const METADATA_MIGRATIONS: &[(u32, &str)] = &[
     // OAuth sessions used the removed client-secret key and must be invalidated
     // before the PAT-derived session key can load current durable rows.
     (5, PAT_AUTHENTICATION_SESSION_MIGRATION),
+    // Provider-PAT sessions use different encryption material from the new
+    // dedicated server secret and must be removed before durable loading.
+    (6, SESSION_ENCRYPTION_SECRET_MIGRATION),
 ];
 
 impl MetadataDatabase {
@@ -475,7 +487,7 @@ PRAGMA user_version = 1;
                 row.get(0)
             })
             .expect("migration count should load");
-        assert_eq!(migration_count, 5);
+        assert_eq!(migration_count, 6);
         assert_eq!(
             database
                 .schema_version()
@@ -654,6 +666,70 @@ PRAGMA user_version = 1;
                 ],
             )
             .expect("legacy OAuth session should be inserted");
+        drop(legacy_connection);
+
+        let database = MetadataDatabase::open(&db_path).expect("metadata DB should migrate");
+        let session_count: u32 = database
+            .connection
+            .lock()
+            .expect("metadata connection should lock")
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("session count should load");
+
+        assert_eq!(session_count, 0);
+        assert_eq!(
+            database
+                .schema_version()
+                .expect("schema version should load"),
+            METADATA_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_invalidates_sessions_encrypted_with_legacy_provider_pat() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let db_path = directory.path().join("metadata.sqlite3");
+        let legacy_connection =
+            rusqlite::Connection::open(&db_path).expect("legacy metadata DB should open");
+        legacy_connection
+            .execute_batch(INITIAL_SCHEMA)
+            .expect("initial schema should be created");
+        for migration in [
+            NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION,
+            PROTECTED_SESSION_TOKEN_MIGRATION,
+            ACTIVE_REPOSITORY_MAPPING_MIGRATION,
+            PAT_AUTHENTICATION_SESSION_MIGRATION,
+        ] {
+            legacy_connection
+                .execute_batch(migration)
+                .expect("legacy migration should apply");
+        }
+        legacy_connection
+            .execute(
+                "INSERT INTO sessions(
+                    token_sha256,
+                    provider_id,
+                    login,
+                    stable_id,
+                    granted_scopes_json,
+                    issued_at_unix_seconds,
+                    expires_at_unix_seconds,
+                    provider_access_token_ciphertext,
+                    provider_access_token_nonce
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "b".repeat(64),
+                    "github-main",
+                    "octocat",
+                    "42",
+                    "[\"repo\"]",
+                    1_700_000_000_i64,
+                    4_000_000_000_i64,
+                    vec![1_u8, 2, 3],
+                    vec![4_u8, 5, 6],
+                ],
+            )
+            .expect("provider-PAT-encrypted session should be inserted");
         drop(legacy_connection);
 
         let database = MetadataDatabase::open(&db_path).expect("metadata DB should migrate");
