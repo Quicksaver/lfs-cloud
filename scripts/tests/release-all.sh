@@ -36,7 +36,10 @@ assert_contains() {
 }
 
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/lfscloud-release-all-tests.XXXXXX")"
-trap 'rm -rf "$fixture_root"' EXIT
+restore_fixture_cleanup_trap() {
+  trap 'rm -rf "$fixture_root"' EXIT
+}
+restore_fixture_cleanup_trap
 
 assert_equal \
   'E:\Projects\lfs-cloud' \
@@ -68,6 +71,12 @@ assert_contains \
 release_script="$(release_all_windows_release_script 'v1.2.3')"
 assert_contains "$release_script" "-Tag 'v1.2.3'" 'Windows continuation receives the exact tag'
 
+ssh_arguments_file="$fixture_root/ssh-arguments"
+ssh() { printf '%s\n' "$@" >"$ssh_arguments_file"; }
+release_all_windows_execute_script 'Write-Output fixture'
+unset -f ssh
+assert_equal '-n' "$(sed -n '1p' "$ssh_arguments_file")" 'Windows SSH detaches stdin'
+
 RELEASE_REPO_ROOT="$fixture_root"
 RELEASE_ALL_SHA='0123456789abcdef0123456789abcdef01234567'
 if release_all_local_artifacts_are_valid macos-arm64 1.2.3 >/dev/null 2>&1; then
@@ -84,6 +93,50 @@ release_all_prune_logs
 if [[ -e "$fixture_root/logs/release-old/old.log" ]] \
   || [[ ! -e "$fixture_root/logs/release-recent/recent.log" ]]; then
   printf '[release-all-tests] FAIL: coordinator log retention was not bounded correctly\n' >&2
+  exit 1
+fi
+TESTS_PASSED=$((TESTS_PASSED + 1))
+
+annotated_tag_sha='0123456789abcdef0123456789abcdef01234567'
+git() {
+  printf '%s\trefs/tags/v1.2.3\n' '1111111111111111111111111111111111111111'
+  printf '%s\trefs/tags/v1.2.3^{}\n' "$annotated_tag_sha"
+}
+assert_equal \
+  "$annotated_tag_sha" \
+  "$(release_all_remote_tag_commit v1.2.3)" \
+  'remote annotated tag resolves to its peeled commit'
+git() { return 23; }
+set +e
+remote_failure="$(release_all_remote_tag_commit v1.2.3 2>&1)"
+remote_failure_exit=$?
+set -e
+unset -f git
+assert_equal '1' "$remote_failure_exit" 'remote tag transport failure status'
+assert_contains \
+  "$remote_failure" \
+  "Could not read release tag 'v1.2.3' from origin." \
+  'remote tag transport failure message'
+
+if ! /bin/bash -c '
+  source "$1"
+  RELEASE_ALL_RESUMING=false
+  RELEASE_ALL_IS_DRAFT=true
+  RELEASE_ALL_SHA=0123456789abcdef0123456789abcdef01234567
+  release_all_collect_missing_base_checks() {
+    RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS=()
+    RELEASE_ALL_WINDOWS_NEEDED=false
+  }
+  release_all_collect_missing_candidate_checks() {
+    RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS=()
+    RELEASE_ALL_WINDOWS_NEEDED=false
+  }
+  release_all_run_verification_wave() { [[ "$#" -eq 2 ]]; }
+  release_all_require_all_green() { :; }
+  release_all_ensure_base_verifications
+  release_all_verify_candidate v1.2.3
+' _ "$REPO_ROOT/scripts/release-all.sh"; then
+  printf '[release-all-tests] FAIL: empty verifier lists failed under system Bash\n' >&2
   exit 1
 fi
 TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -107,6 +160,7 @@ release_all_initialize_ui() { :; }
 release_all_finalize_ui() { :; }
 
 release_all_main patch
+restore_fixture_cleanup_trap
 assert_equal "$(cat <<'EOF'
 preflight
 base-verifiers
@@ -138,6 +192,7 @@ set +e
 release_all_main minor >/dev/null 2>&1
 failure_exit=$?
 set -e
+restore_fixture_cleanup_trap
 assert_equal '9' "$failure_exit" 'base verification failure status'
 assert_equal "$(cat <<'EOF'
 preflight
@@ -150,11 +205,20 @@ release_all_finalize_ui() { :; }
 RELEASE_REPO_ROOT="$fixture_root"
 RELEASE_ALL_TAG='v1.2.3'
 termination_marker="$fixture_root/terminated"
+readiness_marker="$fixture_root/ready"
 release_all_run_local_verifiers() {
   trap 'printf terminated >"$termination_marker"; exit 143' TERM
+  printf ready >"$readiness_marker"
   while true; do sleep 0.1; done
 }
-release_all_run_windows_action() { return 7; }
+release_all_run_windows_action() {
+  local attempt
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [[ -e "$readiness_marker" ]] && return 7
+    sleep 0.1
+  done
+  return 8
+}
 set +e
 release_all_run_verification_wave fail-fast release macos-arm64 >/dev/null 2>&1
 wave_exit=$?

@@ -119,7 +119,7 @@ release_all_windows_execute_script() {
       | base64 \
       | tr -d '\r\n'
   )"
-  ssh -o BatchMode=yes -o ConnectTimeout=15 \
+  ssh -n -o BatchMode=yes -o ConnectTimeout=15 \
     "$RELEASE_ALL_WINDOWS_HOST" \
     "pwsh -NoProfile -NonInteractive -EncodedCommand $encoded"
 }
@@ -339,7 +339,7 @@ release_all_run_verification_wave() {
       else
         exit_code=$?
       fi
-      states[$idx]=done
+      states[idx]='done'
       active=$((active - 1))
       if ((exit_code != 0)); then
         failed="$exit_code"
@@ -388,7 +388,8 @@ release_all_ensure_base_verifications() {
     windows_action=verify
   fi
   release_all_run_verification_wave \
-    base "$windows_action" "${RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS[@]}" \
+    base "$windows_action" \
+    ${RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS[@]+"${RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS[@]}"} \
     || return $?
   release_all_require_all_green "$RELEASE_ALL_SHA"
 }
@@ -429,16 +430,23 @@ release_all_current_release_document() {
 
 release_all_remote_tag_commit() {
   local tag="$1"
+  local listing
   local commit
 
+  if ! listing="$(
+    git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}"
+  )"; then
+    fail "Could not read release tag '$tag' from origin."
+    return 1
+  fi
   commit="$(
-    git ls-remote --tags origin "refs/tags/$tag^{}" \
-      | awk 'NR == 1 { print $1 }'
+    printf '%s\n' "$listing" \
+      | awk -v ref="refs/tags/$tag^{}" '$2 == ref { print $1; exit }'
   )"
   if [[ -z "$commit" ]]; then
     commit="$(
-      git ls-remote --tags origin "refs/tags/$tag" \
-        | awk 'NR == 1 { print $1 }'
+      printf '%s\n' "$listing" \
+        | awk -v ref="refs/tags/$tag" '$2 == ref { print $1; exit }'
     )"
   fi
   printf '%s\n' "$commit"
@@ -516,7 +524,8 @@ release_all_verify_candidate() {
     windows_action=release
   fi
   release_all_run_verification_wave \
-    candidate "$windows_action" "${RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS[@]}" \
+    candidate "$windows_action" \
+    ${RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS[@]+"${RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS[@]}"} \
     || return $?
   release_all_require_all_green "$RELEASE_ALL_SHA"
 }

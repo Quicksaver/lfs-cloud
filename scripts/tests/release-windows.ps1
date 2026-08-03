@@ -118,6 +118,53 @@ Invoke-Test 'Requested tag selects one exact Windows release candidate' {
     Assert-True $threw 'missing targeted draft should fail'
 }
 
+Invoke-Test 'Requested tag ignores unrelated drafts before metadata lookup' {
+    $originalNativeCapture = (Get-Item Function:Invoke-NativeCapture).ScriptBlock
+    $originalTagCommit = (Get-Item Function:Get-RemoteReleaseTagCommit).ScriptBlock
+    $originalStatusState = (Get-Item Function:Get-WindowsVerificationStatusState).ScriptBlock
+    $script:RequestedCandidateMetadataCalls = [System.Collections.Generic.List[string]]::new()
+
+    try {
+        Set-Item Function:Invoke-NativeCapture {
+            return [pscustomobject] @{
+                ExitCode = 0
+                Output = @'
+[
+  {"tagName":"v2.0.0","isDraft":true,"isPrerelease":false,"publishedAt":null},
+  {"tagName":"v1.0.0","isDraft":true,"isPrerelease":false,"publishedAt":null}
+]
+'@
+            }
+        }
+        Set-Item Function:Get-RemoteReleaseTagCommit {
+            param([string] $Tag)
+            [void] $script:RequestedCandidateMetadataCalls.Add("tag:$Tag")
+            if ($Tag -ne 'v1.0.0') {
+                throw "unexpected origin lookup for $Tag"
+            }
+            return '0123456789abcdef0123456789abcdef01234567'
+        }
+        Set-Item Function:Get-WindowsVerificationStatusState {
+            param([string] $Commit)
+            [void] $script:RequestedCandidateMetadataCalls.Add("status:$Commit")
+            return 'missing'
+        }
+
+        $candidates = @(Get-WindowsReleaseCandidates -RequestedTag 'v1.0.0')
+        Assert-Equal 1 $candidates.Count 'targeted discovery candidate count'
+        Assert-Equal 'v1.0.0' $candidates[0].Tag 'targeted discovery tag'
+        Assert-Equal `
+            'tag:v1.0.0,status:0123456789abcdef0123456789abcdef01234567' `
+            ($script:RequestedCandidateMetadataCalls -join ',') `
+            'targeted discovery metadata lookups'
+    }
+    finally {
+        Set-Item Function:Invoke-NativeCapture $originalNativeCapture
+        Set-Item Function:Get-RemoteReleaseTagCommit $originalTagCommit
+        Set-Item Function:Get-WindowsVerificationStatusState $originalStatusState
+    }
+}
+
 Invoke-Test 'Windows upload passes each asset path as a distinct argument' {
     $assetPaths = @('archive.tar.gz', 'archive.tar.gz.sha256', 'archive.build.json')
     $arguments = @(Get-WindowsReleaseUploadArguments `

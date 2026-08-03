@@ -73,6 +73,8 @@ function Get-WindowsVerificationStatusState {
 }
 
 function Get-WindowsReleaseCandidates {
+    param([string] $RequestedTag = '')
+
     $result = Invoke-NativeCapture 'gh' @(
         'release',
         'list',
@@ -97,6 +99,10 @@ function Get-WindowsReleaseCandidates {
     $candidates = [System.Collections.Generic.List[object]]::new()
     foreach ($release in $releases) {
         $tag = [string] $release.tagName
+        if (-not [string]::IsNullOrWhiteSpace($RequestedTag) -and
+            $tag -ne $RequestedTag) {
+            continue
+        }
         if (-not [bool] $release.isDraft -or
             [bool] $release.isPrerelease -or
             $tag -notmatch '^v(\d+\.\d+\.\d+)$') {
@@ -532,7 +538,7 @@ function Invoke-WindowsReleaseContinuation {
 
         $candidates = @(
             Select-WindowsReleaseCandidates `
-                -Candidates @(Get-WindowsReleaseCandidates) `
+                -Candidates @(Get-WindowsReleaseCandidates -RequestedTag $RequestedTag) `
                 -RequestedTag $RequestedTag
         )
         if ($candidates.Count -eq 0) {
