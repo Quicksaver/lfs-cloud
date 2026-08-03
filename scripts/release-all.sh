@@ -155,19 +155,83 @@ catch {
 EOF
 }
 
+release_all_windows_encode_script() {
+  printf '%s' "$1" \
+    | iconv -f UTF-8 -t UTF-16LE \
+    | base64 \
+    | tr -d '\r\n'
+}
+
 release_all_windows_execute_script() {
-  local script_text="$1"
   local encoded
 
-  encoded="$(
-    printf '%s' "$script_text" \
-      | iconv -f UTF-8 -t UTF-16LE \
-      | base64 \
-      | tr -d '\r\n'
-  )"
+  encoded="$(release_all_windows_encode_script "$1")"
   ssh -n -o BatchMode=yes -o ConnectTimeout=15 \
     "$RELEASE_ALL_WINDOWS_HOST" \
     "pwsh -NoProfile -NonInteractive -EncodedCommand $encoded"
+}
+
+release_all_windows_authenticated_script() {
+  local script_text="$1"
+
+  cat <<EOF
+\$ErrorActionPreference = 'Stop'
+\$githubToken = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrWhiteSpace(\$githubToken)) {
+    throw 'The coordinator did not provide a GitHub token.'
+}
+\$githubToken = \$githubToken.Trim()
+\$env:GH_TOKEN = \$githubToken
+try {
+    & {
+$script_text
+    }
+}
+finally {
+    Remove-Item -LiteralPath Env:GH_TOKEN -ErrorAction SilentlyContinue
+    \$githubToken = \$null
+}
+EOF
+}
+
+release_all_windows_execute_authenticated_script() {
+  local script_text="$1"
+  local authenticated_script
+  local encoded
+  local github_token
+  local exit_code
+  local xtrace_was_enabled=false
+
+  if [[ "$-" == *x* ]]; then
+    xtrace_was_enabled=true
+    set +x
+  fi
+
+  if ! github_token="$(gh auth token --hostname github.com 2>/dev/null)" \
+    || [[ -z "$github_token" ]]; then
+    github_token=""
+    if [[ "$xtrace_was_enabled" == true ]]; then
+      set -x
+    fi
+    fail "Could not read the local GitHub CLI token for Windows verification."
+    return 1
+  fi
+
+  authenticated_script="$(release_all_windows_authenticated_script "$script_text")"
+  encoded="$(release_all_windows_encode_script "$authenticated_script")"
+  if printf '%s' "$github_token" \
+    | ssh -o BatchMode=yes -o ConnectTimeout=15 \
+      "$RELEASE_ALL_WINDOWS_HOST" \
+      "pwsh -NoProfile -NonInteractive -EncodedCommand $encoded"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+  github_token=""
+  if [[ "$xtrace_was_enabled" == true ]]; then
+    set -x
+  fi
+  return "$exit_code"
 }
 
 release_all_sync_windows() {
@@ -181,7 +245,7 @@ release_all_sync_windows() {
 release_all_windows_candidate_assets_are_valid() {
   local tag="$1"
   local expected_sha="$2"
-  release_all_windows_execute_script \
+  release_all_windows_execute_authenticated_script \
     "$(release_all_windows_candidate_assets_script "$tag" "$expected_sha")"
 }
 
@@ -323,9 +387,11 @@ release_all_run_local_verifiers() {
 release_all_run_windows_action() {
   local action="$1"
   if [[ "$action" == verify ]]; then
-    release_all_windows_execute_script "$(release_all_windows_verify_script)"
+    release_all_windows_execute_authenticated_script \
+      "$(release_all_windows_verify_script)"
   else
-    release_all_windows_execute_script "$(release_all_windows_release_script "$RELEASE_ALL_TAG")"
+    release_all_windows_execute_authenticated_script \
+      "$(release_all_windows_release_script "$RELEASE_ALL_TAG")"
   fi
 }
 

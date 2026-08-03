@@ -148,7 +148,7 @@ yarn release:all patch
 # or: yarn release:all major
 ```
 
-Run it from a clean local `main` checkout that exactly matches `origin/main`. The Mac needs `ssh`, `iconv`, and `base64`. The command connects in batch mode to the fleet SSH alias `windows-desktop`, so that alias must already authenticate non-interactively with a key or agent and without a password or passphrase prompt. It requires a clean Windows `main` checkout at `E:\Projects\lfs-cloud` and fast-forwards that checkout to the same `origin/main` commit. Override those fleet defaults only when the device configuration has intentionally changed:
+Run it from a clean local `main` checkout that exactly matches `origin/main`. The Mac needs `gh`, `ssh`, `iconv`, and `base64`, and its GitHub CLI login must have permission to write commit statuses, tags, and releases. The command connects in batch mode to the fleet SSH alias `windows-desktop`, so that alias must already authenticate non-interactively with a key or agent and without a password or passphrase prompt. Windows key-authenticated OpenSSH sessions cannot use the desktop session's credential store, so the coordinator sends the validated Mac GitHub token over encrypted SSH stdin only for remote `gh` operations. The token is exposed as `GH_TOKEN` for that remote process and is not placed in command arguments, logs, or files. It requires a clean Windows `main` checkout at `E:\Projects\lfs-cloud` and fast-forwards that checkout to the same `origin/main` commit. Override those fleet defaults only when the device configuration has intentionally changed:
 
 ```bash
 export LFS_CLOUD_WINDOWS_SSH_HOST=windows-desktop

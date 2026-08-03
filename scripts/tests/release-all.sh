@@ -35,6 +35,19 @@ assert_contains() {
   TESTS_PASSED=$((TESTS_PASSED + 1))
 }
 
+assert_not_contains() {
+  local text="$1"
+  local unexpected="$2"
+  local message="$3"
+
+  if [[ "$text" == *"$unexpected"* ]]; then
+    printf '[release-all-tests] FAIL: %s (unexpected %q)\n' \
+      "$message" "$unexpected" >&2
+    exit 1
+  fi
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+}
+
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/lfscloud-release-all-tests.XXXXXX")"
 restore_fixture_cleanup_trap() {
   trap 'rm -rf "$fixture_root"' EXIT
@@ -99,11 +112,91 @@ assert_contains \
   '-ErrorAction Continue' \
   'candidate reuse preserves the recoverable validation exit code'
 
-ssh_arguments_file="$fixture_root/ssh-arguments"
-ssh() { printf '%s\n' "$@" >"$ssh_arguments_file"; }
+authenticated_script="$(
+  release_all_windows_authenticated_script 'Write-Output fixture'
+)"
+assert_contains \
+  "$authenticated_script" \
+  '[Console]::In.ReadToEnd()' \
+  'Windows authentication reads the token from SSH stdin'
+assert_contains \
+  "$authenticated_script" \
+  '$env:GH_TOKEN = $githubToken' \
+  'Windows authentication exposes the token to GitHub CLI'
+assert_contains \
+  "$authenticated_script" \
+  'Remove-Item -LiteralPath Env:GH_TOKEN' \
+  'Windows authentication clears the transient token'
+assert_contains \
+  "$authenticated_script" \
+  'Write-Output fixture' \
+  'Windows authentication executes the requested script'
+
+detached_ssh_arguments_file="$fixture_root/detached-ssh-arguments"
+ssh() { printf '%s\n' "$@" >"$detached_ssh_arguments_file"; }
 release_all_windows_execute_script 'Write-Output fixture'
 unset -f ssh
-assert_equal '-n' "$(sed -n '1p' "$ssh_arguments_file")" 'Windows SSH detaches stdin'
+assert_equal \
+  '-n' \
+  "$(sed -n '1p' "$detached_ssh_arguments_file")" \
+  'Windows SSH detaches stdin when authentication is unnecessary'
+
+fixture_token='fixture-token-must-not-enter-command-arguments'
+gh_arguments_file="$fixture_root/gh-arguments"
+ssh_arguments_file="$fixture_root/ssh-arguments"
+ssh_stdin_file="$fixture_root/ssh-stdin"
+gh() {
+  printf '%s\n' "$@" >"$gh_arguments_file"
+  printf '%s' "$fixture_token"
+}
+ssh() {
+  local stdin_value
+  stdin_value="$(cat)"
+  printf '%s' "$stdin_value" >"$ssh_stdin_file"
+  printf '%s\n' "$@" >"$ssh_arguments_file"
+}
+execution_output="$(
+  release_all_windows_execute_authenticated_script 'Write-Output fixture' 2>&1
+)"
+xtrace_output="$(
+  (
+    set -x
+    release_all_windows_execute_authenticated_script 'Write-Output fixture'
+  ) 2>&1
+)"
+unset -f gh ssh
+assert_equal 'auth' "$(sed -n '1p' "$gh_arguments_file")" 'Windows SSH requests GitHub auth'
+assert_equal 'token' "$(sed -n '2p' "$gh_arguments_file")" 'Windows SSH requests the token'
+assert_equal \
+  '--hostname' \
+  "$(sed -n '3p' "$gh_arguments_file")" \
+  'Windows SSH scopes token lookup to a hostname'
+assert_equal \
+  'github.com' \
+  "$(sed -n '4p' "$gh_arguments_file")" \
+  'Windows SSH requests the GitHub.com token'
+assert_equal "$fixture_token" "$(cat "$ssh_stdin_file")" 'Windows SSH forwards the token on stdin'
+ssh_arguments="$(cat "$ssh_arguments_file")"
+assert_not_contains "$ssh_arguments" '-n' 'Windows SSH leaves stdin attached to the token pipe'
+assert_not_contains "$ssh_arguments" "$fixture_token" 'Windows SSH arguments exclude the token'
+assert_not_contains "$execution_output" "$fixture_token" 'Windows SSH output excludes the token'
+assert_not_contains "$xtrace_output" "$fixture_token" 'Windows SSH tracing excludes the token'
+
+ssh_called_file="$fixture_root/ssh-called"
+gh() { return 19; }
+ssh() { touch "$ssh_called_file"; }
+set +e
+release_all_windows_execute_authenticated_script \
+  'Write-Output fixture' >/dev/null 2>&1
+token_failure_exit=$?
+set -e
+unset -f gh ssh
+assert_equal '1' "$token_failure_exit" 'Windows SSH fails when the local token is unavailable'
+if [[ -e "$ssh_called_file" ]]; then
+  printf '[release-all-tests] FAIL: Windows SSH ran without a local GitHub token\n' >&2
+  exit 1
+fi
+TESTS_PASSED=$((TESTS_PASSED + 1))
 
 RELEASE_REPO_ROOT="$fixture_root"
 RELEASE_ALL_SHA='0123456789abcdef0123456789abcdef01234567'
