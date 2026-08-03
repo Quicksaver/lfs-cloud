@@ -71,6 +71,28 @@ assert_contains \
 release_script="$(release_all_windows_release_script 'v1.2.3')"
 assert_contains "$release_script" "-Tag 'v1.2.3'" 'Windows continuation receives the exact tag'
 
+candidate_assets_script="$(
+  release_all_windows_candidate_assets_script \
+    'v1.2.3' \
+    '0123456789abcdef0123456789abcdef01234567'
+)"
+assert_contains \
+  "$candidate_assets_script" \
+  "Initialize-Release -StartDirectory \$repo" \
+  'candidate reuse initializes release metadata'
+assert_contains \
+  "$candidate_assets_script" \
+  "Test-ArtifactChecksum -ArtifactPath \$artifact" \
+  'candidate reuse validates the Windows checksum'
+assert_contains \
+  "$candidate_assets_script" \
+  "Test-WindowsBuildManifest -ArtifactPath \$artifact" \
+  'candidate reuse validates the Windows manifest'
+assert_contains \
+  "$candidate_assets_script" \
+  "Assert-WindowsReleaseAssetsPublished -Release \$release" \
+  'candidate reuse validates the remote Windows assets'
+
 ssh_arguments_file="$fixture_root/ssh-arguments"
 ssh() { printf '%s\n' "$@" >"$ssh_arguments_file"; }
 release_all_windows_execute_script 'Write-Output fixture'
@@ -84,6 +106,87 @@ if release_all_local_artifacts_are_valid macos-arm64 1.2.3 >/dev/null 2>&1; then
   exit 1
 fi
 TESTS_PASSED=$((TESTS_PASSED + 1))
+
+real_release_verify_checksum="$(declare -f release_verify_checksum)"
+real_release_verify_macos_manifest="$(declare -f release_verify_macos_manifest)"
+release_verify_checksum() { :; }
+release_verify_macos_manifest() { :; }
+if release_all_local_artifacts_are_valid macos-arm64 1.2.3 >/dev/null 2>&1; then
+  printf '[release-all-tests] FAIL: macOS artifacts without the executable were reused\n' >&2
+  exit 1
+fi
+TESTS_PASSED=$((TESTS_PASSED + 1))
+mkdir -p "$fixture_root/target/aarch64-apple-darwin/release"
+printf '#!/usr/bin/env sh\nprintf "lfscloud 1.2.3\\n"\n' \
+  >"$fixture_root/target/aarch64-apple-darwin/release/lfscloud"
+chmod +x "$fixture_root/target/aarch64-apple-darwin/release/lfscloud"
+if ! release_all_local_artifacts_are_valid macos-arm64 1.2.3 >/dev/null 2>&1; then
+  printf '[release-all-tests] FAIL: complete reusable macOS state was rejected\n' >&2
+  exit 1
+fi
+TESTS_PASSED=$((TESTS_PASSED + 1))
+eval "$real_release_verify_checksum"
+eval "$real_release_verify_macos_manifest"
+
+real_release_all_status_is_green="$(declare -f release_all_status_is_green)"
+real_release_all_local_artifacts_are_valid="$(
+  declare -f release_all_local_artifacts_are_valid
+)"
+real_release_all_windows_candidate_assets_are_valid="$(
+  declare -f release_all_windows_candidate_assets_are_valid
+)"
+release_all_status_is_green() { return 0; }
+release_all_local_artifacts_are_valid() { return 0; }
+release_all_windows_candidate_assets_are_valid() { return 1; }
+RELEASE_ALL_TAG='v1.2.3'
+release_all_collect_missing_candidate_checks
+assert_equal 'true' "$RELEASE_ALL_WINDOWS_NEEDED" 'missing Windows assets require continuation'
+release_all_windows_candidate_assets_are_valid() { return 0; }
+release_all_collect_missing_candidate_checks
+assert_equal 'false' "$RELEASE_ALL_WINDOWS_NEEDED" 'verified Windows assets permit reuse'
+eval "$real_release_all_status_is_green"
+eval "$real_release_all_local_artifacts_are_valid"
+eval "$real_release_all_windows_candidate_assets_are_valid"
+
+real_release_initialize="$(declare -f release_initialize)"
+real_release_require_command="$(declare -f release_require_command)"
+real_release_require_fully_clean="$(declare -f release_require_fully_clean)"
+real_release_require_current_commit_on_origin="$(
+  declare -f release_require_current_commit_on_origin
+)"
+real_release_all_sync_windows="$(declare -f release_all_sync_windows)"
+real_release_require_matching_versions="$(declare -f release_require_matching_versions)"
+preflight_marker="$fixture_root/preflight-continued"
+release_initialize() {
+  RELEASE_REPO_ROOT="$fixture_root"
+  RELEASE_BRANCH=main
+  RELEASE_SHA='0123456789abcdef0123456789abcdef01234567'
+}
+release_require_command() { :; }
+release_require_fully_clean() { :; }
+release_require_current_commit_on_origin() { :; }
+release_all_sync_windows() { return 19; }
+release_require_matching_versions() {
+  printf continued >"$preflight_marker"
+  printf '1.2.3\n'
+}
+set +e
+release_all_preflight >/dev/null 2>&1
+preflight_exit=$?
+set -e
+cd "$REPO_ROOT"
+assert_equal '19' "$preflight_exit" 'Windows preflight sync failure status'
+if [[ -e "$preflight_marker" ]]; then
+  printf '[release-all-tests] FAIL: Windows sync failure did not stop preflight\n' >&2
+  exit 1
+fi
+TESTS_PASSED=$((TESTS_PASSED + 1))
+eval "$real_release_initialize"
+eval "$real_release_require_command"
+eval "$real_release_require_fully_clean"
+eval "$real_release_require_current_commit_on_origin"
+eval "$real_release_all_sync_windows"
+eval "$real_release_require_matching_versions"
 
 mkdir -p "$fixture_root/logs/release-old" "$fixture_root/logs/release-recent"
 printf old >"$fixture_root/logs/release-old/old.log"

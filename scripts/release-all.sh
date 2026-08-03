@@ -109,6 +109,36 @@ if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
 EOF
 }
 
+release_all_windows_candidate_assets_script() {
+  local tag="$1"
+  local version="${tag#v}"
+  local expected_sha="$2"
+  local repository
+  repository="$(release_all_powershell_literal "$RELEASE_ALL_WINDOWS_REPO")"
+
+  cat <<EOF
+\$ErrorActionPreference = 'Stop'
+\$repo = $repository
+Set-Location -LiteralPath \$repo
+. '.\scripts\release.ps1' -Tag '$tag'
+Initialize-Release -StartDirectory \$repo
+\$artifact = Get-WindowsArtifactPath -RepositoryRoot \$repo -Version '$version'
+\$manifest = Get-WindowsManifestPath -RepositoryRoot \$repo -Version '$version'
+\$assets = @(\$artifact, "\$artifact.sha256", \$manifest)
+if (-not (Test-ArtifactChecksum -ArtifactPath \$artifact)) {
+    throw 'Windows candidate artifact checksum is invalid.'
+}
+if (-not (Test-WindowsBuildManifest -ArtifactPath \$artifact -ManifestPath \$manifest -Version '$version' -Commit '$expected_sha')) {
+    throw 'Windows candidate build manifest is invalid.'
+}
+\$release = Get-GitHubReleaseDocument -Tag '$tag'
+if (-not [bool] \$release.isDraft -or \$release.tagName -ne '$tag') {
+    throw 'Windows candidate release is not the expected draft.'
+}
+Assert-WindowsReleaseAssetsPublished -Release \$release -AssetPaths \$assets
+EOF
+}
+
 release_all_windows_execute_script() {
   local script_text="$1"
   local encoded
@@ -130,6 +160,13 @@ release_all_sync_windows() {
     "Fast-forward Windows main to $expected_sha" \
     release_all_windows_execute_script \
     "$(release_all_windows_sync_script "$expected_sha")"
+}
+
+release_all_windows_candidate_assets_are_valid() {
+  local tag="$1"
+  local expected_sha="$2"
+  release_all_windows_execute_script \
+    "$(release_all_windows_candidate_assets_script "$tag" "$expected_sha")"
 }
 
 release_all_status_is_green() {
@@ -165,6 +202,9 @@ release_all_local_artifacts_are_valid() (
 
   case "$environment" in
     macos-arm64)
+      path="$RELEASE_REPO_ROOT/target/aarch64-apple-darwin/release/lfscloud"
+      [[ -x "$path" ]] || return 1
+      [[ "$("$path" --version)" == "lfscloud $version" ]] || return 1
       path="$(release_macos_artifact_path "$version")"
       release_verify_checksum "$path"
       release_verify_macos_manifest \
@@ -410,7 +450,7 @@ release_all_preflight() {
   release_all_prune_logs
   release_all_validate_windows_repo_path "$RELEASE_ALL_WINDOWS_REPO" || return 1
   RELEASE_ALL_SHA="$RELEASE_SHA"
-  release_all_sync_windows "$RELEASE_ALL_SHA"
+  release_all_sync_windows "$RELEASE_ALL_SHA" || return $?
 
   current_version="$(release_require_matching_versions)"
   if [[ "$(git log -1 --format=%s HEAD)" == "Release v$current_version" ]]; then
@@ -505,8 +545,11 @@ release_all_collect_missing_candidate_checks() {
     || ! release_all_local_artifacts_are_valid linux-x86-64 "$version" >/dev/null 2>&1; then
     RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS+=(linux-x86-64)
   fi
-  release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_WINDOWS_STATUS_CONTEXT" \
-    || RELEASE_ALL_WINDOWS_NEEDED=true
+  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_WINDOWS_STATUS_CONTEXT" \
+    || ! release_all_windows_candidate_assets_are_valid \
+      "$RELEASE_ALL_TAG" "$RELEASE_ALL_SHA" >/dev/null 2>&1; then
+    RELEASE_ALL_WINDOWS_NEEDED=true
+  fi
 }
 
 release_all_verify_candidate() {
