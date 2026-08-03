@@ -96,6 +96,17 @@ assert_equal \
   "$(jq -r '.tag' <<<"$PUBLISH_SELECTED_CANDIDATE")" \
   "arrow-key selector returns the highlighted candidate"
 
+publish_select_release_candidate "$candidate_document" 'v2.0.0'
+assert_equal \
+  'v2.0.0' \
+  "$(jq -r '.tag' <<<"$PUBLISH_SELECTED_CANDIDATE")" \
+  'explicit tag selects the exact publish candidate'
+if publish_select_release_candidate "$candidate_document" 'v3.0.0' >/dev/null 2>&1; then
+  printf '[publish-release-tests] FAIL: missing explicit publish tag was accepted\n' >&2
+  exit 1
+fi
+TESTS_PASSED=$((TESTS_PASSED + 1))
+
 expected_assets="$(publish_expected_release_asset_names '1.2.3')"
 for required in \
   'lfscloud-v1.2.3-windows-x86_64.zip' \
@@ -220,6 +231,21 @@ if [[ -e "$clean_guard_marker" ]]; then
   exit 1
 fi
 TESTS_PASSED=$((TESTS_PASSED + 1))
+
+set +e
+(
+  release_ui_initialize() { :; }
+  release_ui_finalize() { :; }
+  release_initialize() { RELEASE_REPO_ROOT="$fixture_root"; }
+  publish_release_candidates() { printf '[]\n'; }
+  publish_main v9.9.9
+) >/dev/null 2>&1
+missing_requested_publish_exit=$?
+set -e
+assert_equal \
+  '1' \
+  "$missing_requested_publish_exit" \
+  'explicit ineligible publication target fails'
 
 apt_distribution_marker="$fixture_root/apt-distribution-called"
 (

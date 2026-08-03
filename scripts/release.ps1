@@ -2,7 +2,8 @@
 
 [CmdletBinding()]
 param(
-    [Alias('h', 'Help')] [switch] $ShowHelp
+    [Alias('h', 'Help')] [switch] $ShowHelp,
+    [ValidatePattern('^v\d+\.\d+\.\d+$')] [string] $Tag = ''
 )
 
 Set-StrictMode -Version Latest
@@ -13,7 +14,7 @@ $continuationScriptDirectory = Split-Path -Parent $PSCommandPath
 
 function Write-Usage {
     @'
-Usage: pwsh ./scripts/release.ps1
+Usage: pwsh ./scripts/release.ps1 [-Tag vX.Y.Z]
 
 Complete a draft created by release.sh from a native Windows x64 checkout.
 The script lists draft semantic versions without successful
@@ -21,11 +22,16 @@ local-checks/windows-x86_64 verification, prompts for a version with an
 arrow-key menu, checks out its tag, verifies and packages its exact executable,
 uploads the Windows assets to the draft, verifies them on GitHub, and restores
 the original checkout. It never publishes the release.
+
+Pass -Tag to complete one exact draft without opening the interactive selector.
 '@ | Write-Host
 }
 
 function Get-WindowsVerificationStatusStateFromDocument {
-    param([Parameter(Mandatory = $true)] $Document)
+    param(
+        [Parameter(Mandatory = $true)] $Document,
+        [string] $TrustedLogin = ''
+    )
 
     $matchingStatuses = @(
         $Document.statuses |
@@ -34,6 +40,10 @@ function Get-WindowsVerificationStatusStateFromDocument {
     )
     if ($matchingStatuses.Count -eq 0) {
         return 'missing'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TrustedLogin) -and
+        [string] $matchingStatuses[0].creator.login -ne $TrustedLogin) {
+        return 'untrusted'
     }
 
     return [string] $matchingStatuses[0].state
@@ -57,7 +67,9 @@ function Get-WindowsVerificationStatusState {
         throw "GitHub returned invalid commit-status JSON for $Commit."
     }
 
-    return Get-WindowsVerificationStatusStateFromDocument -Document $document
+    return Get-WindowsVerificationStatusStateFromDocument `
+        -Document $document `
+        -TrustedLogin $script:RELEASE_GITHUB_LOGIN
 }
 
 function Get-WindowsReleaseCandidates {
@@ -239,6 +251,23 @@ function Read-WindowsReleaseSelection {
             return @()
         }
     }
+}
+
+function Select-WindowsReleaseCandidates {
+    param(
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Candidates,
+        [string] $RequestedTag = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RequestedTag)) {
+        return @($Candidates)
+    }
+
+    $selected = @($Candidates | Where-Object { $_.Tag -eq $RequestedTag })
+    if ($selected.Count -ne 1) {
+        throw "Draft release $RequestedTag is not eligible for Windows continuation."
+    }
+    return $selected
 }
 
 function Get-ReleaseCheckoutState {
@@ -475,6 +504,8 @@ function Complete-WindowsDraftAssets {
 }
 
 function Invoke-WindowsReleaseContinuation {
+    param([string] $RequestedTag = '')
+
     $originalLocation = Get-Location
     $checkoutState = $null
     $failedTags = [System.Collections.Generic.List[string]]::new()
@@ -499,12 +530,21 @@ function Invoke-WindowsReleaseContinuation {
             throw 'Could not fetch release tags from origin.'
         }
 
-        $candidates = @(Get-WindowsReleaseCandidates)
+        $candidates = @(
+            Select-WindowsReleaseCandidates `
+                -Candidates @(Get-WindowsReleaseCandidates) `
+                -RequestedTag $RequestedTag
+        )
         if ($candidates.Count -eq 0) {
             Write-ReleasePass 'Every draft semantic release already has successful Windows verification.'
         }
         else {
-            $selectedIndices = @(Read-WindowsReleaseSelection -Candidates $candidates)
+            $selectedIndices = if ([string]::IsNullOrWhiteSpace($RequestedTag)) {
+                @(Read-WindowsReleaseSelection -Candidates $candidates)
+            }
+            else {
+                @(0)
+            }
             if ($selectedIndices.Count -eq 0) {
                 Write-ReleaseInfo 'Windows release continuation cancelled.'
             }
@@ -561,5 +601,5 @@ if ($MyInvocation.InvocationName -ne '.') {
         exit 0
     }
 
-    exit (Invoke-WindowsReleaseContinuation)
+    exit (Invoke-WindowsReleaseContinuation -RequestedTag $Tag)
 }

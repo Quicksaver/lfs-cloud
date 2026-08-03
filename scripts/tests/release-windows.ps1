@@ -96,6 +96,28 @@ Invoke-Test 'Arrow-key selector cancels with Escape' {
     Assert-Equal 0 $selection.Count 'cancelled selection count'
 }
 
+Invoke-Test 'Requested tag selects one exact Windows release candidate' {
+    $empty = @(Select-WindowsReleaseCandidates -Candidates @())
+    Assert-Equal 0 $empty.Count 'empty interactive candidate list'
+
+    $candidates = @(
+        [pscustomobject] @{ Tag = 'v2.0.0'; Status = 'missing' },
+        [pscustomobject] @{ Tag = 'v1.0.0'; Status = 'failure' }
+    )
+    $selected = @(Select-WindowsReleaseCandidates -Candidates $candidates -RequestedTag 'v1.0.0')
+    Assert-Equal 1 $selected.Count 'targeted candidate count'
+    Assert-Equal 'v1.0.0' $selected[0].Tag 'targeted candidate tag'
+
+    $threw = $false
+    try {
+        Select-WindowsReleaseCandidates -Candidates $candidates -RequestedTag 'v3.0.0'
+    }
+    catch {
+        $threw = $true
+    }
+    Assert-True $threw 'missing targeted draft should fail'
+}
+
 Invoke-Test 'Windows upload passes each asset path as a distinct argument' {
     $assetPaths = @('archive.tar.gz', 'archive.tar.gz.sha256', 'archive.build.json')
     $arguments = @(Get-WindowsReleaseUploadArguments `
@@ -145,6 +167,11 @@ Invoke-Test 'Latest Windows status wins and unrelated contexts are ignored' {
     }
     $state = Get-WindowsVerificationStatusStateFromDocument -Document $document
     Assert-Equal 'pending' $state 'latest Windows status'
+    $document.statuses[2] | Add-Member -NotePropertyName creator -NotePropertyValue ([pscustomobject] @{ login = 'other' })
+    $untrusted = Get-WindowsVerificationStatusStateFromDocument `
+        -Document $document `
+        -TrustedLogin 'fixture'
+    Assert-Equal 'untrusted' $untrusted 'unexpected Windows status creator'
 
     $missing = Get-WindowsVerificationStatusStateFromDocument -Document ([pscustomobject] @{ statuses = @() })
     Assert-Equal 'missing' $missing 'missing Windows status'

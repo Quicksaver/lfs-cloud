@@ -13,6 +13,7 @@ Usage:
   ./scripts/release.sh minor
   ./scripts/release.sh patch
   ./scripts/release.sh resume
+  ./scripts/release.sh major|minor|patch|resume --prepare-only
 
 major, minor, patch
   Require a clean pushed commit with green local checks, increment the version,
@@ -24,6 +25,11 @@ major, minor, patch
 resume
   Continue an interrupted release from the current pushed version commit
   without incrementing the version again.
+
+--prepare-only
+  For an increment, commit and push the requested version; for resume, retain
+  the current version. Create its tag and draft without starting the version
+  verifier wave or attaching platform assets.
 EOF
 }
 
@@ -31,7 +37,10 @@ if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
   usage
   exit 0
 fi
-if (($# != 1)); then
+prepare_only=false
+if (($# == 2)) && [[ "$2" == "--prepare-only" ]]; then
+  prepare_only=true
+elif (($# != 1)); then
   usage >&2
   exit 2
 fi
@@ -65,7 +74,9 @@ release_require_command shasum
 
 release_require_fully_clean
 release_require_current_commit_on_origin
-release_require_local_statuses_green "$RELEASE_SHA"
+if [[ "$prepare_only" != true || "$mode" != resume ]]; then
+  release_require_local_statuses_green "$RELEASE_SHA"
+fi
 
 current_version="$(release_require_matching_versions)"
 
@@ -342,6 +353,11 @@ release_run_step \
 
 ensure_release_tag "$tag" "$RELEASE_SHA"
 prepare_release_draft "$tag" "$release_notes_file"
+
+if [[ "$prepare_only" == true ]]; then
+  release_pass "Prepared $tag for cross-machine verification"
+  exit 0
+fi
 
 if [[ "$run_version_verifiers" == true ]]; then
   run_all_local_verifiers

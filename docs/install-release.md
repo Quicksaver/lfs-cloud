@@ -138,6 +138,29 @@ cargo install --path .
 
 ## Local Release
 
+### All-In-One Fleet Release
+
+The preferred manual entry point performs the complete cross-machine release and publication flow:
+
+```bash
+yarn release:all patch
+# or: yarn release:all minor
+# or: yarn release:all major
+```
+
+Run it from a clean local `main` checkout that exactly matches `origin/main`. The command connects to the fleet SSH alias `windows-desktop`, requires a clean Windows `main` checkout at `E:\Projects\lfs-cloud`, and fast-forwards that checkout to the same `origin/main` commit. Override those fleet defaults only when the device configuration has intentionally changed:
+
+```bash
+export LFS_CLOUD_WINDOWS_SSH_HOST=windows-desktop
+export LFS_CLOUD_WINDOWS_REPO='E:\Projects\lfs-cloud'
+```
+
+Before changing the version, the coordinator reads trusted commit statuses and runs only missing macOS ARM64, Linux ARM64 Docker, Linux x86-64 Docker, and native Windows x86-64 checks. It then creates the version commit, tag, and asset-less draft; fast-forwards Windows to the version commit; and runs the three local version checks concurrently with the exact tagged Windows draft continuation. Complete output for each cross-machine wave is retained under `logs/release-[timestamp]-[stage]-[pid]/`, while the nested local verifier logs remain under `logs/verify-[timestamp]/`.
+
+After all four trusted version statuses are green, the coordinator attaches the macOS and Linux assets, invokes publication for that exact tag without an interactive selector, and follows the established immutable GitHub release, direct installer, Homebrew, optional APT, and WinGet distribution flow. A failed phase stops later phases and terminates its still-running cross-machine peer. Rerun the same command after correcting the failure: a current `Release vX.Y.Z` commit resumes its existing draft or incomplete immutable distribution instead of incrementing again.
+
+The lower-level commands below remain available for manual recovery and individual phases.
+
 Authenticate `gh` with permission to write commit statuses, tags, and releases, then run all local verifiers on the current pushed commit:
 
 ```bash

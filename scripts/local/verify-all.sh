@@ -21,13 +21,17 @@ VERIFY_ALL_TIMESTAMP="${VERIFY_ALL_TIMESTAMP:-}"
 
 verify_all_usage() {
   cat <<'EOF'
-Usage: ./scripts/local/verify-all.sh
+Usage: ./scripts/local/verify-all.sh [environment ...]
 
 Run every deterministic local verifier supported by the current system in
 parallel. macOS runs the native macOS verifier, Windows runs the native Windows
 verifier, and a responsive Docker Linux engine runs both Linux verifiers. Each
 verifier records its own local-checks/* commit status and release artifact. Its
 stdout and stderr are saved under logs/verify-[timestamp]/[environment].log.
+
+With no environments, run every verifier supported by this host. Otherwise run
+only the named supported environments: macos-arm64, windows-x86-64,
+linux-arm64, or linux-x86-64.
 EOF
 }
 
@@ -78,6 +82,38 @@ verify_all_validate_command() {
   elif [[ ! -x "$command_path" ]]; then
     release_die "Verifier is not executable: $command_path"
   fi
+}
+
+verify_all_select_environments() {
+  local requested_environment
+  local selected_labels=()
+  local selected_environments=()
+  local selected_commands=()
+  local idx
+  local found
+
+  for requested_environment in "$@"; do
+    found=false
+    for ((idx = 0; idx < ${#VERIFY_ALL_ENVIRONMENTS[@]}; idx++)); do
+      if [[ "${VERIFY_ALL_ENVIRONMENTS[$idx]}" == "$requested_environment" ]]; then
+        if [[ " ${selected_environments[*]:-} " == *" $requested_environment "* ]]; then
+          release_die "Verification environment was requested more than once: $requested_environment"
+        fi
+        selected_labels+=("${VERIFY_ALL_LABELS[$idx]}")
+        selected_environments+=("${VERIFY_ALL_ENVIRONMENTS[$idx]}")
+        selected_commands+=("${VERIFY_ALL_COMMANDS[$idx]}")
+        found=true
+        break
+      fi
+    done
+    if [[ "$found" != true ]]; then
+      release_die "Verification environment is not supported by this host: $requested_environment"
+    fi
+  done
+
+  VERIFY_ALL_LABELS=("${selected_labels[@]}")
+  VERIFY_ALL_ENVIRONMENTS=("${selected_environments[@]}")
+  VERIFY_ALL_COMMANDS=("${selected_commands[@]}")
 }
 
 verify_all_run_command() {
@@ -291,14 +327,11 @@ verify_all_run_parallel() {
 
 verify_all_main() {
   local command_path
+  local requested_environments=("$@")
 
-  if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+  if (($# == 1)) && { [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; }; then
     verify_all_usage
     return 0
-  fi
-  if (($# != 0)); then
-    verify_all_usage >&2
-    return 2
   fi
 
   release_ui_initialize "[verify-all]" "Verify all release environments"
@@ -307,6 +340,9 @@ verify_all_main() {
   trap 'exit 143' TERM
 
   verify_all_configure_default_commands
+  if ((${#requested_environments[@]} > 0)); then
+    verify_all_select_environments "${requested_environments[@]}"
+  fi
   if ((${#VERIFY_ALL_COMMANDS[@]} == 0)); then
     release_die "This system supports no local verifiers; use macOS, Windows, or a responsive Docker Linux engine."
   fi

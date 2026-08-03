@@ -6,7 +6,6 @@ PUBLISH_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/release-common.sh
 source "$PUBLISH_SCRIPT_DIR/lib/release-common.sh"
 
-LOCAL_WINDOWS_STATUS_CONTEXT="local-checks/windows-x86_64"
 DISTRIBUTION_DIRECT_CONTEXT="distribution/direct-installer"
 DISTRIBUTION_HOMEBREW_CONTEXT="distribution/homebrew"
 DISTRIBUTION_APT_CONTEXT="distribution/apt"
@@ -17,7 +16,7 @@ PUBLISH_TEMPORARY_ROOT=""
 
 publish_usage() {
   cat <<'EOF'
-Usage: ./scripts/publish.sh
+Usage: ./scripts/publish.sh [vX.Y.Z]
 
 List semantic draft releases whose macOS, Linux, and Windows local checks are
 green, prompt for one version, verify every remote release asset, enable GitHub
@@ -30,6 +29,9 @@ release immutability, publish the draft, and distribute that exact release to:
 
 Published immutable releases with incomplete configured distribution statuses
 are also listed so interrupted publication can be resumed safely.
+
+Pass a semantic tag to publish or resume that exact eligible release without
+opening the interactive selector.
 
 Optional environment:
   LFS_CLOUD_HOMEBREW_TAP_REPO=OWNER/homebrew-TAP
@@ -403,6 +405,28 @@ publish_read_release_selection() {
         ;;
     esac
   done
+}
+
+publish_select_release_candidate() {
+  local candidates="$1"
+  local requested_tag="${2:-}"
+  local selected
+
+  if [[ -z "$requested_tag" ]]; then
+    publish_read_release_selection "$candidates"
+    return
+  fi
+  if [[ ! "$requested_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    publish_error "Release tag must use vX.Y.Z format: $requested_tag"
+    return 1
+  fi
+
+  selected="$(jq -c --arg tag "$requested_tag" '[.[] | select(.tag == $tag)]' <<<"$candidates")"
+  if [[ "$(jq 'length' <<<"$selected")" != 1 ]]; then
+    publish_error "Release $requested_tag is not eligible for publication or resumption."
+    return 1
+  fi
+  PUBLISH_SELECTED_CANDIDATE="$(jq -c '.[0]' <<<"$selected")"
 }
 
 publish_expected_release_asset_names() {
@@ -965,6 +989,7 @@ publish_direct_installers() {
 }
 
 publish_main() {
+  local requested_tag="${1:-}"
   local candidates
   local candidate
   local tag
@@ -987,10 +1012,14 @@ publish_main() {
     return 1
   fi
   if [[ "$(jq 'length' <<<"$candidates")" == 0 ]]; then
+    if [[ -n "$requested_tag" ]]; then
+      publish_error "Release $requested_tag is not eligible for publication or resumption."
+      return 1
+    fi
     release_pass "No fully verified draft or incomplete immutable release is ready to publish."
     return
   fi
-  publish_read_release_selection "$candidates" || return 1
+  publish_select_release_candidate "$candidates" "$requested_tag" || return 1
   candidate="$PUBLISH_SELECTED_CANDIDATE"
   if [[ -z "$candidate" ]]; then
     release_info "Release publication cancelled."
@@ -1102,13 +1131,18 @@ publish_main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if (($# > 1)); then
+    publish_error "Expected at most one release tag."
+    publish_usage >&2
+    exit 2
+  fi
   case "${1:-}" in
     -h|--help)
       publish_usage
       exit 0
       ;;
-    '')
-      publish_main
+    ''|v*)
+      publish_main "${1:-}"
       ;;
     *)
       publish_error "Unknown argument: $1"

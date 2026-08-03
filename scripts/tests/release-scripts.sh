@@ -376,7 +376,31 @@ release_info "Test verify-all capability-based command selection"
     "macOS ARM64" \
     "$(IFS='|'; printf '%s' "${VERIFY_ALL_LABELS[*]}")" \
     "macOS without Docker verify-all selection"
+
+  VERIFY_ALL_LABELS=("macOS ARM64" "Linux ARM64" "Linux x86-64")
+  VERIFY_ALL_ENVIRONMENTS=("macos-arm64" "linux-arm64" "linux-x86-64")
+  VERIFY_ALL_COMMANDS=("macos" "linux-arm" "linux-x86")
+  verify_all_select_environments "macos-arm64" "linux-x86-64"
+  assert_eq \
+    "macos-arm64|linux-x86-64" \
+    "$(IFS='|'; printf '%s' "${VERIFY_ALL_ENVIRONMENTS[*]}")" \
+    "explicit verify-all environment selection"
+  assert_eq \
+    "macos|linux-x86" \
+    "$(IFS='|'; printf '%s' "${VERIFY_ALL_COMMANDS[*]}")" \
+    "explicit verify-all command selection"
 ) >/dev/null
+
+set +e
+(
+  VERIFY_ALL_LABELS=("macOS ARM64")
+  VERIFY_ALL_ENVIRONMENTS=("macos-arm64")
+  VERIFY_ALL_COMMANDS=("macos")
+  verify_all_select_environments "windows-x86-64"
+) >/dev/null 2>&1
+unsupported_environment_exit=$?
+set -e
+assert_eq "1" "$unsupported_environment_exit" "unsupported verify-all environment exit status"
 
 rm -f -- "$preflight_gh_marker"
 set +e
@@ -815,6 +839,9 @@ if ! grep -Fq 'release_latest_published_version' "$REPO_ROOT/scripts/release.sh"
     "$REPO_ROOT/scripts/release.sh"; then
   fail_test "Local release should build notes from every version after the latest published release"
 fi
+if ! grep -Fq -- '--prepare-only' "$REPO_ROOT/scripts/release.sh"; then
+  fail_test "Local release should expose a prepare-only phase for cross-machine orchestration"
+fi
 release_tag_line="$(
   grep -nF 'ensure_release_tag "$tag" "$RELEASE_SHA"' "$REPO_ROOT/scripts/release.sh" \
     | tail -n 1 \
@@ -855,6 +882,7 @@ bash -n \
   "$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" \
   "$REPO_ROOT/scripts/local/verify-macos.sh" \
   "$REPO_ROOT/scripts/install.sh" \
+  "$REPO_ROOT/scripts/release-all.sh" \
   "$REPO_ROOT/scripts/release.sh" \
   "$REPO_ROOT/scripts/tests/install-scripts.sh" \
   "$REPO_ROOT/scripts/tests/release-scripts.sh"
@@ -863,6 +891,7 @@ bash -n \
 "$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-macos.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-all.sh" --help >/dev/null
+"$REPO_ROOT/scripts/release-all.sh" --help >/dev/null
 "$REPO_ROOT/scripts/release.sh" --help >/dev/null
 
 release_pass "Release script tests"
