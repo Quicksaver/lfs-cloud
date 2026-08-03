@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- [fixed]: Prevent targeted Windows draft verification from failing under PowerShell StrictMode when exactly one release is selected.
+
 ## [0.2.0] - 2026-08-03
 
 - [added]: Preserve the legacy remote LFS URL in `.lfsconfig` so pulling the new target configuration does not prevent users from migrating remaining objects.

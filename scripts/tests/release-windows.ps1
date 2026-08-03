@@ -218,6 +218,16 @@ Invoke-Test 'Requested tag selects one exact Windows release candidate' {
     Assert-True $threw 'missing targeted draft should fail'
 }
 
+Invoke-Test 'Requested tag selection indices remain a collection' {
+    $indices = Get-WindowsReleaseSelectionIndices `
+        -Candidates @([pscustomobject] @{ Tag = 'v1.2.3' }) `
+        -RequestedTag 'v1.2.3'
+
+    Assert-Equal 'System.Int32[]' $indices.GetType().FullName 'selection index collection type'
+    Assert-Equal 1 $indices.Count 'selection index count'
+    Assert-Equal 0 $indices[0] 'targeted selection index'
+}
+
 Invoke-Test 'Requested tag ignores unrelated drafts before metadata lookup' {
     $originalNativeCapture = (Get-Item Function:Invoke-NativeCapture).ScriptBlock
     $originalTagCommit = (Get-Item Function:Get-RemoteReleaseTagCommit).ScriptBlock

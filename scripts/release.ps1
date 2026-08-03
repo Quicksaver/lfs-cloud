@@ -284,6 +284,31 @@ function Select-WindowsReleaseCandidates {
     return $selected
 }
 
+function Get-WindowsReleaseSelectionIndices {
+    param(
+        [Parameter(Mandatory = $true)] [object[]] $Candidates,
+        [string] $RequestedTag = '',
+        [scriptblock] $ReadSelection
+    )
+
+    [int[]] $indices = if ([string]::IsNullOrWhiteSpace($RequestedTag)) {
+        if ($null -eq $ReadSelection) {
+            @(Read-WindowsReleaseSelection -Candidates $Candidates)
+        }
+        else {
+            @(& $ReadSelection $Candidates)
+        }
+    }
+    else {
+        @(0)
+    }
+
+    # PowerShell enumerates arrays emitted from an if expression. Return the
+    # typed array as one pipeline object so a single index retains `.Count`
+    # under StrictMode in the non-interactive -Tag continuation.
+    return ,$indices
+}
+
 function Get-ReleaseCheckoutState {
     $shaResult = Invoke-NativeCapture 'git' @(
         '-C',
@@ -553,12 +578,9 @@ function Invoke-WindowsReleaseContinuation {
             Write-ReleasePass 'Every draft semantic release already has successful Windows verification.'
         }
         else {
-            $selectedIndices = if ([string]::IsNullOrWhiteSpace($RequestedTag)) {
-                @(Read-WindowsReleaseSelection -Candidates $candidates)
-            }
-            else {
-                @(0)
-            }
+            $selectedIndices = Get-WindowsReleaseSelectionIndices `
+                -Candidates $candidates `
+                -RequestedTag $RequestedTag
             if ($selectedIndices.Count -eq 0) {
                 Write-ReleaseInfo 'Windows release continuation cancelled.'
             }
