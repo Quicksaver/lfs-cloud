@@ -132,6 +132,8 @@ function Invoke-WindowsVerification {
     $checksPassed = $false
     $statusFinalized = $false
     $packageStage = ''
+    $rustupProxyShimDirectory = ''
+    $originalPath = $env:PATH
     $exitCode = 0
     $package = $null
     $windowsVersion = [System.Environment]::OSVersion.Version.ToString()
@@ -175,6 +177,15 @@ function Invoke-WindowsVerification {
         $env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-msvc'
         $env:CARGO_TERM_COLOR = 'never'
 
+        $cargoInvocation = Resolve-ReleaseNativeInvocation -Command 'cargo'
+        if ([System.IO.Path]::GetFileNameWithoutExtension($cargoInvocation.Command) -eq 'rustup') {
+            # Cargo launches these tools as child processes. Resolve their real
+            # toolchain paths so key-authenticated SSH does not traverse the
+            # rustup proxy symlinks in the user's Cargo bin directory.
+            $env:RUSTC = Resolve-ReleaseRustupToolPath -ToolName 'rustc'
+            $env:RUSTDOC = Resolve-ReleaseRustupToolPath -ToolName 'rustdoc'
+        }
+
         Invoke-ReleaseStep 'Install repository tooling' 'yarn' @('install', '--immutable')
         Invoke-ReleaseStep 'Verify Git LFS' 'git' @('lfs', 'version')
         Invoke-ReleaseStep 'Check Rust formatting' 'cargo' @('fmt', '--all', '--', '--check')
@@ -206,6 +217,19 @@ function Invoke-WindowsVerification {
             'lfscloud.exe'
         $env:LFS_CLOUD_SMOKE_BINARY = $releaseBinary
         $env:LFS_CLOUD_SMOKE_SKIP_CARGO_TESTS = '1'
+        if ([System.IO.Path]::GetFileNameWithoutExtension($cargoInvocation.Command) -eq 'rustup') {
+            # Node and Git Bash launch Cargo themselves during the smoke suite,
+            # outside Invoke-ReleaseStep. Put a regular rustup proxy copy ahead
+            # of the SSH-blocked Cargo reparse point for those nested commands.
+            $rustupProxyShimDirectory = Join-Path `
+                $script:RELEASE_REPO_ROOT `
+                'target' `
+                ".verify-windows-tools-$([guid]::NewGuid().ToString('N'))"
+            [void](New-ReleaseRustupProxyShim `
+                    -ProxyName 'cargo' `
+                    -DestinationDirectory $rustupProxyShimDirectory)
+            $env:PATH = "$rustupProxyShimDirectory$([System.IO.Path]::PathSeparator)$env:PATH"
+        }
         Invoke-ReleaseStep `
             'Run smoke tests against the exact release binary' `
             'node' `
@@ -258,6 +282,15 @@ function Invoke-WindowsVerification {
         fail $_.Exception.Message
     }
     finally {
+        $env:PATH = $originalPath
+        if (-not [string]::IsNullOrWhiteSpace($rustupProxyShimDirectory) -and
+            (Test-Path -LiteralPath $rustupProxyShimDirectory -PathType Container)) {
+            Remove-Item `
+                -LiteralPath $rustupProxyShimDirectory `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
         if (-not [string]::IsNullOrWhiteSpace($packageStage) -and
             (Test-Path -LiteralPath $packageStage -PathType Container)) {
             Remove-Item -LiteralPath $packageStage -Recurse -Force -ErrorAction SilentlyContinue

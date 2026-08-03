@@ -114,6 +114,39 @@ Invoke-Test 'Rust toolchain proxy commands run through the active rustup toolcha
     Assert-Equal '--version' $rustc.Arguments[3] 'rustc argument forwarding'
 }
 
+Invoke-Test 'Cargo child compiler commands resolve to real toolchain executables' {
+    $rustc = Resolve-ReleaseRustupToolPath -ToolName 'rustc'
+    $rustdoc = Resolve-ReleaseRustupToolPath -ToolName 'rustdoc'
+
+    Assert-True ([System.IO.Path]::IsPathFullyQualified($rustc)) 'rustc should use an absolute path'
+    Assert-True ([System.IO.Path]::IsPathFullyQualified($rustdoc)) 'rustdoc should use an absolute path'
+    Assert-Equal 'rustc' ([System.IO.Path]::GetFileNameWithoutExtension($rustc)) 'rustc executable name'
+    Assert-Equal 'rustdoc' ([System.IO.Path]::GetFileNameWithoutExtension($rustdoc)) 'rustdoc executable name'
+}
+
+Invoke-Test 'Nested Cargo commands use a regular rustup proxy copy' {
+    $fixtureRoot = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "lfscloud-cargo-shim-$([guid]::NewGuid().ToString('N'))"
+
+    try {
+        $cargo = New-ReleaseRustupProxyShim `
+            -ProxyName 'cargo' `
+            -DestinationDirectory $fixtureRoot
+        $item = Get-Item -LiteralPath $cargo
+        Assert-True `
+            (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) `
+            'nested Cargo shim should be a regular file'
+
+        $result = Invoke-NativeCapture $cargo @('--version')
+        Assert-Equal 0 $result.ExitCode 'nested Cargo shim exit code'
+        Assert-True ($result.Output.StartsWith('cargo ')) 'nested Cargo shim output'
+    }
+    finally {
+        Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Invoke-Test 'Live native runner captures stdout and stderr with the exit code' {
     $liveRegionEnabled = $script:LIVE_REGION_ENABLED
     try {

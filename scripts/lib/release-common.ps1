@@ -61,6 +61,59 @@ function Resolve-ReleaseRustupInvocation {
     }
 }
 
+function Resolve-ReleaseRustupToolPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('rustc', 'rustdoc')]
+        [string] $ToolName
+    )
+
+    $rustup = @(Get-Command 'rustup' -CommandType Application -ErrorAction SilentlyContinue) |
+        Select-Object -First 1
+    if ($null -eq $rustup) {
+        throw "Required command is unavailable: rustup (needed to resolve $ToolName)"
+    }
+
+    $PSNativeCommandUseErrorActionPreference = $false
+    $output = @(& $rustup.Source 'which' $ToolName 2>&1 | ForEach-Object { $_.ToString() })
+    $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { [int] $LASTEXITCODE }
+    $resolved = ($output -join "`n").Trim()
+    if ($exitCode -ne 0 -or
+        -not [System.IO.Path]::IsPathFullyQualified($resolved) -or
+        -not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Could not resolve the active Rust toolchain executable for $ToolName."
+    }
+
+    return $resolved
+}
+
+function New-ReleaseRustupProxyShim {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('cargo')]
+        [string] $ProxyName,
+        [Parameter(Mandatory = $true)] [string] $DestinationDirectory
+    )
+
+    $rustup = @(Get-Command 'rustup' -CommandType Application -ErrorAction SilentlyContinue) |
+        Select-Object -First 1
+    if ($null -eq $rustup) {
+        throw "Required command is unavailable: rustup (needed to create the $ProxyName shim)"
+    }
+
+    [void][System.IO.Directory]::CreateDirectory($DestinationDirectory)
+    $extension = [System.IO.Path]::GetExtension($rustup.Source)
+    $destination = Join-Path $DestinationDirectory "$ProxyName$extension"
+    Copy-Item -LiteralPath $rustup.Source -Destination $destination -Force
+
+    $shim = Get-Item -LiteralPath $destination
+    if ($shim.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Could not create a regular $ProxyName executable for nested verification commands."
+    }
+
+    return $shim.FullName
+}
+
 function Resolve-ReleaseNativeInvocation {
     param(
         [Parameter(Mandatory = $true)] [string] $Command,

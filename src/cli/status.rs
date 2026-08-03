@@ -604,11 +604,33 @@ mod tests {
             "{}",
         )
         .expect("ADC marker file should be written");
+        #[cfg(windows)]
+        let executable = {
+            let path = directory.path().join("gcloud-test.cmd");
+            fs::write(&path, "@exit /b 0\r\n")
+                .expect("fake Windows gcloud command should be written");
+            path
+        };
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = directory.path().join("gcloud-test");
+            fs::write(&path, "#!/bin/sh\nexit 0\n")
+                .expect("fake Unix gcloud command should be written");
+            let mut permissions = fs::metadata(&path)
+                .expect("fake Unix gcloud metadata should load")
+                .permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions)
+                .expect("fake Unix gcloud command should become executable");
+            path
+        };
         let storage = StorageProviderConfig::GoogleDrive(GoogleDriveStorageConfig {
             id: "drive-user-a".to_owned(),
             credentials: crate::GoogleDriveGcloudCredentialsConfig {
                 config_dir: directory.path().to_owned(),
-                executable: PathBuf::from("rustc"),
+                executable,
             },
             root_folder_id: "root-folder".to_owned(),
             display_name: None,

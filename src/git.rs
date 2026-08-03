@@ -728,7 +728,6 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::TempDir;
 
-    #[cfg(unix)]
     use super::GitLfsConfigTarget;
     use super::{GitRemote, GitRepository, redacted_url_for_display};
     use crate::CliError;

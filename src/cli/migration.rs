@@ -1813,7 +1813,7 @@ mod tests {
             )
             .route(
                 &format!("{target_route}/objects/{{oid}}"),
-                put(move || {
+                put(move |_body: Bytes| {
                     let upload_count = Arc::clone(&upload_count_for_route);
                     async move {
                         let mut count = upload_count
@@ -1863,7 +1863,10 @@ mod tests {
             .expect_err("second upload should fail migration");
         server.abort();
 
-        assert!(matches!(error, CliError::MigrationUploadFailed { .. }));
+        assert!(
+            matches!(error, CliError::MigrationUploadFailed { .. }),
+            "unexpected migration error: {error:?}"
+        );
         assert_eq!(
             *upload_count
                 .lock()

@@ -9,8 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - [added]: Preserve the legacy remote LFS URL in `.lfsconfig` so pulling the new target configuration does not prevent users from migrating remaining objects.
 - [changed]: Authorize each user's GitHub identity and current repository permissions instead of sharing one server-configured GitHub account.
 - [changed]: Reconcile and upload migrations through LFS Cloud so clients no longer need private server configuration or direct Google Drive access.
+- [fixed]: Prevent fleet Windows verification from failing under SSH when Cargo, compiler, or nested smoke commands encounter rustup proxy links.
+- [fixed]: Prevent Windows regression and smoke fixtures from failing before their intended assertions by consuming upload bodies and using current Basic action credentials.
 - [fixed]: Let fleet Windows verification use the coordinator's active GitHub authentication without being rejected by an inaccessible inactive desktop credential.
-- [fixed]: Run Windows verifier commands through SSH-safe Rust toolchain executables and capture their output without PowerShell native redirection failures.
 - [fixed]: Reject stale migration config arguments, ignore the target as a legacy source, and validate server-issued upload actions before sending object bytes.
 - [fixed]: Reject ambiguous fleet release resumes, surface remote validation failures, and repair missing Windows assets even after a green check.
 - [fixed]: Validate the durable-session secret during config loading and count its documented minimum in characters.

@@ -481,6 +481,8 @@ async function mockServerMediatedFollowUpMigrationSmoke(): Promise<void> {
   const targetBatches: Array<{ actor: string; oids: string[] }> = [];
   let serverBase = '';
   let serverFailure: string | undefined;
+  const uploadAuthorization = (actor: string): string =>
+    `Basic ${Buffer.from(`lfscloud:lfs-session-${actor}`, 'utf8').toString('base64')}`;
 
   const server = createHttpServer((request, response) => {
     void (async () => {
@@ -561,7 +563,7 @@ async function mockServerMediatedFollowUpMigrationSmoke(): Promise<void> {
             : {
                 upload: {
                   href: `${serverBase}${targetRoute}/objects/${object.oid}?size=${object.size}`,
-                  header: { Authorization: `Bearer lfs-session-${actor}` },
+                  header: { Authorization: uploadAuthorization(actor) },
                 },
               },
         }));
@@ -572,8 +574,8 @@ async function mockServerMediatedFollowUpMigrationSmoke(): Promise<void> {
       const targetObjectPrefix = `${targetRoute}/objects/`;
       if (request.method === 'PUT' && url.pathname.startsWith(targetObjectPrefix)) {
         const actors: Record<string, string> = {
-          'Bearer lfs-session-user-a': 'user-a',
-          'Bearer lfs-session-user-b': 'user-b',
+          [uploadAuthorization('user-a')]: 'user-a',
+          [uploadAuthorization('user-b')]: 'user-b',
         };
         const actor = actors[authorization];
         if (actor === undefined) {
