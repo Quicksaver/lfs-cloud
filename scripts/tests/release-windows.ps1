@@ -96,6 +96,51 @@ Invoke-Test 'GitHub authentication checks only the active account' {
     }
 }
 
+Invoke-Test 'Rust toolchain proxy commands run through the active rustup toolchain' {
+    $cargo = Resolve-ReleaseRustupInvocation `
+        -ProxyName 'cargo' `
+        -Arguments @('fmt', '--version')
+    $rustc = Resolve-ReleaseRustupInvocation `
+        -ProxyName 'rustc' `
+        -Arguments @('--version')
+
+    Assert-True ([System.IO.Path]::IsPathFullyQualified($cargo.Command)) 'rustup should resolve to an absolute path'
+    Assert-Equal 'rustup' ([System.IO.Path]::GetFileNameWithoutExtension($cargo.Command)) 'rustup executable name'
+    Assert-Equal 'run' $cargo.Arguments[0] 'rustup subcommand'
+    Assert-True ($cargo.Arguments[1] -match '^\S+$') 'active toolchain name'
+    Assert-Equal 'cargo' $cargo.Arguments[2] 'cargo proxy name'
+    Assert-Equal 'fmt' $cargo.Arguments[3] 'cargo argument forwarding'
+    Assert-Equal 'rustc' $rustc.Arguments[2] 'rustc proxy name'
+    Assert-Equal '--version' $rustc.Arguments[3] 'rustc argument forwarding'
+}
+
+Invoke-Test 'Live native runner captures stdout and stderr with the exit code' {
+    $liveRegionEnabled = $script:LIVE_REGION_ENABLED
+    try {
+        $script:LIVE_REGION_ENABLED = $true
+        $script:LIVE_OUTPUT_TAIL_LINES.Clear()
+
+        $passed = ui_run_with_live_stdout `
+            'pwsh' `
+            @(
+                '-NoLogo',
+                '-NoProfile',
+                '-NonInteractive',
+                '-Command',
+                '[Console]::Out.WriteLine("fixture stdout"); [Console]::Error.WriteLine("fixture stderr"); exit 7'
+            )
+        $output = $script:LIVE_OUTPUT_TAIL_LINES -join "`n"
+
+        Assert-True (-not $passed) 'nonzero native exit should fail'
+        Assert-True ($output.Contains('fixture stdout')) 'stdout should be retained'
+        Assert-True ($output.Contains('fixture stderr')) 'stderr should be retained'
+    }
+    finally {
+        $script:LIVE_REGION_ENABLED = $liveRegionEnabled
+        $script:LIVE_OUTPUT_TAIL_LINES.Clear()
+    }
+}
+
 Invoke-Test 'Arrow-key selector chooses the highlighted release with Enter' {
     $selection = @(Invoke-ReleaseSelectionKeys -Keys @(
             [System.ConsoleKey]::DownArrow,

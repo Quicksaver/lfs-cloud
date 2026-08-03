@@ -35,6 +35,61 @@ function Complete-ReleaseUi {
     }
 }
 
+function Resolve-ReleaseRustupInvocation {
+    param(
+        [Parameter(Mandatory = $true)] [ValidateSet('cargo', 'rustc')] [string] $ProxyName,
+        [string[]] $Arguments = @()
+    )
+
+    $rustup = @(Get-Command 'rustup' -CommandType Application -ErrorAction SilentlyContinue) |
+        Select-Object -First 1
+    if ($null -eq $rustup) {
+        throw "Required command is unavailable: rustup (needed to resolve $ProxyName)"
+    }
+
+    $PSNativeCommandUseErrorActionPreference = $false
+    $output = @(& $rustup.Source 'show' 'active-toolchain' 2>&1 | ForEach-Object { $_.ToString() })
+    $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { [int] $LASTEXITCODE }
+    $activeToolchain = (($output -join "`n").Trim() -split '\s+')[0]
+    if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($activeToolchain)) {
+        throw "Could not resolve the active Rust toolchain for $ProxyName."
+    }
+
+    return [pscustomobject] @{
+        Command = $rustup.Source
+        Arguments = @('run', $activeToolchain, $ProxyName) + @($Arguments)
+    }
+}
+
+function Resolve-ReleaseNativeInvocation {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Command,
+        [string[]] $Arguments = @(),
+        [bool] $WindowsHost = $IsWindows
+    )
+
+    if ($WindowsHost -and $Command -in @('cargo', 'cargo.exe', 'rustc', 'rustc.exe')) {
+        $nativeCommand = @(Get-Command $Command -CommandType Application -ErrorAction SilentlyContinue) |
+            Select-Object -First 1
+        $nativeCommandItem = if ($null -eq $nativeCommand) {
+            $null
+        }
+        else {
+            Get-Item -LiteralPath $nativeCommand.Source -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $nativeCommandItem -and
+            ($nativeCommandItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            $proxyName = [System.IO.Path]::GetFileNameWithoutExtension($Command)
+            return Resolve-ReleaseRustupInvocation -ProxyName $proxyName -Arguments $Arguments
+        }
+    }
+
+    return [pscustomobject] @{
+        Command = $Command
+        Arguments = @($Arguments)
+    }
+}
+
 function Invoke-ReleaseStep {
     param(
         [Parameter(Mandatory = $true)] [string] $Message,
@@ -42,8 +97,9 @@ function Invoke-ReleaseStep {
         [string[]] $Arguments = @()
     )
 
+    $invocation = Resolve-ReleaseNativeInvocation -Command $Command -Arguments $Arguments
     ui_set_live_task_state 'running' $Message
-    if (ui_run_with_live_stdout $Command $Arguments) {
+    if (ui_run_with_live_stdout $invocation.Command $invocation.Arguments) {
         ui_set_live_task_state 'pass' $Message
         ui_clear_live_task
         pass $Message
@@ -115,11 +171,13 @@ function Invoke-NativeCapture {
         [string[]] $Arguments = @()
     )
 
+    $invocation = Resolve-ReleaseNativeInvocation -Command $Command -Arguments $Arguments
+
     # Native stderr is expected for probes such as `cargo audit --version`.
     # Keep the probe result explicit even when the caller enabled native-error
     # promotion in its own PowerShell session.
     $PSNativeCommandUseErrorActionPreference = $false
-    $output = @(& $Command @Arguments 2>&1 | ForEach-Object { $_.ToString() })
+    $output = @(& $invocation.Command @($invocation.Arguments) 2>&1 | ForEach-Object { $_.ToString() })
     $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { [int] $LASTEXITCODE }
 
     return [pscustomobject] @{

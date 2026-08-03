@@ -617,79 +617,26 @@ function ui_run_with_live_stdout {
         }
     }
 
-    $stdoutFile = [System.IO.Path]::GetTempFileName()
-    $stderrFile = [System.IO.Path]::GetTempFileName()
     $workingDirectory = (Get-Location).Path
     $job = $null
 
     ui_live_stdout_reset
 
-    $stdoutOffset = 0L
-    $stderrOffset = 0L
-    $stdoutRemainder = ''
-    $stderrRemainder = ''
+    $jobExitCode = $null
+    $drainJob = {
+        param([ref] $ExitCode)
 
-    $drainFile = {
-        param(
-            [string]$Path,
-            [ref]$Offset,
-            [ref]$Remainder
-        )
-
-        if (-not (Test-Path -LiteralPath $Path)) {
-            return
-        }
-
-        $fs = $null
-        $sr = $null
-        try {
-            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-            if ($Offset.Value -gt $fs.Length) {
-                $Offset.Value = 0L
-                $Remainder.Value = ''
+        foreach ($item in @(Receive-Job -Job $job -ErrorAction SilentlyContinue)) {
+            $exitCodeProperty = $item.PSObject.Properties['LfsCloudNativeExitCode']
+            if ($null -ne $exitCodeProperty) {
+                $ExitCode.Value = [int] $exitCodeProperty.Value
+                continue
             }
 
-            if ($Offset.Value -ge $fs.Length) {
-                return
-            }
-
-            [void]$fs.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
-            $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8, $true, 4096, $true)
-            $chunk = $sr.ReadToEnd()
-            $Offset.Value = $fs.Position
-
-            if (-not [string]::IsNullOrEmpty($chunk)) {
-                $text = $Remainder.Value + $chunk
-                $text = $text -replace "`r", ""
-                $parts = $text -split "`n"
-
-                if ($text.EndsWith("`n")) {
-                    $Remainder.Value = ''
-                    $emit = $parts
+            foreach ($line in ([string] $item -replace "`r", '' -split "`n")) {
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    ui_live_stdout_append_line $line
                 }
-                else {
-                    $Remainder.Value = $parts[-1]
-                    if ($parts.Count -gt 1) {
-                        $emit = $parts[0..($parts.Count - 2)]
-                    }
-                    else {
-                        $emit = @()
-                    }
-                }
-
-                foreach ($line in $emit) {
-                    if (-not [string]::IsNullOrWhiteSpace($line)) {
-                        ui_live_stdout_append_line $line
-                    }
-                }
-            }
-        }
-        finally {
-            if ($sr) {
-                $sr.Dispose()
-            }
-            if ($fs) {
-                $fs.Dispose()
             }
         }
     }
@@ -699,44 +646,31 @@ function ui_run_with_live_stdout {
             param(
                 [string]$InnerCommand,
                 [string[]]$InnerArguments,
-                [string]$InnerStdoutFile,
-                [string]$InnerStderrFile,
                 [string]$InnerWorkingDirectory
             )
 
             $ErrorActionPreference = 'Continue'
+            $PSNativeCommandUseErrorActionPreference = $false
+            $exitCode = 1
             try {
                 Set-Location -Path $InnerWorkingDirectory
-                & $InnerCommand @InnerArguments 1> $InnerStdoutFile 2> $InnerStderrFile
-                if ($null -eq $LASTEXITCODE) {
-                    return 0
-                }
-
-                return [int]$LASTEXITCODE
+                & $InnerCommand @InnerArguments 2>&1 |
+                    ForEach-Object { $_.ToString() }
+                $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { [int] $LASTEXITCODE }
             }
             catch {
-                $_ | Out-String | Set-Content -Path $InnerStderrFile -Encoding UTF8
-                return 1
+                $_ | Out-String
             }
-        } -ArgumentList @($Command, $Arguments, $stdoutFile, $stderrFile, $workingDirectory)
+
+            [pscustomobject] @{ LfsCloudNativeExitCode = $exitCode }
+        } -ArgumentList @($Command, $Arguments, $workingDirectory)
 
         while ($job.State -eq 'Running' -or $job.State -eq 'NotStarted') {
-            & $drainFile $stdoutFile ([ref]$stdoutOffset) ([ref]$stdoutRemainder)
-            & $drainFile $stderrFile ([ref]$stderrOffset) ([ref]$stderrRemainder)
+            & $drainJob ([ref] $jobExitCode)
             Start-Sleep -Milliseconds 40
         }
 
-        & $drainFile $stdoutFile ([ref]$stdoutOffset) ([ref]$stdoutRemainder)
-        & $drainFile $stderrFile ([ref]$stderrOffset) ([ref]$stderrRemainder)
-
-        if (-not [string]::IsNullOrWhiteSpace($stdoutRemainder)) {
-            ui_live_stdout_append_line $stdoutRemainder
-        }
-        if (-not [string]::IsNullOrWhiteSpace($stderrRemainder)) {
-            ui_live_stdout_append_line $stderrRemainder
-        }
-
-        $jobExitCode = Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue | Select-Object -Last 1
+        & $drainJob ([ref] $jobExitCode)
         if ($null -eq $jobExitCode) {
             $exitCode = 1
         }
@@ -748,8 +682,6 @@ function ui_run_with_live_stdout {
         if ($job) {
             Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
         }
-        Remove-Item -LiteralPath $stdoutFile -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
     }
 
     if ($script:LIVE_STDOUT_LINES.Count -gt 0) {
