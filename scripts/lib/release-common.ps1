@@ -165,6 +165,17 @@ function ConvertTo-GitHubRepositorySlug {
     return "$($segments[0])/$($segments[1])"
 }
 
+function Test-GitHubCliAuthentication {
+    $result = Invoke-NativeCapture 'gh' @(
+        'auth',
+        'status',
+        '--active',
+        '--hostname',
+        'github.com'
+    )
+    return $result.ExitCode -eq 0
+}
+
 function Initialize-Release {
     param(
         [Parameter(Mandatory = $true)] [string] $StartDirectory,
@@ -180,8 +191,7 @@ function Initialize-Release {
     }
     $script:RELEASE_REPO_ROOT = $rootResult.Output
 
-    $authResult = Invoke-NativeCapture 'gh' @('auth', 'status', '--hostname', 'github.com')
-    if ($authResult.ExitCode -ne 0) {
+    if (-not (Test-GitHubCliAuthentication)) {
         throw "GitHub CLI is not authenticated. Run 'gh auth login' and retry."
     }
 

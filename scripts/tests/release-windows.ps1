@@ -74,6 +74,28 @@ function Invoke-ReleaseSelectionKeys {
     )
 }
 
+Invoke-Test 'GitHub authentication checks only the active account' {
+    $originalNativeCapture = (Get-Item Function:Invoke-NativeCapture).ScriptBlock
+    $script:AuthenticationArguments = @()
+
+    try {
+        Set-Item Function:Invoke-NativeCapture {
+            param([string] $Command, [string[]] $Arguments)
+            $script:AuthenticationArguments = @($Command) + @($Arguments)
+            return [pscustomobject] @{ ExitCode = 0; Output = '' }
+        }
+
+        Assert-True (Test-GitHubCliAuthentication) 'active authentication should pass'
+        Assert-Equal `
+            'gh auth status --active --hostname github.com' `
+            ($script:AuthenticationArguments -join ' ') `
+            'active authentication arguments'
+    }
+    finally {
+        Set-Item Function:Invoke-NativeCapture $originalNativeCapture
+    }
+}
+
 Invoke-Test 'Arrow-key selector chooses the highlighted release with Enter' {
     $selection = @(Invoke-ReleaseSelectionKeys -Keys @(
             [System.ConsoleKey]::DownArrow,

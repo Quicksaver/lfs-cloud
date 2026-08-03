@@ -34,6 +34,16 @@ finalize_release_tests() {
 trap finalize_release_tests EXIT
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/lfscloud-release-tests.XXXXXX")"
 
+release_info "Test active GitHub CLI authentication selection"
+github_auth_arguments="$fixture_root/github-auth-arguments"
+gh() { printf '%s\n' "$@" >"$github_auth_arguments"; }
+release_github_cli_is_authenticated
+unset -f gh
+assert_eq \
+  "auth status --active --hostname github.com" \
+  "$(tr '\n' ' ' <"$github_auth_arguments" | sed 's/ $//')" \
+  "GitHub authentication must ignore invalid inactive accounts"
+
 release_info "Test semantic-version increments"
 assert_eq "1.0.0" "$(release_next_version "0.9.4" major)" "major increment"
 assert_eq "0.10.0" "$(release_next_version "0.9.4" minor)" "minor increment"

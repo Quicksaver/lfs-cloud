@@ -83,6 +83,10 @@ release_require_command() {
   fi
 }
 
+release_github_cli_is_authenticated() {
+  gh auth status --active --hostname github.com >/dev/null 2>&1
+}
+
 release_initialize() {
   local start_dir="$1"
 
@@ -95,7 +99,7 @@ release_initialize() {
     release_die "Could not resolve the repository root."
   fi
 
-  if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  if ! release_github_cli_is_authenticated; then
     release_die "GitHub CLI is not authenticated. Run 'gh auth login' and retry."
   fi
 
