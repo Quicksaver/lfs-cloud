@@ -2,6 +2,8 @@
 
 `lfscloud.yml` is private server-owned configuration. Do not commit it to the Git repositories being served: it contains repository-to-storage routing, credential references, Drive folder IDs, and metadata database paths.
 
+The default path is `${HOME}/lfscloud.yml`. On Windows, LFS Cloud falls back to `%USERPROFILE%\lfscloud.yml` when `HOME` is not set. Pass `--config PATH` to every command that reads the private server configuration when a different location is required.
+
 The committed repository-side `.lfsconfig` should contain only the LFS Cloud endpoint for that repository, for example:
 
 ```ini
@@ -22,9 +24,9 @@ lfscloud repository         -> repositories
 Each resource supports `add`, `list`, and `remove`. With no entry flags, `add` prompts for a complete new entry or all values of an existing entry:
 
 ```bash
-lfscloud --config ./lfscloud.yml config repository add
-lfscloud --config ./lfscloud.yml config storage add
-lfscloud --config ./lfscloud.yml repository add
+lfscloud config repository add
+lfscloud config storage add
+lfscloud repository add
 ```
 
 Press Enter to accept a displayed default or retain an existing value. If any entry flag is supplied, the command is non-interactive. A new entry then requires every required field, while an existing `--id` accepts only the fields to update. Replaying the same update succeeds without changing the file.
@@ -32,12 +34,12 @@ Press Enter to accept a displayed default or retain an existing value. If any en
 The complete flag-based forms for the currently supported providers are:
 
 ```bash
-lfscloud --config ./lfscloud.yml config repository add \
+lfscloud config repository add \
   --id github-main \
   --type github \
   --api-url https://api.github.com
 
-lfscloud --config ./lfscloud.yml config storage add \
+lfscloud config storage add \
   --id drive-personal \
   --type google-drive \
   --credentials-type gcloud \
@@ -46,7 +48,7 @@ lfscloud --config ./lfscloud.yml config storage add \
   --root-folder-id YOUR_DRIVE_FOLDER_ID \
   --display-name 'Personal Drive LFS'
 
-lfscloud --config ./lfscloud.yml repository add \
+lfscloud repository add \
   --id github-main:OWNER/REPOSITORY \
   --repo-provider github-main \
   --host github.com \
@@ -63,11 +65,11 @@ Every environment variable referenced anywhere in the config must be set while a
 Partial updates identify the existing entry by its stable ID:
 
 ```bash
-lfscloud --config ./lfscloud.yml config storage add \
+lfscloud config storage add \
   --id drive-personal \
   --display-name 'Archive Drive'
 
-lfscloud --config ./lfscloud.yml repository add \
+lfscloud repository add \
   --id github-main:OWNER/REPOSITORY \
   --storage-provider drive-archive
 ```
@@ -75,18 +77,18 @@ lfscloud --config ./lfscloud.yml repository add \
 List commands print tab-separated, script-friendly summaries. A legacy session-secret fallback is reported only as configured or absent; its value is never printed:
 
 ```bash
-lfscloud --config ./lfscloud.yml config repository list
-lfscloud --config ./lfscloud.yml config storage list
-lfscloud --config ./lfscloud.yml repository list
+lfscloud config repository list
+lfscloud config storage list
+lfscloud repository list
 ```
 
 Remove commands are idempotent: removing an absent ID succeeds and reports that it was not found. A provider cannot be removed while a repository mapping still references it, because every changed document is validated before it replaces the original:
 
 ```bash
-lfscloud --config ./lfscloud.yml repository remove \
+lfscloud repository remove \
   --id github-main:OWNER/REPOSITORY
-lfscloud --config ./lfscloud.yml config storage remove --id drive-personal
-lfscloud --config ./lfscloud.yml config repository remove --id github-main
+lfscloud config storage remove --id drive-personal
+lfscloud config repository remove --id github-main
 ```
 
 Successful writes use a temporary file beside the config, preserve the original file permissions, and atomically replace it after validation. YAML values and environment references are preserved, but comments and custom formatting are normalized when a change is written.
@@ -167,7 +169,7 @@ server:
 The `serve` command can also override the bind address and port:
 
 ```bash
-lfscloud serve --config ./lfscloud.yml --host 0.0.0.0 --port 8080
+lfscloud serve --host 0.0.0.0 --port 8080
 ```
 
 `public_url` is the URL embedded in Git LFS batch action responses. Set it to the address clients can actually reach. Plaintext LAN mode exposes users' GitHub PATs during login, LFS credentials, and object bytes to the network, so it requires the explicit `allow_insecure_http: true` development opt-in. Prefer HTTPS through trusted TLS termination. Client commands using this LAN URL also require `--allow-insecure-http`.

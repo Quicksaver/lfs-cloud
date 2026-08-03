@@ -249,6 +249,15 @@ impl CliError {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
+    /// The current user's home directory could not be resolved for the default config path.
+    #[error(
+        "cannot resolve the default server config path because {environment_variables} is not set or is empty; pass --config PATH"
+    )]
+    DefaultConfigHomeUnavailable {
+        /// Environment variables accepted for resolving the current user's home directory.
+        environment_variables: &'static str,
+    },
+
     /// The server configuration file could not be read.
     #[error("failed to read server config {}: {source}", path.display())]
     ConfigRead {

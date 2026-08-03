@@ -48,16 +48,28 @@ where
     S: FnMut(&StorageProviderConfig) -> CliResult<()>,
 {
     let mut report = StatusReport::new();
-    let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
-    let config = match ServerConfig::load_from_path(&config_path) {
-        Ok(config) => {
-            report.ok("config", format!("loaded {}", config_path.display()));
-            Some(config)
-        }
-        Err(error) => {
-            report.error("config", format!("{error}"));
-            None
-        }
+    let config_path = match config_path {
+        Some(config_path) => Some(config_path),
+        None => match ServerConfig::default_path() {
+            Ok(config_path) => Some(config_path),
+            Err(error) => {
+                report.error("config", format!("{error}"));
+                None
+            }
+        },
+    };
+    let config = match config_path {
+        Some(config_path) => match ServerConfig::load_from_path(&config_path) {
+            Ok(config) => {
+                report.ok("config", format!("loaded {}", config_path.display()));
+                Some(config)
+            }
+            Err(error) => {
+                report.error("config", format!("{error}"));
+                None
+            }
+        },
+        None => None,
     };
     let repository = match GitRepository::discover(start_dir.as_ref()) {
         Ok(repository) => {

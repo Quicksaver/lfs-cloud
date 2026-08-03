@@ -971,6 +971,13 @@ function tests(): SmokeTest[] {
       },
     },
     { name: 'configuration command workflows', run: configurationCommandsSmoke },
+    {
+      name: 'default server config path',
+      run: () =>
+        script('verify-default-config-path.sh', defaultTimeoutMs, {
+          LFS_CLOUD_SMOKE_BINARY: binaryPath,
+        }),
+    },
     { name: 'repository initialization', run: initRepositorySmoke },
     { name: 'historical Git LFS migration planning', run: migrationDryRunSmoke },
     { name: 'Git credential approval', run: () => script('verify-git-credential-approve.sh') },

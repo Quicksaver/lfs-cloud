@@ -97,7 +97,7 @@ Create or choose the private Drive folder that will hold LFS objects, then keep 
 
 ### 3. Create `lfscloud.yml`
 
-Create a private server configuration file. Do not commit it.
+Create a private server configuration file at `${HOME}/lfscloud.yml`. On Windows, LFS Cloud falls back to `%USERPROFILE%\lfscloud.yml` when `HOME` is not set. This is the default path whenever `--config PATH` is omitted. Do not commit the file.
 
 ```yaml
 server:
@@ -132,9 +132,9 @@ repositories:
 The same provider and repository entries can be added interactively:
 
 ```bash
-lfscloud --config ./lfscloud.yml config repository add
-lfscloud --config ./lfscloud.yml config storage add
-lfscloud --config ./lfscloud.yml repository add
+lfscloud config repository add
+lfscloud config storage add
+lfscloud repository add
 ```
 
 Create the file and its `server` section first. Passing no entry flags prompts for the complete entry; passing any entry flag makes `add` non-interactive. Existing IDs can be updated with only the fields that should change. See [Manage Configuration From The CLI](docs/configuration.md#manage-configuration-from-the-cli) for every flag plus `list` and `remove`.
@@ -153,7 +153,7 @@ Export the server-owned session encryption secret and start LFS Cloud:
 
 ```bash
 export LFS_CLOUD_SESSION_SECRET="replace-with-at-least-32-random-characters"
-lfscloud serve --config ./lfscloud.yml
+lfscloud serve
 ```
 
 The server validates its configuration, Google Drive credentials, and Drive root before it begins accepting requests.
@@ -165,7 +165,7 @@ From the configured Git repository:
 ```bash
 lfscloud init --server http://127.0.0.1:8080
 lfscloud login --server http://127.0.0.1:8080
-lfscloud --config /path/to/lfscloud.yml status
+lfscloud status
 ```
 
 `init` writes the repository-specific endpoint to `.lfsconfig`. Use `--local` to write only repository-local Git config instead. `login` verifies your GitHub PAT, creates a short-lived LFS Cloud session, and stores only the opaque local token through Git's credential helper. The PAT stays encrypted on the server for current GitHub permission checks.

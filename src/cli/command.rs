@@ -6,7 +6,7 @@ use super::*;
 #[command(name = "lfscloud", version, about, propagate_version = true)]
 #[command(arg_required_else_help = true)]
 pub(super) struct Cli {
-    /// Server config path to load.
+    /// Server config path to load (defaults to HOME/lfscloud.yml).
     #[arg(long, global = true, value_name = "PATH")]
     pub(super) config: Option<PathBuf>,
 
@@ -540,6 +540,13 @@ mod tests {
             .expect("log-level flag should be registered");
 
         assert!(config.is_global_set());
+        assert!(
+            config
+                .get_help()
+                .expect("config flag should have help text")
+                .to_string()
+                .contains("HOME/lfscloud.yml")
+        );
         assert!(log_level.is_global_set());
     }
 

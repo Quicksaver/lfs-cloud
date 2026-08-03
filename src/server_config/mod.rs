@@ -19,7 +19,7 @@ pub use providers::{
 pub use repository::RepositoryMapping;
 pub use settings::{ServerSessionEncryptionSecret, ServerSettings};
 
-/// Default server config path used when no explicit path is supplied.
+/// Default server config filename appended to the user's home directory.
 pub const DEFAULT_CONFIG_PATH: &str = "lfscloud.yml";
 /// Default metadata state directory relative to the config file.
 pub const DEFAULT_METADATA_DIR: &str = ".lfscloud";

@@ -40,7 +40,10 @@ where
     W: Write,
     S: FnMut(&mut R) -> CliResult<String>,
 {
-    let config_path = config_path.unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
+    let config_path = match config_path {
+        Some(config_path) => config_path,
+        None => ServerConfig::default_path()?,
+    };
     let mut config = EditableServerConfig::load(config_path)?;
 
     match command {

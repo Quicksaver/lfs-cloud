@@ -100,10 +100,10 @@ impl ServerBuilder {
     }
 
     async fn serve(self) -> ServerResult<()> {
-        let config_path = self
-            .options
-            .config_path
-            .unwrap_or_else(|| ServerConfig::default_path().to_path_buf());
+        let config_path = match self.options.config_path {
+            Some(config_path) => config_path,
+            None => ServerConfig::default_path()?,
+        };
         let mut config = ServerConfig::load_from_path(config_path)?;
         let bind = ServerBind::from_config_and_overrides(
             &config.server.host,
