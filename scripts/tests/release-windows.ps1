@@ -165,7 +165,7 @@ Invoke-Test 'Requested tag ignores unrelated drafts before metadata lookup' {
     }
 }
 
-Invoke-Test 'Requested tag repairs assets after a successful Windows status' {
+Invoke-Test 'Requested tag remains eligible after a successful Windows status' {
     $originalNativeCapture = (Get-Item Function:Invoke-NativeCapture).ScriptBlock
     $originalTagCommit = (Get-Item Function:Get-RemoteReleaseTagCommit).ScriptBlock
     $originalStatusState = (Get-Item Function:Get-WindowsVerificationStatusState).ScriptBlock
