@@ -41,7 +41,7 @@ release_all_finalize_ui() {
 
 release_all_validate_windows_repo_path() {
   case "$1" in
-    [Ee]:\\*) return 0 ;;
+    [Ee]:\\*|[Ee]:/*) return 0 ;;
     *)
       printf 'Windows repository must remain on fleet storage E:\\: %s\n' "$1" >&2
       return 1
@@ -58,7 +58,9 @@ release_all_powershell_literal() {
 release_all_windows_sync_script() {
   local expected_sha="$1"
   local repository
+  local expected_sha_literal
   repository="$(release_all_powershell_literal "$RELEASE_ALL_WINDOWS_REPO")"
+  expected_sha_literal="$(release_all_powershell_literal "$expected_sha")"
 
   cat <<EOF
 \$ErrorActionPreference = 'Stop'
@@ -79,8 +81,8 @@ if (\$LASTEXITCODE -ne 0) { throw 'Could not fetch origin/main on Windows.' }
 & git merge --ff-only refs/remotes/origin/main
 if (\$LASTEXITCODE -ne 0) { throw 'Windows main cannot fast-forward to origin/main.' }
 \$sha = (& git rev-parse HEAD).Trim()
-if (\$LASTEXITCODE -ne 0 -or \$sha -ne '$expected_sha') {
-    throw "Windows main is at \$sha instead of $expected_sha."
+if (\$LASTEXITCODE -ne 0 -or \$sha -ne $expected_sha_literal) {
+    throw "Windows main is not at the expected release commit."
 }
 Write-Output \$sha
 EOF
@@ -100,11 +102,13 @@ EOF
 release_all_windows_release_script() {
   local tag="$1"
   local repository
+  local tag_literal
   repository="$(release_all_powershell_literal "$RELEASE_ALL_WINDOWS_REPO")"
+  tag_literal="$(release_all_powershell_literal "$tag")"
   cat <<EOF
 \$ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $repository
-& pwsh -NoProfile -File '.\scripts\release.ps1' -Tag '$tag'
+& pwsh -NoProfile -File '.\scripts\release.ps1' -Tag $tag_literal
 if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
 EOF
 }
@@ -114,28 +118,40 @@ release_all_windows_candidate_assets_script() {
   local version="${tag#v}"
   local expected_sha="$2"
   local repository
+  local tag_literal
+  local version_literal
+  local expected_sha_literal
   repository="$(release_all_powershell_literal "$RELEASE_ALL_WINDOWS_REPO")"
+  tag_literal="$(release_all_powershell_literal "$tag")"
+  version_literal="$(release_all_powershell_literal "$version")"
+  expected_sha_literal="$(release_all_powershell_literal "$expected_sha")"
 
   cat <<EOF
 \$ErrorActionPreference = 'Stop'
-\$repo = $repository
-Set-Location -LiteralPath \$repo
-. '.\scripts\release.ps1' -Tag '$tag'
-Initialize-Release -StartDirectory \$repo
-\$artifact = Get-WindowsArtifactPath -RepositoryRoot \$repo -Version '$version'
-\$manifest = Get-WindowsManifestPath -RepositoryRoot \$repo -Version '$version'
-\$assets = @(\$artifact, "\$artifact.sha256", \$manifest)
-if (-not (Test-ArtifactChecksum -ArtifactPath \$artifact)) {
-    throw 'Windows candidate artifact checksum is invalid.'
+try {
+    \$repo = $repository
+    Set-Location -LiteralPath \$repo
+    . '.\scripts\release.ps1' -Tag $tag_literal
+    Initialize-Release -StartDirectory \$repo
+    \$artifact = Get-WindowsArtifactPath -RepositoryRoot \$repo -Version $version_literal
+    \$manifest = Get-WindowsManifestPath -RepositoryRoot \$repo -Version $version_literal
+    \$assets = @(\$artifact, "\$artifact.sha256", \$manifest)
+    if (-not (Test-ArtifactChecksum -ArtifactPath \$artifact)) {
+        throw 'Windows candidate artifact checksum is invalid.'
+    }
+    if (-not (Test-WindowsBuildManifest -ArtifactPath \$artifact -ManifestPath \$manifest -Version $version_literal -Commit $expected_sha_literal)) {
+        throw 'Windows candidate build manifest is invalid.'
+    }
+    \$release = Get-GitHubReleaseDocument -Tag $tag_literal
+    if (-not [bool] \$release.isDraft -or \$release.tagName -ne $tag_literal) {
+        throw 'Windows candidate release is not the expected draft.'
+    }
+    Assert-WindowsReleaseAssetsPublished -Release \$release -AssetPaths \$assets
 }
-if (-not (Test-WindowsBuildManifest -ArtifactPath \$artifact -ManifestPath \$manifest -Version '$version' -Commit '$expected_sha')) {
-    throw 'Windows candidate build manifest is invalid.'
+catch {
+    Write-Error ("Windows candidate assets are not reusable: " + \$_.Exception.Message)
+    exit 20
 }
-\$release = Get-GitHubReleaseDocument -Tag '$tag'
-if (-not [bool] \$release.isDraft -or \$release.tagName -ne '$tag') {
-    throw 'Windows candidate release is not the expected draft.'
-}
-Assert-WindowsReleaseAssetsPublished -Release \$release -AssetPaths \$assets
 EOF
 }
 
@@ -293,8 +309,7 @@ release_all_signal_tree() {
 
 release_all_stop_jobs() {
   local pid
-  for pid in "${RELEASE_ALL_JOB_PIDS[@]:-}"; do
-    [[ -n "$pid" ]] || continue
+  for pid in ${RELEASE_ALL_JOB_PIDS[@]+"${RELEASE_ALL_JOB_PIDS[@]}"}; do
     if kill -0 "$pid" 2>/dev/null; then
       release_all_signal_tree TERM "$pid"
     fi
@@ -323,6 +338,7 @@ release_all_run_verification_wave() {
   local log_directory
   local local_log=""
   local windows_log=""
+  local local_environment_names=""
   local pid
   local exit_code
   local failed=0
@@ -338,14 +354,15 @@ release_all_run_verification_wave() {
   RELEASE_ALL_JOB_PIDS=()
 
   if ((${#local_environments[@]} > 0)); then
-    local_log="$log_directory/macos-linux.log"
+    local_environment_names="${local_environments[*]}"
+    local_log="$log_directory/${local_environment_names// /-}.log"
     (
       release_all_run_local_verifiers "${local_environments[@]}"
     ) >"$local_log" 2>&1 &
     RELEASE_ALL_JOB_PIDS+=("$!")
     states+=(running)
     logs+=("$local_log")
-    labels+=("macOS/Linux verification")
+    labels+=("Local verification ($local_environment_names)")
   fi
 
   if [[ "$windows_action" != none ]]; then
@@ -393,7 +410,7 @@ release_all_run_verification_wave() {
   done
 
   if ((failed != 0)); then
-    for pid in "${RELEASE_ALL_JOB_PIDS[@]}"; do
+    for pid in ${RELEASE_ALL_JOB_PIDS[@]+"${RELEASE_ALL_JOB_PIDS[@]}"}; do
       wait "$pid" 2>/dev/null || true
     done
     RELEASE_ALL_JOB_PIDS=()
@@ -436,6 +453,8 @@ release_all_ensure_base_verifications() {
 
 release_all_preflight() {
   local current_version
+  local current_tag
+  local tag_sha
   release_initialize "$SCRIPT_DIR"
   cd "$RELEASE_REPO_ROOT"
   release_require_command ssh
@@ -453,7 +472,13 @@ release_all_preflight() {
   release_all_sync_windows "$RELEASE_ALL_SHA" || return $?
 
   current_version="$(release_require_matching_versions)"
-  if [[ "$(git log -1 --format=%s HEAD)" == "Release v$current_version" ]]; then
+  current_tag="v$current_version"
+  tag_sha="$(git rev-list -n 1 "$current_tag" 2>/dev/null || true)"
+  if [[ -z "$tag_sha" ]]; then
+    tag_sha="$(release_all_remote_tag_commit "$current_tag")" || return $?
+  fi
+  if [[ "$(git log -1 --format=%s HEAD)" == "Release $current_tag" ]] \
+    && [[ "$tag_sha" == "$RELEASE_ALL_SHA" ]]; then
     RELEASE_ALL_RESUMING=true
   else
     RELEASE_ALL_RESUMING=false
@@ -508,7 +533,7 @@ release_all_prepare_candidate() {
     tag_sha="$(release_all_remote_tag_commit "$current_tag")"
   fi
   if [[ "$head_subject" == "Release $current_tag" ]] \
-    && { [[ -z "$tag_sha" ]] || [[ "$tag_sha" == "$RELEASE_SHA" ]]; }; then
+    && [[ "$tag_sha" == "$RELEASE_SHA" ]]; then
     release_document="$(release_all_current_release_document "$current_tag" || true)"
     if [[ -z "$release_document" ]]; then
       "$SCRIPT_DIR/release.sh" resume --prepare-only || return $?
@@ -525,29 +550,57 @@ release_all_prepare_candidate() {
 
   RELEASE_ALL_TAG="$current_tag"
   RELEASE_ALL_SHA="$(git rev-parse HEAD)"
+  if ! jq -e '.isDraft | type == "boolean"' \
+    <<<"$release_document" >/dev/null; then
+    fail "GitHub returned an invalid draft-state document for $current_tag."
+    return 1
+  fi
   RELEASE_ALL_IS_DRAFT="$(jq -r '.isDraft' <<<"$release_document")"
 }
 
 release_all_collect_missing_candidate_checks() {
   local version="${RELEASE_ALL_TAG#v}"
+  local validation_output
+  local validation_exit
   RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS=()
   RELEASE_ALL_WINDOWS_NEEDED=false
 
-  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_MACOS_STATUS_CONTEXT" \
-    || ! release_all_local_artifacts_are_valid macos-arm64 "$version" >/dev/null 2>&1; then
+  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_MACOS_STATUS_CONTEXT"; then
+    RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS+=(macos-arm64)
+  elif ! release_all_local_artifacts_are_valid macos-arm64 "$version" >/dev/null 2>&1; then
+    release_warn "macos-arm64 candidate artifacts are not reusable; rebuild them"
     RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS+=(macos-arm64)
   fi
-  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_LINUX_ARM64_STATUS_CONTEXT" \
-    || ! release_all_local_artifacts_are_valid linux-arm64 "$version" >/dev/null 2>&1; then
+  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_LINUX_ARM64_STATUS_CONTEXT"; then
+    RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS+=(linux-arm64)
+  elif ! release_all_local_artifacts_are_valid linux-arm64 "$version" >/dev/null 2>&1; then
+    release_warn "linux-arm64 candidate artifacts are not reusable; rebuild them"
     RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS+=(linux-arm64)
   fi
-  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_LINUX_X86_64_STATUS_CONTEXT" \
-    || ! release_all_local_artifacts_are_valid linux-x86-64 "$version" >/dev/null 2>&1; then
+  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_LINUX_X86_64_STATUS_CONTEXT"; then
+    RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS+=(linux-x86-64)
+  elif ! release_all_local_artifacts_are_valid linux-x86-64 "$version" >/dev/null 2>&1; then
+    release_warn "linux-x86-64 candidate artifacts are not reusable; rebuild them"
     RELEASE_ALL_MISSING_LOCAL_ENVIRONMENTS+=(linux-x86-64)
   fi
-  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_WINDOWS_STATUS_CONTEXT" \
-    || ! release_all_windows_candidate_assets_are_valid \
-      "$RELEASE_ALL_TAG" "$RELEASE_ALL_SHA" >/dev/null 2>&1; then
+  if ! release_all_status_is_green "$RELEASE_ALL_SHA" "$LOCAL_WINDOWS_STATUS_CONTEXT"; then
+    RELEASE_ALL_WINDOWS_NEEDED=true
+  elif validation_output="$(
+    release_all_windows_candidate_assets_are_valid \
+      "$RELEASE_ALL_TAG" "$RELEASE_ALL_SHA" 2>&1
+  )"; then
+    :
+  else
+    validation_exit=$?
+    validation_output="${validation_output##*$'\n'}"
+    if [[ -z "$validation_output" ]]; then
+      validation_output="Windows candidate assets are not reusable; rebuild them"
+    fi
+    if ((validation_exit != 20)); then
+      fail "Could not inspect reusable Windows candidate assets: $validation_output"
+      return "$validation_exit"
+    fi
+    release_warn "$validation_output"
     RELEASE_ALL_WINDOWS_NEEDED=true
   fi
 }
@@ -562,7 +615,7 @@ release_all_verify_candidate() {
     return
   fi
 
-  release_all_collect_missing_candidate_checks
+  release_all_collect_missing_candidate_checks || return $?
   if [[ "$RELEASE_ALL_WINDOWS_NEEDED" == true ]]; then
     windows_action=release
   fi

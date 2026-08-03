@@ -57,6 +57,8 @@ fi
 TESTS_PASSED=$((TESTS_PASSED + 1))
 release_all_validate_windows_repo_path 'E:\Projects\lfs-cloud'
 TESTS_PASSED=$((TESTS_PASSED + 1))
+release_all_validate_windows_repo_path 'E:/Projects/lfs-cloud'
+TESTS_PASSED=$((TESTS_PASSED + 1))
 
 sync_script="$(release_all_windows_sync_script '0123456789abcdef0123456789abcdef01234567')"
 assert_contains "$sync_script" "\$repo = 'E:\Projects\lfs-cloud'" 'sync uses fleet checkout'
@@ -137,10 +139,16 @@ real_release_all_windows_candidate_assets_are_valid="$(
 )"
 release_all_status_is_green() { return 0; }
 release_all_local_artifacts_are_valid() { return 0; }
-release_all_windows_candidate_assets_are_valid() { return 1; }
+release_all_windows_candidate_assets_are_valid() { return 20; }
 RELEASE_ALL_TAG='v1.2.3'
 release_all_collect_missing_candidate_checks
 assert_equal 'true' "$RELEASE_ALL_WINDOWS_NEEDED" 'missing Windows assets require continuation'
+release_all_windows_candidate_assets_are_valid() { return 37; }
+set +e
+release_all_collect_missing_candidate_checks >/dev/null 2>&1
+candidate_transport_exit=$?
+set -e
+assert_equal '37' "$candidate_transport_exit" 'Windows asset transport failure is surfaced'
 release_all_windows_candidate_assets_are_valid() { return 0; }
 release_all_collect_missing_candidate_checks
 assert_equal 'false' "$RELEASE_ALL_WINDOWS_NEEDED" 'verified Windows assets permit reuse'
@@ -220,6 +228,69 @@ assert_contains \
   "$remote_failure" \
   "Could not read release tag 'v1.2.3' from origin." \
   'remote tag transport failure message'
+
+real_script_dir="$SCRIPT_DIR"
+real_release_require_matching_versions="$(declare -f release_require_matching_versions)"
+real_release_all_remote_tag_commit="$(declare -f release_all_remote_tag_commit)"
+real_release_all_current_release_document="$(declare -f release_all_current_release_document)"
+candidate_script_dir="$fixture_root/candidate-script"
+candidate_calls="$fixture_root/candidate-calls"
+mkdir -p "$candidate_script_dir"
+cat >"$candidate_script_dir/release.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$RELEASE_ALL_TEST_CANDIDATE_CALLS"
+EOF
+chmod +x "$candidate_script_dir/release.sh"
+export RELEASE_ALL_TEST_CANDIDATE_CALLS="$candidate_calls"
+SCRIPT_DIR="$candidate_script_dir"
+RELEASE_SHA='0123456789abcdef0123456789abcdef01234567'
+release_require_matching_versions() { printf '1.2.3\n'; }
+release_all_current_release_document() {
+  printf '%s\n' '{"isDraft":true,"tagName":"v1.2.3"}'
+}
+candidate_local_tag=''
+candidate_remote_tag=''
+git() {
+  case "$1:${2:-}:${3:-}" in
+    'log:-1:--format=%s') printf 'Release v1.2.3\n' ;;
+    'rev-list:-n:1') printf '%s\n' "$candidate_local_tag" ;;
+    'rev-parse:HEAD:') printf '%s\n' "$RELEASE_SHA" ;;
+    *) return 2 ;;
+  esac
+}
+release_all_remote_tag_commit() { printf '%s\n' "$candidate_remote_tag"; }
+
+candidate_local_tag='1111111111111111111111111111111111111111'
+: >"$candidate_calls"
+release_all_prepare_candidate patch
+assert_equal \
+  'patch --prepare-only' \
+  "$(<"$candidate_calls")" \
+  'mismatched release tag does not enter direct resume mode'
+
+candidate_local_tag=''
+candidate_remote_tag=''
+: >"$candidate_calls"
+release_all_prepare_candidate minor
+assert_equal \
+  'minor --prepare-only' \
+  "$(<"$candidate_calls")" \
+  'missing release tag uses the checked lower-level recovery path'
+
+candidate_local_tag="$RELEASE_SHA"
+release_all_current_release_document() { printf '%s\n' '{"isDraft":null}'; }
+: >"$candidate_calls"
+set +e
+release_all_prepare_candidate patch >/dev/null 2>&1
+invalid_draft_exit=$?
+set -e
+assert_equal '1' "$invalid_draft_exit" 'non-boolean draft state fails closed'
+
+unset -f git
+eval "$real_release_require_matching_versions"
+eval "$real_release_all_remote_tag_commit"
+eval "$real_release_all_current_release_document"
+SCRIPT_DIR="$real_script_dir"
 
 if ! /bin/bash -c '
   source "$1"

@@ -41,8 +41,16 @@ function Get-WindowsVerificationStatusStateFromDocument {
     if ($matchingStatuses.Count -eq 0) {
         return 'missing'
     }
+    $creatorLogin = ''
+    $creatorProperty = $matchingStatuses[0].PSObject.Properties['creator']
+    if ($null -ne $creatorProperty -and $null -ne $creatorProperty.Value) {
+        $loginProperty = $creatorProperty.Value.PSObject.Properties['login']
+        if ($null -ne $loginProperty) {
+            $creatorLogin = [string] $loginProperty.Value
+        }
+    }
     if (-not [string]::IsNullOrWhiteSpace($TrustedLogin) -and
-        [string] $matchingStatuses[0].creator.login -ne $TrustedLogin) {
+        $creatorLogin -ne $TrustedLogin) {
         return 'untrusted'
     }
 
@@ -115,7 +123,7 @@ function Get-WindowsReleaseCandidates {
         }
 
         $status = Get-WindowsVerificationStatusState -Commit $commit
-        if ($status -eq 'success') {
+        if ($status -eq 'success' -and [string]::IsNullOrWhiteSpace($RequestedTag)) {
             continue
         }
 

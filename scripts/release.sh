@@ -29,7 +29,9 @@ resume
 --prepare-only
   For an increment, commit and push the requested version; for resume, retain
   the current version. Create its tag and draft without starting the version
-  verifier wave or attaching platform assets.
+  verifier wave or attaching platform assets. Resume preparation intentionally
+  skips the ordinary-status gate because the candidate wave verifies the exact
+  version commit before any assets are published.
 EOF
 }
 

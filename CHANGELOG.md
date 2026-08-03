@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - [changed]: Authorize each user's GitHub identity and current repository permissions instead of sharing one server-configured GitHub account.
 - [changed]: Reconcile and upload migrations through LFS Cloud so clients no longer need private server configuration or direct Google Drive access.
 - [fixed]: Reject stale migration config arguments, ignore the target as a legacy source, and validate server-issued upload actions before sending object bytes.
+- [fixed]: Reject ambiguous fleet release resumes, surface remote validation failures, and repair missing Windows assets even after a green check.
 - [fixed]: Validate the durable-session secret during config loading and count its documented minimum in characters.
 - [documentation]: Group direct installers, Homebrew, WinGet, and checkout installation into compact README sections without advertising unavailable APT installation.
 - [tooling]: Add one fail-fast fleet release command that fills missing Mac, Linux, and Windows checks, assembles the draft across both machines, and publishes the exact verified tag.

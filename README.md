@@ -4,6 +4,8 @@ LFS Cloud is a self-hosted Git LFS server and companion CLI that stores large fi
 
 > LFS Cloud is preparing for its first release. The release tooling now builds checksummed binaries, direct installers, Debian packages, Homebrew metadata, and WinGet manifests; Cloudsmith APT publication is optional. These channels will not resolve until the first release is published. Binary signatures and macOS notarization are not available yet.
 
+Maintainers should use `yarn release:all patch` (or `minor`/`major`) as the preferred manual release entry point. See the [all-in-one fleet release guide](docs/install-release.md#all-in-one-fleet-release) for prerequisites, recovery behavior, and lower-level commands.
+
 ## What It Does
 
 LFS Cloud keeps repository history and permissions on GitHub, proxies Git LFS uploads and downloads, and stores the object bytes in a private Google Drive folder:

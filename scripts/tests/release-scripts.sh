@@ -891,6 +891,7 @@ bash -n \
 "$REPO_ROOT/scripts/local/verify-linux-x86-64.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-macos.sh" --help >/dev/null
 "$REPO_ROOT/scripts/local/verify-all.sh" --help >/dev/null
+"$REPO_ROOT/scripts/local/verify-all.sh" --help ignored >/dev/null
 "$REPO_ROOT/scripts/release-all.sh" --help >/dev/null
 "$REPO_ROOT/scripts/release.sh" --help >/dev/null
 

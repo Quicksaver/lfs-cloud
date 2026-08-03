@@ -1141,8 +1141,17 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       publish_usage
       exit 0
       ;;
-    ''|v*)
-      publish_main "${1:-}"
+    '')
+      publish_main
+      ;;
+    v*)
+      if [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        publish_main "$1"
+      else
+        publish_error "Unknown argument: $1"
+        publish_usage >&2
+        exit 2
+      fi
       ;;
     *)
       publish_error "Unknown argument: $1"

@@ -343,4 +343,14 @@ assert_not_contains \
   'read -r -p' \
   "selected releases do not require a second typed confirmation"
 
+set +e
+unknown_argument_output="$("$SCRIPT_DIR/../publish.sh" verbose 2>&1)"
+unknown_argument_exit=$?
+set -e
+assert_equal '2' "$unknown_argument_exit" 'non-semantic v-prefix argument exit status'
+assert_contains \
+  "$unknown_argument_output" \
+  'Unknown argument: verbose' \
+  'non-semantic v-prefix argument diagnostic'
+
 printf '[publish-release-tests] %d passed, 0 failed\n' "$TESTS_PASSED"

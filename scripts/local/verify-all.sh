@@ -329,7 +329,7 @@ verify_all_main() {
   local command_path
   local requested_environments=("$@")
 
-  if (($# == 1)) && { [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; }; then
+  if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     verify_all_usage
     return 0
   fi

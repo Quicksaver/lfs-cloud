@@ -165,6 +165,34 @@ Invoke-Test 'Requested tag ignores unrelated drafts before metadata lookup' {
     }
 }
 
+Invoke-Test 'Requested tag repairs assets after a successful Windows status' {
+    $originalNativeCapture = (Get-Item Function:Invoke-NativeCapture).ScriptBlock
+    $originalTagCommit = (Get-Item Function:Get-RemoteReleaseTagCommit).ScriptBlock
+    $originalStatusState = (Get-Item Function:Get-WindowsVerificationStatusState).ScriptBlock
+
+    try {
+        Set-Item Function:Invoke-NativeCapture {
+            return [pscustomobject] @{
+                ExitCode = 0
+                Output = '[{"tagName":"v1.0.0","isDraft":true,"isPrerelease":false,"publishedAt":null}]'
+            }
+        }
+        Set-Item Function:Get-RemoteReleaseTagCommit {
+            return '0123456789abcdef0123456789abcdef01234567'
+        }
+        Set-Item Function:Get-WindowsVerificationStatusState { return 'success' }
+
+        $candidates = @(Get-WindowsReleaseCandidates -RequestedTag 'v1.0.0')
+        Assert-Equal 1 $candidates.Count 'targeted successful candidate count'
+        Assert-Equal 'success' $candidates[0].Status 'targeted successful candidate status'
+    }
+    finally {
+        Set-Item Function:Invoke-NativeCapture $originalNativeCapture
+        Set-Item Function:Get-RemoteReleaseTagCommit $originalTagCommit
+        Set-Item Function:Get-WindowsVerificationStatusState $originalStatusState
+    }
+}
+
 Invoke-Test 'Windows upload passes each asset path as a distinct argument' {
     $assetPaths = @('archive.tar.gz', 'archive.tar.gz.sha256', 'archive.build.json')
     $arguments = @(Get-WindowsReleaseUploadArguments `
@@ -222,6 +250,18 @@ Invoke-Test 'Latest Windows status wins and unrelated contexts are ignored' {
 
     $missing = Get-WindowsVerificationStatusStateFromDocument -Document ([pscustomobject] @{ statuses = @() })
     Assert-Equal 'missing' $missing 'missing Windows status'
+
+    $document.statuses[2].creator = $null
+    $nullCreator = Get-WindowsVerificationStatusStateFromDocument `
+        -Document $document `
+        -TrustedLogin 'fixture'
+    Assert-Equal 'untrusted' $nullCreator 'null Windows status creator'
+
+    $document.statuses[2].PSObject.Properties.Remove('creator')
+    $missingCreator = Get-WindowsVerificationStatusStateFromDocument `
+        -Document $document `
+        -TrustedLogin 'fixture'
+    Assert-Equal 'untrusted' $missingCreator 'missing Windows status creator'
 }
 
 Invoke-Test 'Published assets must match local names, sizes, and SHA-256 digests' {
