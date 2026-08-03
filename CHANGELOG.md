@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - [fixed]: Reject stale migration config arguments, ignore the target as a legacy source, and validate server-issued upload actions before sending object bytes.
 - [fixed]: Validate the durable-session secret during config loading and count its documented minimum in characters.
 - [documentation]: Group direct installers, Homebrew, WinGet, and checkout installation into compact README sections without advertising unavailable APT installation.
+- [tooling]: Create the tagged draft before version verification so the native Windows continuation can start while macOS and Linux checks are still running.
+- [tooling]: Save each aggregate verifier's output to its own retained log instead of terminal rolling windows, and purge verification logs older than 14 days.
 - [tooling]: Generate required WinGet schema headers and update existing submission branches so requested manifest changes can be addressed.
 - [tooling]: Resume failed Homebrew publication by trusting the configured tap and accepting its matching generated formula, and prevent duplicate WinGet upstream remotes.
 - [tooling]: Publish a selected verified release without requiring a redundant typed `publish vX.Y.Z` confirmation.

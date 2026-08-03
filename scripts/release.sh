@@ -16,7 +16,8 @@ Usage:
 
 major, minor, patch
   Require a clean pushed commit with green local checks, increment the version,
-  commit and push it, rerun local checks, tag it, and prepare its draft release.
+  commit and push it, create its tag and draft, then rerun local checks and
+  attach their verified assets.
   An untagged current-version release commit resumes without another increment;
   an already-tagged HEAD requires a new commit before another release can start.
 
@@ -137,6 +138,7 @@ prepare_release_draft() {
   local notes_file="$2"
   shift 2
   local assets=("$@")
+  local asset_count="$#"
   local asset
   local asset_name
   local release_json
@@ -157,20 +159,33 @@ prepare_release_draft() {
       --repo "$RELEASE_GITHUB_REPO" \
       --notes-file "$notes_file"
 
-    release_run_step \
-      "Replace assets on the existing draft release $tag" \
-      gh release upload "$tag" "${assets[@]}" \
-      --repo "$RELEASE_GITHUB_REPO" \
-      --clobber
+    if ((asset_count > 0)); then
+      release_run_step \
+        "Replace assets on the existing draft release $tag" \
+        gh release upload "$tag" "${assets[@]}" \
+        --repo "$RELEASE_GITHUB_REPO" \
+        --clobber
+    fi
   else
-    release_run_step \
-      "Create draft release $tag and upload verified assets" \
-      gh release create "$tag" "${assets[@]}" \
-      --repo "$RELEASE_GITHUB_REPO" \
-      --draft \
-      --verify-tag \
-      --notes-file "$notes_file" \
-      --title "LFS Cloud $tag"
+    if ((asset_count > 0)); then
+      release_run_step \
+        "Create draft release $tag and upload verified assets" \
+        gh release create "$tag" "${assets[@]}" \
+        --repo "$RELEASE_GITHUB_REPO" \
+        --draft \
+        --verify-tag \
+        --notes-file "$notes_file" \
+        --title "LFS Cloud $tag"
+    else
+      release_run_step \
+        "Create draft release $tag" \
+        gh release create "$tag" \
+        --repo "$RELEASE_GITHUB_REPO" \
+        --draft \
+        --verify-tag \
+        --notes-file "$notes_file" \
+        --title "LFS Cloud $tag"
+    fi
   fi
 
   release_json="$(
@@ -182,15 +197,17 @@ prepare_release_draft() {
     release_die "Release $tag must remain a draft until its assets are verified."
   fi
 
-  for asset in "${assets[@]}"; do
-    asset_name="$(basename "$asset")"
-    if ! printf '%s' "$release_json" \
-      | jq -e --arg name "$asset_name" \
-        '[.assets[] | select(.name == $name and .state == "uploaded" and .size > 0)] | length == 1' \
-        >/dev/null; then
-      release_die "Draft release $tag does not contain uploaded asset $asset_name."
-    fi
-  done
+  if ((asset_count > 0)); then
+    for asset in "${assets[@]}"; do
+      asset_name="$(basename "$asset")"
+      if ! printf '%s' "$release_json" \
+        | jq -e --arg name "$asset_name" \
+          '[.assets[] | select(.name == $name and .state == "uploaded" and .size > 0)] | length == 1' \
+          >/dev/null; then
+        release_die "Draft release $tag does not contain uploaded asset $asset_name."
+      fi
+    done
+  fi
 
   release_pass "Prepared draft $(printf '%s' "$release_json" | jq -r '.url')"
 }
@@ -246,6 +263,7 @@ case "$version_action" in
     ;;
 esac
 
+run_version_verifiers=false
 if [[ "$mode" != "resume" ]]; then
   next_version="$(release_next_version "$current_version" "$mode")"
   tag="v$next_version"
@@ -300,10 +318,8 @@ $changed_files" "$YELLOW"
   RELEASE_SHA="$(git rev-parse HEAD)"
   release_require_current_commit_on_origin
 
-  run_all_local_verifiers
-  release_require_local_statuses_green "$RELEASE_SHA"
-
   current_version="$next_version"
+  run_version_verifiers=true
 else
   tag="v$current_version"
   release_pass "Resuming release $tag from $RELEASE_SHA"
@@ -323,6 +339,14 @@ release_run_step \
   "$current_version" \
   "$published_version" \
   "$release_notes_file"
+
+ensure_release_tag "$tag" "$RELEASE_SHA"
+prepare_release_draft "$tag" "$release_notes_file"
+
+if [[ "$run_version_verifiers" == true ]]; then
+  run_all_local_verifiers
+  release_require_local_statuses_green "$RELEASE_SHA"
+fi
 
 artifact="$(release_macos_artifact_path "$current_version")"
 manifest="$(release_macos_manifest_path "$current_version")"
@@ -446,5 +470,4 @@ if [[ "$("$release_binary" --version)" != "lfscloud $current_version" ]]; then
 fi
 
 release_require_local_statuses_green "$RELEASE_SHA"
-ensure_release_tag "$tag" "$RELEASE_SHA"
 prepare_release_draft "$tag" "$release_notes_file" "${release_assets[@]}"

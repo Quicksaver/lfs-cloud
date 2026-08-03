@@ -434,19 +434,49 @@ cp "$parallel_fixture/verifier-template.sh" "$parallel_fixture/verifier-fail.sh"
 chmod +x "$parallel_fixture"/verifier-*.sh
 
 VERIFY_ALL_LABELS=("one" "two" "expected failure")
+VERIFY_ALL_ENVIRONMENTS=("one" "two" "expected-failure")
 VERIFY_ALL_COMMANDS=(
   "$parallel_fixture/verifier-one.sh"
   "$parallel_fixture/verifier-two.sh"
   "$parallel_fixture/verifier-fail.sh"
 )
+VERIFY_ALL_LOG_ROOT="$parallel_fixture/logs"
+VERIFY_ALL_TIMESTAMP="20260803T120000Z"
+mkdir -p \
+  "$VERIFY_ALL_LOG_ROOT/verify-old" \
+  "$VERIFY_ALL_LOG_ROOT/verify-recent"
+printf 'expired log\n' > "$VERIFY_ALL_LOG_ROOT/verify-old/old.log"
+printf 'preserved non-log file\n' > "$VERIFY_ALL_LOG_ROOT/verify-old/old.txt"
+printf 'recent log\n' > "$VERIFY_ALL_LOG_ROOT/verify-recent/recent.log"
+touch -t 202001010000 \
+  "$VERIFY_ALL_LOG_ROOT/verify-old/old.log" \
+  "$VERIFY_ALL_LOG_ROOT/verify-old/old.txt"
 set +e
 parallel_output="$(verify_all_run_parallel 2>&1)"
 parallel_exit=$?
 set -e
 assert_eq "1" "$parallel_exit" "one failed verifier should produce one aggregate failure"
+if [[ -e "$VERIFY_ALL_LOG_ROOT/verify-old/old.log" ]]; then
+  fail_test "verify-all did not purge an expired verification log"
+fi
+if [[ ! -e "$VERIFY_ALL_LOG_ROOT/verify-old/old.txt" ]]; then
+  fail_test "verify-all purged a non-log file"
+fi
+if [[ ! -e "$VERIFY_ALL_LOG_ROOT/verify-recent/recent.log" ]]; then
+  fail_test "verify-all purged a recent verification log"
+fi
 for verifier_name in verifier-one verifier-two verifier-fail; do
-  if ! grep -q "$verifier_name unique output" <<< "$parallel_output"; then
-    fail_test "parallel output omitted $verifier_name"
+  verifier_environment="${verifier_name#verifier-}"
+  if [[ "$verifier_environment" == "fail" ]]; then
+    verifier_environment="expected-failure"
+  fi
+  verifier_log="$VERIFY_ALL_LOG_ROOT/verify-$VERIFY_ALL_TIMESTAMP/$verifier_environment.log"
+  if [[ ! -f "$verifier_log" ]] \
+    || ! grep -q "$verifier_name unique output" "$verifier_log"; then
+    fail_test "parallel log omitted $verifier_name output"
+  fi
+  if grep -q "$verifier_name unique output" <<< "$parallel_output"; then
+    fail_test "parallel terminal output included $verifier_name output"
   fi
 done
 
@@ -469,7 +499,10 @@ EOF
 chmod +x "$powershell_fixture/bin/pwsh"
 
 VERIFY_ALL_LABELS=("Windows fixture")
+VERIFY_ALL_ENVIRONMENTS=("windows-fixture")
 VERIFY_ALL_COMMANDS=("$powershell_fixture/verifier.ps1")
+VERIFY_ALL_LOG_ROOT="$powershell_fixture/logs"
+VERIFY_ALL_TIMESTAMP="20260803T120001Z"
 set +e
 PATH="$powershell_fixture/bin:$PATH" \
   VERIFY_ALL_POWERSHELL_MARKER="$powershell_marker" \
@@ -781,6 +814,28 @@ if ! grep -Fq 'release_latest_published_version' "$REPO_ROOT/scripts/release.sh"
   || ! grep -Fq 'release_extract_cumulative_changelog_notes' \
     "$REPO_ROOT/scripts/release.sh"; then
   fail_test "Local release should build notes from every version after the latest published release"
+fi
+release_tag_line="$(
+  grep -nF 'ensure_release_tag "$tag" "$RELEASE_SHA"' "$REPO_ROOT/scripts/release.sh" \
+    | tail -n 1 \
+    | cut -d: -f1
+)"
+release_draft_line="$(
+  grep -nF 'prepare_release_draft "$tag" "$release_notes_file"' "$REPO_ROOT/scripts/release.sh" \
+    | head -n 1 \
+    | cut -d: -f1
+)"
+release_verifier_line="$(
+  grep -nE '^[[:space:]]+run_all_local_verifiers$' "$REPO_ROOT/scripts/release.sh" \
+    | head -n 1 \
+    | cut -d: -f1
+)"
+if [[ -z "$release_tag_line" ]] \
+  || [[ -z "$release_draft_line" ]] \
+  || [[ -z "$release_verifier_line" ]] \
+  || ((release_tag_line >= release_draft_line)) \
+  || ((release_draft_line >= release_verifier_line)); then
+  fail_test "Local release should create its tag and draft before starting version verification"
 fi
 if ! grep -Fqx 'RELEASE_REPO_ROOT="$repo_root"' \
   "$REPO_ROOT/scripts/docker/run-linux-verification.sh"; then

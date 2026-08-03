@@ -6,6 +6,7 @@
 /target/
 **/target/
 /dist/
+/logs/
 
 # Cargo.lock is committed for binaries, but listed here for reference
 # Cargo.lock

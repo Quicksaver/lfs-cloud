@@ -7,14 +7,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/release-common.sh"
 
 VERIFY_ALL_LABELS=()
+VERIFY_ALL_ENVIRONMENTS=()
 VERIFY_ALL_COMMANDS=()
 VERIFY_ALL_PIDS=()
 VERIFY_ALL_LOG_FILES=()
 VERIFY_ALL_STATUS_FILES=()
-VERIFY_ALL_LOG_OFFSETS=()
 VERIFY_ALL_EXIT_CODES=()
 VERIFY_ALL_STATES=()
 VERIFY_ALL_TEMP_DIR=""
+VERIFY_ALL_LOG_ROOT="${VERIFY_ALL_LOG_ROOT:-}"
+VERIFY_ALL_LOG_DIR=""
+VERIFY_ALL_TIMESTAMP="${VERIFY_ALL_TIMESTAMP:-}"
 
 verify_all_usage() {
   cat <<'EOF'
@@ -23,7 +26,8 @@ Usage: ./scripts/local/verify-all.sh
 Run every deterministic local verifier supported by the current system in
 parallel. macOS runs the native macOS verifier, Windows runs the native Windows
 verifier, and a responsive Docker Linux engine runs both Linux verifiers. Each
-verifier records its own local-checks/* commit status and release artifact.
+verifier records its own local-checks/* commit status and release artifact. Its
+stdout and stderr are saved under logs/verify-[timestamp]/[environment].log.
 EOF
 }
 
@@ -36,22 +40,26 @@ verify_all_configure_default_commands() {
   local system_name
 
   VERIFY_ALL_LABELS=()
+  VERIFY_ALL_ENVIRONMENTS=()
   VERIFY_ALL_COMMANDS=()
   system_name="$(uname -s)"
 
   case "$system_name" in
     Darwin)
       VERIFY_ALL_LABELS+=("macOS ARM64")
+      VERIFY_ALL_ENVIRONMENTS+=("macos-arm64")
       VERIFY_ALL_COMMANDS+=("$SCRIPT_DIR/verify-macos.sh")
       ;;
     CYGWIN* | MINGW* | MSYS* | Windows_NT)
       VERIFY_ALL_LABELS+=("Windows x86-64")
+      VERIFY_ALL_ENVIRONMENTS+=("windows-x86-64")
       VERIFY_ALL_COMMANDS+=("$SCRIPT_DIR/verify-windows.ps1")
       ;;
   esac
 
   if verify_all_docker_is_runnable; then
     VERIFY_ALL_LABELS+=("Linux ARM64" "Linux x86-64")
+    VERIFY_ALL_ENVIRONMENTS+=("linux-arm64" "linux-x86-64")
     VERIFY_ALL_COMMANDS+=(
       "$SCRIPT_DIR/verify-linux-arm64.sh"
       "$SCRIPT_DIR/verify-linux-x86-64.sh"
@@ -140,39 +148,31 @@ verify_all_cleanup() {
   fi
 }
 
-verify_all_drain_log() {
-  local idx="$1"
-  local log_file="${VERIFY_ALL_LOG_FILES[$idx]}"
-  local previous_line="${VERIFY_ALL_LOG_OFFSETS[$idx]:-0}"
-  local total_lines
-  local first_line
-  local line
+verify_all_prepare_log_directory() {
+  local log_root
+  local timestamp
 
-  total_lines="$(wc -l < "$log_file" | tr -d '[:space:]')"
-  if ((total_lines <= previous_line)); then
-    return
+  log_root="${VERIFY_ALL_LOG_ROOT:-$RELEASE_REPO_ROOT/logs}"
+  mkdir -p "$log_root"
+
+  find "$log_root" \
+    -type f \
+    -path "$log_root/verify-*/*.log" \
+    -mmin +20160 \
+    -delete
+  find "$log_root" \
+    -depth \
+    -type d \
+    -name 'verify-*' \
+    -empty \
+    -delete
+
+  timestamp="${VERIFY_ALL_TIMESTAMP:-$(date -u '+%Y%m%dT%H%M%SZ')}"
+  VERIFY_ALL_LOG_DIR="$log_root/verify-$timestamp"
+  if [[ -e "$VERIFY_ALL_LOG_DIR" ]]; then
+    release_die "Verification log directory already exists: $VERIFY_ALL_LOG_DIR"
   fi
-
-  first_line=$((previous_line + 1))
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    ui_append_rolling_slot_output "$idx" "$line"
-  done < <(sed -n "${first_line},${total_lines}p" "$log_file")
-  VERIFY_ALL_LOG_OFFSETS[$idx]="$total_lines"
-}
-
-verify_all_print_failed_logs() {
-  local idx
-  local output
-
-  [[ "$LIVE_REGION_ENABLED" == true ]] || return
-
-  for ((idx = 0; idx < ${#VERIFY_ALL_LABELS[@]}; idx++)); do
-    if [[ "${VERIFY_ALL_EXIT_CODES[$idx]:-1}" != "0" ]]; then
-      release_warn "${VERIFY_ALL_LABELS[$idx]} verifier output"
-      output="$(cat "${VERIFY_ALL_LOG_FILES[$idx]}")"
-      ui_log_persistent_raw_batch "$output" "$YELLOW"
-    fi
-  done
+  mkdir -p "$VERIFY_ALL_LOG_DIR"
 }
 
 verify_all_run_parallel() {
@@ -185,26 +185,31 @@ verify_all_run_parallel() {
   local status_file
   local status_tmp
 
-  if ((count == 0)) || ((count != ${#VERIFY_ALL_LABELS[@]})); then
-    release_die "Parallel verification requires matching command and label lists."
+  if ((count == 0)) \
+    || ((count != ${#VERIFY_ALL_LABELS[@]})) \
+    || ((count != ${#VERIFY_ALL_ENVIRONMENTS[@]})); then
+    release_die "Parallel verification requires matching command, environment, and label lists."
   fi
 
+  verify_all_prepare_log_directory
   VERIFY_ALL_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lfscloud-verify-all.XXXXXX")"
   VERIFY_ALL_PIDS=()
   VERIFY_ALL_LOG_FILES=()
   VERIFY_ALL_STATUS_FILES=()
-  VERIFY_ALL_LOG_OFFSETS=()
   VERIFY_ALL_EXIT_CODES=()
   VERIFY_ALL_STATES=()
 
-  ui_enable_rolling_slots "$count" 3
+  release_info "Verification logs: $VERIFY_ALL_LOG_DIR"
+  ui_enable_slots "$count"
   for ((idx = 0; idx < count; idx++)); do
     command_path="${VERIFY_ALL_COMMANDS[$idx]}"
     verify_all_validate_command "$command_path"
+    if [[ ! "${VERIFY_ALL_ENVIRONMENTS[$idx]}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+      release_die "Invalid verification environment name: ${VERIFY_ALL_ENVIRONMENTS[$idx]}"
+    fi
 
-    VERIFY_ALL_LOG_FILES[$idx]="$VERIFY_ALL_TEMP_DIR/verifier-$idx.log"
+    VERIFY_ALL_LOG_FILES[$idx]="$VERIFY_ALL_LOG_DIR/${VERIFY_ALL_ENVIRONMENTS[$idx]}.log"
     VERIFY_ALL_STATUS_FILES[$idx]="$VERIFY_ALL_TEMP_DIR/verifier-$idx.status"
-    VERIFY_ALL_LOG_OFFSETS[$idx]=0
     VERIFY_ALL_EXIT_CODES[$idx]=""
     VERIFY_ALL_STATES[$idx]="running"
     : > "${VERIFY_ALL_LOG_FILES[$idx]}"
@@ -229,8 +234,6 @@ verify_all_run_parallel() {
 
   while ((completed < count)); do
     for ((idx = 0; idx < count; idx++)); do
-      verify_all_drain_log "$idx"
-
       if [[ "${VERIFY_ALL_STATES[$idx]}" == "running" ]] \
         && [[ -f "${VERIFY_ALL_STATUS_FILES[$idx]}" ]]; then
         exit_code="$(cat "${VERIFY_ALL_STATUS_FILES[$idx]}")"
@@ -246,9 +249,6 @@ verify_all_run_parallel() {
       fi
 
       if [[ "${VERIFY_ALL_STATES[$idx]}" == "running" ]]; then
-        # The completion marker is written after the log, but it can appear
-        # between the poll's first log drain and this completion check.
-        verify_all_drain_log "$idx"
         VERIFY_ALL_EXIT_CODES[$idx]="$exit_code"
         VERIFY_ALL_STATES[$idx]="done"
         completed=$((completed + 1))
@@ -262,23 +262,22 @@ verify_all_run_parallel() {
       fi
     done
 
-    ui_flush_rolling_slots
     if ((completed < count)); then
       sleep 0.1
     fi
   done
 
-  ui_flush_rolling_slots
-  verify_all_print_failed_logs
   ui_clear_all_slots
   ui_set_render_mode "task_only"
   ui_clear_live_state
 
   for ((idx = 0; idx < count; idx++)); do
     if [[ "${VERIFY_ALL_EXIT_CODES[$idx]}" == "0" ]]; then
-      release_pass "${VERIFY_ALL_LABELS[$idx]} verification passed"
+      release_pass \
+        "${VERIFY_ALL_LABELS[$idx]} verification passed (log: ${VERIFY_ALL_LOG_FILES[$idx]})"
     else
-      fail "${VERIFY_ALL_LABELS[$idx]} verification failed (exit ${VERIFY_ALL_EXIT_CODES[$idx]})"
+      fail \
+        "${VERIFY_ALL_LABELS[$idx]} verification failed (exit ${VERIFY_ALL_EXIT_CODES[$idx]}; log: ${VERIFY_ALL_LOG_FILES[$idx]})"
     fi
   done
 

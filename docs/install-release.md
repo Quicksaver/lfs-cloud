@@ -54,7 +54,7 @@ yarn verify:all
 
 The orchestrator detects host capabilities before repository or GitHub checks. On macOS it selects the macOS ARM64 verifier; on Windows it selects the Windows x86-64 verifier. Whenever a responsive Docker Linux engine is available, it also selects both Linux Docker verifiers. The selected checks run concurrently. If the host supports no verifier, the command fails before contacting GitHub.
 
-The orchestrator requires a clean tracked worktree and proves that the checked-out commit is exactly the current branch on `origin`. Its terminal display keeps a bounded rolling output window for each environment, waits for every selected verifier even when one fails, and reports their results independently. Each verifier packages its verified binary, checksum, and commit-bound build manifest under `dist/`, then posts its own `local-checks/*` commit status through the authenticated GitHub CLI.
+The orchestrator requires a clean tracked worktree and proves that the checked-out commit is exactly the current branch on `origin`. Its terminal display reports one status line per environment without streaming the child processes. Complete stdout and stderr are written to separate `logs/verify-[timestamp]/[environment].log` files, and each run removes verification log files older than 14 days. The orchestrator waits for every selected verifier even when one fails and prints the corresponding log path with each result. Each verifier packages its verified binary, checksum, and commit-bound build manifest under `dist/`, then posts its own `local-checks/*` commit status through the authenticated GitHub CLI.
 
 Run one environment independently when needed:
 
@@ -157,12 +157,12 @@ The release script:
 1. Requires a completely clean worktree and a current commit exactly matching the current branch on `origin`.
 2. Requires the latest macOS, Linux ARM64 Docker, and Linux x86-64 Docker statuses to be successful and created by the currently authenticated GitHub user.
 3. Updates the matching versions in `Cargo.toml`, `Cargo.lock`, and `package.json`; moves the current `CHANGELOG.md` entries from `Unreleased` into a dated `[X.Y.Z] - YYYY-MM-DD` section; adds a fresh `Unreleased` section; then commits `Release vX.Y.Z` and pushes that commit without force.
-4. Reruns all three deterministic local verifiers and requires their new commit statuses to be green.
-5. Verifies that the packaged macOS binary reports the new version and that every platform archive's SHA-256 checksum and build manifest match the exact commit.
-6. Creates and pushes an annotated `vX.Y.Z` tag for the exact verified commit.
-7. Creates or refreshes a draft GitHub release using every `CHANGELOG.md` section newer than the highest successfully published stable release, through the candidate version, as its description. Failed, interrupted, or unpublished draft versions therefore keep rolling into later release notes until a release is published. It uploads the three platform archives, both Debian packages, direct installers, checksums, and commit-bound manifests, verifies those draft assets, and leaves the release editable for the Windows continuation.
+4. Creates and pushes the annotated `vX.Y.Z` tag, then creates or refreshes an asset-less draft GitHub release using every `CHANGELOG.md` section newer than the highest successfully published stable release, through the candidate version, as its description. Failed, interrupted, or unpublished draft versions therefore keep rolling into later release notes until a release is published.
+5. Reruns all three deterministic local verifiers, writing their output to `logs/verify-[timestamp]/[environment].log`, and requires their new commit statuses to be green.
+6. Verifies that the packaged macOS binary reports the new version and that every platform archive's SHA-256 checksum and build manifest match the exact commit.
+7. Uploads the three platform archives, both Debian packages, direct installers, checksums, and commit-bound manifests, verifies those draft assets, and leaves the release editable for the Windows continuation.
 
-After `release.sh` succeeds, continue the same draft release from a clean native Windows x86-64 checkout:
+As soon as `release.sh` creates the draft, continue the same release from a clean native Windows x86-64 checkout; the Windows verifier can run while the macOS and Linux verifiers are still working:
 
 ```powershell
 yarn release:windows
