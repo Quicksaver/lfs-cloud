@@ -94,6 +94,10 @@ assert_contains \
   "$candidate_assets_script" \
   "Assert-WindowsReleaseAssetsPublished -Release \$release" \
   'candidate reuse validates the remote Windows assets'
+assert_contains \
+  "$candidate_assets_script" \
+  '-ErrorAction Continue' \
+  'candidate reuse preserves the recoverable validation exit code'
 
 ssh_arguments_file="$fixture_root/ssh-arguments"
 ssh() { printf '%s\n' "$@" >"$ssh_arguments_file"; }

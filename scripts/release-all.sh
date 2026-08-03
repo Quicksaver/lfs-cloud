@@ -149,7 +149,7 @@ try {
     Assert-WindowsReleaseAssetsPublished -Release \$release -AssetPaths \$assets
 }
 catch {
-    Write-Error ("Windows candidate assets are not reusable: " + \$_.Exception.Message)
+    Write-Error ("Windows candidate assets are not reusable: " + \$_.Exception.Message) -ErrorAction Continue
     exit 20
 }
 EOF
