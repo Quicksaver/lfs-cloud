@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-03
+
 - [added]: Preserve the legacy remote LFS URL in `.lfsconfig` so pulling the new target configuration does not prevent users from migrating remaining objects.
 - [changed]: Authorize each user's GitHub identity and current repository permissions instead of sharing one server-configured GitHub account.
 - [changed]: Reconcile and upload migrations through LFS Cloud so clients no longer need private server configuration or direct Google Drive access.
