@@ -73,6 +73,13 @@ pub(crate) fn load_or_create_managed_session_key(
     Ok(secret)
 }
 
+/// Invalidates every durable session and replaces the managed encryption key.
+///
+/// Session invalidation is intentionally committed before the new key is
+/// stored. If the native credential-store write fails, this function returns
+/// the error after all sessions have been deleted and leaves the previous key
+/// in place. The operator must restore credential-store access and retry the
+/// rotation before issuing new sessions.
 pub(crate) fn rotate_managed_session_key(
     database: &MetadataDatabase,
     key_store: &dyn SessionEncryptionKeyStore,
@@ -153,6 +160,22 @@ mod tests {
         }
     }
 
+    struct FailingStore<'a> {
+        inner: &'a MemoryKeyStore,
+    }
+
+    impl SessionEncryptionKeyStore for FailingStore<'_> {
+        fn load(&self, account: &str) -> crate::ServerResult<Option<Vec<u8>>> {
+            self.inner.load(account)
+        }
+
+        fn store(&self, _account: &str, _secret: &[u8]) -> crate::ServerResult<()> {
+            Err(crate::ServerError::Internal {
+                message: "simulated credential-store write failure".to_owned(),
+            })
+        }
+    }
+
     fn user() -> RepositoryUser {
         RepositoryUser::new("github", "octocat", Some("1".to_owned()))
     }
@@ -228,6 +251,37 @@ mod tests {
         assert_ne!(new_key, old_key);
         LocalLfsSessionStore::open_durable(database, new_key)
             .expect("rotated key should open after invalidation");
+    }
+
+    #[test]
+    fn failed_rotation_store_invalidates_sessions_and_preserves_previous_key() {
+        let database = Arc::new(MetadataDatabase::open_in_memory().expect("metadata should open"));
+        let key_store = MemoryKeyStore::default();
+        let old_key = load_or_create_managed_session_key(&database, &key_store)
+            .expect("initial managed key should be generated");
+        LocalLfsSessionStore::open_durable(database.clone(), &old_key)
+            .expect("durable sessions should open")
+            .issue_session_with_github_pat(
+                &user(),
+                ["repo"],
+                GitHubPersonalAccessToken::from_secret("github-pat").expect("PAT should validate"),
+            )
+            .expect("active session should be stored");
+
+        let error = rotate_managed_session_key(&database, &FailingStore { inner: &key_store })
+            .expect_err("credential-store failure should fail rotation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated credential-store write failure")
+        );
+        assert_eq!(database.session_count().expect("sessions should count"), 0);
+        assert_eq!(
+            load_or_create_managed_session_key(&database, &key_store)
+                .expect("previous key should remain stored"),
+            old_key
+        );
     }
 
     #[test]

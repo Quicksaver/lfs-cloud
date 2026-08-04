@@ -824,6 +824,65 @@ macro_rules! server_routing_and_batch_tests {
             .expect("server should shut down cleanly");
     }
 
+    #[tokio::test]
+    async fn embedded_router_without_public_url_uses_the_connection_adapter() {
+        let (store, token) = issued_session_token(Duration::from_secs(60));
+        let mut config = test_config();
+        config.server.public_url = None;
+        let router = test_router_with_config_authorizer_and_transfer_store(
+            config,
+            store,
+            RecordingBatchAuthorizer::allow(),
+            RecordingTransferStore::missing(),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("embedded router listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("embedded router listener address should be available");
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<AcceptedSocketAddress>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+            .expect("embedded router should serve");
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/github.com/owner/repo.git/info/lfs/objects/batch"
+            ))
+            .bearer_auth(token)
+            .header(CONTENT_TYPE, "application/vnd.git-lfs+json")
+            .body(VALID_UPLOAD_BATCH_REQUEST)
+            .send()
+            .await
+            .expect("embedded batch request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("embedded batch response should be JSON");
+        let upload_url = body["objects"][0]["actions"]["upload"]["href"]
+            .as_str()
+            .expect("missing object should receive an upload action");
+        assert!(
+            upload_url.starts_with(&format!("http://{address}/")),
+            "upload action should use the accepted connection origin: {upload_url}"
+        );
+
+        shutdown_sender
+            .send(())
+            .expect("embedded router shutdown receiver should remain active");
+        server.await.expect("embedded router task should join");
+    }
+
     #[test]
     fn server_bind_rejects_invalid_host_before_listener_bind() {
         let error = ServerBind::from_config_and_overrides("bad host", 8080, None, None)

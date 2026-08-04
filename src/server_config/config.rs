@@ -1275,6 +1275,25 @@ repository_providers:
     }
 
     #[test]
+    fn local_client_url_normalizes_bracketed_and_unbracketed_ipv6_hosts() {
+        for (host, expected) in [
+            ("::", "http://[::1]:15370"),
+            ("[::]", "http://[::1]:15370"),
+            ("2001:db8::1", "http://[2001:db8::1]:15370"),
+            ("[2001:db8::1]", "http://[2001:db8::1]:15370"),
+        ] {
+            let config = ServerConfig::load_from_str_with_env(
+                &format!("server:\n  host: '{host}'\n"),
+                "<test>",
+                test_env,
+            )
+            .expect("IPv6 server settings should load");
+
+            assert_eq!(config.server.local_client_url(), expected);
+        }
+    }
+
+    #[test]
     fn requires_a_persisted_provider_repository_id() {
         let error = ServerConfig::load_from_str_with_env(
             r#"

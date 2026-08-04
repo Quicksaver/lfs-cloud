@@ -98,8 +98,8 @@ pub use providers::{
 #[doc(hidden)]
 pub use server::lfs_server_router_with_provider_adapters;
 pub use server::{
-    AdvertisedServerUrls, LFS_SESSION_REVOKE_PATH, LfsRouteEndpoint, LfsRouteResolver,
-    ResolvedLfsRoute, ServeOptions, advertised_server_urls, lfs_server_router,
+    AcceptedSocketAddress, AdvertisedServerUrls, LFS_SESSION_REVOKE_PATH, LfsRouteEndpoint,
+    LfsRouteResolver, ResolvedLfsRoute, ServeOptions, advertised_server_urls, lfs_server_router,
     lfs_server_router_with_sessions, render_server_startup_message, serve,
 };
 pub use server_config::{

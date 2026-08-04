@@ -159,7 +159,7 @@ impl ServerSettings {
 
         let host = match self.host.as_str() {
             "0.0.0.0" => "127.0.0.1".to_owned(),
-            "::" => "[::1]".to_owned(),
+            "::" | "[::]" => "[::1]".to_owned(),
             host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
             host => host.to_owned(),
         };

@@ -4,8 +4,15 @@ enum ServerShutdownOutcome {
     TimedOut,
 }
 
+/// Connection metadata used to infer direct Git LFS action URL origins.
+///
+/// Callers embedding a router built by [`crate::lfs_server_router`] or
+/// [`crate::lfs_server_router_with_sessions`] must pass this type to Axum's
+/// `Router::into_make_service_with_connect_info` when `server.public_url` is
+/// omitted. It captures the accepted socket's local destination so wildcard
+/// listeners advertise the exact address each client used.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AcceptedSocketAddress(Option<SocketAddr>);
+pub struct AcceptedSocketAddress(Option<SocketAddr>);
 
 impl Connected<IncomingStream<'_, tokio::net::TcpListener>> for AcceptedSocketAddress {
     fn connect_info(stream: IncomingStream<'_, tokio::net::TcpListener>) -> Self {

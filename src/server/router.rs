@@ -1,4 +1,8 @@
 /// Builds the Axum router for configured Git LFS paths.
+///
+/// When `server.public_url` is omitted, serve this router with
+/// `Router::into_make_service_with_connect_info::<AcceptedSocketAddress>()` so
+/// batch responses can infer action URL origins from accepted connections.
 pub fn lfs_server_router(config: ServerConfig) -> Router {
     lfs_server_router_with_sessions(config, LocalLfsSessionStore::new())
 }
@@ -66,6 +70,10 @@ async fn revoke_lfs_session_route(
 /// [`LocalLfsSessionStore`] used by request authentication. Git LFS endpoint
 /// requests must present a valid local LFS session token before protocol
 /// handlers receive the resolved route.
+///
+/// When `server.public_url` is omitted, serve this router with
+/// `Router::into_make_service_with_connect_info::<AcceptedSocketAddress>()` so
+/// batch responses can infer action URL origins from accepted connections.
 pub fn lfs_server_router_with_sessions(
     config: ServerConfig,
     session_store: LocalLfsSessionStore,
