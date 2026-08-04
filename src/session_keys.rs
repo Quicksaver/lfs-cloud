@@ -121,6 +121,7 @@ fn native_key_store_error(error: keyring::Error) -> ServerError {
     }
 }
 
+/// An in-memory session encryption key store shared across test modules.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MemorySessionEncryptionKeyStore {
