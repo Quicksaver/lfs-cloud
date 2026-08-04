@@ -47,6 +47,7 @@ pub(crate) struct RepositoryProviderValues {
     pub(crate) id: String,
     pub(crate) provider_type: Option<String>,
     pub(crate) api_url: Option<String>,
+    pub(crate) clear_api_url: bool,
     pub(crate) personal_access_token: Option<String>,
 }
 
@@ -132,6 +133,7 @@ impl EditableServerConfig {
             id: id.to_owned(),
             provider_type: string_value(entry, "type"),
             api_url: string_value(entry, "api_url"),
+            clear_api_url: false,
             personal_access_token: string_value(entry, "personal_access_token"),
         }))
     }
@@ -145,6 +147,7 @@ impl EditableServerConfig {
                     id,
                     provider_type: string_value(entry, "type"),
                     api_url: string_value(entry, "api_url"),
+                    clear_api_url: false,
                     personal_access_token: string_value(entry, "personal_access_token"),
                 })
             })
@@ -167,7 +170,11 @@ impl EditableServerConfig {
         let before = self.document.clone();
         let entry = self.map_entry_mut(REPOSITORY_PROVIDERS_KEY, &values.id)?;
         set_optional_string(entry, "type", values.provider_type);
-        set_optional_string(entry, "api_url", values.api_url);
+        if values.clear_api_url {
+            entry.remove(&key("api_url"));
+        } else {
+            set_optional_string(entry, "api_url", values.api_url);
+        }
         set_optional_string(entry, "personal_access_token", values.personal_access_token);
 
         Ok(edit_outcome(existed, before != self.document))
@@ -709,6 +716,29 @@ repositories:
         let loaded = ServerConfig::load_from_path(&path).expect("saved config should validate");
         let crate::RepositoryProviderConfig::GitHub(provider) =
             &loaded.repository_providers["github"];
+        assert_eq!(provider.api_url, "https://api.github.com");
+    }
+
+    #[test]
+    fn github_provider_api_override_can_be_cleared() {
+        let (_temp, path) = fixture();
+        let mut config = EditableServerConfig::load(&path).expect("config should load");
+
+        let outcome = config
+            .upsert_repository_provider(RepositoryProviderValues {
+                id: "github-main".to_owned(),
+                clear_api_url: true,
+                ..RepositoryProviderValues::default()
+            })
+            .expect("API override should be removed");
+        config.save().expect("cleared config should save");
+
+        assert_eq!(outcome, EditOutcome::Updated);
+        let written = fs::read_to_string(&path).expect("saved config should be readable");
+        assert!(!written.contains("api_url"));
+        let loaded = ServerConfig::load_from_path(&path).expect("saved config should validate");
+        let crate::RepositoryProviderConfig::GitHub(provider) =
+            &loaded.repository_providers["github-main"];
         assert_eq!(provider.api_url, "https://api.github.com");
     }
 

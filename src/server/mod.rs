@@ -6,6 +6,7 @@
 //! to configured repository mappings, and proxying authenticated transfers.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     future::{Future, IntoFuture},
     io::{self, ErrorKind},

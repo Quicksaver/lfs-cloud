@@ -140,15 +140,15 @@ impl LfsServerState {
         result
     }
 
-    fn public_url_for_request(&self, request: &Request) -> ServerResult<String> {
+    fn public_url_for_request(&self, request: &Request) -> ServerResult<Cow<'_, str>> {
         if let Some(public_url) = &self.public_url {
-            return Ok(public_url.clone());
+            return Ok(Cow::Borrowed(public_url));
         }
 
         request
             .extensions()
             .get::<ConnectInfo<AcceptedSocketAddress>>()
-            .and_then(|ConnectInfo(address)| address.http_origin())
+            .and_then(|ConnectInfo(address)| address.http_origin().map(Cow::Owned))
             .ok_or_else(|| ServerError::Internal {
                 message: "accepted socket local address is unavailable for inferred public URL"
                     .to_owned(),

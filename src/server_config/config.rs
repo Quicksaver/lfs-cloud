@@ -1275,10 +1275,13 @@ repository_providers:
     }
 
     #[test]
-    fn local_client_url_normalizes_bracketed_and_unbracketed_ipv6_hosts() {
+    fn local_client_url_normalizes_ip_literals_and_unspecified_hosts() {
         for (host, expected) in [
+            ("0", "http://127.0.0.1:15370"),
             ("::", "http://[::1]:15370"),
             ("[::]", "http://[::1]:15370"),
+            ("::0", "http://[::1]:15370"),
+            ("[0:0:0:0:0:0:0:0]", "http://[::1]:15370"),
             ("2001:db8::1", "http://[2001:db8::1]:15370"),
             ("[2001:db8::1]", "http://[2001:db8::1]:15370"),
         ] {

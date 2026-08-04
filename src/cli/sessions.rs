@@ -12,28 +12,38 @@ pub(super) fn run_sessions_to_stdio(
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut output = io::stdout().lock();
-    run_sessions_with_io(command, config_path, &mut input, &mut output).map_err(anyhow::Error::from)
+    let mut warning_output = io::stderr().lock();
+    run_sessions_with_io(
+        command,
+        config_path,
+        &mut input,
+        &mut output,
+        &mut warning_output,
+    )
+    .map_err(anyhow::Error::from)
 }
 
-fn run_sessions_with_io<R, W>(
+fn run_sessions_with_io<R, W, E>(
     command: SessionsCommand,
     config_path: Option<PathBuf>,
     input: &mut R,
     output: &mut W,
+    warning_output: &mut E,
 ) -> CliResult<()>
 where
     R: BufRead,
     W: Write,
+    E: Write,
 {
     match command.action {
         SessionsAction::GenerateKey => {
-            output
+            warning_output
                 .write_all(ROTATION_WARNING.as_bytes())
                 .map_err(|source| CliError::Io {
                     context: "failed to write session-key rotation warning".to_owned(),
                     source,
                 })?;
-            output.flush().map_err(|source| CliError::Io {
+            warning_output.flush().map_err(|source| CliError::Io {
                 context: "failed to flush session-key rotation warning".to_owned(),
                 source,
             })?;
@@ -100,6 +110,8 @@ fn rotate_configured_managed_key<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -109,17 +121,63 @@ mod tests {
         };
         let mut input = "no\n".as_bytes();
         let mut output = Vec::new();
+        let mut warning_output = Vec::new();
 
         run_sessions_with_io(
             command,
             Some(PathBuf::from("does-not-exist.yml")),
             &mut input,
             &mut output,
+            &mut warning_output,
         )
         .expect("declining rotation should not touch configuration");
 
         let rendered = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(rendered.contains("invalidate all current"));
         assert!(rendered.contains("was not changed"));
+        let warning = String::from_utf8(warning_output).expect("warning should be UTF-8");
+        assert!(warning.contains("invalidate all current"));
+    }
+
+    #[test]
+    fn generate_key_rejects_explicit_secret_before_opening_metadata() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = directory.path().join("lfscloud.yml");
+        let metadata_path = directory.path().join("metadata.sqlite3");
+        fs::write(
+            &config_path,
+            format!(
+                "server:\n  metadata_path: {:?}\n  session_encryption_secret: explicit-session-secret-at-least-32-characters\n",
+                metadata_path.to_string_lossy()
+            ),
+        )
+        .expect("configuration fixture should be written");
+
+        let error = rotate_configured_managed_key(Some(config_path), &mut Vec::new())
+            .expect_err("an explicit secret should reject managed-key rotation");
+
+        assert!(error.to_string().contains("native credential-store key"));
+        assert!(!metadata_path.exists());
+    }
+
+    #[test]
+    fn generate_key_rejects_rotation_while_server_lock_is_held() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = directory.path().join("lfscloud.yml");
+        let metadata_path = directory.path().join("metadata.sqlite3");
+        fs::write(
+            &config_path,
+            format!(
+                "server:\n  metadata_path: {:?}\n",
+                metadata_path.to_string_lossy()
+            ),
+        )
+        .expect("configuration fixture should be written");
+        let _server_lock = crate::metadata::ServerProcessLock::acquire(&metadata_path)
+            .expect("server fixture should acquire the lifecycle lock");
+
+        let error = rotate_configured_managed_key(Some(config_path), &mut Vec::new())
+            .expect_err("an active server lock should reject rotation");
+
+        assert!(error.to_string().contains("already running"));
     }
 }

@@ -37,6 +37,7 @@ type CommandInvocation = {
 };
 
 type BackgroundCommand = {
+  finished: () => boolean;
   output: () => string;
   result: Promise<CommandResult>;
   stop: () => Promise<CommandResult>;
@@ -180,10 +181,24 @@ function runBackgroundCommand(command: string, args: string[], options: CommandO
   let output = '';
   let finished = false;
   let completeResult: (result: CommandResult) => void = () => undefined;
-  let background: BackgroundCommand;
   const result = new Promise<CommandResult>(complete => {
     completeResult = complete;
   });
+  const background: BackgroundCommand = {
+    finished: () => finished,
+    output: () => output,
+    result,
+    stop: async () => {
+      if (!finished) terminateChild(child, 'SIGTERM');
+      const hardKill = setTimeout(() => {
+        if (!finished) terminateChild(child, 'SIGKILL');
+      }, 2_000);
+      const completed = await result;
+      clearTimeout(hardKill);
+      return completed;
+    },
+  };
+  backgroundCommands.add(background);
   const finish = (completed: CommandResult) => {
     if (finished) return;
     finished = true;
@@ -207,21 +222,6 @@ function runBackgroundCommand(command: string, args: string[], options: CommandO
   child.on('close', (code, signal) => {
     finish({ code, output, signal, timedOut: false });
   });
-
-  background = {
-    output: () => output,
-    result,
-    stop: async () => {
-      if (!finished) terminateChild(child, 'SIGTERM');
-      const hardKill = setTimeout(() => {
-        if (!finished) terminateChild(child, 'SIGKILL');
-      }, 2_000);
-      const completed = await result;
-      clearTimeout(hardKill);
-      return completed;
-    },
-  };
-  backgroundCommands.add(background);
   return background;
 }
 
@@ -345,9 +345,9 @@ function requestHttpStatus(url: string): Promise<number | undefined> {
 async function waitForHttpStatus(url: string, expectedStatus: number, server: BackgroundCommand): Promise<void> {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    const completed = await Promise.race([server.result.then(result => ({ result })), sleep(0).then(() => undefined)]);
-    if (completed !== undefined) {
-      throw new SmokeFailure('lfscloud serve exited before becoming ready', completed.result.output);
+    if (server.finished()) {
+      const completed = await server.result;
+      throw new SmokeFailure('lfscloud serve exited before becoming ready', completed.output);
     }
     if ((await requestHttpStatus(url)) === expectedStatus) return;
     await sleep(250);
@@ -385,10 +385,14 @@ async function defaultServerStartupSmoke(): Promise<void> {
   try {
     await waitForHttpStatus('http://127.0.0.1:15370/status', 404, server);
     assert(
-      server.output().includes('local:   http://127.0.0.1:15370'),
+      server.output().includes('local:') && server.output().includes('http://127.0.0.1:15370'),
       'default server startup did not advertise the loopback URL on port 15370',
     );
     assert(server.output().includes('network:'), 'default server startup omitted network reachability output');
+    assert(
+      server.output().includes('plaintext HTTP exposes credentials'),
+      'default network listener omitted its plaintext exposure warning',
+    );
   } finally {
     stopped = await server.stop();
   }

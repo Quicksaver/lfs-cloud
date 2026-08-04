@@ -1,6 +1,9 @@
 //! Server listener, request-limit, and metadata-path settings.
 
-use std::path::{Path, PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -157,11 +160,20 @@ impl ServerSettings {
             return public_url.clone();
         }
 
-        let host = match self.host.as_str() {
-            "0.0.0.0" => "127.0.0.1".to_owned(),
-            "::" | "[::]" => "[::1]".to_owned(),
-            host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
-            host => host.to_owned(),
+        let unbracketed = self
+            .host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(&self.host);
+        let host = match unbracketed.parse::<IpAddr>() {
+            Ok(IpAddr::V4(address)) if address.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
+            Ok(IpAddr::V6(address)) if address.is_unspecified() => {
+                format!("[{}]", Ipv6Addr::LOCALHOST)
+            }
+            Ok(IpAddr::V4(address)) => address.to_string(),
+            Ok(IpAddr::V6(address)) => format!("[{address}]"),
+            Err(_) if self.host == "0" => Ipv4Addr::LOCALHOST.to_string(),
+            Err(_) => self.host.clone(),
         };
         format!("http://{host}:{}", self.port)
     }

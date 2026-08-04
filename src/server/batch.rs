@@ -644,6 +644,10 @@ macro_rules! server_routing_and_batch_tests {
         assert!(message.contains("LFS Cloud server running"));
         assert!(message.contains("local:   http://127.0.0.1:8080"));
         assert!(message.contains("network: "));
+        assert!(super::is_exact_loopback_host("127.0.0.1"));
+        assert!(super::is_exact_loopback_host("[::1]"));
+        assert!(!super::is_exact_loopback_host("0.0.0.0"));
+        assert!(!super::is_exact_loopback_host("192.0.2.10"));
     }
 
     #[test]
@@ -1018,33 +1022,11 @@ macro_rules! server_routing_and_batch_tests {
 
     #[test]
     fn production_session_store_generates_and_reuses_managed_native_key() {
-        #[derive(Default)]
-        struct MemoryKeyStore(Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
-
-        impl crate::session_keys::SessionEncryptionKeyStore for MemoryKeyStore {
-            fn load(&self, account: &str) -> ServerResult<Option<Vec<u8>>> {
-                Ok(self
-                    .0
-                    .lock()
-                    .expect("test key store should lock")
-                    .get(account)
-                    .cloned())
-            }
-
-            fn store(&self, account: &str, secret: &[u8]) -> ServerResult<()> {
-                self.0
-                    .lock()
-                    .expect("test key store should lock")
-                    .insert(account.to_owned(), secret.to_vec());
-                Ok(())
-            }
-        }
-
         let config = test_config_with_github_api_url_and_auth("https://api.github.com", "");
         let database = Arc::new(
             MetadataDatabase::open_in_memory().expect("metadata database should open"),
         );
-        let key_store = MemoryKeyStore::default();
+        let key_store = crate::session_keys::MemorySessionEncryptionKeyStore::default();
 
         let first = production_session_store_with_key_store(
             &config,

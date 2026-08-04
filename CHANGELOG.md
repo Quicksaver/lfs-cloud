@@ -7,8 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 - [added]: Generate durable-session encryption keys in the native credential store and add confirmed `lfscloud sessions generate-key` rotation that invalidates current sessions.
+- [changed]: Hold an exclusive lifecycle lock for each metadata database so only one server can retain its sessions in memory and key rotation refuses to run while that server is active.
 - [changed]: Listen on `0.0.0.0:15370` by default and infer Git LFS action URLs from each accepted connection, while retaining `server.public_url` for explicit hostname and proxy overrides.
 - [changed]: Default GitHub repository providers to `https://api.github.com` so `api_url` is needed only for GitHub Enterprise or another override.
+- [fixed]: Let configuration commands clear a stored GitHub API override and keep managed session-key bytes zeroed after use.
 - [documentation]: Explain the credential exposure of plaintext LAN HTTP and the encrypted-tunnel but application-HTTP tradeoff for direct Tailscale access.
 
 ## [0.2.1] - 2026-08-04

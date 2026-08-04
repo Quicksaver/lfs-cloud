@@ -191,6 +191,11 @@ impl ServerBuilder {
         let urls = advertised_server_urls(&bind.host, local_addr.port());
 
         println!("{}", render_server_startup_message(&urls));
+        if !is_exact_loopback_host(&bind.host) {
+            eprintln!(
+                "WARNING: plaintext HTTP exposes credentials and object bytes; use only a trusted network"
+            );
+        }
 
         let shutdown_signal = self
             .shutdown_signal

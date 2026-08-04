@@ -73,6 +73,16 @@ lfscloud repository add \
   --storage-provider drive-archive
 ```
 
+Remove a GitHub API override to return to the public-service default:
+
+```bash
+lfscloud config repository add \
+  --id github \
+  --clear-api-url
+```
+
+In the interactive repository-provider editor, enter `default` at the API URL prompt to perform the same removal; a blank response retains an existing override.
+
 List commands print tab-separated, script-friendly summaries. A legacy session-secret fallback is reported only as configured or absent; its value is never printed:
 
 ```bash
@@ -260,6 +270,8 @@ lfscloud sessions generate-key
 
 The command warns that all current sessions will be invalidated and requires confirmation. It refuses to run while the server owns the metadata database, deletes the durable sessions, replaces the native key, and reports only the number invalidated. Users must run `lfscloud login` again. The command also refuses configs with an explicit session secret or deprecated provider PAT because those values, rather than the native store, are authoritative.
 
+Session deletion commits before the replacement credential-store write. If that write fails, no old session remains valid and the previous key remains stored; restore credential-store access and retry `lfscloud sessions generate-key` before accepting new logins. Deleting and recreating the metadata database also creates a new installation ID and does not remove the old native credential automatically. Remove that orphan through the operating system's credential manager if the old database will not be restored.
+
 ## Metadata Path
 
 If `server.metadata_path` is omitted, the server stores SQLite metadata at:
@@ -270,7 +282,7 @@ If `server.metadata_path` is omitted, the server stores SQLite metadata at:
 
 Relative `metadata_path` values resolve against the directory containing the config file.
 
-The server creates a `<metadata filename>.lock` file and an `upload-locks` directory beside the metadata database. The lifecycle lock allows only one active server process for an installation and prevents key rotation while that process still holds sessions in memory. The object-keyed locks serialize the final Drive existence check and upload and are released automatically if a process exits. Cross-host writers are not supported by the MVP. Lookup deterministically selects the smallest Drive file ID when an older race has already left multiple otherwise exact object matches.
+The server creates a `<metadata filename>.lock` file and an `upload-locks` directory beside the metadata database. The lifecycle lock allows only one active server process for an installation and prevents key rotation while that process still holds sessions in memory. The object-keyed locks retain crash-safe serialization of the final Drive existence check and upload across successive local server processes, and are released automatically if a process exits. Cross-host writers and simultaneous servers for one installation are not supported by the MVP. Lookup deterministically selects the smallest Drive file ID when an older race has already left multiple otherwise exact object matches.
 
 ## Validation Rules
 

@@ -110,6 +110,7 @@ impl RepositoryProviderAddCommand {
         self.id.is_none()
             && self.provider_type.is_none()
             && self.api_url.is_none()
+            && !self.clear_api_url
             && self.personal_access_token.is_none()
     }
 
@@ -120,6 +121,7 @@ impl RepositoryProviderAddCommand {
                 RepositoryProviderKind::GitHub => "github".to_owned(),
             }),
             api_url: self.api_url,
+            clear_api_url: self.clear_api_url,
             personal_access_token: self.personal_access_token,
         })
     }
@@ -203,17 +205,27 @@ where
             message: "repository provider type must be github".to_owned(),
         });
     }
-    let api_url = prompt_value(
+    let api_url_label = if existing.api_url.is_some() {
+        "GitHub API URL override (blank to retain; enter 'default' to clear)"
+    } else {
+        "GitHub API URL override (blank for https://api.github.com)"
+    };
+    let mut api_url = prompt_value(
         input,
         output,
-        "GitHub API URL override (blank for https://api.github.com)",
+        api_url_label,
         existing.api_url.as_deref(),
         false,
     )?;
+    let clear_api_url = api_url.as_deref() == Some("default");
+    if clear_api_url {
+        api_url = None;
+    }
     Ok(RepositoryProviderValues {
         id,
         provider_type,
         api_url,
+        clear_api_url,
         personal_access_token: existing.personal_access_token,
     })
 }
@@ -717,6 +729,31 @@ mod tests {
     }
 
     #[test]
+    fn interactive_repository_provider_can_clear_api_override() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(
+            &config_path,
+            "server: {}\nrepository_providers:\n  github:\n    type: github\n    api_url: https://github.example/api/v3\n",
+        )
+        .expect("configuration fixture should be written");
+        let config = EditableServerConfig::load(config_path).expect("config should load");
+        let mut input = "github\n\ndefault\n".as_bytes();
+        let mut output = Vec::new();
+
+        let values = prompt_repository_provider(
+            &config,
+            &mut input,
+            &mut output,
+            &mut read_config_prompt_value,
+        )
+        .expect("interactive provider values should parse");
+
+        assert!(values.clear_api_url);
+        assert!(values.api_url.is_none());
+    }
+
+    #[test]
     fn flag_add_partial_update_list_and_idempotent_remove_work_end_to_end() {
         let temp = TempDir::new().expect("temporary directory should be created");
         let config_path = temp.path().join("lfscloud.yml");
@@ -815,6 +852,23 @@ storage_providers:
         assert!(repository_providers.contains("github-main"));
         assert!(repository_providers.contains("configured"));
         assert!(!repository_providers.contains("test-pat"));
+        let cleared = run_configuration_test_command(
+            &[
+                "lfscloud",
+                "--config",
+                path,
+                "config",
+                "repository",
+                "add",
+                "--id",
+                "github-main",
+                "--clear-api-url",
+            ],
+            "",
+        );
+        assert!(cleared.contains("updated repository provider"));
+        let cleared_yaml = fs::read_to_string(&config_path).expect("config should be readable");
+        assert!(!cleared_yaml.contains("api_url"));
         let storage_providers = run_configuration_test_command(
             &["lfscloud", "--config", path, "config", "storage", "list"],
             "",

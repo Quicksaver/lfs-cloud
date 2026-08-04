@@ -2,7 +2,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use std::{collections::BTreeMap, sync::Mutex};
+
 use ring::rand::{SecureRandom, SystemRandom};
+use zeroize::Zeroizing;
 
 use crate::{MetadataDatabase, ServerError, ServerResult};
 
@@ -20,6 +24,13 @@ pub(crate) struct NativeSessionEncryptionKeyStore;
 impl NativeSessionEncryptionKeyStore {
     fn entry(account: &str) -> ServerResult<keyring::Entry> {
         keyring::Entry::new(NATIVE_KEY_SERVICE, account).map_err(native_key_store_error)
+    }
+
+    #[cfg(test)]
+    fn delete(account: &str) -> ServerResult<()> {
+        Self::entry(account)?
+            .delete_credential()
+            .map_err(native_key_store_error)
     }
 }
 
@@ -42,7 +53,7 @@ impl SessionEncryptionKeyStore for NativeSessionEncryptionKeyStore {
 pub(crate) fn load_or_create_managed_session_key(
     database: &MetadataDatabase,
     key_store: &dyn SessionEncryptionKeyStore,
-) -> ServerResult<Vec<u8>> {
+) -> ServerResult<Zeroizing<Vec<u8>>> {
     let account = database.instance_id()?;
     if let Some(secret) = key_store.load(&account)? {
         if secret.len() != MANAGED_SESSION_KEY_BYTES {
@@ -50,7 +61,7 @@ pub(crate) fn load_or_create_managed_session_key(
                 message: "native session encryption key has an invalid length; run `lfscloud sessions generate-key` to invalidate sessions and replace it".to_owned(),
             });
         }
-        return Ok(secret);
+        return Ok(Zeroizing::new(secret));
     }
 
     let now = SystemTime::now()
@@ -91,7 +102,7 @@ pub(crate) fn rotate_managed_session_key(
     Ok(invalidated)
 }
 
-fn generate_managed_session_key() -> ServerResult<Vec<u8>> {
+fn generate_managed_session_key() -> ServerResult<Zeroizing<Vec<u8>>> {
     let mut secret = vec![0_u8; MANAGED_SESSION_KEY_BYTES];
     SystemRandom::new()
         .fill(&mut secret)
@@ -99,7 +110,7 @@ fn generate_managed_session_key() -> ServerResult<Vec<u8>> {
             message: "operating-system randomness could not generate a session encryption key"
                 .to_owned(),
         })?;
-    Ok(secret)
+    Ok(Zeroizing::new(secret))
 }
 
 fn native_key_store_error(error: keyring::Error) -> ServerError {
@@ -111,57 +122,56 @@ fn native_key_store_error(error: keyring::Error) -> ServerError {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MemorySessionEncryptionKeyStore {
+    keys: Mutex<BTreeMap<String, Vec<u8>>>,
+}
+
+#[cfg(test)]
+impl SessionEncryptionKeyStore for MemorySessionEncryptionKeyStore {
+    fn load(&self, account: &str) -> ServerResult<Option<Vec<u8>>> {
+        Ok(self
+            .keys
+            .lock()
+            .expect("test key store should lock")
+            .get(account)
+            .cloned())
+    }
+
+    fn store(&self, account: &str, secret: &[u8]) -> ServerResult<()> {
+        self.keys
+            .lock()
+            .expect("test key store should lock")
+            .insert(account.to_owned(), secret.to_vec());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeMap,
-        sync::{Arc, Mutex},
-    };
+    use std::sync::Arc;
 
     use crate::{
         GitHubPersonalAccessToken, LocalLfsSessionStore, MetadataDatabase, RepositoryUser,
     };
 
     use super::{
-        NATIVE_KEY_SERVICE, NativeSessionEncryptionKeyStore, SessionEncryptionKeyStore,
-        load_or_create_managed_session_key, rotate_managed_session_key,
+        MemorySessionEncryptionKeyStore, NativeSessionEncryptionKeyStore,
+        SessionEncryptionKeyStore, load_or_create_managed_session_key, rotate_managed_session_key,
     };
 
     struct NativeCredentialCleanup {
-        entry: keyring::Entry,
+        account: String,
     }
 
     impl Drop for NativeCredentialCleanup {
         fn drop(&mut self) {
-            let _ = self.entry.delete_credential();
-        }
-    }
-
-    #[derive(Default)]
-    struct MemoryKeyStore {
-        keys: Mutex<BTreeMap<String, Vec<u8>>>,
-    }
-
-    impl SessionEncryptionKeyStore for MemoryKeyStore {
-        fn load(&self, account: &str) -> crate::ServerResult<Option<Vec<u8>>> {
-            Ok(self
-                .keys
-                .lock()
-                .expect("test key store should lock")
-                .get(account)
-                .cloned())
-        }
-
-        fn store(&self, account: &str, secret: &[u8]) -> crate::ServerResult<()> {
-            self.keys
-                .lock()
-                .expect("test key store should lock")
-                .insert(account.to_owned(), secret.to_vec());
-            Ok(())
+            let _ = NativeSessionEncryptionKeyStore::delete(&self.account);
         }
     }
 
     struct FailingStore<'a> {
-        inner: &'a MemoryKeyStore,
+        inner: &'a MemorySessionEncryptionKeyStore,
     }
 
     impl SessionEncryptionKeyStore for FailingStore<'_> {
@@ -183,7 +193,7 @@ mod tests {
     #[test]
     fn managed_key_is_generated_once_and_reused_for_the_database_identity() {
         let database = MetadataDatabase::open_in_memory().expect("metadata should open");
-        let key_store = MemoryKeyStore::default();
+        let key_store = MemorySessionEncryptionKeyStore::default();
 
         let first = load_or_create_managed_session_key(&database, &key_store)
             .expect("first run should generate and store a managed key");
@@ -201,7 +211,7 @@ mod tests {
     #[test]
     fn missing_native_key_never_silently_replaces_key_for_active_sessions() {
         let database = Arc::new(MetadataDatabase::open_in_memory().expect("metadata should open"));
-        let original_store = MemoryKeyStore::default();
+        let original_store = MemorySessionEncryptionKeyStore::default();
         let key = load_or_create_managed_session_key(&database, &original_store)
             .expect("initial managed key should be generated");
         LocalLfsSessionStore::open_durable(database.clone(), key)
@@ -213,7 +223,7 @@ mod tests {
             )
             .expect("active session should be stored");
 
-        let missing_store = MemoryKeyStore::default();
+        let missing_store = MemorySessionEncryptionKeyStore::default();
         let error = load_or_create_managed_session_key(&database, &missing_store)
             .expect_err("a missing native key must not replace an active key");
 
@@ -230,7 +240,7 @@ mod tests {
     #[test]
     fn rotation_replaces_the_managed_key_and_invalidates_all_sessions() {
         let database = Arc::new(MetadataDatabase::open_in_memory().expect("metadata should open"));
-        let key_store = MemoryKeyStore::default();
+        let key_store = MemorySessionEncryptionKeyStore::default();
         let old_key = load_or_create_managed_session_key(&database, &key_store)
             .expect("initial managed key should be generated");
         LocalLfsSessionStore::open_durable(database.clone(), &old_key)
@@ -256,7 +266,7 @@ mod tests {
     #[test]
     fn failed_rotation_store_invalidates_sessions_and_preserves_previous_key() {
         let database = Arc::new(MetadataDatabase::open_in_memory().expect("metadata should open"));
-        let key_store = MemoryKeyStore::default();
+        let key_store = MemorySessionEncryptionKeyStore::default();
         let old_key = load_or_create_managed_session_key(&database, &key_store)
             .expect("initial managed key should be generated");
         LocalLfsSessionStore::open_durable(database.clone(), &old_key)
@@ -299,8 +309,7 @@ mod tests {
             .instance_id()
             .expect("metadata installation identity should load");
         let cleanup = NativeCredentialCleanup {
-            entry: keyring::Entry::new(NATIVE_KEY_SERVICE, &account)
-                .expect("native credential entry should initialize"),
+            account: account.clone(),
         };
         let key_store = NativeSessionEncryptionKeyStore;
         let old_key = load_or_create_managed_session_key(&database, &key_store)
@@ -326,9 +335,7 @@ mod tests {
 
         assert_eq!(invalidated, 1);
         assert_ne!(new_key, old_key);
-        cleanup
-            .entry
-            .delete_credential()
+        NativeSessionEncryptionKeyStore::delete(&cleanup.account)
             .expect("disposable native credential should be deleted");
     }
 }

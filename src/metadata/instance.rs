@@ -2,6 +2,7 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
+use rusqlite::OptionalExtension as _;
 
 use crate::{ServerError, ServerResult};
 
@@ -35,13 +36,11 @@ impl MetadataDatabase {
                 [INSTANCE_ID_KEY, candidate.as_str()],
             )
             .map_err(|source| self.operation_error(source))?;
-        connection
-            .query_row(
-                "SELECT value FROM server_properties WHERE key = ?1",
-                [INSTANCE_ID_KEY],
-                |row| row.get(0),
-            )
-            .map_err(|source| self.operation_error(source))
+        drop(connection);
+        self.load_property(INSTANCE_ID_KEY)?
+            .ok_or_else(|| ServerError::Internal {
+                message: "server instance ID disappeared after initialization".to_owned(),
+            })
     }
 
     fn load_property(&self, key: &str) -> ServerResult<Option<String>> {
@@ -55,5 +54,3 @@ impl MetadataDatabase {
             .map_err(|source| self.operation_error(source))
     }
 }
-
-use rusqlite::OptionalExtension as _;

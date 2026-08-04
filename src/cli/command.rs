@@ -109,6 +109,10 @@ pub(super) struct RepositoryProviderAddCommand {
     #[arg(long, value_name = "URL")]
     pub(super) api_url: Option<String>,
 
+    /// Remove a configured GitHub REST API override.
+    #[arg(long, conflicts_with = "api_url")]
+    pub(super) clear_api_url: bool,
+
     /// Deprecated server-session encryption fallback.
     #[arg(long, value_name = "TOKEN_OR_ENV_REFERENCE", hide = true)]
     pub(super) personal_access_token: Option<String>,
@@ -613,6 +617,7 @@ mod tests {
         assert_eq!(command.id.as_deref(), Some("github-main"));
         assert_eq!(command.provider_type, Some(RepositoryProviderKind::GitHub));
         assert_eq!(command.api_url.as_deref(), Some("https://api.github.com"));
+        assert!(!command.clear_api_url);
         assert_eq!(
             command.personal_access_token.as_deref(),
             Some("${LFS_CLOUD_GITHUB_PAT}")

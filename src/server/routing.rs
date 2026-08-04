@@ -331,6 +331,14 @@ pub fn render_server_startup_message(urls: &AdvertisedServerUrls) -> String {
     )
 }
 
+fn is_exact_loopback_host(host: &str) -> bool {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
 fn is_unspecified_host(host: &str) -> bool {
     matches!(host, "0.0.0.0" | "::" | "[::]")
 }
