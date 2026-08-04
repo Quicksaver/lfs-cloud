@@ -90,7 +90,7 @@ The implementation remains a single root Rust package. Do not split it into a wo
 
 **Package Manager**
 
-Use `cargo` (Cargo.lock present) for Rust code
+Use `cargo` (Cargo.lock present) for Rust code.
 
 **Add any learnings to `§ Learnings`** that fit the requirements for that section. **Update or remove any stale entries.**
 
@@ -156,6 +156,8 @@ pub struct LfsPointer {
 - `// SAFETY:` comments for every `unsafe` block
 - Inline `//` comments for complex algorithms
 - Explain **why**, not just **what**
+- No hardcoded secrets, use `std::env::var`
+- Use `dbg!()` macros to debug (better than `println!`), remove before final commit
 
 ### Test-First Approach
 
@@ -163,39 +165,6 @@ pub struct LfsPointer {
 2. Tests may be unit or integration depending on task
 3. Some tasks require manual verification (marked `[M]` in checklist)
 4. Tests can be adapted during implementation if needed
-
----
-
-## Quick Reference
-
-### Key Libraries
-
-| Purpose | Crate |
-| ------- | ----- |
-
----
-
-## Your Skills
-
-You have access to the following specialized protocols. **Activate** a skill by adopting its persona when the `Trigger` condition is met.
-
-### 🦀 Rust Specialists
-
-| Agent | Description | Trigger |
-| :-- | :-- | :-- |
-| **Rust Core Specialist** | Implementing idiomatic, safe, and performant Rust code. | Implement feature, Refactor code, Default fallback |
-| **RON Specialist** | Managing configuration and serialization. | Configure settings, Serialize data, .ron files |
-| **Pest Specialist** | Generating PEG parsers with pest. | Define grammar, Parse input, .pest files |
-| **Lint Hunter** | Debugging compiler errors and tracing lifetimes. | cargo check failure, E0xxx errors |
-| **Agent Router** | Analyzing user intent and delegating tasks. | New request, Analyze intent |
-
-### 🛠️ General Specialists
-
-| Agent                   | Description                           | Trigger                                           |
-| :---------------------- | :------------------------------------ | :------------------------------------------------ |
-| **Security Specialist** | Auditing for unsafe code and secrets. | Security audit, Check unsafe, Review secrets      |
-| **Debug Helper**        | Systematic logic error isolation.     | Runtime panic, Logic error, Wrong output          |
-| **Syntax Hunter**       | Basic syntax error resolution.        | Syntax Error, Unexpected token, Missing semicolon |
 
 ---
 
