@@ -45,7 +45,10 @@ impl ServerBind {
             return Ok(());
         }
 
-        let public_url = Url::parse(&config.server.public_url).map_err(|source| {
+        let Some(configured_public_url) = &config.server.public_url else {
+            return Ok(());
+        };
+        let public_url = Url::parse(configured_public_url).map_err(|source| {
             ServerError::InvalidConfiguration {
                 message: format!("server.public_url must be a valid absolute URL: {source}"),
             }
@@ -105,13 +108,10 @@ impl LfsRouteResolver {
     ///
     /// let config = ServerConfig::load_from_str(
     ///     r#"
-    /// server:
-    ///   public_url: http://127.0.0.1:8080
-    ///   session_encryption_secret: a-test-session-secret-at-least-32-characters
+    /// server: {}
     /// repository_providers:
     ///   github-main:
     ///     type: github
-    ///     api_url: https://api.github.com
     /// storage_providers:
     ///   drive-user-a:
     ///     type: google_drive

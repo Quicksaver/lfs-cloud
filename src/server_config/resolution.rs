@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use super::{DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR};
 use crate::ServerResult;
 
-use super::validation::{
-    invalid_config, invalid_config_error, validate_config_http_url, validate_no_outer_whitespace,
-};
+use super::validation::{invalid_config, invalid_config_error, validate_no_outer_whitespace};
 
 pub(super) fn resolve_required(
     value: Option<String>,
@@ -23,18 +21,6 @@ pub(super) fn resolve_required(
         return invalid_config(path, "is required");
     }
 
-    Ok(value)
-}
-
-pub(super) fn resolve_http_url(
-    value: Option<String>,
-    path: impl Into<String>,
-    allow_insecure_http: bool,
-    env: &mut impl FnMut(&str) -> Option<String>,
-) -> ServerResult<String> {
-    let path = path.into();
-    let value = resolve_required(value, &path, env)?;
-    validate_config_http_url(&value, &path, allow_insecure_http)?;
     Ok(value)
 }
 

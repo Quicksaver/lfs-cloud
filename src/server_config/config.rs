@@ -199,25 +199,8 @@ impl ServerConfig {
             storage_providers,
             repositories,
         };
-        config.validate_session_encryption_secret()?;
         config.validate_references()?;
         Ok(config)
-    }
-
-    fn validate_session_encryption_secret(&self) -> ServerResult<()> {
-        if self.server.session_encryption_secret.is_some() {
-            return Ok(());
-        }
-        for provider in self.repository_providers.values() {
-            let RepositoryProviderConfig::GitHub(provider) = provider;
-            if provider.authentication.personal_access_token().is_none() {
-                return invalid_config(
-                    "server.session_encryption_secret",
-                    "is required when GitHub authentication is configured",
-                );
-            }
-        }
-        Ok(())
     }
 
     fn validate_references(&self) -> ServerResult<()> {
@@ -393,7 +376,10 @@ repositories:
 
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8081);
-        assert_eq!(config.server.public_url, "http://127.0.0.1:8081");
+        assert_eq!(
+            config.server.public_url.as_deref(),
+            Some("http://127.0.0.1:8081")
+        );
         assert!(!config.server.allow_insecure_http);
         assert!(config.server.session_encryption_secret.is_some());
         assert_eq!(config.server.max_batch_objects, 100);
@@ -463,7 +449,7 @@ repositories:
     }
 
     #[test]
-    fn github_provider_requires_durable_session_encryption_material_at_load_time() {
+    fn github_provider_uses_managed_session_encryption_when_secret_is_omitted() {
         let contents = valid_yaml()
             .replace(
                 "  session_encryption_secret: ${SESSION_ENCRYPTION_SECRET}\n",
@@ -471,13 +457,10 @@ repositories:
             )
             .replace("    personal_access_token: ${GITHUB_PAT}\n", "");
 
-        let error = ServerConfig::load_from_str_with_env(&contents, "<test>", test_env)
-            .expect_err("GitHub config without session encryption material should be rejected");
+        let config = ServerConfig::load_from_str_with_env(&contents, "<test>", test_env)
+            .expect("GitHub config should use managed session encryption by default");
 
-        assert_error_contains(
-            &error,
-            "server.session_encryption_secret is required when GitHub authentication is configured",
-        );
+        assert!(config.server.session_encryption_secret.is_none());
     }
 
     #[test]
@@ -847,7 +830,10 @@ storage_providers:
 
         let config = ServerConfig::load_from_path(&config_path).expect("config should load");
 
-        assert_eq!(config.server.public_url, "http://127.0.0.1:8080");
+        assert_eq!(
+            config.server.public_url.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
         assert_eq!(
             config.server.metadata_path,
             directory
@@ -925,7 +911,7 @@ storage_providers:
     }
 
     #[test]
-    fn server_bind_defaults_to_localhost_when_host_and_port_are_omitted() {
+    fn server_bind_defaults_to_all_ipv4_interfaces_on_the_default_port() {
         let config = load_with_test_env(
             r#"
 server:
@@ -933,8 +919,8 @@ server:
 "#,
         );
 
-        assert_eq!(config.server.host, "127.0.0.1");
-        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 15_370);
     }
 
     #[test]
@@ -1193,7 +1179,10 @@ server:
         )
         .expect("config should load");
 
-        assert_eq!(config.server.public_url, "http://127.0.0.1:8080");
+        assert_eq!(
+            config.server.public_url.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
     }
 
     #[test]
@@ -1254,8 +1243,8 @@ storage_providers:
     }
 
     #[test]
-    fn validates_required_github_fields_with_exact_paths() {
-        let error = ServerConfig::load_from_str_with_env(
+    fn github_provider_defaults_to_public_github_api() {
+        let config = ServerConfig::load_from_str_with_env(
             r#"
 server:
   public_url: http://127.0.0.1:8080
@@ -1267,12 +1256,22 @@ repository_providers:
             "<test>",
             test_env,
         )
-        .unwrap_err();
+        .expect("GitHub API URL should have a public-service default");
 
-        assert_error_contains(
-            &error,
-            "repository_providers.github-main.api_url is required",
-        );
+        let RepositoryProviderConfig::GitHub(provider) =
+            &config.repository_providers["github-main"];
+        assert_eq!(provider.api_url, "https://api.github.com");
+    }
+
+    #[test]
+    fn server_network_defaults_require_no_explicit_fields() {
+        let config = ServerConfig::load_from_str_with_env("server: {}\n", "<test>", test_env)
+            .expect("empty server settings should use safe documented defaults");
+
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 15_370);
+        assert_eq!(config.server.public_url, None);
+        assert_eq!(config.server.local_client_url(), "http://127.0.0.1:15370");
     }
 
     #[test]

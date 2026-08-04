@@ -13,8 +13,9 @@ mod validation;
 
 pub use config::ServerConfig;
 pub use providers::{
-    GitHubAuthenticationConfig, GitHubProviderConfig, GoogleDriveGcloudCredentialsConfig,
-    GoogleDriveStorageConfig, RepositoryProviderConfig, StorageProviderConfig,
+    DEFAULT_GITHUB_API_URL, GitHubAuthenticationConfig, GitHubProviderConfig,
+    GoogleDriveGcloudCredentialsConfig, GoogleDriveStorageConfig, RepositoryProviderConfig,
+    StorageProviderConfig,
 };
 pub use repository::RepositoryMapping;
 pub use settings::{ServerSessionEncryptionSecret, ServerSettings};

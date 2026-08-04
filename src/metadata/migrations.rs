@@ -14,7 +14,7 @@ use crate::{ServerError, ServerResult};
 use super::MetadataDatabase;
 
 /// Current metadata schema version installed by the migration runner.
-pub const METADATA_SCHEMA_VERSION: u32 = 6;
+pub const METADATA_SCHEMA_VERSION: u32 = 7;
 
 pub(super) const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_SCHEMA: &str = r#"
@@ -214,6 +214,18 @@ VALUES (6, 'invalidate_provider_pat_sessions_for_server_secret');
 PRAGMA user_version = 6;
 "#;
 
+const SERVER_INSTANCE_IDENTITY_MIGRATION: &str = r#"
+CREATE TABLE server_properties (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT;
+
+INSERT OR IGNORE INTO schema_migrations(version, name)
+VALUES (7, 'server_instance_identity');
+
+PRAGMA user_version = 7;
+"#;
+
 const METADATA_MIGRATIONS: &[(u32, &str)] = &[
     (2, NULLABLE_OBJECT_VERIFICATION_TIMESTAMP_MIGRATION),
     (3, PROTECTED_SESSION_TOKEN_MIGRATION),
@@ -224,6 +236,7 @@ const METADATA_MIGRATIONS: &[(u32, &str)] = &[
     // Provider-PAT sessions use different encryption material from the new
     // dedicated server secret and must be removed before durable loading.
     (6, SESSION_ENCRYPTION_SECRET_MIGRATION),
+    (7, SERVER_INSTANCE_IDENTITY_MIGRATION),
 ];
 
 impl MetadataDatabase {
@@ -464,6 +477,7 @@ PRAGMA user_version = 1;
                 "objects".to_owned(),
                 "repository_mappings".to_owned(),
                 "schema_migrations".to_owned(),
+                "server_properties".to_owned(),
                 "sessions".to_owned(),
                 "storage_providers".to_owned(),
                 "transfer_attempts".to_owned(),
@@ -487,7 +501,7 @@ PRAGMA user_version = 1;
                 row.get(0)
             })
             .expect("migration count should load");
-        assert_eq!(migration_count, 6);
+        assert_eq!(migration_count, 7);
         assert_eq!(
             database
                 .schema_version()

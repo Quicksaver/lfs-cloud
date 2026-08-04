@@ -366,6 +366,26 @@ pub enum ServerError {
         source: tokio::task::JoinError,
     },
 
+    /// The server lifecycle lock file could not be opened or locked.
+    #[error("failed to acquire server lifecycle lock {}: {source}", path.display())]
+    ServerLock {
+        /// Lock file associated with the configured metadata database.
+        path: PathBuf,
+        /// Underlying filesystem lock failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Another server process already owns the configured metadata state.
+    #[error(
+        "an LFS Cloud server is already running for {}; stop it before rotating session keys or starting another server",
+        path.display()
+    )]
+    ServerAlreadyRunning {
+        /// Contended lifecycle lock file.
+        path: PathBuf,
+    },
+
     /// The server could not bind its configured listener.
     #[error("failed to bind server listener on {host}:{port}: {source}")]
     Bind {

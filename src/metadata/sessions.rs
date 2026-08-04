@@ -142,6 +142,27 @@ impl MetadataDatabase {
             )
             .map_err(|source| self.operation_error(source))
     }
+
+    /// Counts every durable session row, including rows that have just
+    /// expired but have not yet been pruned.
+    pub(crate) fn session_count(&self) -> ServerResult<usize> {
+        let count = self
+            .lock_connection()?
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|source| self.operation_error(source))?;
+        usize::try_from(count).map_err(|_| ServerError::Internal {
+            message: "durable session count exceeds this platform's addressable range".to_owned(),
+        })
+    }
+
+    /// Invalidates every durable local session.
+    pub(crate) fn delete_all_sessions(&self) -> ServerResult<usize> {
+        self.lock_connection()?
+            .execute("DELETE FROM sessions", [])
+            .map_err(|source| self.operation_error(source))
+    }
 }
 
 fn metadata_session_record_from_row(row: &Row<'_>) -> rusqlite::Result<MetadataSessionRecord> {

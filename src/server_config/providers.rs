@@ -8,8 +8,8 @@ use std::{
 use serde::Deserialize;
 
 use super::{
-    resolution::{resolve_config_directory, resolve_http_url, resolve_optional, resolve_required},
-    validation::{invalid_config, validate_key},
+    resolution::{resolve_config_directory, resolve_optional, resolve_required},
+    validation::{invalid_config, validate_config_http_url, validate_key},
 };
 use crate::ServerResult;
 
@@ -17,6 +17,9 @@ use crate::ServerResult;
 pub(super) const DEFAULT_GCLOUD_EXECUTABLE: &str = "gcloud";
 #[cfg(windows)]
 pub(super) const DEFAULT_GCLOUD_EXECUTABLE: &str = "gcloud.cmd";
+
+/// Default REST API base for the public GitHub service.
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
 
 /// Configured repository-provider entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,21 +40,22 @@ impl RepositoryProviderConfig {
         let provider_type = resolve_required(raw.provider_type, format!("{base_path}.type"), env)?;
 
         match provider_type.as_str() {
-            "github" => Ok(Self::GitHub(GitHubProviderConfig {
-                id,
-                api_url: resolve_http_url(
-                    raw.api_url,
-                    format!("{base_path}.api_url"),
+            "github" => {
+                let api_path = format!("{base_path}.api_url");
+                let api_url = resolve_optional(raw.api_url, &api_path, env)?
+                    .unwrap_or_else(|| DEFAULT_GITHUB_API_URL.to_owned());
+                validate_config_http_url(&api_url, &api_path, allow_insecure_http)?;
+                Ok(Self::GitHub(GitHubProviderConfig {
+                    id,
+                    api_url,
+                    authentication: GitHubAuthenticationConfig::from_raw(
+                        raw.personal_access_token,
+                        &base_path,
+                        env,
+                    )?,
                     allow_insecure_http,
-                    env,
-                )?,
-                authentication: GitHubAuthenticationConfig::from_raw(
-                    raw.personal_access_token,
-                    &base_path,
-                    env,
-                )?,
-                allow_insecure_http,
-            })),
+                }))
+            }
             unsupported => invalid_config(
                 format!("{base_path}.type"),
                 format!("unsupported repository provider type {unsupported:?}"),

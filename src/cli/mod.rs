@@ -68,6 +68,7 @@ mod configuration;
 mod http;
 mod init;
 mod migration;
+mod sessions;
 mod status;
 
 pub use command::run_from_env;
@@ -79,6 +80,7 @@ use configuration::*;
 use http::*;
 use init::*;
 use migration::*;
+use sessions::*;
 use status::*;
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{OriginalUri, Request, State},
+    extract::{ConnectInfo, OriginalUri, Request, State, connect_info::Connected},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{
@@ -29,6 +29,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::delete,
+    serve::IncomingStream,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{StreamExt, stream};

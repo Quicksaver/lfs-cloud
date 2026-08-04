@@ -2,6 +2,7 @@ async fn handle_parsed_lfs_batch_request(
     repository: RepositoryMapping,
     session: AuthenticatedLfsSession,
     state: &LfsServerState,
+    public_url: &str,
     request: LfsBatchRequest,
 ) -> Response {
     if request.objects.len() > state.max_batch_objects {
@@ -50,7 +51,14 @@ async fn handle_parsed_lfs_batch_request(
 
     match request.operation {
         LfsBatchOperation::Download => {
-            match download_batch_response_with_storage_lookup(&repository, state, request).await {
+            match download_batch_response_with_storage_lookup(
+                &repository,
+                state,
+                public_url,
+                request,
+            )
+            .await
+            {
                 Ok(response) => git_lfs_json_response(with_session_action_authorization(
                     response,
                     session.token(),
@@ -66,7 +74,14 @@ async fn handle_parsed_lfs_batch_request(
             }
         }
         LfsBatchOperation::Upload => {
-            match upload_batch_response_with_storage_lookup(&repository, state, request).await {
+            match upload_batch_response_with_storage_lookup(
+                &repository,
+                state,
+                public_url,
+                request,
+            )
+            .await
+            {
                 Ok(response) => git_lfs_json_response(with_session_action_authorization(
                     response,
                     session.token(),
@@ -119,6 +134,7 @@ fn permission_required_for_batch_operation(operation: LfsBatchOperation) -> Repo
 async fn download_batch_response_with_storage_lookup(
     repository: &RepositoryMapping,
     state: &LfsServerState,
+    public_url: &str,
     request: LfsBatchRequest,
 ) -> ServerResult<LfsBatchResponse> {
     let objects = batch_objects_with_storage_lookup(
@@ -130,7 +146,7 @@ async fn download_batch_response_with_storage_lookup(
     .await;
 
     Ok(LfsBatchResponse::download(
-        &state.public_url,
+        public_url,
         repository.route_path(),
         objects,
     ))
@@ -139,6 +155,7 @@ async fn download_batch_response_with_storage_lookup(
 async fn upload_batch_response_with_storage_lookup(
     repository: &RepositoryMapping,
     state: &LfsServerState,
+    public_url: &str,
     request: LfsBatchRequest,
 ) -> ServerResult<LfsBatchResponse> {
     let objects = batch_objects_with_storage_lookup(
@@ -150,7 +167,7 @@ async fn upload_batch_response_with_storage_lookup(
     .await;
 
     Ok(LfsBatchResponse::upload(
-        &state.public_url,
+        public_url,
         repository.route_path(),
         objects,
     ))
@@ -762,6 +779,51 @@ macro_rules! server_routing_and_batch_tests {
         request.abort();
     }
 
+    #[tokio::test]
+    async fn wildcard_listener_exposes_the_accepted_local_address_to_requests() {
+        async fn local_origin(
+            axum::extract::ConnectInfo(address): axum::extract::ConnectInfo<AcceptedSocketAddress>,
+        ) -> String {
+            address
+                .http_origin()
+                .expect("accepted TCP sockets should expose a local address")
+        }
+
+        let router = Router::new().route("/", get(local_origin));
+        let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0))
+            .await
+            .expect("wildcard test listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("wildcard listener address should be available")
+            .port();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_with_graceful_shutdown(
+            listener,
+            router,
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            Duration::from_secs(1),
+        ));
+
+        let origin = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .expect("wildcard listener should accept loopback traffic")
+            .text()
+            .await
+            .expect("local origin response should be readable");
+        assert_eq!(origin, format!("http://127.0.0.1:{port}"));
+
+        shutdown_sender
+            .send(())
+            .expect("shutdown receiver should remain active");
+        server
+            .await
+            .expect("server task should join")
+            .expect("server should shut down cleanly");
+    }
+
     #[test]
     fn server_bind_rejects_invalid_host_before_listener_bind() {
         let error = ServerBind::from_config_and_overrides("bad host", 8080, None, None)
@@ -771,24 +833,26 @@ macro_rules! server_routing_and_batch_tests {
     }
 
     #[test]
-    fn plaintext_listener_requires_loopback_or_explicit_unsafe_opt_in() {
+    fn inferred_plaintext_listener_allows_wildcard_bind_by_default() {
         let bind = ServerBind::from_config_and_overrides("0.0.0.0", 8080, None, None)
             .expect("unspecified bind should be structurally valid");
-        let config = test_config();
-        let error = bind
-            .validate_transport(&config)
-            .expect_err("plaintext public listener should require explicit opt-in");
-        assert!(error.to_string().contains("exact loopback IP"));
+        let mut config = test_config();
+        config.server.public_url = None;
+        bind.validate_transport(&config)
+            .expect("inferred direct-interface URLs should allow the wildcard default");
 
         let mut secure_public_config = config.clone();
-        secure_public_config.server.public_url = "https://lfs.example.com".to_owned();
+        secure_public_config.server.public_url = Some("https://lfs.example.com".to_owned());
         bind.validate_transport(&secure_public_config)
             .expect("HTTPS through trusted TLS termination should allow a private bind");
 
-        let mut development_config = config;
-        development_config.server.allow_insecure_http = true;
-        bind.validate_transport(&development_config)
-            .expect("explicit unsafe opt-in should allow trusted LAN development");
+        let mut insecure_explicit_config = config;
+        insecure_explicit_config.server.public_url =
+            Some("http://192.168.1.25:8080".to_owned());
+        let error = bind
+            .validate_transport(&insecure_explicit_config)
+            .expect_err("explicit LAN HTTP URLs should retain the unsafe opt-in");
+        assert!(error.to_string().contains("allow_insecure_http"));
     }
 
     #[test]
@@ -891,6 +955,52 @@ macro_rules! server_routing_and_batch_tests {
                 .as_str(),
             "github_pat_production_restart"
         );
+    }
+
+    #[test]
+    fn production_session_store_generates_and_reuses_managed_native_key() {
+        #[derive(Default)]
+        struct MemoryKeyStore(Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
+
+        impl crate::session_keys::SessionEncryptionKeyStore for MemoryKeyStore {
+            fn load(&self, account: &str) -> ServerResult<Option<Vec<u8>>> {
+                Ok(self
+                    .0
+                    .lock()
+                    .expect("test key store should lock")
+                    .get(account)
+                    .cloned())
+            }
+
+            fn store(&self, account: &str, secret: &[u8]) -> ServerResult<()> {
+                self.0
+                    .lock()
+                    .expect("test key store should lock")
+                    .insert(account.to_owned(), secret.to_vec());
+                Ok(())
+            }
+        }
+
+        let config = test_config_with_github_api_url_and_auth("https://api.github.com", "");
+        let database = Arc::new(
+            MetadataDatabase::open_in_memory().expect("metadata database should open"),
+        );
+        let key_store = MemoryKeyStore::default();
+
+        let first = production_session_store_with_key_store(
+            &config,
+            database.clone(),
+            &key_store,
+        )
+        .expect("first run should generate a native key");
+        let issued = first
+            .issue_session(&RepositoryUser::new("github-main", "octocat", None), ["repo"])
+            .expect("managed durable session should be issued");
+        drop(first);
+
+        let reopened = production_session_store_with_key_store(&config, database, &key_store)
+            .expect("reopen should reuse the same native key");
+        assert!(reopened.verify(&issued.token).is_some());
     }
 
     #[test]

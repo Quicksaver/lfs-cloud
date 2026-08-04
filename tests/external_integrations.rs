@@ -295,7 +295,6 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
     };
     let repository_id = format!("{LIVE_GITHUB_PROVIDER_ID}:owner/repo");
     let config = live_server_config_json(LiveServerConfigFixture {
-        server_url: "http://127.0.0.1:8080",
         port: 8080,
         metadata_path: &metadata_path,
         github_api_url: GITHUB_API_URL,
@@ -304,6 +303,13 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
         folder: &folder,
         gcloud_credentials: &gcloud_credentials,
     });
+    assert!(config["server"].get("host").is_none());
+    assert!(config["server"].get("public_url").is_none());
+    assert!(
+        config["repository_providers"][LIVE_GITHUB_PROVIDER_ID]
+            .get("api_url")
+            .is_none()
+    );
     fs::write(
         &config_path,
         serde_json::to_vec_pretty(&config).expect("config fixture should serialize"),
@@ -319,7 +325,10 @@ fn live_server_transfer_config_fixture_uses_production_provider_ids() {
     );
     let lfscloud::RepositoryProviderConfig::GitHub(provider) =
         &config.repository_providers[LIVE_GITHUB_PROVIDER_ID];
+    assert_eq!(provider.api_url, GITHUB_API_URL);
     assert_eq!(provider.authentication.personal_access_token(), None);
+    assert_eq!(config.server.host, "0.0.0.0");
+    assert_eq!(config.server.public_url, None);
     assert!(config.server.session_encryption_secret.is_some());
     assert!(
         config
@@ -434,7 +443,6 @@ async fn exercise_black_box_git_lfs_transfer(
         repository.owner.login, repository.name
     );
     let config_json = live_server_config_json(LiveServerConfigFixture {
-        server_url: &server_url,
         port,
         metadata_path: &metadata_path,
         github_api_url,
@@ -530,7 +538,6 @@ async fn exercise_black_box_git_lfs_transfer(
 }
 
 struct LiveServerConfigFixture<'a> {
-    server_url: &'a str,
     port: u16,
     metadata_path: &'a Path,
     github_api_url: &'a str,
@@ -542,7 +549,6 @@ struct LiveServerConfigFixture<'a> {
 
 fn live_server_config_json(fixture: LiveServerConfigFixture<'_>) -> Value {
     let LiveServerConfigFixture {
-        server_url,
         port,
         metadata_path,
         github_api_url,
@@ -555,19 +561,18 @@ fn live_server_config_json(fixture: LiveServerConfigFixture<'_>) -> Value {
         "{LIVE_GITHUB_PROVIDER_ID}:{}/{}",
         repository.owner.login, repository.name
     );
+    let mut github_provider = json!({ "type": "github" });
+    if github_api_url != GITHUB_API_URL {
+        github_provider["api_url"] = Value::String(github_api_url.to_owned());
+    }
     json!({
         "server": {
-            "host": "127.0.0.1",
             "port": port,
-            "public_url": server_url,
             "metadata_path": metadata_path.to_string_lossy(),
             "session_encryption_secret": LIVE_SESSION_ENCRYPTION_SECRET,
         },
         "repository_providers": {
-            LIVE_GITHUB_PROVIDER_ID: {
-                "type": "github",
-                "api_url": github_api_url,
-            }
+            LIVE_GITHUB_PROVIDER_ID: github_provider,
         },
         "storage_providers": {
             LIVE_DRIVE_PROVIDER_ID: {

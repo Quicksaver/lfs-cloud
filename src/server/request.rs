@@ -2,7 +2,7 @@
 struct LfsServerState {
     routes: LfsRouteResolver,
     session_store: LocalLfsSessionStore,
-    public_url: String,
+    public_url: Option<String>,
     max_batch_objects: usize,
     batch_body_guardrails: BatchBodyGuardrails,
     authorizer: Arc<dyn LfsBatchAuthorizer>,
@@ -138,6 +138,21 @@ impl LfsServerState {
             self.session_store.revoke(session.token())?;
         }
         result
+    }
+
+    fn public_url_for_request(&self, request: &Request) -> ServerResult<String> {
+        if let Some(public_url) = &self.public_url {
+            return Ok(public_url.clone());
+        }
+
+        request
+            .extensions()
+            .get::<ConnectInfo<AcceptedSocketAddress>>()
+            .and_then(|ConnectInfo(address)| address.http_origin())
+            .ok_or_else(|| ServerError::Internal {
+                message: "accepted socket local address is unavailable for inferred public URL"
+                    .to_owned(),
+            })
     }
 
     fn authorization_is_cached(&self, key: &AuthorizationCacheKey) -> bool {
@@ -354,7 +369,28 @@ async fn handle_authenticated_lfs_request(
 ) -> Response {
     match route.endpoint {
         LfsRouteEndpoint::Batch => {
-            handle_lfs_batch_request(route.repository, session, method, request, state).await
+            let public_url = match state.public_url_for_request(&request) {
+                Ok(public_url) => public_url,
+                Err(error) => {
+                    tracing::error!(
+                        error_category = %server_error_log_category(&error),
+                        "failed to infer Git LFS action URL origin"
+                    );
+                    return git_lfs_json_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "LFS Cloud could not determine its action URL",
+                    );
+                }
+            };
+            handle_lfs_batch_request(
+                route.repository,
+                session,
+                method,
+                request,
+                state,
+                &public_url,
+            )
+            .await
         }
         LfsRouteEndpoint::Object { oid } => {
             handle_lfs_object_request(route.repository, oid, session, method, request, state).await
@@ -440,6 +476,7 @@ async fn handle_lfs_batch_request(
     method: Method,
     request: Request,
     state: &LfsServerState,
+    public_url: &str,
 ) -> Response {
     if method != Method::POST {
         let mut response = git_lfs_json_error_response(
@@ -462,7 +499,14 @@ async fn handle_lfs_batch_request(
                     object_count = batch_request.objects.len(),
                     "parsed Git LFS batch request"
                 );
-                handle_parsed_lfs_batch_request(repository, session, state, batch_request).await
+                handle_parsed_lfs_batch_request(
+                    repository,
+                    session,
+                    state,
+                    public_url,
+                    batch_request,
+                )
+                .await
             }
             Err(_) => {
                 tracing::debug!(

@@ -206,12 +206,9 @@ where
     let api_url = prompt_value(
         input,
         output,
-        "GitHub API URL",
-        existing
-            .api_url
-            .as_deref()
-            .or(Some("https://api.github.com")),
-        true,
+        "GitHub API URL override (blank for https://api.github.com)",
+        existing.api_url.as_deref(),
+        false,
     )?;
     Ok(RepositoryProviderValues {
         id,
@@ -525,7 +522,10 @@ where
             "{}\t{}\t{}\t{}",
             one_line(&provider.id),
             optional_cell(provider.provider_type.as_deref()),
-            optional_cell(provider.api_url.as_deref()),
+            optional_cell(provider.api_url.as_deref().or_else(|| {
+                (provider.provider_type.as_deref() == Some("github"))
+                    .then_some(crate::DEFAULT_GITHUB_API_URL)
+            })),
             if provider.personal_access_token.is_some() {
                 "configured"
             } else {

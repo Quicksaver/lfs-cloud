@@ -91,7 +91,7 @@ where
     let server_url = command.server.clone().or_else(|| {
         config
             .as_ref()
-            .map(|config| config.server.public_url.clone())
+            .map(|config| config.server.local_client_url())
     });
     let allow_insecure_http = command.allow_insecure_http
         || (command.server.is_none()
@@ -111,7 +111,7 @@ where
     } else {
         report.error(
             "server",
-            "missing --server and no server.public_url could be loaded from config",
+            "missing --server and no server settings could be loaded from config",
         );
     }
 

@@ -4,7 +4,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createHttpServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { type AddressInfo, createServer as createNetServer } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -34,6 +34,12 @@ type SmokeTest = {
 type CommandInvocation = {
   executable: string;
   args: string[];
+};
+
+type BackgroundCommand = {
+  output: () => string;
+  result: Promise<CommandResult>;
+  stop: () => Promise<CommandResult>;
 };
 
 const scriptPath = fileURLToPath(import.meta.url);
@@ -79,6 +85,7 @@ const driveConfigDirEnv = 'LFS_CLOUD_GOOGLE_DRIVE_CONFIG_DIR';
 
 let sandbox = '';
 let currentChild: ChildProcess | undefined;
+const backgroundCommands = new Set<BackgroundCommand>();
 
 class SmokeFailure extends Error {
   readonly detail: string;
@@ -157,6 +164,65 @@ function runCommand(command: string, args: string[], options: CommandOptions = {
       finish({ code, output, signal, timedOut });
     });
   });
+}
+
+function runBackgroundCommand(command: string, args: string[], options: CommandOptions = {}): BackgroundCommand {
+  const child = spawn(command, args, {
+    cwd: options.cwd ?? repoRoot,
+    detached: true,
+    env: {
+      ...process.env,
+      ...baseEnv(),
+      ...options.env,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let finished = false;
+  let completeResult: (result: CommandResult) => void = () => undefined;
+  let background: BackgroundCommand;
+  const result = new Promise<CommandResult>(complete => {
+    completeResult = complete;
+  });
+  const finish = (completed: CommandResult) => {
+    if (finished) return;
+    finished = true;
+    backgroundCommands.delete(background);
+    completeResult(completed);
+  };
+  child.stdout?.on('data', chunk => {
+    output = appendOutput(output, chunk);
+  });
+  child.stderr?.on('data', chunk => {
+    output = appendOutput(output, chunk);
+  });
+  child.on('error', error => {
+    finish({
+      code: null,
+      output: appendOutput(output, error.message),
+      signal: null,
+      timedOut: false,
+    });
+  });
+  child.on('close', (code, signal) => {
+    finish({ code, output, signal, timedOut: false });
+  });
+
+  background = {
+    output: () => output,
+    result,
+    stop: async () => {
+      if (!finished) terminateChild(child, 'SIGTERM');
+      const hardKill = setTimeout(() => {
+        if (!finished) terminateChild(child, 'SIGKILL');
+      }, 2_000);
+      const completed = await result;
+      clearTimeout(hardKill);
+      return completed;
+    },
+  };
+  backgroundCommands.add(background);
+  return background;
 }
 
 async function command(executable: string, args: string[], options: CommandOptions = {}): Promise<string> {
@@ -261,6 +327,122 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds));
+}
+
+function requestHttpStatus(url: string): Promise<number | undefined> {
+  return new Promise(resolveStatus => {
+    const request = httpGet(url, response => {
+      response.resume();
+      resolveStatus(response.statusCode);
+    });
+    request.setTimeout(1_000, () => request.destroy());
+    request.on('error', () => resolveStatus(undefined));
+  });
+}
+
+async function waitForHttpStatus(url: string, expectedStatus: number, server: BackgroundCommand): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const completed = await Promise.race([server.result.then(result => ({ result })), sleep(0).then(() => undefined)]);
+    if (completed !== undefined) {
+      throw new SmokeFailure('lfscloud serve exited before becoming ready', completed.result.output);
+    }
+    if ((await requestHttpStatus(url)) === expectedStatus) return;
+    await sleep(250);
+  }
+  throw new SmokeFailure(`lfscloud serve did not return HTTP ${expectedStatus} for ${url}`, server.output());
+}
+
+async function availablePort(host: string, port: number): Promise<number> {
+  const server = createNetServer();
+  await new Promise<void>((ready, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, ready);
+  }).catch(error => {
+    throw new SmokeFailure(`TCP port ${host}:${port} is unavailable`, String(error));
+  });
+  const address = server.address() as AddressInfo;
+  await new Promise<void>((closed, reject) => server.close(error => (error === undefined ? closed() : reject(error))));
+  return address.port;
+}
+
+function assertExpectedServerStop(result: CommandResult): void {
+  assert(!result.timedOut, 'background lfscloud server timed out during shutdown');
+  assert(
+    result.code === 0 || result.signal === 'SIGTERM',
+    `background lfscloud server stopped unexpectedly: ${result.output}`,
+  );
+}
+
+async function defaultServerStartupSmoke(): Promise<void> {
+  const configPath = join(sandbox, 'default-server.yml');
+  await availablePort('0.0.0.0', 15_370);
+  await writeFile(configPath, 'server: {}\n');
+  const server = runBackgroundCommand(binaryPath, ['--config', configPath, 'serve']);
+  let stopped: CommandResult | undefined;
+  try {
+    await waitForHttpStatus('http://127.0.0.1:15370/status', 404, server);
+    assert(
+      server.output().includes('local:   http://127.0.0.1:15370'),
+      'default server startup did not advertise the loopback URL on port 15370',
+    );
+    assert(server.output().includes('network:'), 'default server startup omitted network reachability output');
+  } finally {
+    stopped = await server.stop();
+  }
+  assert(stopped !== undefined, 'default server shutdown result was unavailable');
+  assertExpectedServerStop(stopped);
+}
+
+async function sessionKeyRotationSafetySmoke(): Promise<void> {
+  const missingConfig = join(sandbox, 'missing-session-config.yml');
+  const cancelled = await runCommand(binaryPath, ['--config', missingConfig, 'sessions', 'generate-key'], {
+    env: baseEnv(),
+    input: 'no\n',
+  });
+  assert(cancelled.code === 0, 'declined session-key rotation did not exit successfully');
+  assert(cancelled.output.includes('invalidate all current'), 'rotation confirmation omitted invalidation warning');
+  assert(cancelled.output.includes('was not changed'), 'declined rotation did not report cancellation');
+  assert(!(await pathExists(missingConfig)), 'declined rotation touched a missing config path');
+
+  const explicitConfig = join(sandbox, 'explicit-session-secret.yml');
+  await writeFile(
+    explicitConfig,
+    'server:\n  session_encryption_secret: smoke-explicit-session-secret-at-least-32-characters\n',
+  );
+  const explicit = await runCommand(binaryPath, ['--config', explicitConfig, 'sessions', 'generate-key'], {
+    env: baseEnv(),
+    input: 'yes\n',
+  });
+  assert(explicit.code !== 0, 'managed rotation unexpectedly accepted an explicit session secret');
+  assert(
+    explicit.output.includes('manages only the native credential-store key'),
+    'explicit-secret rotation failure omitted the authoritative-key explanation',
+  );
+
+  const lockedConfig = join(sandbox, 'locked-session-key.yml');
+  const lockedMetadata = join(sandbox, 'locked-session-metadata.sqlite3');
+  const port = await availablePort('0.0.0.0', 0);
+  await writeFile(lockedConfig, `server:\n  port: ${port}\n  metadata_path: ${JSON.stringify(lockedMetadata)}\n`);
+  const server = runBackgroundCommand(binaryPath, ['--config', lockedConfig, 'serve']);
+  let stopped: CommandResult | undefined;
+  try {
+    await waitForHttpStatus(`http://127.0.0.1:${port}/status`, 404, server);
+    const locked = await runCommand(binaryPath, ['--config', lockedConfig, 'sessions', 'generate-key'], {
+      env: baseEnv(),
+      input: 'yes\n',
+    });
+    assert(locked.code !== 0, 'session-key rotation unexpectedly ran while the server was active');
+    assert(locked.output.includes('already running'), 'active-server rotation failure omitted lock guidance');
+  } finally {
+    stopped = await server.stop();
+  }
+  assert(stopped !== undefined, 'session-key safety server shutdown result was unavailable');
+  assertExpectedServerStop(stopped);
+}
+
 async function initRepositorySmoke(): Promise<void> {
   const committedRepo = join(sandbox, 'init-committed');
   await mkdir(committedRepo);
@@ -289,10 +471,7 @@ async function initRepositorySmoke(): Promise<void> {
 
 async function configurationCommandsSmoke(): Promise<void> {
   const configPath = join(sandbox, 'configuration-commands.yml');
-  await writeFile(
-    configPath,
-    'server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n  session_encryption_secret: smoke-session-secret-at-least-32-characters\n',
-  );
+  await writeFile(configPath, 'server: {}\n');
 
   await command(binaryPath, [
     '--config',
@@ -304,8 +483,6 @@ async function configurationCommandsSmoke(): Promise<void> {
     'github-main',
     '--type',
     'github',
-    '--api-url',
-    'https://api.github.com',
   ]);
   await command(binaryPath, [
     '--config',
@@ -376,12 +553,17 @@ async function configurationCommandsSmoke(): Promise<void> {
   const storageProviders = await command(binaryPath, ['--config', configPath, 'config', 'storage', 'list']);
   const repositories = await command(binaryPath, ['--config', configPath, 'repository', 'list']);
   assert(repositoryProviders.includes('github-main'), 'repository-provider list omitted the configured provider');
+  assert(
+    repositoryProviders.includes('https://api.github.com'),
+    'repository-provider list omitted the effective public GitHub API default',
+  );
   assert(repositoryProviders.includes('LEGACY SESSION SECRET'), 'repository-provider list omitted legacy auth heading');
   assert(
     !repositoryProviders.includes('configured'),
     'new repository provider unexpectedly configured a server-owned PAT',
   );
   const configuredYaml = await readFile(configPath, 'utf8');
+  assert(!configuredYaml.includes('api_url'), 'configuration command persisted the default GitHub API URL');
   assert(!configuredYaml.includes('personal_access_token'), 'configuration command wrote a server-owned GitHub PAT');
   assert(storageProviders.includes('drive-main'), 'storage-provider list omitted the configured provider');
   assert(storageProviders.includes('Smoke Drive'), 'storage-provider list omitted the display name');
@@ -408,10 +590,7 @@ async function configurationCommandsSmoke(): Promise<void> {
   await command(binaryPath, ['--config', configPath, 'config', 'repository', 'remove', '--id', 'github-main']);
 
   const interactivePath = join(sandbox, 'interactive-configuration-commands.yml');
-  await writeFile(
-    interactivePath,
-    'server:\n  host: 127.0.0.1\n  port: 8080\n  public_url: http://127.0.0.1:8080\n  session_encryption_secret: interactive-session-secret-at-least-32-characters\n',
-  );
+  await writeFile(interactivePath, 'server: {}\n');
   await command(binaryPath, ['--config', interactivePath, 'config', 'repository', 'add'], {
     input: 'github-interactive\n\n\n',
   });
@@ -940,6 +1119,7 @@ function tests(): SmokeTest[] {
         for (const subcommand of [
           'config',
           'repository',
+          'sessions',
           'serve',
           'login',
           'logout',
@@ -956,6 +1136,7 @@ function tests(): SmokeTest[] {
         assert(version.startsWith('lfscloud '), 'CLI version output was unexpected');
       },
     },
+    { name: 'default server startup', run: defaultServerStartupSmoke },
     {
       name: 'automated Rust targets',
       skip: cargoTestsAlreadyRan,
@@ -971,6 +1152,15 @@ function tests(): SmokeTest[] {
       },
     },
     { name: 'configuration command workflows', run: configurationCommandsSmoke },
+    { name: 'session key rotation safety', run: sessionKeyRotationSafetySmoke },
+    {
+      name: 'native credential store session key',
+      skip: enabledFlag(
+        'LFS_CLOUD_RUN_NATIVE_KEYRING_SMOKE',
+        'mutates one disposable native credential and removes it afterward',
+      ),
+      run: () => script('verify-native-session-key-store.sh', 10 * 60 * 1000),
+    },
     {
       name: 'default server config path',
       run: () =>
@@ -1073,6 +1263,7 @@ function sanitizeDetail(detail: string): string {
 }
 
 async function cleanup(): Promise<void> {
+  await Promise.all([...backgroundCommands].map(command => command.stop()));
   if (!sandbox) return;
   const relativeSandbox = relative(throwawayRoot, sandbox);
   if (relativeSandbox.startsWith('..') || !relativeSandbox.startsWith('.lfscloud-smoke-')) {

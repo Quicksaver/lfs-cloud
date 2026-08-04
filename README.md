@@ -100,16 +100,11 @@ Create or choose the private Drive folder that will hold LFS objects, then keep 
 Create a private server configuration file at `${HOME}/lfscloud.yml`. On Windows, LFS Cloud falls back to `%USERPROFILE%\lfscloud.yml` when `HOME` is not set. This is the default path whenever `--config PATH` is omitted. Do not commit the file.
 
 ```yaml
-server:
-  host: 127.0.0.1
-  port: 8080
-  public_url: http://127.0.0.1:8080
-  session_encryption_secret: ${LFS_CLOUD_SESSION_SECRET}
+server: {}
 
 repository_providers:
-  github-main:
+  github:
     type: github
-    api_url: https://api.github.com
 
 storage_providers:
   drive-personal:
@@ -120,14 +115,18 @@ storage_providers:
     root_folder_id: YOUR_DRIVE_FOLDER_ID
 
 repositories:
-  - id: github-main:OWNER/REPOSITORY
-    repo_provider: github-main
+  - id: github:OWNER/REPOSITORY
+    repo_provider: github
     host: github.com
     owner: OWNER
     name: REPOSITORY
     provider_repository_id: '123456789'
     storage_provider: drive-personal
 ```
+
+The server defaults to port `15370` on `0.0.0.0`, so it accepts connections through loopback, LAN, and direct Tailscale IPv4 addresses without network fields in the config. Git LFS action URLs are inferred from the interface each client connected to. Set `server.public_url` only when clients should receive a different hostname or path, such as a MagicDNS name or reverse proxy URL.
+
+GitHub providers use `https://api.github.com` by default. Set `api_url` only for an alternative REST endpoint such as GitHub Enterprise Server.
 
 The same provider and repository entries can be added interactively:
 
@@ -149,22 +148,21 @@ See the [configuration guide](docs/configuration.md) for the full schema, securi
 
 ### 4. Start The Server
 
-Export the server-owned session encryption secret and start LFS Cloud:
+Start LFS Cloud:
 
 ```bash
-export LFS_CLOUD_SESSION_SECRET="replace-with-at-least-32-random-characters"
 lfscloud serve
 ```
 
-The server validates its configuration, Google Drive credentials, and Drive root before it begins accepting requests.
+On first run, LFS Cloud generates its durable-session encryption key and stores it in the operating system's native credential store: macOS Keychain, Windows Credential Manager, or Secret Service on Linux. The server validates its configuration, native key access, Google Drive credentials, and Drive root before it begins accepting requests.
 
 ### 5. Connect A Repository
 
 From the configured Git repository:
 
 ```bash
-lfscloud init --server http://127.0.0.1:8080
-lfscloud login --server http://127.0.0.1:8080
+lfscloud init --server http://127.0.0.1:15370
+lfscloud login --server http://127.0.0.1:15370
 lfscloud status
 ```
 
@@ -182,13 +180,13 @@ git add .gitattributes .lfsconfig
 Use a non-shallow clone with all source branches and tags available. Keep the source LFS endpoint configured while planning and transferring:
 
 ```bash
-lfscloud login --server http://127.0.0.1:8080
+lfscloud login --server http://127.0.0.1:15370
 lfscloud migrate \
-  --server http://127.0.0.1:8080 \
+  --server http://127.0.0.1:15370 \
   --all-refs \
   --dry-run
 lfscloud migrate \
-  --server http://127.0.0.1:8080 \
+  --server http://127.0.0.1:15370 \
   --all-refs
 git add .lfsconfig
 git commit -m "Route Git LFS through LFS Cloud"
@@ -206,21 +204,22 @@ Execution requires `--all-refs`; narrower current-checkout and `--ref` scopes re
 
 ## Commands
 
-| Command                        | Purpose                                                         |
-| ------------------------------ | --------------------------------------------------------------- |
-| `lfscloud config repository`   | Add, update, list, or remove repository-provider configuration  |
-| `lfscloud config storage`      | Add, update, list, or remove storage-provider configuration     |
-| `lfscloud repository`          | Add, update, list, or remove served repository mappings         |
-| `lfscloud serve`               | Run the Git LFS-compatible server                               |
-| `lfscloud init`                | Configure the current repository's LFS Cloud endpoint           |
-| `lfscloud login`               | Create and store a repository-scoped local session              |
-| `lfscloud logout`              | Revoke that session and erase its Git credential                |
-| `lfscloud status`              | Check repository, server, auth, storage, and cache readiness    |
-| `lfscloud pull`                | Fetch Git LFS objects and hydrate the current checkout          |
-| `lfscloud hydrate <path...>`   | Replace pointer files with verified bytes from the shared cache |
-| `lfscloud dehydrate <path...>` | Replace clean LFS files with pointers after preserving bytes    |
-| `lfscloud gc --dry-run`        | Preview cleanup of unreferenced shared-cache objects            |
-| `lfscloud migrate`             | Migrate complete Git LFS history into LFS Cloud                 |
+| Command                          | Purpose                                                         |
+| -------------------------------- | --------------------------------------------------------------- |
+| `lfscloud config repository`     | Add, update, list, or remove repository-provider configuration  |
+| `lfscloud config storage`        | Add, update, list, or remove storage-provider configuration     |
+| `lfscloud repository`            | Add, update, list, or remove served repository mappings         |
+| `lfscloud sessions generate-key` | Rotate the managed session key and invalidate current sessions  |
+| `lfscloud serve`                 | Run the Git LFS-compatible server                               |
+| `lfscloud init`                  | Configure the current repository's LFS Cloud endpoint           |
+| `lfscloud login`                 | Create and store a repository-scoped local session              |
+| `lfscloud logout`                | Revoke that session and erase its Git credential                |
+| `lfscloud status`                | Check repository, server, auth, storage, and cache readiness    |
+| `lfscloud pull`                  | Fetch Git LFS objects and hydrate the current checkout          |
+| `lfscloud hydrate <path...>`     | Replace pointer files with verified bytes from the shared cache |
+| `lfscloud dehydrate <path...>`   | Replace clean LFS files with pointers after preserving bytes    |
+| `lfscloud gc --dry-run`          | Preview cleanup of unreferenced shared-cache objects            |
+| `lfscloud migrate`               | Migrate complete Git LFS history into LFS Cloud                 |
 
 Run `lfscloud <command> --help` for all options.
 
@@ -231,7 +230,7 @@ Run `lfscloud <command> --help` for all options.
 - Uploads and downloads are proxied through the LFS Cloud process, so the host must support long-lived large-file transfers.
 - The package channels will remain unavailable until the first release is published; release binaries are not signed or notarized yet.
 
-Use HTTPS for every non-loopback deployment. Plaintext LAN mode is an explicit development-only opt-in and exposes credentials and object bytes to network observers.
+The default listener makes the server reachable from trusted LAN and Tailscale interfaces, but it does not add TLS. Plain HTTP over a LAN exposes GitHub PATs during login, local LFS credentials, and object bytes to network observers; client commands therefore require `--allow-insecure-http` for non-loopback HTTP. Prefer HTTPS on any network you do not fully trust. Direct Tailscale traffic is encrypted by the tailnet tunnel, although the application URL remains HTTP.
 
 ## Documentation
 

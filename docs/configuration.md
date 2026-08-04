@@ -8,7 +8,7 @@ The committed repository-side `.lfsconfig` should contain only the LFS Cloud end
 
 ```ini
 [lfs]
-    url = http://127.0.0.1:8080/github.com/octo-org/assets.git/info/lfs
+    url = http://127.0.0.1:15370/github.com/octo-org/assets.git/info/lfs
 ```
 
 ## Manage Configuration From The CLI
@@ -35,9 +35,8 @@ The complete flag-based forms for the currently supported providers are:
 
 ```bash
 lfscloud config repository add \
-  --id github-main \
-  --type github \
-  --api-url https://api.github.com
+  --id github \
+  --type github
 
 lfscloud config storage add \
   --id drive-personal \
@@ -49,8 +48,8 @@ lfscloud config storage add \
   --display-name 'Personal Drive LFS'
 
 lfscloud repository add \
-  --id github-main:OWNER/REPOSITORY \
-  --repo-provider github-main \
+  --id github:OWNER/REPOSITORY \
+  --repo-provider github \
   --host github.com \
   --owner OWNER \
   --name REPOSITORY \
@@ -70,7 +69,7 @@ lfscloud config storage add \
   --display-name 'Archive Drive'
 
 lfscloud repository add \
-  --id github-main:OWNER/REPOSITORY \
+  --id github:OWNER/REPOSITORY \
   --storage-provider drive-archive
 ```
 
@@ -86,9 +85,9 @@ Remove commands are idempotent: removing an absent ID succeeds and reports that 
 
 ```bash
 lfscloud repository remove \
-  --id github-main:OWNER/REPOSITORY
+  --id github:OWNER/REPOSITORY
 lfscloud config storage remove --id drive-personal
-lfscloud config repository remove --id github-main
+lfscloud config repository remove --id github
 ```
 
 Successful writes use a temporary file beside the config, preserve the original file permissions, and atomically replace it after validation. YAML values and environment references are preserved, but comments and custom formatting are normalized when a change is written.
@@ -104,22 +103,11 @@ This target-first protocol makes follow-up migrations idempotent. A second user 
 ## Minimal Local Config
 
 ```yaml
-server:
-  host: 127.0.0.1
-  port: 8080
-  public_url: http://127.0.0.1:8080
-  session_encryption_secret: ${LFS_CLOUD_SESSION_SECRET}
-  max_batch_objects: 100
-  max_provider_calls: 16
-  max_concurrent_requests: 64
-  max_concurrent_uploads: 8
-  max_concurrent_uploads_per_user: 2
-  metadata_path: ./.lfscloud/metadata.sqlite3
+server: {}
 
 repository_providers:
-  github-main:
+  github:
     type: github
-    api_url: https://api.github.com
 
 storage_providers:
   drive-personal:
@@ -131,8 +119,8 @@ storage_providers:
     display_name: Personal Drive LFS
 
 repositories:
-  - id: github-main:octo-org/assets
-    repo_provider: github-main
+  - id: github:octo-org/assets
+    repo_provider: github
     host: github.com
     owner: octo-org
     name: assets
@@ -143,36 +131,56 @@ repositories:
 With that mapping, the repository LFS URL is:
 
 ```text
-http://127.0.0.1:8080/github.com/octo-org/assets.git/info/lfs
+http://127.0.0.1:15370/github.com/octo-org/assets.git/info/lfs
 ```
 
 Repository `name` omits the `.git` suffix because the route adds it. `provider_repository_id` is GitHub's immutable numeric repository ID, available with `gh api repos/OWNER/REPOSITORY --jq .id`. LFS Cloud verifies this value before every permission check so a renamed, transferred, deleted, or reused `owner/name` cannot silently switch the mapping to another repository.
 
 Each user runs `lfscloud login --server URL` with their own GitHub PAT. Login calls GitHub's authenticated-user endpoint to establish identity; it does not grant repository access. For every LFS operation, the server uses that user's retained PAT to check the current GitHub permission on the configured repository. Read or stronger permits downloads; write or admin permits uploads and migration. Token scope, organization SSO policy, expiry, and revocation can still limit otherwise valid repository membership. The PAT is never written to Git's credential helper.
 
-`server.session_encryption_secret` is a server-owned value of at least 32 characters used only to protect durable session credentials. Keep it private and stable across restarts. Configuration loading rejects a GitHub provider without this setting or the transition fallback. For transition compatibility, an old repository-provider `personal_access_token` can supply this encryption material when the dedicated setting is absent, but it no longer selects or authenticates the users allowed to log in and should be removed after configuring the dedicated secret.
+GitHub providers use `https://api.github.com` when `api_url` is omitted. Set it only to override the REST base, most commonly for GitHub Enterprise Server. The provider ID is the stable name referenced by repository mappings, so `github` is the concise default choice. The current authentication composition supports one GitHub provider per server instance.
+
+When `server.session_encryption_secret` is omitted, LFS Cloud manages the key in the operating system's native credential store. It uses macOS Keychain, Windows Credential Manager, or Secret Service on Linux and associates the credential with a stable, non-secret installation ID in the metadata database. Moving the config and metadata files together therefore preserves the lookup identity.
+
+The key is generated only when the native store reports that no entry exists and the database has no active sessions. A locked, denied, or unavailable native store fails startup instead of silently replacing the key. Headless services and containers without a native credential store can explicitly set `server.session_encryption_secret` to an environment reference containing at least 32 characters.
+
+For transition compatibility, an old repository-provider `personal_access_token` still supplies encryption material when the dedicated setting is absent. It no longer authenticates users. To move to managed storage, remove that field and run `lfscloud sessions generate-key`; the confirmation makes the required session invalidation explicit.
 
 The metadata upgrade that introduces the dedicated server secret invalidates sessions encrypted with the legacy provider PAT before loading durable session state. Existing users must log in again after that upgrade.
 
-## LAN Config
+## Default Network Reachability
 
-Use a LAN bind only on a trusted network:
+The default listener is `0.0.0.0:15370`. One server process therefore accepts IPv4 connections through loopback, LAN, and direct Tailscale addresses without enumerating interfaces. When `server.public_url` is omitted, each Git LFS batch response uses the actual local destination address of that accepted TCP connection. It does not trust the request's `Host` or forwarded headers.
+
+From another machine on the same tailnet, use the server's Tailscale IP and explicitly acknowledge application-layer HTTP:
+
+```bash
+lfscloud init \
+  --server http://100.x.y.z:15370 \
+  --allow-insecure-http
+lfscloud login \
+  --server http://100.x.y.z:15370 \
+  --allow-insecure-http
+```
+
+Direct Tailscale packets are encrypted by the tailnet tunnel, but LFS Cloud still serves HTTP rather than HTTPS. On an ordinary LAN, plaintext HTTP exposes users' GitHub PATs during login, local LFS credentials, and object bytes to network observers. Use only a trusted LAN or terminate TLS in front of the server.
+
+`server.public_url` remains available when the socket address is not the URL clients should receive. Examples include MagicDNS, trusted TLS termination, a reverse proxy, or a path prefix:
 
 ```yaml
 server:
-  host: 0.0.0.0
-  port: 8080
-  public_url: http://192.168.1.25:8080
+  public_url: https://lfs-host.example.ts.net
+```
+
+If MagicDNS resolves directly to the plaintext listener instead of HTTPS termination, configure both the HTTP URL and its explicit server-side exception. Client commands still need `--allow-insecure-http`:
+
+```yaml
+server:
+  public_url: http://lfs-host.example.ts.net:15370
   allow_insecure_http: true
 ```
 
-The `serve` command can also override the bind address and port:
-
-```bash
-lfscloud serve --host 0.0.0.0 --port 8080
-```
-
-`public_url` is the URL embedded in Git LFS batch action responses. Set it to the address clients can actually reach. Plaintext LAN mode exposes users' GitHub PATs during login, LFS credentials, and object bytes to the network, so it requires the explicit `allow_insecure_http: true` development opt-in. Prefer HTTPS through trusted TLS termination. Client commands using this LAN URL also require `--allow-insecure-http`.
+Override `server.host` or `server.port`, or use `lfscloud serve --host HOST --port PORT`, only when a different bind is required.
 
 ## Provider And Request Work Limits
 
@@ -242,7 +250,15 @@ The configured `root_folder_id` must be a folder that the app credential can acc
 
 Production `serve` processes persist unexpired local LFS sessions in the configured metadata database so Git credentials continue to work across server restarts. The database contains only the local token's SHA-256 digest. The private GitHub PAT and the session identity, scopes, and timestamps are authenticated together with AES-256-GCM before persistence.
 
-The encryption key is derived from `server.session_encryption_secret`; the secret itself is never stored in SQLite. Keep it stable while sessions are active. Rotating it intentionally makes existing rows unreadable, so allow current sessions to expire or remove them first.
+The encryption key comes from the native credential store by default; its secret bytes are never stored in SQLite or printed. An explicit `server.session_encryption_secret` remains authoritative for headless deployments.
+
+Rotate the managed key with:
+
+```bash
+lfscloud sessions generate-key
+```
+
+The command warns that all current sessions will be invalidated and requires confirmation. It refuses to run while the server owns the metadata database, deletes the durable sessions, replaces the native key, and reports only the number invalidated. Users must run `lfscloud login` again. The command also refuses configs with an explicit session secret or deprecated provider PAT because those values, rather than the native store, are authoritative.
 
 ## Metadata Path
 
@@ -254,11 +270,11 @@ If `server.metadata_path` is omitted, the server stores SQLite metadata at:
 
 Relative `metadata_path` values resolve against the directory containing the config file.
 
-The server creates an `upload-locks` directory beside the metadata database. All LFS Cloud processes that can write to the same Google Drive root must use the same metadata location. Those OS-backed object-keyed locks serialize the final Drive existence check and upload across local processes and are released automatically if a process exits. Cross-host writers are not supported by the MVP. Lookup deterministically selects the smallest Drive file ID when an older race has already left multiple otherwise exact object matches.
+The server creates a `<metadata filename>.lock` file and an `upload-locks` directory beside the metadata database. The lifecycle lock allows only one active server process for an installation and prevents key rotation while that process still holds sessions in memory. The object-keyed locks serialize the final Drive existence check and upload and are released automatically if a process exits. Cross-host writers are not supported by the MVP. Lookup deterministically selects the smallest Drive file ID when an older race has already left multiple otherwise exact object matches.
 
 ## Validation Rules
 
-- `server.public_url`, GitHub `api_url`, and CLI `--server` route bases use the same validation policy. They must be HTTP(S) URLs without credentials, query strings, fragments, trailing slashes, whitespace, control characters, backslashes, or path dot segments. They must use HTTPS unless the host is an exact IPv4/IPv6 loopback address. Non-loopback HTTP requires the explicit development-only `server.allow_insecure_http: true` setting and the matching CLI `--allow-insecure-http` flag.
+- Explicit `server.public_url`, GitHub `api_url` overrides, and CLI `--server` route bases must be HTTP(S) URLs without credentials, query strings, fragments, trailing slashes, whitespace, control characters, backslashes, or path dot segments. Explicit config URLs must use HTTPS unless the host is an exact IPv4/IPv6 loopback address or `server.allow_insecure_http: true` is set. Client commands require their own `--allow-insecure-http` flag for non-loopback HTTP. Per-connection server URLs inferred from the direct listener use HTTP and are covered by the LAN tradeoff above.
 - `server.max_batch_objects`, `server.max_provider_calls`, `server.max_concurrent_requests`, `server.max_concurrent_uploads`, and `server.max_concurrent_uploads_per_user` must be greater than zero when configured. The per-user upload limit cannot exceed the process-wide upload limit.
 - Custom Google Drive API base URLs used by embedded runtimes or tests must use HTTPS except for literal loopback IP HTTP endpoints; names such as `localhost` are not accepted.
 - Provider IDs and storage IDs must start with an ASCII letter or digit and use only ASCII letters, digits, `_`, or `-`.

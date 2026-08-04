@@ -4,6 +4,21 @@ enum ServerShutdownOutcome {
     TimedOut,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AcceptedSocketAddress(Option<SocketAddr>);
+
+impl Connected<IncomingStream<'_, tokio::net::TcpListener>> for AcceptedSocketAddress {
+    fn connect_info(stream: IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        Self(stream.io().local_addr().ok())
+    }
+}
+
+impl AcceptedSocketAddress {
+    fn http_origin(self) -> Option<String> {
+        self.0.map(|address| format!("http://{address}"))
+    }
+}
+
 /// Runtime options supplied by `lfscloud serve`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServeOptions {
@@ -113,6 +128,9 @@ impl ServerBuilder {
         )?;
         bind.validate_transport(&config)?;
 
+        let _server_process_lock =
+            crate::metadata::ServerProcessLock::acquire(&config.server.metadata_path)?;
+
         let metadata_database =
             Arc::new(MetadataDatabase::open(config.server.metadata_path.clone())?);
         metadata_database.sync_config(&config)?;
@@ -123,7 +141,17 @@ impl ServerBuilder {
             Some(clients) => clients,
             None => ServerCompositionClients::production()?,
         };
-        let session_store = production_session_store(&config, metadata_database.clone())?;
+        let session_config = config.clone();
+        let session_database = metadata_database.clone();
+        let session_metadata_path = config.server.metadata_path.clone();
+        let session_store = tokio::task::spawn_blocking(move || {
+            production_session_store(&session_config, session_database)
+        })
+        .await
+        .map_err(|source| ServerError::MetadataTaskJoin {
+            path: session_metadata_path,
+            source,
+        })??;
         let storage_provider_factory = clients.storage_provider_factory;
         #[cfg(test)]
         let storage_provider_factory = match self.drive_object_api_base_url {
@@ -186,7 +214,10 @@ where
         shutdown_signal.await;
         let _ = shutdown_started_sender.send(());
     };
-    let server = axum::serve(listener, router)
+    let server = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<AcceptedSocketAddress>(),
+    )
         .with_graceful_shutdown(tracked_shutdown_signal)
         .into_future();
     tokio::pin!(server);
@@ -248,6 +279,18 @@ fn production_session_store(
     config: &ServerConfig,
     metadata_database: Arc<MetadataDatabase>,
 ) -> ServerResult<LocalLfsSessionStore> {
+    production_session_store_with_key_store(
+        config,
+        metadata_database,
+        &crate::session_keys::NativeSessionEncryptionKeyStore,
+    )
+}
+
+fn production_session_store_with_key_store(
+    config: &ServerConfig,
+    metadata_database: Arc<MetadataDatabase>,
+    key_store: &dyn crate::session_keys::SessionEncryptionKeyStore,
+) -> ServerResult<LocalLfsSessionStore> {
     if let Some(secret) = &config.server.session_encryption_secret {
         return LocalLfsSessionStore::open_durable(metadata_database, secret.as_bytes());
     }
@@ -261,10 +304,13 @@ fn production_session_store(
                 );
                 LocalLfsSessionStore::open_durable(metadata_database, legacy_secret.as_bytes())
             }
-            None => Err(ServerError::InvalidConfiguration {
-                message: "server.session_encryption_secret is required when GitHub authentication is configured"
-                    .to_owned(),
-            }),
+            None => {
+                let secret = crate::session_keys::load_or_create_managed_session_key(
+                    &metadata_database,
+                    key_store,
+                )?;
+                LocalLfsSessionStore::open_durable(metadata_database, secret)
+            }
         },
     }
 }
@@ -604,7 +650,6 @@ macro_rules! server_storage_and_composition_tests {
 server:
   host: 127.0.0.1
   port: {server_port}
-  public_url: {server_url}
   metadata_path: state/metadata.sqlite3
 repository_providers:
   github-main:
@@ -702,10 +747,14 @@ repositories:
             .json()
             .await
             .expect("composition LFS batch should return JSON");
-        assert!(
-            batch_body["objects"][0]["actions"]["upload"]["href"]
+        assert_eq!(
+            batch_body["objects"][0]["actions"]["upload"]["href"].as_str(),
+            Some(
+                format!(
+                    "{server_url}/github.com/owner/repo.git/info/lfs/objects/{object_oid}?size=42"
+                )
                 .as_str()
-                .is_some_and(|href| href.contains(object_oid))
+            )
         );
 
         shutdown_sender

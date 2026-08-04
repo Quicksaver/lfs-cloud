@@ -24,6 +24,8 @@ pub(super) enum Command {
     Config(ConfigCommand),
     /// Manage repositories served by this LFS Cloud instance.
     Repository(RepositoryCommand),
+    /// Manage server-side LFS sessions and their encryption key.
+    Sessions(SessionsCommand),
     /// Run the local Git LFS-compatible HTTP server.
     Serve(ServeCommand),
     /// Authenticate with GitHub and store the local LFS token for this repo.
@@ -184,6 +186,18 @@ pub(super) struct ConfigEntryRemoveCommand {
 pub(super) struct RepositoryCommand {
     #[command(subcommand)]
     pub(super) action: RepositoryAction,
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
+pub(super) struct SessionsCommand {
+    #[command(subcommand)]
+    pub(super) action: SessionsAction,
+}
+
+#[derive(Debug, Subcommand, Eq, PartialEq)]
+pub(super) enum SessionsAction {
+    /// Generate a new managed encryption key and invalidate current sessions.
+    GenerateKey,
 }
 
 #[derive(Debug, Subcommand, Eq, PartialEq)]
@@ -392,6 +406,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         cli,
         crate::serve,
         run_configuration_to_stdio,
+        run_sessions_to_stdio,
         run_init_to_stdout,
         run_login_to_stdio,
         run_logout_to_stdout,
@@ -409,10 +424,11 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     clippy::too_many_arguments,
     reason = "command dispatch keeps per-subcommand side effects injectable for focused tests"
 )]
-pub(super) async fn dispatch<F, Fut, C, I, L, O, S, P, H, D, G, M>(
+pub(super) async fn dispatch<F, Fut, C, X, I, L, O, S, P, H, D, G, M>(
     cli: Cli,
     serve: F,
     configure: C,
+    sessions: X,
     init: I,
     login: L,
     logout: O,
@@ -427,6 +443,7 @@ where
     F: FnOnce(ServeOptions) -> Fut,
     Fut: Future<Output = crate::ServerResult<()>>,
     C: FnOnce(ConfigurationCommand, Option<PathBuf>) -> anyhow::Result<()>,
+    X: FnOnce(SessionsCommand, Option<PathBuf>) -> anyhow::Result<()>,
     I: FnOnce(InitCommand) -> anyhow::Result<()>,
     L: FnOnce(LoginCommand) -> anyhow::Result<()>,
     O: FnOnce(LogoutCommand) -> anyhow::Result<()>,
@@ -446,6 +463,9 @@ where
         Command::Repository(command) => {
             configure(ConfigurationCommand::Repository(command), cli.config)
                 .context("failed to edit lfscloud repository mappings")
+        }
+        Command::Sessions(command) => {
+            sessions(command, cli.config).context("failed to manage lfscloud sessions")
         }
         Command::Serve(command) => serve(command.serve_options(cli.config))
             .await
@@ -1066,6 +1086,26 @@ mod tests {
     }
 
     #[test]
+    fn sessions_generate_key_command_parses_with_global_config() {
+        let cli = Cli::try_parse_from([
+            "lfscloud",
+            "--config",
+            "custom-lfscloud.yml",
+            "sessions",
+            "generate-key",
+        ])
+        .expect("sessions generate-key command should parse");
+
+        assert_eq!(cli.config, Some("custom-lfscloud.yml".into()));
+        assert!(matches!(
+            cli.command,
+            super::Command::Sessions(SessionsCommand {
+                action: SessionsAction::GenerateKey
+            })
+        ));
+    }
+
+    #[test]
     fn default_tracing_config_uses_rust_log_env_override() {
         let cli = Cli::try_parse_from(["lfscloud", "serve"]).expect("serve command should parse");
         let config = tracing_config(&cli);
@@ -1087,6 +1127,7 @@ mod tests {
     #[derive(Debug, Eq, PartialEq)]
     enum Invoked {
         Configuration(ConfigurationCommand, Option<PathBuf>),
+        Sessions(SessionsCommand, Option<PathBuf>),
         Serve(ServeOptions),
         Init(InitCommand),
         Login(LoginCommand),
@@ -1138,6 +1179,21 @@ mod tests {
                         action: RepositoryAction::List,
                     }),
                     None,
+                ),
+            ),
+            (
+                vec![
+                    "lfscloud",
+                    "--config",
+                    "lfscloud.test.yml",
+                    "sessions",
+                    "generate-key",
+                ],
+                Invoked::Sessions(
+                    SessionsCommand {
+                        action: SessionsAction::GenerateKey,
+                    },
+                    Some("lfscloud.test.yml".into()),
                 ),
             ),
             (
@@ -1324,6 +1380,10 @@ mod tests {
                 },
                 |command, config| {
                     record_invocation(recorder, Invoked::Configuration(command, config));
+                    Ok(())
+                },
+                |command, config| {
+                    record_invocation(recorder, Invoked::Sessions(command, config));
                     Ok(())
                 },
                 |command| {

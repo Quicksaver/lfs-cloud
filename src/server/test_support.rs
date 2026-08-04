@@ -27,13 +27,14 @@
     use tower::ServiceExt;
 
     use super::{
-        BASE64_STANDARD, BatchBodyGuardrails, ConfiguredStorageProviders, LFS_AUTH_CHALLENGE,
+        AcceptedSocketAddress, BASE64_STANDARD, BatchBodyGuardrails, ConfiguredStorageProviders, LFS_AUTH_CHALLENGE,
         LFS_SESSION_REVOKE_PATH, LfsBatchAuthorizer, LfsObjectTransferStore, LfsRouteEndpoint,
         LfsRouteResolver, LfsRouterBuilder, LfsSessionRecord, MAX_UPLOAD_OBJECT_BYTES,
         ProviderBatchAuthorizer, ServeOptions, ServerBind, ServerBuilder, ServerCompositionClients,
         ServerShutdownOutcome, StorageProviderTransferStore, UploadStagingCoordinator,
         UploadStagingGuardrails, advertised_server_urls, authenticate_lfs_session,
         lfs_server_router, lfs_server_router_with_sessions, production_session_store,
+        production_session_store_with_key_store,
         render_server_startup_message, serve_with_graceful_shutdown, server_router_with_sessions,
         stage_upload_request_body, stage_upload_request_body_with_guardrails,
         stage_upload_request_body_with_limit, upload_staging_file_io_error,
@@ -94,6 +95,13 @@
     }
 
     fn test_config_with_github_api_url(api_url: &str) -> ServerConfig {
+        test_config_with_github_api_url_and_auth(
+            api_url,
+            "    personal_access_token: github-pat\n",
+        )
+    }
+
+    fn test_config_with_github_api_url_and_auth(api_url: &str, legacy_auth: &str) -> ServerConfig {
         ServerConfig::load_from_str(&format!(
             r#"
 server:
@@ -102,7 +110,7 @@ repository_providers:
   github-main:
     type: github
     api_url: {api_url}
-    personal_access_token: github-pat
+{legacy_auth}
 storage_providers:
   drive-user-a:
     type: google_drive

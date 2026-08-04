@@ -162,7 +162,6 @@ impl EditableServerConfig {
             .is_some();
         if !existed {
             require_some(&values.provider_type, "--type")?;
-            require_some(&values.api_url, "--api-url")?;
         }
 
         let before = self.document.clone();
@@ -687,6 +686,30 @@ repositories:
                 .expect("identical repository update should succeed"),
             EditOutcome::Unchanged
         );
+    }
+
+    #[test]
+    fn new_github_provider_does_not_require_or_write_default_api_url() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let path = temp.path().join("lfscloud.yml");
+        fs::write(&path, "server: {}\n").expect("minimal config fixture should be written");
+        let mut config = EditableServerConfig::load(&path).expect("config should load");
+
+        config
+            .upsert_repository_provider(RepositoryProviderValues {
+                id: "github".to_owned(),
+                provider_type: Some("github".to_owned()),
+                ..RepositoryProviderValues::default()
+            })
+            .expect("GitHub provider should use its API default");
+        config.save().expect("provider config should save");
+
+        let written = fs::read_to_string(&path).expect("saved config should be readable");
+        assert!(!written.contains("api_url"));
+        let loaded = ServerConfig::load_from_path(&path).expect("saved config should validate");
+        let crate::RepositoryProviderConfig::GitHub(provider) =
+            &loaded.repository_providers["github"];
+        assert_eq!(provider.api_url, "https://api.github.com");
     }
 
     #[test]

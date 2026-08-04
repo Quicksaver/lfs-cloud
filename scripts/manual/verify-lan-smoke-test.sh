@@ -47,7 +47,7 @@ PY
 )"
 fi
 
-public_url="${LFS_CLOUD_LAN_PUBLIC_URL:-http://127.0.0.1:$port}"
+public_url="${LFS_CLOUD_LAN_PUBLIC_URL:-}"
 config_file="${LFS_CLOUD_LAN_CONFIG:-$tmp_dir/lfscloud-lan.yml}"
 route_host="${LFS_CLOUD_LAN_ROUTE_HOST:-github.com}"
 route_owner="${LFS_CLOUD_LAN_ROUTE_OWNER:-owner}"
@@ -190,7 +190,7 @@ sys.exit(1)
 PY
 }
 
-if [[ "$public_url" == */ ]]; then
+if [[ -n "$public_url" && "$public_url" == */ ]]; then
   echo "LFS_CLOUD_LAN_PUBLIC_URL must not end with a trailing slash" >&2
   exit 1
 fi
@@ -221,38 +221,25 @@ if ! is_loopback_host "$host"; then
   echo "Notice: LFS Cloud will bind to $host and may be reachable from your LAN." >&2
 fi
 
+probe_path="$route_path"
+expected_http_status="401"
 if [[ -z "${LFS_CLOUD_LAN_CONFIG:-}" ]]; then
+  optional_server_config=""
+  if [[ -n "${LFS_CLOUD_LAN_HOST:-}" ]]; then
+    optional_server_config+="  host: $host"$'\n'
+  fi
+  if [[ -n "$public_url" ]]; then
+    optional_server_config+="  public_url: $public_url"$'\n'
+    optional_server_config+="  allow_insecure_http: true"$'\n'
+  fi
   cat >"$config_file" <<YAML
 server:
-  host: $host
-  port: $port
-  public_url: $public_url
-  allow_insecure_http: true
+${optional_server_config}  port: $port
   session_encryption_secret: lan-smoke-session-secret-at-least-32-characters
   metadata_path: $tmp_dir/metadata.sqlite3
-
-repository_providers:
-  github-main:
-    type: github
-    api_url: https://api.github.com
-
-storage_providers:
-  drive-user-a:
-    type: google_drive
-    credentials:
-      type: gcloud
-      config_dir: .gcloud-drive
-    root_folder_id: lan-smoke-root
-
-repositories:
-  - id: github-main:$route_owner/$route_repo
-    repo_provider: github-main
-    host: $route_host
-    owner: $route_owner
-    name: $route_repo
-    provider_repository_id: "8675309"
-    storage_provider: drive-user-a
 YAML
+  probe_path="/status"
+  expected_http_status="404"
 elif [[ -n "${LFS_CLOUD_LAN_PUBLIC_URL:-}" ]]; then
   actual_public_url="$(extract_server_public_url "$config_file" || true)"
   if [[ "$actual_public_url" != "$public_url" ]]; then
@@ -266,8 +253,11 @@ expected_local_url="$(advertised_local_url "$host" "$port")"
 
 lfscloud_bin="$(build_lfscloud_binary)"
 
-"$lfscloud_bin" --config "$config_file" serve --host "$host" --port "$port" \
-  >"$server_log" 2>&1 &
+serve_args=(--config "$config_file" serve)
+if [[ -n "${LFS_CLOUD_LAN_CONFIG:-}" ]]; then
+  serve_args+=(--host "$host" --port "$port")
+fi
+"$lfscloud_bin" "${serve_args[@]}" >"$server_log" 2>&1 &
 server_pid="$!"
 
 startup_attempts=$((startup_timeout_seconds * 4))
@@ -278,9 +268,9 @@ for _ in $(seq 1 "$startup_attempts"); do
     curl --silent --show-error \
       --output "$tmp_dir/startup-response" \
       --write-out "%{http_code}" \
-      "$expected_local_url$route_path" 2>"$tmp_dir/startup-curl-error" || true
+      "$expected_local_url$probe_path" 2>"$tmp_dir/startup-curl-error" || true
   )"
-  if [[ "$startup_http_status" == "401" ]]; then
+  if [[ "$startup_http_status" == "$expected_http_status" ]]; then
     break
   fi
   if ! kill -0 "$server_pid" >/dev/null 2>&1; then
@@ -292,10 +282,10 @@ for _ in $(seq 1 "$startup_attempts"); do
   sleep 0.25
 done
 
-if [[ "$startup_http_status" != "401" ]]; then
+if [[ "$startup_http_status" != "$expected_http_status" ]]; then
   cat "$server_log" >&2
   cat "$tmp_dir/startup-curl-error" >&2
-  echo "lfscloud serve did not respond with HTTP 401 before timeout" >&2
+  echo "lfscloud serve did not respond with HTTP $expected_http_status before timeout" >&2
   exit 1
 fi
 
@@ -322,29 +312,30 @@ http_status="$(
   curl --silent --show-error \
     --output "$tmp_dir/info-response" \
     --write-out "%{http_code}" \
-    "$expected_local_url$route_path"
+    "$expected_local_url$probe_path"
 )"
-if [[ "$http_status" != "401" ]]; then
+if [[ "$http_status" != "$expected_http_status" ]]; then
   cat "$tmp_dir/info-response" >&2
-  echo "expected unauthenticated LFS info request to return HTTP 401, got $http_status" >&2
+  echo "expected LAN preflight request to return HTTP $expected_http_status, got $http_status" >&2
   exit 1
 fi
 
-require_file_contains '"message":"LFS Cloud authentication required"' "$tmp_dir/info-response" \
-  "info route response missing expected authentication message"
+if [[ "$expected_http_status" == "401" ]]; then
+  require_file_contains '"message":"LFS Cloud authentication required"' "$tmp_dir/info-response" \
+    "info route response missing expected authentication message"
+fi
 
 cat <<CHECKLIST
 LAN smoke server preflight passed.
 
 Manual cross-machine checklist:
 
-1. On the server machine, choose a reachable LAN base URL with no trailing slash:
-   LFS_CLOUD_LAN_PUBLIC_URL=http://<server-lan-ip>:$port \\
-     LFS_CLOUD_LAN_PORT=$port \\
+1. On the server machine, start the generated config without a public URL override:
+   LFS_CLOUD_LAN_PORT=$port \\
      scripts/manual/verify-lan-smoke-test.sh
    For a real disposable-repo transfer run, point LFS_CLOUD_LAN_CONFIG at the
-   real server config, make sure its server.public_url uses that same LAN URL
-   with server.allow_insecure_http: true,
+   real server config and omit server.public_url so direct connections infer
+   their own destination address,
    and set LFS_CLOUD_LAN_ROUTE_HOST, LFS_CLOUD_LAN_ROUTE_OWNER, and
    LFS_CLOUD_LAN_ROUTE_REPO to a mapped repository if it is not github.com/owner/repo.
 2. Confirm the server output includes both:
@@ -361,9 +352,9 @@ Manual cross-machine checklist:
    Expected: the Git LFS endpoint points at the LAN URL for the disposable repo.
 5. Track and push one small Git LFS file from the client, then clone or pull
    from another clean worktree using the same LAN URL.
-   Expected: upload and download batch requests succeed, object bytes round-trip
-   through Google Drive storage, and no GitHub PAT or Drive token appears in CLI,
-   server, or Git LFS output.
+   Expected: upload and download action URLs use <server-lan-ip>:$port, object
+   bytes round-trip through Google Drive storage, and no GitHub PAT or Drive
+   token appears in CLI, server, or Git LFS output.
 6. Stop the server and remove the disposable GitHub repo, Drive folder contents,
    and local credential-helper entries created for the smoke test.
 CHECKLIST

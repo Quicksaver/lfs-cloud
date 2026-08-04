@@ -5,8 +5,10 @@
 //! attempts without becoming part of any Git repository's committed config.
 
 mod configuration;
+mod instance;
 mod migrations;
 mod objects;
+mod process_lock;
 mod sessions;
 mod transfers;
 mod upload_locks;
@@ -22,6 +24,7 @@ use crate::{LfsObject, ServerError, ServerResult};
 
 pub use migrations::METADATA_SCHEMA_VERSION;
 pub use objects::{MetadataObjectRecord, MetadataObjectVerificationStatus};
+pub(crate) use process_lock::ServerProcessLock;
 pub(crate) use sessions::MetadataSessionRecord;
 pub(crate) use transfers::{MetadataTransferOperation, MetadataTransferResult};
 #[allow(unused_imports)]

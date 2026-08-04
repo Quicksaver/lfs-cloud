@@ -10,8 +10,8 @@ use super::{
 };
 use crate::ServerResult;
 
-const DEFAULT_BIND_HOST: &str = "127.0.0.1";
-const DEFAULT_BIND_PORT: u16 = 8080;
+const DEFAULT_BIND_HOST: &str = "0.0.0.0";
+const DEFAULT_BIND_PORT: u16 = 15_370;
 const DEFAULT_MAX_BATCH_OBJECTS: usize = 100;
 const DEFAULT_MAX_PROVIDER_CALLS: usize = 16;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
@@ -25,14 +25,19 @@ pub struct ServerSettings {
     pub host: String,
     /// TCP port the server should bind to.
     pub port: u16,
-    /// Public base URL used when constructing Git LFS action URLs.
-    pub public_url: String,
-    /// Whether non-loopback plaintext HTTP is explicitly allowed.
+    /// Optional public base URL override used for Git LFS action URLs.
     ///
-    /// This development-only escape hatch affects the public server URL and
-    /// repository-provider API URLs. It should never be enabled on an
-    /// untrusted network because those endpoints carry credentials and LFS
-    /// object content.
+    /// When omitted, the server derives the direct URL from the local address
+    /// of each accepted connection. Configure this for hostnames, reverse
+    /// proxies, TLS termination, or path prefixes that the listening socket
+    /// cannot infer.
+    pub public_url: Option<String>,
+    /// Whether explicitly configured non-loopback HTTP URLs are allowed.
+    ///
+    /// This development-only escape hatch affects an explicit public URL and
+    /// repository-provider API overrides. Direct URLs inferred from accepted
+    /// HTTP connections do not require this config switch. Plaintext LAN
+    /// traffic still exposes credentials and object content to observers.
     pub allow_insecure_http: bool,
     /// Stable server-owned secret used to encrypt durable user sessions.
     ///
@@ -82,8 +87,10 @@ impl ServerSettings {
         metadata_base_dir: &Path,
     ) -> ServerResult<Self> {
         let host = resolve_required(raw.host, "server.host", env)?;
-        let public_url = resolve_required(raw.public_url, "server.public_url", env)?;
-        validate_config_http_url(&public_url, "server.public_url", raw.allow_insecure_http)?;
+        let public_url = resolve_optional(raw.public_url, "server.public_url", env)?;
+        if let Some(public_url) = &public_url {
+            validate_config_http_url(public_url, "server.public_url", raw.allow_insecure_http)?;
+        }
         let metadata_path = resolve_metadata_path(raw.metadata_path, metadata_base_dir, env)?;
         let session_encryption_secret = resolve_optional(
             raw.session_encryption_secret,
@@ -137,6 +144,26 @@ impl ServerSettings {
             max_concurrent_uploads_per_user: raw.max_concurrent_uploads_per_user,
             metadata_path,
         })
+    }
+
+    /// Returns the URL used by local CLI commands when no explicit server URL
+    /// or public URL override is configured.
+    ///
+    /// Wildcard binds are intentionally represented as loopback because
+    /// unspecified addresses are listener targets, not connectable endpoints.
+    #[must_use]
+    pub fn local_client_url(&self) -> String {
+        if let Some(public_url) = &self.public_url {
+            return public_url.clone();
+        }
+
+        let host = match self.host.as_str() {
+            "0.0.0.0" => "127.0.0.1".to_owned(),
+            "::" => "[::1]".to_owned(),
+            host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
+            host => host.to_owned(),
+        };
+        format!("http://{host}:{}", self.port)
     }
 }
 

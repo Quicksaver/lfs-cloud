@@ -24,6 +24,7 @@ mod provider_factory;
 pub mod providers;
 pub mod server;
 pub mod server_config;
+mod session_keys;
 pub mod sessions;
 
 pub use cli::run_from_env;
@@ -102,7 +103,7 @@ pub use server::{
     lfs_server_router_with_sessions, render_server_startup_message, serve,
 };
 pub use server_config::{
-    DEFAULT_CONFIG_PATH, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR,
+    DEFAULT_CONFIG_PATH, DEFAULT_GITHUB_API_URL, DEFAULT_METADATA_DB_FILE, DEFAULT_METADATA_DIR,
     GitHubAuthenticationConfig, GitHubProviderConfig, GoogleDriveGcloudCredentialsConfig,
     GoogleDriveStorageConfig, RepositoryMapping, RepositoryProviderConfig, ServerConfig,
     ServerSessionEncryptionSecret, ServerSettings, StorageProviderConfig,
