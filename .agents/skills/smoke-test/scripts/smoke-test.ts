@@ -119,15 +119,18 @@ function appendOutput(current: string, chunk: Buffer | string): string {
 
 function runCommand(command: string, args: string[], options: CommandOptions = {}): Promise<CommandResult> {
   return new Promise(complete => {
-    const environment = {
-      ...process.env,
-      ...options.env,
-    };
-    if (process.platform === 'win32' && options.env?.PATH !== undefined) {
-      for (const key of Object.keys(environment)) {
-        if (key !== 'PATH' && key.toUpperCase() === 'PATH') delete environment[key];
+    const inheritedEnvironment = { ...process.env };
+    if (process.platform === 'win32') {
+      for (const overrideKey of Object.keys(options.env ?? {})) {
+        for (const inheritedKey of Object.keys(inheritedEnvironment)) {
+          if (inheritedKey.toUpperCase() === overrideKey.toUpperCase()) delete inheritedEnvironment[inheritedKey];
+        }
       }
     }
+    const environment = {
+      ...inheritedEnvironment,
+      ...options.env,
+    };
     const child = spawn(command, args, {
       cwd: options.cwd ?? repoRoot,
       detached: true,
@@ -601,7 +604,7 @@ async function configurationCommandsSmoke(): Promise<void> {
   if (process.platform === 'win32') {
     await writeFile(
       fakeGcloud,
-      '@echo off\r\nif not exist "%CLOUDSDK_CONFIG%" mkdir "%CLOUDSDK_CONFIG%"\r\n> "%CLOUDSDK_CONFIG%\\application_default_credentials.json" echo {}\r\n',
+      '@echo off\r\nif not exist "%CLOUDSDK_CONFIG%" mkdir "%CLOUDSDK_CONFIG%"\r\necho {}>"%CLOUDSDK_CONFIG%\\application_default_credentials.json"\r\n',
     );
     await writeFile(fakeGh, '@echo off\r\necho 987654321\r\n');
   } else {
@@ -627,14 +630,14 @@ async function configurationCommandsSmoke(): Promise<void> {
   await command(binaryPath, ['--config', interactivePath, 'config', 'storage', 'add'], {
     input: `\ndrive-interactive\n${clientSecret}\n${interactiveGcloud}\n${fakeGcloud}\n\nInteractive Drive\n`,
   });
-  await command(binaryPath, ['--config', interactivePath, 'repository', 'add'], {
-    input: '\n\nowner\nrepo\n\n',
-    env: { PATH: `${fakeTools}${delimiter}${process.env.PATH ?? ''}` },
-  });
   assert(
     await pathExists(join(interactiveGcloud, 'application_default_credentials.json')),
     'interactive storage add did not create isolated ADC state',
   );
+  await command(binaryPath, ['--config', interactivePath, 'repository', 'add'], {
+    input: '\n\nowner\nrepo\n\n',
+    env: { PATH: `${fakeTools}${delimiter}${process.env.PATH ?? ''}` },
+  });
   const interactiveRepositories = await command(binaryPath, ['--config', interactivePath, 'repository', 'list']);
   assert(
     interactiveRepositories.includes('github-interactive:owner/repo'),

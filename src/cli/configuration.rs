@@ -1,12 +1,14 @@
 //! Editing and listing the server's provider and repository configuration.
 
 use super::*;
+use crate::GOOGLE_DRIVE_FILE_SCOPE;
 
 const MAX_CONFIG_PROMPT_INPUT_BYTES: usize = 16 * 1024;
+const MAX_GITHUB_REPOSITORY_LOOKUP_OUTPUT_BYTES: usize = 8 * 1024;
+const GITHUB_REPOSITORY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GOOGLE_DRIVE_PROVIDER_ID: &str = "google_drive";
 const DEFAULT_GOOGLE_DRIVE_ROOT_FOLDER_ID: &str = "root";
 const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
-const GOOGLE_DRIVE_FILE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 
 #[derive(Debug)]
 struct PreparedStorageProvider {
@@ -28,13 +30,13 @@ pub(super) fn run_configuration_to_stdio(
     let mut input = stdin.lock();
     let mut output = io::stdout().lock();
 
+    // dialoguer renders arrow menus on stderr, so both streams must be terminals.
     if use_terminal_selection(stdin.is_terminal(), io::stderr().is_terminal()) {
         run_configuration_with_input(
             command,
             config_path,
             &mut input,
             &mut output,
-            |_| read_hidden_config_value_from_terminal(),
             ConfigurationOperations {
                 select: terminal_select_index,
                 authorize_drive: authorize_google_drive_adc,
@@ -47,7 +49,6 @@ pub(super) fn run_configuration_to_stdio(
             config_path,
             &mut input,
             &mut output,
-            read_config_prompt_value,
             ConfigurationOperations {
                 select: prompt_select_index,
                 authorize_drive: authorize_google_drive_adc,
@@ -58,18 +59,16 @@ pub(super) fn run_configuration_to_stdio(
     .map_err(anyhow::Error::from)
 }
 
-fn run_configuration_with_input<R, W, S, M, A, G>(
+fn run_configuration_with_input<R, W, M, A, G>(
     command: ConfigurationCommand,
     config_path: Option<PathBuf>,
     input: &mut R,
     output: &mut W,
-    mut read_secret: S,
     mut operations: ConfigurationOperations<M, A, G>,
 ) -> CliResult<()>
 where
     R: BufRead,
     W: Write,
-    S: FnMut(&mut R) -> CliResult<String>,
     M: FnMut(&mut R, &mut W, &str, &[String], usize) -> CliResult<usize>,
     A: FnMut(&PreparedStorageProvider, &Path) -> CliResult<()>,
     G: FnMut(&str, &str, &str) -> CliResult<String>,
@@ -86,13 +85,7 @@ where
         }) => match action {
             ConfigRepositoryAction::Add(command) => {
                 let values = if command.is_interactive() {
-                    prompt_repository_provider(
-                        &config,
-                        input,
-                        output,
-                        &mut read_secret,
-                        &mut operations.select,
-                    )?
+                    prompt_repository_provider(&config, input, output, &mut operations.select)?
                 } else {
                     command.into_values()?
                 };
@@ -103,12 +96,15 @@ where
             ConfigRepositoryAction::Remove(command) => {
                 let id = select_remove_id(
                     command.id,
-                    config
-                        .repository_providers()?
-                        .into_iter()
-                        .map(|provider| provider.id)
-                        .collect(),
+                    || {
+                        Ok(config
+                            .repository_providers()?
+                            .into_iter()
+                            .map(|provider| provider.id)
+                            .collect())
+                    },
                     "repository provider",
+                    "repository providers",
                     input,
                     output,
                     &mut operations.select,
@@ -125,10 +121,13 @@ where
                 let prepared = if command.is_interactive() {
                     prompt_storage_provider(&config, input, output, &mut operations.select)?
                 } else {
-                    command.into_prepared()?
+                    command.into_prepared(&config)?
                 };
                 if prepared.client_secret_file.is_some() {
-                    (operations.authorize_drive)(&prepared, config.path())?;
+                    let authorization = prepared.with_effective_values(&config)?;
+                    (operations.authorize_drive)(&authorization, config.path())?;
+                } else {
+                    validate_changed_gcloud_config_directory(&config, &prepared)?;
                 }
                 let id = prepared.values.id.clone();
                 let outcome = config.upsert_storage_provider(prepared.values)?;
@@ -137,12 +136,15 @@ where
             ConfigStorageAction::Remove(command) => {
                 let id = select_remove_id(
                     command.id,
-                    config
-                        .storage_providers()?
-                        .into_iter()
-                        .map(|provider| provider.id)
-                        .collect(),
+                    || {
+                        Ok(config
+                            .storage_providers()?
+                            .into_iter()
+                            .map(|provider| provider.id)
+                            .collect())
+                    },
                     "storage provider",
+                    "storage providers",
                     input,
                     output,
                     &mut operations.select,
@@ -172,12 +174,15 @@ where
             RepositoryAction::Remove(command) => {
                 let id = select_remove_id(
                     command.id,
-                    config
-                        .repositories()?
-                        .into_iter()
-                        .map(|repository| repository.id)
-                        .collect(),
+                    || {
+                        Ok(config
+                            .repositories()?
+                            .into_iter()
+                            .map(|repository| repository.id)
+                            .collect())
+                    },
                     "repository",
+                    "repositories",
                     input,
                     output,
                     &mut operations.select,
@@ -228,14 +233,16 @@ impl StorageProviderAddCommand {
             && self.display_name.is_none()
     }
 
-    fn into_prepared(self) -> CliResult<PreparedStorageProvider> {
-        let applies_google_drive_defaults = self.client_secret_file.is_some();
-        let id = if applies_google_drive_defaults {
+    fn into_prepared(self, config: &EditableServerConfig) -> CliResult<PreparedStorageProvider> {
+        let has_client_secret = self.client_secret_file.is_some();
+        let id = if has_client_secret {
             self.id
                 .unwrap_or_else(|| DEFAULT_GOOGLE_DRIVE_PROVIDER_ID.to_owned())
         } else {
             required_flag(self.id, "--id")?
         };
+        let applies_google_drive_defaults =
+            has_client_secret && config.storage_provider(&id)?.is_none();
         let provider_type = self.provider_type.map(|kind| match kind {
             StorageProviderKind::GoogleDrive => "google_drive".to_owned(),
         });
@@ -264,6 +271,34 @@ impl StorageProviderAddCommand {
     }
 }
 
+impl PreparedStorageProvider {
+    fn with_effective_values(&self, config: &EditableServerConfig) -> CliResult<Self> {
+        let existing = config
+            .storage_provider(&self.values.id)?
+            .unwrap_or_default();
+        Ok(Self {
+            values: StorageProviderValues {
+                id: self.values.id.clone(),
+                provider_type: self.values.provider_type.clone().or(existing.provider_type),
+                credentials_type: self
+                    .values
+                    .credentials_type
+                    .clone()
+                    .or(existing.credentials_type),
+                config_dir: self.values.config_dir.clone().or(existing.config_dir),
+                executable: self.values.executable.clone().or(existing.executable),
+                root_folder_id: self
+                    .values
+                    .root_folder_id
+                    .clone()
+                    .or(existing.root_folder_id),
+                display_name: self.values.display_name.clone().or(existing.display_name),
+            },
+            client_secret_file: self.client_secret_file.clone(),
+        })
+    }
+}
+
 impl RepositoryAddCommand {
     fn is_interactive(&self) -> bool {
         self.id.is_none()
@@ -288,17 +323,15 @@ impl RepositoryAddCommand {
     }
 }
 
-fn prompt_repository_provider<R, W, S, M>(
+fn prompt_repository_provider<R, W, M>(
     config: &EditableServerConfig,
     input: &mut R,
     output: &mut W,
-    _read_secret: &mut S,
     select: &mut M,
 ) -> CliResult<RepositoryProviderValues>
 where
     R: BufRead,
     W: Write,
-    S: FnMut(&mut R) -> CliResult<String>,
     M: FnMut(&mut R, &mut W, &str, &[String], usize) -> CliResult<usize>,
 {
     let provider_kinds = vec!["GitHub".to_owned()];
@@ -309,7 +342,15 @@ where
         &provider_kinds,
         0,
     )?;
-    debug_assert_eq!(selected, 0);
+    let provider_type = match provider_kinds.get(selected).map(String::as_str) {
+        Some("GitHub") => "github",
+        _ => {
+            return Err(invalid_selection(
+                "Repository provider type",
+                provider_kinds.len(),
+            ));
+        }
+    };
     let default_id = config
         .repository_provider("github")?
         .is_none()
@@ -335,7 +376,7 @@ where
     }
     Ok(RepositoryProviderValues {
         id,
-        provider_type: Some("github".to_owned()),
+        provider_type: Some(provider_type.to_owned()),
         api_url,
         clear_api_url,
         personal_access_token: existing.personal_access_token,
@@ -355,7 +396,15 @@ where
 {
     let provider_kinds = vec!["Google Drive".to_owned()];
     let selected = select(input, output, "Storage provider type", &provider_kinds, 0)?;
-    debug_assert_eq!(selected, 0);
+    let (provider_type, credentials_type) = match provider_kinds.get(selected).map(String::as_str) {
+        Some("Google Drive") => ("google_drive", "gcloud"),
+        _ => {
+            return Err(invalid_selection(
+                "Storage provider type",
+                provider_kinds.len(),
+            ));
+        }
+    };
     let default_id = config
         .storage_provider(DEFAULT_GOOGLE_DRIVE_PROVIDER_ID)?
         .is_none()
@@ -413,8 +462,8 @@ where
     Ok(PreparedStorageProvider {
         values: StorageProviderValues {
             id,
-            provider_type: Some("google_drive".to_owned()),
-            credentials_type: Some("gcloud".to_owned()),
+            provider_type: Some(provider_type.to_owned()),
+            credentials_type: Some(credentials_type.to_owned()),
             config_dir,
             executable,
             root_folder_id,
@@ -451,6 +500,15 @@ where
         select,
     )?;
     let repo_provider = repository_provider_ids[repo_provider_index].clone();
+    let provider = &repository_providers[repo_provider_index];
+    if provider.provider_type.as_deref() != Some("github") {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "interactive repository setup currently supports only github providers, not {:?}",
+                provider.provider_type.as_deref().unwrap_or("unknown")
+            ),
+        });
+    }
     let storage_provider_ids = config
         .storage_providers()?
         .into_iter()
@@ -469,17 +527,9 @@ where
         .expect("required prompt returns a value");
     let name = prompt_value(input, output, "Repository name", None, true)?
         .expect("required prompt returns a value");
-    let host = prompt_value(input, output, "Repository host", Some("github.com"), true)?
+    let default_host = github_provider_host(provider)?;
+    let host = prompt_value(input, output, "Repository host", Some(&default_host), true)?
         .expect("required prompt returns a value");
-    let provider = &repository_providers[repo_provider_index];
-    if provider.provider_type.as_deref() != Some("github") {
-        return Err(CliError::InvalidArguments {
-            message: format!(
-                "interactive repository setup does not support repository provider type {:?}",
-                provider.provider_type.as_deref().unwrap_or("unknown")
-            ),
-        });
-    }
     let provider_repository_id = resolve_github_id(&host, &owner, &name)?;
     let id = format!("{repo_provider}:{owner}/{name}");
     Ok(RepositoryValues {
@@ -491,6 +541,25 @@ where
         provider_repository_id: Some(provider_repository_id),
         storage_provider: Some(storage_provider),
     })
+}
+
+fn github_provider_host(provider: &RepositoryProviderValues) -> CliResult<String> {
+    let api_url = provider
+        .api_url
+        .as_deref()
+        .unwrap_or(crate::DEFAULT_GITHUB_API_URL);
+    if api_url == crate::DEFAULT_GITHUB_API_URL {
+        return Ok("github.com".to_owned());
+    }
+    Url::parse(api_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .ok_or_else(|| CliError::InvalidArguments {
+            message: format!(
+                "repository provider {:?} has an invalid GitHub API URL",
+                provider.id
+            ),
+        })
 }
 
 fn select_required_configured_value<R, W, M>(
@@ -511,13 +580,18 @@ where
             message: format!("no {kind} are configured; add one before configuring a repository"),
         });
     }
-    select(input, output, prompt, items, 0)
+    let index = select(input, output, prompt, items, 0)?;
+    if index >= items.len() {
+        return Err(invalid_selection(prompt, items.len()));
+    }
+    Ok(index)
 }
 
-fn select_remove_id<R, W, M>(
+fn select_remove_id<R, W, M, L>(
     id: Option<String>,
-    items: Vec<String>,
+    load_items: L,
     kind: &str,
+    plural_kind: &str,
     input: &mut R,
     output: &mut W,
     select: &mut M,
@@ -526,17 +600,28 @@ where
     R: BufRead,
     W: Write,
     M: FnMut(&mut R, &mut W, &str, &[String], usize) -> CliResult<usize>,
+    L: FnOnce() -> CliResult<Vec<String>>,
 {
     if let Some(id) = id {
         return Ok(id);
     }
+    let items = load_items()?;
     if items.is_empty() {
         return Err(CliError::InvalidArguments {
-            message: format!("no {kind}s are configured to remove"),
+            message: format!("no {plural_kind} are configured to remove"),
         });
     }
     let index = select(input, output, &format!("{kind} to remove"), &items, 0)?;
+    if index >= items.len() {
+        return Err(invalid_selection(&format!("{kind} to remove"), items.len()));
+    }
     Ok(items[index].clone())
+}
+
+fn invalid_selection(prompt: &str, item_count: usize) -> CliError {
+    CliError::InvalidArguments {
+        message: format!("{prompt} selection must be between 1 and {item_count}"),
+    }
 }
 
 fn terminal_select_index<R, W>(
@@ -582,21 +667,23 @@ where
     if value.is_empty() {
         return Ok(default);
     }
-    if let Some(index) = items.iter().position(|item| item == &value) {
-        return Ok(index);
-    }
-    let index = value
+    if let Some(index) = value
         .parse::<usize>()
         .ok()
         .and_then(|number| number.checked_sub(1))
         .filter(|index| *index < items.len())
+    {
+        return Ok(index);
+    }
+    items
+        .iter()
+        .position(|item| item.eq_ignore_ascii_case(&value))
         .ok_or_else(|| CliError::InvalidArguments {
             message: format!(
                 "{prompt} selection must name an item or be between 1 and {}",
                 items.len()
             ),
-        })?;
-    Ok(index)
+        })
 }
 
 #[cfg(not(windows))]
@@ -688,6 +775,34 @@ fn authorize_google_drive_adc(
     set_private_file_permissions(&adc_path)
 }
 
+fn validate_changed_gcloud_config_directory(
+    config: &EditableServerConfig,
+    prepared: &PreparedStorageProvider,
+) -> CliResult<()> {
+    let Some(requested_config_dir) = prepared.values.config_dir.as_deref() else {
+        return Ok(());
+    };
+    let Some(existing) = config.storage_provider(&prepared.values.id)? else {
+        return Ok(());
+    };
+    if existing.config_dir.as_deref() == Some(requested_config_dir) {
+        return Ok(());
+    }
+
+    let config_base_dir = config.path().parent().unwrap_or_else(|| Path::new("."));
+    let adc_path = resolve_setup_path(requested_config_dir, config_base_dir)?
+        .join("application_default_credentials.json");
+    if !adc_path.is_file() {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "changing --config-dir requires existing Application Default Credentials at {} or a --client-secret-file to authorize it",
+                adc_path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn resolve_setup_path(value: &str, config_base_dir: &Path) -> CliResult<PathBuf> {
     let mut expanded_path = None;
     for variable in ["HOME", "USERPROFILE"] {
@@ -696,11 +811,17 @@ fn resolve_setup_path(value: &str, config_base_dir: &Path) -> CliResult<PathBuf>
             if suffix.contains("${") {
                 return Err(unresolved_setup_path_environment_reference());
             }
-            let root = std::env::var_os(variable).ok_or_else(|| CliError::InvalidArguments {
-                message: format!(
-                    "gcloud config directory references unset environment variable {variable}"
-                ),
-            })?;
+            let root = std::env::var_os(variable)
+                .or_else(|| {
+                    (variable == "HOME")
+                        .then(|| std::env::var_os("USERPROFILE"))
+                        .flatten()
+                })
+                .ok_or_else(|| CliError::InvalidArguments {
+                    message: format!(
+                        "gcloud config directory references unset environment variable {variable}"
+                    ),
+                })?;
             expanded_path = Some(PathBuf::from(root).join(suffix.trim_start_matches(['/', '\\'])));
             break;
         }
@@ -721,9 +842,8 @@ fn resolve_setup_path(value: &str, config_base_dir: &Path) -> CliResult<PathBuf>
 
 fn unresolved_setup_path_environment_reference() -> CliError {
     CliError::InvalidArguments {
-        message:
-            "gcloud config directory contains an environment reference that setup cannot resolve"
-                .to_owned(),
+        message: "gcloud config directory contains an environment reference that setup cannot resolve; only ${HOME} and ${USERPROFILE} are supported"
+            .to_owned(),
     }
 }
 
@@ -772,6 +892,7 @@ fn resolve_github_repository_id_with_executable(
 ) -> CliResult<String> {
     validate_github_repository_path_component(owner, "repository owner")?;
     validate_github_repository_path_component(name, "repository name")?;
+    validate_github_host(host)?;
 
     let mut command = ProcessCommand::new(executable);
     command.arg("api");
@@ -781,11 +902,12 @@ fn resolve_github_repository_id_with_executable(
     command
         .arg(format!("repos/{owner}/{name}"))
         .args(["--jq", ".id"]);
-    let output = command.output().map_err(|source| CliError::Io {
-        context: "failed to start gh for GitHub repository ID lookup; install and authenticate GitHub CLI"
-            .to_owned(),
-        source,
-    })?;
+    let output = run_bounded_child_command(
+        &mut command,
+        "gh api repository ID lookup",
+        GITHUB_REPOSITORY_LOOKUP_TIMEOUT,
+        MAX_GITHUB_REPOSITORY_LOOKUP_OUTPUT_BYTES,
+    )?;
     if !output.status.success() {
         return Err(CliError::ExternalCommand {
             command: format!("gh api repos/{owner}/{name} --jq .id"),
@@ -810,7 +932,6 @@ fn resolve_github_repository_id_with_executable(
 fn validate_github_repository_path_component(value: &str, label: &str) -> CliResult<()> {
     if value.is_empty()
         || matches!(value, "." | "..")
-        || value.contains("..")
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -822,6 +943,31 @@ fn validate_github_repository_path_component(value: &str, label: &str) -> CliRes
         });
     }
 
+    Ok(())
+}
+
+fn validate_github_host(host: &str) -> CliResult<()> {
+    let labels_are_valid = !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        });
+    if !labels_are_valid {
+        return Err(CliError::InvalidArguments {
+            message: "repository host must be a hostname containing only ASCII letters, digits, dots, and non-leading hyphens"
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -897,41 +1043,6 @@ where
         .map_err(|_| CliError::InvalidArguments {
             message: "interactive configuration input must be valid UTF-8".to_owned(),
         })
-}
-
-fn read_hidden_config_value_from_terminal() -> CliResult<String> {
-    let mut terminal = terminal_prompt::Terminal::open().map_err(|source| CliError::Io {
-        context: "failed to open terminal for hidden configuration input".to_owned(),
-        source,
-    })?;
-    let echo_was_enabled = terminal
-        .is_echo_enabled()
-        .map_err(|source| config_terminal_echo_error("inspect", source))?;
-    if echo_was_enabled {
-        terminal
-            .set_echo_enabled(false)
-            .map_err(|source| config_terminal_echo_error("disable", source))?;
-    }
-    let read_result = read_config_prompt_value(&mut terminal);
-    let restore_result = if echo_was_enabled {
-        terminal
-            .set_echo_enabled(true)
-            .map_err(|source| config_terminal_echo_error("restore", source))
-    } else {
-        Ok(())
-    };
-    match (read_result, restore_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
-}
-
-fn config_terminal_echo_error(action: &str, source: io::Error) -> CliError {
-    CliError::Io {
-        context: format!("failed to {action} terminal echo for secret configuration input"),
-        source,
-    }
 }
 
 fn save_and_report_edit<W>(
@@ -1204,14 +1315,8 @@ mod tests {
         let mut output = Vec::new();
         let mut select = prompt_select_index;
 
-        let values = prompt_repository_provider(
-            &config,
-            &mut input,
-            &mut output,
-            &mut read_config_prompt_value,
-            &mut select,
-        )
-        .expect("interactive provider values should parse");
+        let values = prompt_repository_provider(&config, &mut input, &mut output, &mut select)
+            .expect("interactive provider values should parse");
 
         assert!(values.clear_api_url);
         assert!(values.api_url.is_none());
@@ -1219,6 +1324,10 @@ mod tests {
 
     #[test]
     fn client_secret_flag_applies_google_drive_setup_defaults() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(&config_path, "").expect("empty config should be written");
+        let config = EditableServerConfig::load(config_path).expect("config should load");
         let prepared = StorageProviderAddCommand {
             id: None,
             provider_type: None,
@@ -1229,7 +1338,7 @@ mod tests {
             root_folder_id: None,
             display_name: None,
         }
-        .into_prepared()
+        .into_prepared(&config)
         .expect("client-secret setup defaults should be complete");
 
         assert_eq!(prepared.values.id, "google_drive");
@@ -1243,6 +1352,102 @@ mod tests {
             Some(default_gcloud_config_reference().as_str())
         );
         assert_eq!(prepared.values.root_folder_id.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn client_secret_reauthorization_preserves_existing_drive_settings() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(
+            &config_path,
+            "storage_providers:\n  drive-archive:\n    type: google_drive\n    credentials:\n      type: gcloud\n      config_dir: ./archive-adc\n      executable: custom-gcloud\n    root_folder_id: archive-root\n",
+        )
+        .expect("storage config should be written");
+        let mut config = EditableServerConfig::load(config_path).expect("config should load");
+        let prepared = StorageProviderAddCommand {
+            id: Some("drive-archive".to_owned()),
+            provider_type: None,
+            credentials_type: None,
+            config_dir: None,
+            client_secret_file: Some(PathBuf::from("client_secret.json")),
+            executable: None,
+            root_folder_id: None,
+            display_name: None,
+        }
+        .into_prepared(&config)
+        .expect("reauthorization should prepare");
+
+        assert!(prepared.values.config_dir.is_none());
+        assert!(prepared.values.root_folder_id.is_none());
+        let authorization = prepared
+            .with_effective_values(&config)
+            .expect("authorization values should merge existing settings");
+        assert_eq!(
+            authorization.values.config_dir.as_deref(),
+            Some("./archive-adc")
+        );
+        assert_eq!(
+            authorization.values.root_folder_id.as_deref(),
+            Some("archive-root")
+        );
+        assert_eq!(
+            config
+                .upsert_storage_provider(prepared.values)
+                .expect("reauthorization upsert should succeed"),
+            EditOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn failed_drive_authorization_leaves_configuration_untouched() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        let original = "# private LFS Cloud configuration\n";
+        fs::write(&config_path, original).expect("config should be written");
+        let path = config_path.to_str().expect("test path should be UTF-8");
+        let cli = Cli::try_parse_from([
+            "lfscloud",
+            "--config",
+            path,
+            "config",
+            "storage",
+            "add",
+            "--client-secret-file",
+            "client_secret.json",
+        ])
+        .expect("configuration command should parse");
+        let super::Command::Config(command) = cli.command else {
+            panic!("config command should parse");
+        };
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let error = run_configuration_with_input(
+            ConfigurationCommand::Config(command),
+            cli.config,
+            &mut input,
+            &mut output,
+            ConfigurationOperations {
+                select: prompt_select_index,
+                authorize_drive: |_prepared: &PreparedStorageProvider, _path: &Path| {
+                    Err(CliError::InvalidArguments {
+                        message: "simulated authorization failure".to_owned(),
+                    })
+                },
+                resolve_github_id: fixed_github_repository_id,
+            },
+        )
+        .expect_err("authorization failure should abort the edit");
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated authorization failure")
+        );
+        assert_eq!(
+            fs::read_to_string(config_path).expect("config should remain readable"),
+            original
+        );
     }
 
     #[test]
@@ -1267,7 +1472,6 @@ mod tests {
             ("", "assets"),
             (".", "assets"),
             ("..", "assets"),
-            ("octo..org", "assets"),
             ("octo/org", "assets"),
             ("octo-org", ""),
             ("octo-org", "assets+archive"),
@@ -1281,6 +1485,37 @@ mod tests {
             .expect_err("invalid repository components must fail before gh starts");
             assert!(matches!(error, CliError::InvalidArguments { .. }));
         }
+
+        let error = resolve_github_repository_id_with_executable(
+            Path::new("definitely-missing-gh"),
+            "-invalid.example",
+            "octo-org",
+            "assets",
+        )
+        .expect_err("invalid hosts must fail before gh starts");
+        assert!(matches!(error, CliError::InvalidArguments { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_repository_lookup_allows_consecutive_dots_in_names() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let fake_gh = temp.path().join("gh");
+        fs::write(&fake_gh, "#!/bin/sh\nprintf '123\\n'\n").expect("fake gh should be written");
+        fs::set_permissions(&fake_gh, fs::Permissions::from_mode(0o700))
+            .expect("fake gh should be executable");
+        assert_eq!(
+            resolve_github_repository_id_with_executable(
+                &fake_gh,
+                "github.com",
+                "octo-org",
+                "assets..archive",
+            )
+            .expect("GitHub-compatible name should be accepted"),
+            "123"
+        );
     }
 
     #[cfg(unix)]
@@ -1300,7 +1535,7 @@ mod tests {
         fs::write(
             &fake_gcloud,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nmkdir -p \"$CLOUDSDK_CONFIG\"\nprintf '{{}}\\n' > \"$CLOUDSDK_CONFIG/application_default_credentials.json\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nmkdir -p \"$CLOUDSDK_CONFIG\"\nprintf '{{}}\\n' > \"$CLOUDSDK_CONFIG/application_default_credentials.json\"\n",
                 args_path.display()
             ),
         )
@@ -1348,6 +1583,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn google_drive_setup_rejects_success_without_an_adc_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let client_secret = temp.path().join("client_secret.json");
+        fs::write(&client_secret, "{}\n").expect("client secret fixture should be written");
+        let fake_gcloud = temp.path().join("gcloud");
+        fs::write(&fake_gcloud, "#!/bin/sh\nexit 0\n").expect("fake gcloud should be written");
+        fs::set_permissions(&fake_gcloud, fs::Permissions::from_mode(0o700))
+            .expect("fake gcloud should be executable");
+        let config_path = temp.path().join("lfscloud.yml");
+
+        let error = authorize_google_drive_adc(
+            &PreparedStorageProvider {
+                values: StorageProviderValues {
+                    id: "google_drive".to_owned(),
+                    config_dir: Some("gcloud-drive".to_owned()),
+                    executable: Some(fake_gcloud.display().to_string()),
+                    ..StorageProviderValues::default()
+                },
+                client_secret_file: Some(client_secret),
+            },
+            &config_path,
+        )
+        .expect_err("successful gcloud without ADC must fail");
+
+        assert!(error.to_string().contains("completed without creating"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn github_repository_lookup_uses_host_and_requires_a_numeric_id() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1357,7 +1623,7 @@ mod tests {
         fs::write(
             &fake_gh,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '987654321\\n'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '987654321\\n'\n",
                 args_path.display()
             ),
         )
@@ -1456,6 +1722,107 @@ repositories:
         assert!(!use_terminal_selection(true, false));
         assert!(!use_terminal_selection(false, true));
         assert!(!use_terminal_selection(false, false));
+    }
+
+    #[test]
+    fn numbered_selection_prefers_numbers_and_matches_names_case_insensitively() {
+        let items = vec!["2".to_owned(), "GitHub".to_owned()];
+        let mut numeric_input = io::Cursor::new(b"2\n".to_vec());
+        let mut output = Vec::new();
+        assert_eq!(
+            prompt_select_index(&mut numeric_input, &mut output, "Provider", &items, 0)
+                .expect("numeric selection should parse"),
+            1
+        );
+
+        let mut named_input = io::Cursor::new(b"github\n".to_vec());
+        assert_eq!(
+            prompt_select_index(&mut named_input, &mut output, "Provider", &items, 0)
+                .expect("case-insensitive item name should parse"),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_remove_id_does_not_load_selection_items() {
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let mut select = prompt_select_index;
+        let id = select_remove_id(
+            Some("missing".to_owned()),
+            || -> CliResult<Vec<String>> { panic!("explicit removal must not enumerate entries") },
+            "repository",
+            "repositories",
+            &mut input,
+            &mut output,
+            &mut select,
+        )
+        .expect("explicit removal should return its ID directly");
+        assert_eq!(id, "missing");
+    }
+
+    #[test]
+    fn interactive_repository_defaults_to_enterprise_provider_host() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(
+            &config_path,
+            "repository_providers:\n  enterprise:\n    type: github\n    api_url: https://github.example/api/v3\nstorage_providers:\n  drive:\n    type: google_drive\n    credentials:\n      type: gcloud\n      config_dir: ./gcloud\n    root_folder_id: root\n",
+        )
+        .expect("enterprise config should be written");
+        let config = EditableServerConfig::load(config_path).expect("config should load");
+        let mut input = io::Cursor::new(b"\n\nowner\nrepo\n\n".to_vec());
+        let mut output = Vec::new();
+        let mut select = prompt_select_index;
+        let mut resolved_host = None;
+        let mut resolve = |host: &str, _owner: &str, _name: &str| {
+            resolved_host = Some(host.to_owned());
+            Ok("123".to_owned())
+        };
+
+        let values = prompt_repository(&config, &mut input, &mut output, &mut select, &mut resolve)
+            .expect("interactive enterprise repository should prepare");
+
+        assert_eq!(resolved_host.as_deref(), Some("github.example"));
+        assert_eq!(values.host.as_deref(), Some("github.example"));
+    }
+
+    #[test]
+    fn changing_gcloud_directory_requires_existing_adc_without_reauthorization() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(
+            &config_path,
+            "storage_providers:\n  drive:\n    type: google_drive\n    credentials:\n      type: gcloud\n      config_dir: ./old\n    root_folder_id: root\n",
+        )
+        .expect("storage config should be written");
+        let config = EditableServerConfig::load(&config_path).expect("config should load");
+        let prepared = PreparedStorageProvider {
+            values: StorageProviderValues {
+                id: "drive".to_owned(),
+                config_dir: Some("./new".to_owned()),
+                ..StorageProviderValues::default()
+            },
+            client_secret_file: None,
+        };
+
+        let error = validate_changed_gcloud_config_directory(&config, &prepared)
+            .expect_err("missing ADC should reject config-dir change");
+        assert!(
+            error
+                .to_string()
+                .contains("requires existing Application Default Credentials")
+        );
+        fs::create_dir(temp.path().join("new")).expect("new ADC directory should be created");
+        fs::write(
+            temp.path()
+                .join("new")
+                .join("application_default_credentials.json"),
+            "{}\n",
+        )
+        .expect("ADC fixture should be written");
+        validate_changed_gcloud_config_directory(&config, &prepared)
+            .expect("existing ADC should allow config-dir change");
     }
 
     #[test]
@@ -1623,7 +1990,6 @@ storage_providers:
             cli.config,
             &mut input,
             &mut output,
-            read_config_prompt_value,
             ConfigurationOperations {
                 select: prompt_select_index,
                 authorize_drive: noop_drive_authorization,

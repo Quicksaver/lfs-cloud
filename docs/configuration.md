@@ -29,13 +29,13 @@ lfscloud config storage add
 lfscloud repository add
 ```
 
-Press Up/Down and Enter to select a menu item. Press Enter at text prompts to accept a displayed default or retain an existing value. Repository and storage provider IDs default to `github` and `google_drive` while those IDs are available. If a default ID already exists, enter another ID explicitly.
+Press Up/Down and Enter to select a menu item. Press Enter at text prompts to accept a displayed default or retain the displayed existing value. Repository and storage provider IDs default to `github` and `google_drive` while those IDs are available. If a default ID already exists, enter another ID explicitly.
 
-Interactive Google Drive setup asks for a Desktop OAuth client JSON, creates `${HOME}/.config/lfscloud/gcloud-drive` (`${USERPROFILE}` on Windows), runs the isolated `gcloud auth application-default login` flow with the required scopes, and secures the resulting local credential state. Its root folder defaults to Drive's `root` alias.
+Interactive Google Drive setup asks for a Desktop OAuth client JSON, creates `${HOME}/.config/lfscloud/gcloud-drive` (`${USERPROFILE}` on Windows), runs the isolated `gcloud auth application-default login` flow with the required scopes, and applies private modes where the platform exposes Unix permissions. Its root folder defaults to Drive's `root` alias.
 
-Interactive repository setup lists the configured repository and storage providers, requires the owner and repository name, defaults the host to `github.com`, derives the mapping ID as `<repository-provider>:<owner>/<name>`, and obtains GitHub's immutable numeric repository ID through authenticated GitHub CLI (`gh`).
+Interactive repository setup lists the configured repository and storage providers, requires the owner and repository name, defaults the host from the selected GitHub provider, derives the mapping ID as `<repository-provider>:<owner>/<name>`, and obtains GitHub's immutable numeric repository ID through authenticated GitHub CLI (`gh`). It can update an existing mapping with that derived ID; use flags to update a mapping that has a custom ID.
 
-If any entry flag is supplied, the command is non-interactive. A new entry normally requires every required field, while an existing `--id` accepts only the fields to update. Google Drive is the exception: supplying `--client-secret-file PATH` applies the current provider, credential, ID, config-directory, and root-folder defaults unless explicitly overridden. Replaying the same update succeeds without changing the file.
+If any entry flag is supplied, the command is non-interactive. A new entry normally requires every required field, while an existing `--id` accepts only the fields to update. Google Drive is the exception for new entries: supplying `--client-secret-file PATH` applies the current provider, credential, ID, config-directory, and root-folder defaults unless explicitly overridden. Existing entries retain omitted settings during reauthorization. Replaying the same update succeeds without changing the file.
 
 The complete flag-based forms for the currently supported providers are:
 
@@ -75,7 +75,7 @@ Single-quote environment references so the shell does not expand them before the
 
 Every environment variable referenced anywhere in the config must be set while a changed document is validated, just as it must be set when the server loads that config.
 
-Partial updates identify the existing entry by its stable ID:
+Partial updates identify the existing entry by its stable ID. Supplying `--client-secret-file` for an existing storage provider reauthorizes its current ADC directory without resetting an omitted custom root folder or directory:
 
 ```bash
 lfscloud config storage add \
@@ -238,7 +238,9 @@ lfscloud config storage add \
 
 With no flags, `lfscloud config storage add` prompts for the same client JSON and lets you accept the default provider ID, credential directory, executable, and `root` folder ID. LFS Cloud creates the directory, applies private permissions where the platform exposes Unix modes, launches the browser authorization, verifies that `application_default_credentials.json` was created, applies private file permissions, and only then writes the storage entry.
 
-Keep `--client-secret-file` when reauthorizing expired or revoked ADC. Omitting it can select the Google Cloud CLI's shared OAuth client instead of the project where you enabled Drive, causing Drive requests to fail with quota-project or `SERVICE_DISABLED` errors even though token minting succeeds.
+Keep `--client-secret-file` when reauthorizing expired or revoked ADC. Omitting it from an existing-provider update retains the current ADC without launching authorization. If `gcloud auth application-default login` is run manually without the project-specific client file, Google Cloud CLI can instead use its shared OAuth client, causing Drive requests to fail with quota-project or `SERVICE_DISABLED` errors even though token minting succeeds.
+
+Changing an existing provider's `config_dir` without `--client-secret-file` requires that the new directory already contain `application_default_credentials.json`; otherwise LFS Cloud rejects the update before changing the configuration.
 
 The directory must contain `application_default_credentials.json`. LFS Cloud invokes `gcloud` at runtime, so the executable must remain installed and accessible to the server user. When `credentials.executable` is omitted, LFS Cloud defaults to `gcloud.cmd` on Windows and `gcloud` on other platforms.
 

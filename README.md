@@ -39,6 +39,7 @@ Every installation needs:
 - Google Cloud CLI (`gcloud`)
 - a Git credential helper
 - a GitHub personal access token limited to the repositories you will serve
+- GitHub CLI (`gh`), installed and authenticated for interactive repository setup
 
 Choose one of the following installation methods.
 
@@ -131,7 +132,6 @@ storage_providers:
     credentials:
       type: gcloud
       config_dir: ${HOME}/.config/lfscloud/gcloud-drive
-      executable: gcloud
     root_folder_id: root
 
 repositories:

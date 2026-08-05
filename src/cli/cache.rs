@@ -291,7 +291,7 @@ fn fetch_git_lfs_objects(worktree_root: &Path) -> CliResult<()> {
 /// reader retains at most `max_output_bytes`; crossing either limit terminates
 /// the whole process tree instead of merely truncating an otherwise unbounded
 /// producer.
-fn run_bounded_child_command(
+pub(super) fn run_bounded_child_command(
     command: &mut ProcessCommand,
     command_name: &str,
     timeout: Duration,

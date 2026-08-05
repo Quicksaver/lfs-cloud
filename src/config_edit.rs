@@ -90,13 +90,13 @@ impl EditableServerConfig {
             context: format!("failed to read server config {}", path.display()),
             source,
         })?;
-        let mut documents = if contents.trim().is_empty() {
-            vec![Yaml::Hash(Hash::new())]
-        } else {
+        let mut documents =
             YamlLoader::load_from_str(&contents).map_err(|error| CliError::InvalidArguments {
                 message: format!("failed to parse server config {}: {error}", path.display()),
-            })?
-        };
+            })?;
+        if documents.is_empty() {
+            documents.push(Yaml::Hash(Hash::new()));
+        }
         if documents.len() != 1 {
             return Err(CliError::InvalidArguments {
                 message: format!(
@@ -712,6 +712,26 @@ repositories:
         let crate::RepositoryProviderConfig::GitHub(provider) =
             &loaded.repository_providers["github"];
         assert_eq!(provider.api_url, "https://api.github.com");
+    }
+
+    #[test]
+    fn empty_and_comment_only_files_load_as_empty_mappings() {
+        for contents in ["", "  \n", "# LFS Cloud configuration\n"] {
+            let temp = TempDir::new().expect("temporary directory should be created");
+            let path = temp.path().join("lfscloud.yml");
+            fs::write(&path, contents).expect("minimal config fixture should be written");
+            let mut config = EditableServerConfig::load(&path)
+                .expect("minimal config should load as an empty mapping");
+            config
+                .upsert_repository_provider(RepositoryProviderValues {
+                    id: "github".to_owned(),
+                    provider_type: Some("github".to_owned()),
+                    ..RepositoryProviderValues::default()
+                })
+                .expect("provider should be added to minimal config");
+            config.save().expect("minimal config should save");
+            assert!(ServerConfig::load_from_path(path).is_ok());
+        }
     }
 
     #[test]

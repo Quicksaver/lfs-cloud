@@ -1265,13 +1265,15 @@ repository_providers:
 
     #[test]
     fn server_network_defaults_require_no_explicit_fields() {
-        let config = ServerConfig::load_from_str_with_env("", "<test>", test_env)
-            .expect("an omitted server section should use safe documented defaults");
+        for contents in ["", " \n"] {
+            let config = ServerConfig::load_from_str_with_env(contents, "<test>", test_env)
+                .expect("an omitted server section should use safe documented defaults");
 
-        assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.server.port, 15_370);
-        assert_eq!(config.server.public_url, None);
-        assert_eq!(config.server.local_client_url(), "http://127.0.0.1:15370");
+            assert_eq!(config.server.host, "0.0.0.0");
+            assert_eq!(config.server.port, 15_370);
+            assert_eq!(config.server.public_url, None);
+            assert_eq!(config.server.local_client_url(), "http://127.0.0.1:15370");
+        }
     }
 
     #[test]

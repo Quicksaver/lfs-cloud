@@ -6,9 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-- [added]: Add arrow-key configuration menus that infer repository IDs and select existing providers and removals.
+- [added]: Add arrow-key configuration menus for provider and repository setup.
+- [added]: Infer interactive repository mapping IDs from the selected provider, owner, and repository.
+- [added]: Select configured providers and removal targets from interactive menus.
 - [added]: Automate isolated Google Drive authorization from a Desktop OAuth client JSON.
+- [changed]: Resolve interactive GitHub repository IDs through authenticated GitHub CLI.
 - [changed]: Let empty configurations use all server defaults without requiring a `server: {}` placeholder.
+- [fixed]: Preserve custom Drive roots and ADC directories during provider reauthorization.
+- [fixed]: Accept comment-only private configuration files as empty configurations.
 
 ## [0.2.2] - 2026-08-05
 
