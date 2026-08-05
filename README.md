@@ -39,7 +39,7 @@ Every installation needs:
 - Google Cloud CLI (`gcloud`)
 - a Git credential helper
 - a GitHub personal access token limited to the repositories you will serve
-- GitHub CLI (`gh`) for the repository ID lookup shown below (optional)
+- GitHub CLI (`gh`) for interactive repository setup; flag-based setup can supply the stable ID directly
 
 Choose one of the following installation methods.
 
@@ -91,28 +91,47 @@ git lfs install
 
 ### 2. Prepare Google Drive Access
 
-Create a Google Cloud Desktop OAuth client, enable the Google Drive API, and authorize an isolated Application Default Credentials directory with the `cloud-platform` and `drive.file` scopes. The complete setup commands and folder-access requirements are in the [configuration guide](docs/configuration.md#google-drive-credentials).
-
-Create or choose the private Drive folder that will hold LFS objects, then keep its folder ID for the server configuration.
+Create a Google Cloud Desktop OAuth client, enable the Google Drive API, and download its client JSON. `lfscloud config storage add` uses that file to create and secure an isolated Application Default Credentials directory and launches the correctly scoped `gcloud` authorization flow. See the [configuration guide](docs/configuration.md#google-drive-credentials) for the Google Cloud prerequisites and folder-access details.
 
 ### 3. Create `lfscloud.yml`
 
-Create a private server configuration file at `${HOME}/lfscloud.yml`. On Windows, LFS Cloud falls back to `%USERPROFILE%\lfscloud.yml` when `HOME` is not set. This is the default path whenever `--config PATH` is omitted. Do not commit the file.
+Create an empty private server configuration file at `${HOME}/lfscloud.yml`. On Windows, LFS Cloud falls back to `%USERPROFILE%\lfscloud.yml` when `HOME` is not set. This is the default path whenever `--config PATH` is omitted. Do not commit the file.
+
+```bash
+touch "$HOME/lfscloud.yml"
+```
+
+On Windows PowerShell:
+
+```powershell
+New-Item -ItemType File -Force "$HOME\lfscloud.yml"
+```
+
+Then add the supported providers and repository mapping interactively:
+
+```bash
+lfscloud config repository add
+lfscloud config storage add
+lfscloud repository add
+```
+
+The menus use Up/Down and Enter. Press Enter at the suggested `github`, `google_drive`, `github.com`, and Drive `root` defaults. Storage setup asks for the downloaded Desktop OAuth client JSON and performs the `gcloud` authorization. Repository setup lists the configured providers and uses authenticated `gh` to obtain GitHub's immutable numeric repository ID.
+
+The resulting configuration has this shape; no `server` section is needed unless overriding a server setting such as `port`:
 
 ```yaml
-server: {}
-
 repository_providers:
   github:
     type: github
 
 storage_providers:
-  drive-personal:
+  google_drive:
     type: google_drive
     credentials:
       type: gcloud
       config_dir: ${HOME}/.config/lfscloud/gcloud-drive
-    root_folder_id: YOUR_DRIVE_FOLDER_ID
+      executable: gcloud
+    root_folder_id: root
 
 repositories:
   - id: github:OWNER/REPOSITORY
@@ -121,24 +140,16 @@ repositories:
     owner: OWNER
     name: REPOSITORY
     provider_repository_id: '123456789'
-    storage_provider: drive-personal
+    storage_provider: google_drive
 ```
 
 The server defaults to port `15370` on `0.0.0.0`, so it accepts connections through loopback, LAN, and direct Tailscale IPv4 addresses without network fields in the config. Git LFS action URLs are inferred from the interface each client connected to. Set `server.public_url` only when clients should receive a different hostname or path, such as a MagicDNS name or reverse proxy URL.
 
 GitHub providers use `https://api.github.com` by default. Set `api_url` only for an alternative REST endpoint such as GitHub Enterprise Server.
 
-The same provider and repository entries can be added interactively:
+For non-interactive setup, supply entry flags. Existing IDs can be updated with only the fields that should change. For example, `--client-secret-file PATH` applies the other Google Drive defaults automatically. See [Manage Configuration From The CLI](docs/configuration.md#manage-configuration-from-the-cli) for every flag plus `list` and `remove`.
 
-```bash
-lfscloud config repository add
-lfscloud config storage add
-lfscloud repository add
-```
-
-Create the file and its `server` section first. Passing no entry flags prompts for the complete entry; passing any entry flag makes `add` non-interactive. Existing IDs can be updated with only the fields that should change. See [Manage Configuration From The CLI](docs/configuration.md#manage-configuration-from-the-cli) for every flag plus `list` and `remove`.
-
-Get GitHub's stable numeric repository ID with:
+If creating a repository mapping entirely with flags, get GitHub's stable numeric repository ID with:
 
 ```bash
 gh api repos/OWNER/REPOSITORY --jq .id

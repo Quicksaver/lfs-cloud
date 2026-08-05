@@ -166,6 +166,10 @@ pub(super) struct StorageProviderAddCommand {
     #[arg(long, value_name = "PATH")]
     pub(super) config_dir: Option<PathBuf>,
 
+    /// Desktop OAuth client JSON used to authorize isolated Google Drive ADC.
+    #[arg(long, value_name = "PATH")]
+    pub(super) client_secret_file: Option<PathBuf>,
+
     /// Google Cloud CLI executable name or path.
     #[arg(long, value_name = "PATH")]
     pub(super) executable: Option<PathBuf>,
@@ -181,9 +185,9 @@ pub(super) struct StorageProviderAddCommand {
 
 #[derive(Debug, Args, Eq, PartialEq)]
 pub(super) struct ConfigEntryRemoveCommand {
-    /// Configured entry ID.
+    /// Configured entry ID; omit to select an existing entry interactively.
     #[arg(long)]
-    pub(super) id: String,
+    pub(super) id: Option<String>,
 }
 
 #[derive(Debug, Args, Eq, PartialEq)]
@@ -639,6 +643,8 @@ mod tests {
             "gcloud",
             "--config-dir",
             "/var/lib/lfscloud/gcloud",
+            "--client-secret-file",
+            "/tmp/client_secret.json",
             "--executable",
             "/usr/local/bin/gcloud",
             "--root-folder-id",
@@ -670,6 +676,10 @@ mod tests {
         assert_eq!(
             command.config_dir.as_deref(),
             Some(Path::new("/var/lib/lfscloud/gcloud"))
+        );
+        assert_eq!(
+            command.client_secret_file.as_deref(),
+            Some(Path::new("/tmp/client_secret.json"))
         );
         assert_eq!(
             command.executable.as_deref(),
@@ -754,6 +764,18 @@ mod tests {
             vec!["lfscloud", "config", "repository", "add"],
             vec!["lfscloud", "config", "storage", "add"],
             vec!["lfscloud", "repository", "add"],
+        ] {
+            Cli::try_parse_from(&args)
+                .unwrap_or_else(|error| panic!("{args:?} should parse: {error}"));
+        }
+    }
+
+    #[test]
+    fn remove_commands_accept_zero_flags_for_interactive_mode() {
+        for args in [
+            vec!["lfscloud", "config", "repository", "remove"],
+            vec!["lfscloud", "config", "storage", "remove"],
+            vec!["lfscloud", "repository", "remove"],
         ] {
             Cli::try_parse_from(&args)
                 .unwrap_or_else(|error| panic!("{args:?} should parse: {error}"));

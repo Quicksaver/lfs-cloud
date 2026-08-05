@@ -13,7 +13,7 @@ The committed repository-side `.lfsconfig` should contain only the LFS Cloud end
 
 ## Manage Configuration From The CLI
 
-Create `lfscloud.yml` and its `server` section before using the configuration commands. The commands manage the three provider and routing sections:
+Create an empty `lfscloud.yml` before using the configuration commands. The `server` section is optional and should be omitted unless a server default is being overridden. The commands manage the three provider and routing sections:
 
 ```text
 lfscloud config repository  -> repository_providers
@@ -21,7 +21,7 @@ lfscloud config storage     -> storage_providers
 lfscloud repository         -> repositories
 ```
 
-Each resource supports `add`, `list`, and `remove`. With no entry flags, `add` prompts for a complete new entry or all values of an existing entry:
+Each resource supports `add`, `list`, and `remove`. With no entry flags, `add` opens arrow-key menus for provider choices and prompts only for values that cannot be inferred:
 
 ```bash
 lfscloud config repository add
@@ -29,7 +29,13 @@ lfscloud config storage add
 lfscloud repository add
 ```
 
-Press Enter to accept a displayed default or retain an existing value. If any entry flag is supplied, the command is non-interactive. A new entry then requires every required field, while an existing `--id` accepts only the fields to update. Replaying the same update succeeds without changing the file.
+Press Up/Down and Enter to select a menu item. Press Enter at text prompts to accept a displayed default or retain an existing value. Repository and storage provider IDs default to `github` and `google_drive` while those IDs are available. If a default ID already exists, enter another ID explicitly.
+
+Interactive Google Drive setup asks for a Desktop OAuth client JSON, creates `${HOME}/.config/lfscloud/gcloud-drive` (`${USERPROFILE}` on Windows), runs the isolated `gcloud auth application-default login` flow with the required scopes, and secures the resulting local credential state. Its root folder defaults to Drive's `root` alias.
+
+Interactive repository setup lists the configured repository and storage providers, requires the owner and repository name, defaults the host to `github.com`, derives the mapping ID as `<repository-provider>:<owner>/<name>`, and obtains GitHub's immutable numeric repository ID through authenticated GitHub CLI (`gh`).
+
+If any entry flag is supplied, the command is non-interactive. A new entry normally requires every required field, while an existing `--id` accepts only the fields to update. Google Drive is the exception: supplying `--client-secret-file PATH` applies the current provider, credential, ID, config-directory, and root-folder defaults unless explicitly overridden. Replaying the same update succeeds without changing the file.
 
 The complete flag-based forms for the currently supported providers are:
 
@@ -39,12 +45,13 @@ lfscloud config repository add \
   --type github
 
 lfscloud config storage add \
-  --id drive-personal \
+  --id google_drive \
   --type google-drive \
   --credentials-type gcloud \
   --config-dir '${HOME}/.config/lfscloud/gcloud-drive' \
+  --client-secret-file "$HOME/Downloads/client_secret.json" \
   --executable gcloud \
-  --root-folder-id YOUR_DRIVE_FOLDER_ID \
+  --root-folder-id root \
   --display-name 'Personal Drive LFS'
 
 lfscloud repository add \
@@ -54,7 +61,14 @@ lfscloud repository add \
   --owner OWNER \
   --name REPOSITORY \
   --provider-repository-id 123456789 \
-  --storage-provider drive-personal
+  --storage-provider google_drive
+```
+
+The short Google Drive form is equivalent when all defaults are wanted:
+
+```bash
+lfscloud config storage add \
+  --client-secret-file "$HOME/Downloads/client_secret.json"
 ```
 
 Single-quote environment references so the shell does not expand them before they are written.
@@ -91,7 +105,7 @@ lfscloud config storage list
 lfscloud repository list
 ```
 
-Remove commands are idempotent: removing an absent ID succeeds and reports that it was not found. A provider cannot be removed while a repository mapping still references it, because every changed document is validated before it replaces the original:
+With no `--id`, `remove` presents an arrow-key list of existing entries. With an explicit ID, removal remains idempotent: removing an absent ID succeeds and reports that it was not found. A provider cannot be removed while a repository mapping still references it, because every changed document is validated before it replaces the original:
 
 ```bash
 lfscloud repository remove \
@@ -113,8 +127,6 @@ This target-first protocol makes follow-up migrations idempotent. A second user 
 ## Minimal Local Config
 
 ```yaml
-server: {}
-
 repository_providers:
   github:
     type: github
@@ -125,7 +137,7 @@ storage_providers:
     credentials:
       type: gcloud
       config_dir: ${HOME}/.config/lfscloud/gcloud-drive
-    root_folder_id: 012345abcdef
+    root_folder_id: root
     display_name: Personal Drive LFS
 
 repositories:
@@ -144,7 +156,7 @@ With that mapping, the repository LFS URL is:
 http://127.0.0.1:15370/github.com/octo-org/assets.git/info/lfs
 ```
 
-Repository `name` omits the `.git` suffix because the route adds it. `provider_repository_id` is GitHub's immutable numeric repository ID, available with `gh api repos/OWNER/REPOSITORY --jq .id`. LFS Cloud verifies this value before every permission check so a renamed, transferred, deleted, or reused `owner/name` cannot silently switch the mapping to another repository.
+Repository `name` omits the `.git` suffix because the route adds it. `provider_repository_id` is GitHub's immutable numeric repository ID. Interactive setup obtains it automatically; flag-based setup can use `gh api repos/OWNER/REPOSITORY --jq .id`. LFS Cloud verifies this value before every permission check so a renamed, transferred, deleted, or reused `owner/name` cannot silently switch the mapping to another repository.
 
 Each user runs `lfscloud login --server URL` with their own GitHub PAT. Login calls GitHub's authenticated-user endpoint to establish identity; it does not grant repository access. For every LFS operation, the server uses that user's retained PAT to check the current GitHub permission on the configured repository. Read or stronger permits downloads; write or admin permits uploads and migration. Token scope, organization SSO policy, expiry, and revocation can still limit otherwise valid repository membership. The PAT is never written to Git's credential helper.
 
@@ -217,20 +229,14 @@ storage_providers:
     root_folder_id: 012345abcdef
 ```
 
-Install `gcloud`, create a Desktop app OAuth client in a Google Cloud project with the Drive API enabled, and download its client JSON. Then generate the isolated ADC state with that project-specific client:
+Install `gcloud`, create a Desktop app OAuth client in a Google Cloud project with the Drive API enabled, and download its client JSON. Then let LFS Cloud create and authorize the isolated ADC state:
 
 ```bash
-mkdir -p "$HOME/.config/lfscloud/gcloud-drive"
-chmod 700 "$HOME/.config/lfscloud/gcloud-drive"
-
-CLOUDSDK_CONFIG="$HOME/.config/lfscloud/gcloud-drive" \
-  gcloud auth application-default login \
-  --client-id-file="$HOME/Downloads/client_secret.json" \
-  --scopes="https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive.file"
-
-chmod 600 \
-  "$HOME/.config/lfscloud/gcloud-drive/application_default_credentials.json"
+lfscloud config storage add \
+  --client-secret-file "$HOME/Downloads/client_secret.json"
 ```
+
+With no flags, `lfscloud config storage add` prompts for the same client JSON and lets you accept the default provider ID, credential directory, executable, and `root` folder ID. LFS Cloud creates the directory, applies private permissions where the platform exposes Unix modes, launches the browser authorization, verifies that `application_default_credentials.json` was created, applies private file permissions, and only then writes the storage entry.
 
 Keep `--client-id-file` when reauthorizing expired or revoked ADC. Omitting it can select the Google Cloud CLI's shared OAuth client instead of the project where you enabled Drive, causing Drive requests to fail with quota-project or `SERVICE_DISABLED` errors even though token minting succeeds.
 
@@ -252,7 +258,7 @@ Google Cloud CLI requires `cloud-platform` when explicit ADC scopes are provided
 https://www.googleapis.com/auth/drive.file
 ```
 
-The configured `root_folder_id` must be a folder that the app credential can access and create children in. Git users never receive Drive tokens or direct Drive access.
+The configured `root_folder_id` must be a folder that the app credential can access and create children in. Google Drive accepts `root` as the alias for the user's My Drive root, so it is the interactive default; set an explicit folder ID to isolate LFS objects in a dedicated folder. Git users never receive Drive tokens or direct Drive access.
 
 `lfscloud serve` asks `gcloud` for an ADC access token for every configured Drive provider, then performs a non-mutating metadata probe that confirms the root is a live folder with child-write capability. These checks complete before the HTTP listener binds; a missing/invalid credential or unusable root prevents the server from reporting readiness.
 

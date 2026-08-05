@@ -10,6 +10,7 @@ Add or update an entry under `## [Unreleased]` for the changes made:
 - Be succinct and straight to the point
 - Word the entry clearly for users
 - Be explicit about the "symptom" that was addressed
+- One independent meaningful phrase/"symptom" per entry
 
 Evaluate existing entries under `## [Unreleased]`, consider them implemented previously to the diff'd changes, and update them if the diff'd changes significantly altered their context or relevance.
 

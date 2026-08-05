@@ -90,10 +90,13 @@ impl EditableServerConfig {
             context: format!("failed to read server config {}", path.display()),
             source,
         })?;
-        let mut documents =
+        let mut documents = if contents.trim().is_empty() {
+            vec![Yaml::Hash(Hash::new())]
+        } else {
             YamlLoader::load_from_str(&contents).map_err(|error| CliError::InvalidArguments {
                 message: format!("failed to parse server config {}: {error}", path.display()),
-            })?;
+            })?
+        };
         if documents.len() != 1 {
             return Err(CliError::InvalidArguments {
                 message: format!(
@@ -257,14 +260,6 @@ impl EditableServerConfig {
     /// Removes one storage provider.
     pub(crate) fn remove_storage_provider(&mut self, id: &str) -> CliResult<RemoveOutcome> {
         remove_map_entry(self.root_mut()?, STORAGE_PROVIDERS_KEY, id)
-    }
-
-    /// Returns one served-repository mapping by ID.
-    pub(crate) fn repository(&self, id: &str) -> CliResult<Option<RepositoryValues>> {
-        Ok(self
-            .repository_entries()?
-            .into_iter()
-            .find(|repository| repository.id == id))
     }
 
     /// Lists served-repository mappings in file order.
@@ -699,7 +694,7 @@ repositories:
     fn new_github_provider_does_not_require_or_write_default_api_url() {
         let temp = TempDir::new().expect("temporary directory should be created");
         let path = temp.path().join("lfscloud.yml");
-        fs::write(&path, "server: {}\n").expect("minimal config fixture should be written");
+        fs::write(&path, "").expect("minimal config fixture should be written");
         let mut config = EditableServerConfig::load(&path).expect("config should load");
 
         config

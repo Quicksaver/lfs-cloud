@@ -3,11 +3,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { type AddressInfo, createServer as createNetServer } from 'node:net';
 import { homedir } from 'node:os';
-import { dirname, join, relative, resolve } from 'node:path';
+import { delimiter, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
 
@@ -379,7 +379,7 @@ function assertExpectedServerStop(result: CommandResult): void {
 async function defaultServerStartupSmoke(): Promise<void> {
   const configPath = join(sandbox, 'default-server.yml');
   await availablePort('0.0.0.0', 15_370);
-  await writeFile(configPath, 'server: {}\n');
+  await writeFile(configPath, '');
   const server = runBackgroundCommand(binaryPath, ['--config', configPath, 'serve']);
   let stopped: CommandResult | undefined;
   try {
@@ -475,7 +475,7 @@ async function initRepositorySmoke(): Promise<void> {
 
 async function configurationCommandsSmoke(): Promise<void> {
   const configPath = join(sandbox, 'configuration-commands.yml');
-  await writeFile(configPath, 'server: {}\n');
+  await writeFile(configPath, '');
 
   await command(binaryPath, [
     '--config',
@@ -573,14 +573,7 @@ async function configurationCommandsSmoke(): Promise<void> {
   assert(storageProviders.includes('Smoke Drive'), 'storage-provider list omitted the display name');
   assert(repositories.includes('smoke-renamed'), 'repository list omitted the partially updated mapping');
 
-  await command(binaryPath, [
-    '--config',
-    configPath,
-    'repository',
-    'remove',
-    '--id',
-    'github-main:smoke-owner/smoke-repo',
-  ]);
+  await command(binaryPath, ['--config', configPath, 'repository', 'remove'], { input: '\n' });
   const repeatedRemove = await command(binaryPath, [
     '--config',
     configPath,
@@ -590,13 +583,35 @@ async function configurationCommandsSmoke(): Promise<void> {
     'github-main:smoke-owner/smoke-repo',
   ]);
   assert(repeatedRemove.includes('not found repository'), 'repeated repository remove was not idempotent');
-  await command(binaryPath, ['--config', configPath, 'config', 'storage', 'remove', '--id', 'drive-main']);
-  await command(binaryPath, ['--config', configPath, 'config', 'repository', 'remove', '--id', 'github-main']);
+  await command(binaryPath, ['--config', configPath, 'config', 'storage', 'remove'], { input: '\n' });
+  await command(binaryPath, ['--config', configPath, 'config', 'repository', 'remove'], { input: '\n' });
 
   const interactivePath = join(sandbox, 'interactive-configuration-commands.yml');
-  await writeFile(interactivePath, 'server: {}\n');
+  await writeFile(interactivePath, '');
+  const fakeTools = join(sandbox, 'interactive-config-tools');
+  await mkdir(fakeTools, { recursive: true });
+  const fakeGcloud = join(fakeTools, process.platform === 'win32' ? 'gcloud.cmd' : 'gcloud');
+  const fakeGh = join(fakeTools, process.platform === 'win32' ? 'gh.cmd' : 'gh');
+  if (process.platform === 'win32') {
+    await writeFile(
+      fakeGcloud,
+      '@echo off\r\nif not exist "%CLOUDSDK_CONFIG%" mkdir "%CLOUDSDK_CONFIG%"\r\n> "%CLOUDSDK_CONFIG%\\application_default_credentials.json" echo {}\r\n',
+    );
+    await writeFile(fakeGh, '@echo off\r\necho 987654321\r\n');
+  } else {
+    await writeFile(
+      fakeGcloud,
+      '#!/bin/sh\nmkdir -p "$CLOUDSDK_CONFIG"\nprintf \'{}\\n\' > "$CLOUDSDK_CONFIG/application_default_credentials.json"\n',
+    );
+    await writeFile(fakeGh, "#!/bin/sh\nprintf '987654321\\n'\n");
+    await chmod(fakeGcloud, 0o700);
+    await chmod(fakeGh, 0o700);
+  }
+  const clientSecret = join(sandbox, 'interactive-client-secret.json');
+  const interactiveGcloud = join(sandbox, 'interactive-gcloud');
+  await writeFile(clientSecret, '{}\n');
   await command(binaryPath, ['--config', interactivePath, 'config', 'repository', 'add'], {
-    input: 'github-interactive\n\n\n',
+    input: '\ngithub-interactive\n\n',
   });
   const interactiveYaml = await readFile(interactivePath, 'utf8');
   assert(
@@ -604,11 +619,16 @@ async function configurationCommandsSmoke(): Promise<void> {
     'interactive provider add wrote a server-owned GitHub PAT',
   );
   await command(binaryPath, ['--config', interactivePath, 'config', 'storage', 'add'], {
-    input: `drive-interactive\n\n\n${join(sandbox, 'interactive-gcloud')}\n\ninteractive-root\nInteractive Drive\n`,
+    input: `\ndrive-interactive\n${clientSecret}\n${interactiveGcloud}\n${fakeGcloud}\n\nInteractive Drive\n`,
   });
   await command(binaryPath, ['--config', interactivePath, 'repository', 'add'], {
-    input: 'github-interactive:owner/repo\ngithub-interactive\n\nowner\nrepo\n987654321\ndrive-interactive\n',
+    input: '\n\nowner\nrepo\n\n',
+    env: { PATH: `${fakeTools}${delimiter}${process.env.PATH ?? ''}` },
   });
+  assert(
+    await pathExists(join(interactiveGcloud, 'application_default_credentials.json')),
+    'interactive storage add did not create isolated ADC state',
+  );
   const interactiveRepositories = await command(binaryPath, ['--config', interactivePath, 'repository', 'list']);
   assert(
     interactiveRepositories.includes('github-interactive:owner/repo'),

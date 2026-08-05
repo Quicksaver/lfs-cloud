@@ -20,6 +20,7 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use dialoguer::{Select, console::Term};
 use reqwest::{
     Body as ReqwestBody, Client, StatusCode as HttpStatusCode,
     header::{CONTENT_LENGTH, HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue},

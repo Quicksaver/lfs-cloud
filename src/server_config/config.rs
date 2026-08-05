@@ -1265,8 +1265,8 @@ repository_providers:
 
     #[test]
     fn server_network_defaults_require_no_explicit_fields() {
-        let config = ServerConfig::load_from_str_with_env("server: {}\n", "<test>", test_env)
-            .expect("empty server settings should use safe documented defaults");
+        let config = ServerConfig::load_from_str_with_env("", "<test>", test_env)
+            .expect("an omitted server section should use safe documented defaults");
 
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 15_370);

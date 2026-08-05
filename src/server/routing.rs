@@ -108,7 +108,6 @@ impl LfsRouteResolver {
     ///
     /// let config = ServerConfig::load_from_str(
     ///     r#"
-    /// server: {}
     /// repository_providers:
     ///   github-main:
     ///     type: github

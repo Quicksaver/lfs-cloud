@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- [added]: Add arrow-key configuration menus that infer repository IDs and select existing providers and removals.
+- [added]: Automate isolated Google Drive authorization from a Desktop OAuth client JSON.
+- [changed]: Let empty configurations use all server defaults without requiring a `server: {}` placeholder.
+
 ## [0.2.2] - 2026-08-05
 
 - [added]: Generate durable-session encryption keys in the native credential store and add confirmed `lfscloud sessions generate-key` rotation that invalidates current sessions.
