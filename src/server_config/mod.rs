@@ -18,6 +18,7 @@ pub use providers::{
     StorageProviderConfig,
 };
 pub use repository::RepositoryMapping;
+pub(crate) use resolution::{resolve_config_directory, resolve_optional};
 pub use settings::{ServerSessionEncryptionSecret, ServerSettings};
 
 /// Default server config filename appended to the user's home directory.

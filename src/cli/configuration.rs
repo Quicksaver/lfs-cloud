@@ -544,14 +544,23 @@ where
 }
 
 fn github_provider_host(provider: &RepositoryProviderValues) -> CliResult<String> {
-    let api_url = provider
-        .api_url
-        .as_deref()
-        .unwrap_or(crate::DEFAULT_GITHUB_API_URL);
+    github_provider_host_with_env(provider, |name| std::env::var(name).ok())
+}
+
+fn github_provider_host_with_env(
+    provider: &RepositoryProviderValues,
+    mut env: impl FnMut(&str) -> Option<String>,
+) -> CliResult<String> {
+    let api_url = crate::server_config::resolve_optional(
+        provider.api_url.clone(),
+        format!("repository_providers.{}.api_url", provider.id),
+        &mut env,
+    )?
+    .unwrap_or_else(|| crate::DEFAULT_GITHUB_API_URL.to_owned());
     if api_url == crate::DEFAULT_GITHUB_API_URL {
         return Ok("github.com".to_owned());
     }
-    Url::parse(api_url)
+    Url::parse(&api_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .ok_or_else(|| CliError::InvalidArguments {
@@ -721,7 +730,7 @@ fn authorize_google_drive_adc(
                 message: "--config-dir is required for Google Drive authorization".to_owned(),
             })?;
     let config_base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let config_dir = resolve_setup_path(config_dir, config_base_dir)?;
+    let config_dir = resolve_setup_path(config_dir, &prepared.values.id, config_base_dir)?;
     fs::create_dir_all(&config_dir).map_err(|source| CliError::Io {
         context: format!(
             "failed to create isolated gcloud config directory {}",
@@ -790,7 +799,7 @@ fn validate_changed_gcloud_config_directory(
     }
 
     let config_base_dir = config.path().parent().unwrap_or_else(|| Path::new("."));
-    let adc_path = resolve_setup_path(requested_config_dir, config_base_dir)?
+    let adc_path = resolve_setup_path(requested_config_dir, &prepared.values.id, config_base_dir)?
         .join("application_default_credentials.json");
     if !adc_path.is_file() {
         return Err(CliError::InvalidArguments {
@@ -803,48 +812,29 @@ fn validate_changed_gcloud_config_directory(
     Ok(())
 }
 
-fn resolve_setup_path(value: &str, config_base_dir: &Path) -> CliResult<PathBuf> {
-    let mut expanded_path = None;
-    for variable in ["HOME", "USERPROFILE"] {
-        let prefix = format!("${{{variable}}}");
-        if let Some(suffix) = value.strip_prefix(&prefix) {
-            if suffix.contains("${") {
-                return Err(unresolved_setup_path_environment_reference());
-            }
-            let root = std::env::var_os(variable)
-                .or_else(|| {
-                    (variable == "HOME")
-                        .then(|| std::env::var_os("USERPROFILE"))
-                        .flatten()
-                })
-                .ok_or_else(|| CliError::InvalidArguments {
-                    message: format!(
-                        "gcloud config directory references unset environment variable {variable}"
-                    ),
-                })?;
-            expanded_path = Some(PathBuf::from(root).join(suffix.trim_start_matches(['/', '\\'])));
-            break;
-        }
-    }
-    let path = match expanded_path {
-        Some(path) => path,
-        None if value.contains("${") => {
-            return Err(unresolved_setup_path_environment_reference());
-        }
-        None => PathBuf::from(value),
-    };
-    if path.is_absolute() || config_base_dir.as_os_str().is_empty() {
-        Ok(path)
-    } else {
-        Ok(config_base_dir.join(path))
-    }
+fn resolve_setup_path(
+    value: &str,
+    provider_id: &str,
+    config_base_dir: &Path,
+) -> CliResult<PathBuf> {
+    resolve_setup_path_with_env(value, provider_id, config_base_dir, |name| {
+        std::env::var(name).ok()
+    })
 }
 
-fn unresolved_setup_path_environment_reference() -> CliError {
-    CliError::InvalidArguments {
-        message: "gcloud config directory contains an environment reference that setup cannot resolve; only ${HOME} and ${USERPROFILE} are supported"
-            .to_owned(),
-    }
+fn resolve_setup_path_with_env(
+    value: &str,
+    provider_id: &str,
+    config_base_dir: &Path,
+    mut env: impl FnMut(&str) -> Option<String>,
+) -> CliResult<PathBuf> {
+    crate::server_config::resolve_config_directory(
+        Some(value.to_owned()),
+        format!("storage_providers.{provider_id}.credentials.config_dir"),
+        &mut env,
+        config_base_dir,
+    )
+    .map_err(CliError::from)
 }
 
 #[cfg(unix)]
@@ -1451,19 +1441,20 @@ mod tests {
     }
 
     #[test]
-    fn setup_path_rejects_additional_environment_references_after_home_prefix() {
-        for value in [
-            "${HOME}/${OTHER}/gcloud",
-            "${USERPROFILE}\\${OTHER}\\gcloud",
-        ] {
-            let error = resolve_setup_path(value, Path::new("."))
-                .expect_err("nested environment references must be rejected before expansion");
-            assert!(matches!(
-                error,
-                CliError::InvalidArguments { message }
-                    if message.contains("contains an environment reference that setup cannot resolve")
-            ));
-        }
+    fn setup_path_resolves_all_supported_environment_references() {
+        let path = resolve_setup_path_with_env(
+            "${GCLOUD_ROOT}/${GCLOUD_PROFILE}",
+            "drive",
+            Path::new("/config"),
+            |name| match name {
+                "GCLOUD_ROOT" => Some("/credentials".to_owned()),
+                "GCLOUD_PROFILE" => Some("drive".to_owned()),
+                _ => None,
+            },
+        )
+        .expect("server config environment references should resolve");
+
+        assert_eq!(path, PathBuf::from("/credentials/drive"));
     }
 
     #[test]
@@ -1785,6 +1776,40 @@ repositories:
 
         assert_eq!(resolved_host.as_deref(), Some("github.example"));
         assert_eq!(values.host.as_deref(), Some("github.example"));
+    }
+
+    #[test]
+    fn github_provider_host_resolves_environment_references() {
+        let provider = RepositoryProviderValues {
+            id: "enterprise".to_owned(),
+            provider_type: Some("github".to_owned()),
+            api_url: Some("https://${GITHUB_HOST}/api/v3".to_owned()),
+            ..RepositoryProviderValues::default()
+        };
+
+        let host = github_provider_host_with_env(&provider, |name| {
+            (name == "GITHUB_HOST").then(|| "github.example".to_owned())
+        })
+        .expect("server config environment references should resolve");
+
+        assert_eq!(host, "github.example");
+    }
+
+    #[test]
+    fn github_provider_host_defaults_when_environment_reference_is_empty() {
+        let provider = RepositoryProviderValues {
+            id: "github".to_owned(),
+            provider_type: Some("github".to_owned()),
+            api_url: Some("${GITHUB_API_URL}".to_owned()),
+            ..RepositoryProviderValues::default()
+        };
+
+        let host = github_provider_host_with_env(&provider, |name| {
+            (name == "GITHUB_API_URL").then(String::new)
+        })
+        .expect("an empty optional API URL should use the public default");
+
+        assert_eq!(host, "github.com");
     }
 
     #[test]

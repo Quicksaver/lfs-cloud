@@ -69,7 +69,8 @@ pub(super) fn resolve_metadata_path(
     }
 }
 
-pub(super) fn resolve_config_directory(
+/// Resolves one environment-backed configuration directory relative to its file.
+pub(crate) fn resolve_config_directory(
     value: Option<String>,
     path: impl Into<String>,
     env: &mut impl FnMut(&str) -> Option<String>,
@@ -94,7 +95,8 @@ fn has_trailing_path_separator(value: &str) -> bool {
     value.ends_with('/') || value.ends_with('\\')
 }
 
-pub(super) fn resolve_optional(
+/// Resolves an optional environment-backed configuration string.
+pub(crate) fn resolve_optional(
     value: Option<String>,
     path: impl Into<String>,
     env: &mut impl FnMut(&str) -> Option<String>,
