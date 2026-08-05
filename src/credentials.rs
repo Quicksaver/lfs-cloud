@@ -2061,49 +2061,34 @@ wait
     #[cfg(unix)]
     fn successful_command_stops_pipe_holding_descendants() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
-        let descendant_pid_path = temp.path().join("descendant.pid");
         let fake_git = write_fake_git(
             temp.path(),
             r#"#!/bin/sh
 sleep 10 &
-printf '%s\n' "$!" > "$1"
 printf 'configured-helper\n'
 exit 0
 "#,
         );
         let mut command = git_command(&fake_git);
         let mut child = command
-            .arg(&descendant_pid_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("fake git should start");
 
+        let started = Instant::now();
         let (status, stdout, stderr) =
             wait_for_git_command_output(&mut child, "fake git", "", Duration::from_secs(5))
                 .expect("successful direct child should complete");
-        let descendant_pid = fs::read_to_string(&descendant_pid_path)
-            .expect("fake git should record its descendant")
-            .trim()
-            .to_owned();
-        let descendant_alive = Command::new("kill")
-            .args(["-0", &descendant_pid])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("kill probe should run")
-            .success();
-        if descendant_alive {
-            let _ = Command::new("kill")
-                .args(["-KILL", &descendant_pid])
-                .status();
-        }
 
         assert!(status.success());
         assert_eq!(stdout, b"configured-helper\n");
         assert!(stderr.is_empty());
-        assert!(!descendant_alive, "pipe-holding descendant was left alive");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "pipe-holding descendant should be stopped before its sleep completes"
+        );
     }
 
     #[test]

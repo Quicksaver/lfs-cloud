@@ -16,7 +16,11 @@ use std::{
 #[cfg(windows)]
 use std::process::Stdio;
 
-const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+// Loaded cross-architecture verifiers can delay a newly spawned pipe reader
+// well beyond one scheduler timeslice after a short-lived child exits. Keep
+// this distinct from the post-termination drain so scheduling latency is not
+// misclassified as a descendant retaining the pipe.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_DRAIN_AFTER_STOP: Duration = Duration::from_secs(1);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -167,16 +171,31 @@ pub(crate) fn wait_for_child(
     command_name: &str,
     options: ChildProcessOptions,
 ) -> Result<ChildProcessOutput, ChildProcessError> {
+    wait_for_child_with_pipe_reader_delay(child, command_name, options, Duration::ZERO)
+}
+
+fn wait_for_child_with_pipe_reader_delay(
+    child: &mut Child,
+    command_name: &str,
+    options: ChildProcessOptions,
+    pipe_reader_delay: Duration,
+) -> Result<ChildProcessOutput, ChildProcessError> {
     let (sender, receiver) = mpsc::channel();
     let mut stdout_reader = child.stdout.take().map(|stdout| {
         let sender = sender.clone();
         thread::spawn(move || {
+            if !pipe_reader_delay.is_zero() {
+                thread::sleep(pipe_reader_delay);
+            }
             let _ = sender.send(PipeEvent::Stdout(read_pipe(stdout, options.stdout)));
         })
     });
     let mut stderr_reader = child.stderr.take().map(|stderr| {
         let sender = sender.clone();
         thread::spawn(move || {
+            if !pipe_reader_delay.is_zero() {
+                thread::sleep(pipe_reader_delay);
+            }
             let _ = sender.send(PipeEvent::Stderr(read_pipe(stderr, options.stderr)));
         })
     });
@@ -248,9 +267,15 @@ pub(crate) fn wait_for_child(
             });
         }
 
-        if status.is_some_and(|_| drain_deadline.is_some_and(|end| Instant::now() >= end)) {
+        if status.is_some_and(|_| {
+            process_tree_has_descendants(child)
+                || drain_deadline.is_some_and(|end| Instant::now() >= end)
+        }) {
             // The direct child exited, so any open output pipe belongs to a
-            // descendant in the command's process group.
+            // known descendant or one that outlived the reader scheduling
+            // grace. Stop owned descendants immediately while still allowing
+            // delayed readers to observe EOF from ordinary short-lived
+            // commands.
             stop_process_tree(child);
             let drain_error = collect_pipe_events(
                 &receiver,
@@ -459,6 +484,28 @@ pub(crate) fn terminate_process_tree(
 }
 
 #[cfg(unix)]
+fn process_tree_has_descendants(child: &Child) -> bool {
+    let Some(process_group_id) = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        // If the platform cannot represent the owned process-group ID, retain
+        // the conservative behavior and attempt cleanup immediately.
+        return true;
+    };
+
+    !matches!(
+        rustix::process::test_kill_process_group(process_group_id),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+#[cfg(not(unix))]
+fn process_tree_has_descendants(_child: &Child) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn stop_process_tree(child: &Child) {
     signal_process_group(rustix::process::Signal::TERM, child.id());
     thread::sleep(Duration::from_millis(50));
@@ -500,7 +547,7 @@ mod tests {
 
     use super::{
         ChildProcessError, ChildProcessOptions, PipeCapture, PipeEvent, collect_pipe_events,
-        configure_process_tree, read_pipe, wait_for_child,
+        configure_process_tree, read_pipe, wait_for_child, wait_for_child_with_pipe_reader_delay,
     };
 
     const PROCESS_TREE_HELPER_TEST: &str = "child_process::tests::process_tree_pipe_holding_helper";
@@ -612,6 +659,46 @@ mod tests {
     }
 
     #[test]
+    fn completed_child_tolerates_delayed_pipe_reader_scheduling() {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--ignored", "--exact", PROCESS_TREE_HELPER_TEST])
+            .env(PROCESS_TREE_MODE_ENV, "complete")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().expect("helper should start");
+
+        let output = wait_for_child_with_pipe_reader_delay(
+            &mut child,
+            "test helper",
+            ChildProcessOptions {
+                timeout: Some(Duration::from_secs(5)),
+                stdout: PipeCapture::Unlimited,
+                stderr: PipeCapture::Unlimited,
+                inherited_pipe_is_error: true,
+            },
+            Duration::from_secs(1),
+        )
+        .expect("reader scheduling delays must not look like inherited pipes");
+
+        assert!(output.status.success());
+        assert!(
+            output
+                .stdout
+                .windows(b"stdout-secret\n".len())
+                .any(|bytes| bytes == b"stdout-secret\n")
+        );
+        assert!(
+            output
+                .stderr
+                .windows(b"stderr-secret\n".len())
+                .any(|bytes| bytes == b"stderr-secret\n")
+        );
+    }
+
+    #[test]
     fn timeout_retains_output_without_exposing_it_through_debug() {
         let temp = tempfile::tempdir().expect("temporary directory should be created");
         let ready_path = temp.path().join("ready");
@@ -718,7 +805,10 @@ mod tests {
                 },
             );
 
-            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "known process-group descendants should be stopped without waiting for the reader scheduling grace"
+            );
             if inherited_pipe_is_error {
                 assert!(matches!(result, Err(ChildProcessError::InheritedPipe)));
             } else {
