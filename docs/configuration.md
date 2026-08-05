@@ -238,7 +238,7 @@ lfscloud config storage add \
 
 With no flags, `lfscloud config storage add` prompts for the same client JSON and lets you accept the default provider ID, credential directory, executable, and `root` folder ID. LFS Cloud creates the directory, applies private permissions where the platform exposes Unix modes, launches the browser authorization, verifies that `application_default_credentials.json` was created, applies private file permissions, and only then writes the storage entry.
 
-Keep `--client-id-file` when reauthorizing expired or revoked ADC. Omitting it can select the Google Cloud CLI's shared OAuth client instead of the project where you enabled Drive, causing Drive requests to fail with quota-project or `SERVICE_DISABLED` errors even though token minting succeeds.
+Keep `--client-secret-file` when reauthorizing expired or revoked ADC. Omitting it can select the Google Cloud CLI's shared OAuth client instead of the project where you enabled Drive, causing Drive requests to fail with quota-project or `SERVICE_DISABLED` errors even though token minting succeeds.
 
 The directory must contain `application_default_credentials.json`. LFS Cloud invokes `gcloud` at runtime, so the executable must remain installed and accessible to the server user. When `credentials.executable` is omitted, LFS Cloud defaults to `gcloud.cmd` on Windows and `gcloud` on other platforms.
 

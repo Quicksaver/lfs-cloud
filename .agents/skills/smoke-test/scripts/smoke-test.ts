@@ -119,13 +119,19 @@ function appendOutput(current: string, chunk: Buffer | string): string {
 
 function runCommand(command: string, args: string[], options: CommandOptions = {}): Promise<CommandResult> {
   return new Promise(complete => {
+    const environment = {
+      ...process.env,
+      ...options.env,
+    };
+    if (process.platform === 'win32' && options.env?.PATH !== undefined) {
+      for (const key of Object.keys(environment)) {
+        if (key !== 'PATH' && key.toUpperCase() === 'PATH') delete environment[key];
+      }
+    }
     const child = spawn(command, args, {
       cwd: options.cwd ?? repoRoot,
       detached: true,
-      env: {
-        ...process.env,
-        ...options.env,
-      },
+      env: environment,
       stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
     currentChild = child;

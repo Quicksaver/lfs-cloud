@@ -39,7 +39,6 @@ Every installation needs:
 - Google Cloud CLI (`gcloud`)
 - a Git credential helper
 - a GitHub personal access token limited to the repositories you will serve
-- GitHub CLI (`gh`) for interactive repository setup; flag-based setup can supply the stable ID directly
 
 Choose one of the following installation methods.
 
@@ -91,20 +90,22 @@ git lfs install
 
 ### 2. Prepare Google Drive Access
 
-Create a Google Cloud Desktop OAuth client, enable the Google Drive API, and download its client JSON. `lfscloud config storage add` uses that file to create and secure an isolated Application Default Credentials directory and launches the correctly scoped `gcloud` authorization flow. See the [configuration guide](docs/configuration.md#google-drive-credentials) for the Google Cloud prerequisites and folder-access details.
+Create a Google Cloud Desktop OAuth client, enable the Google Drive API, and download its client JSON. `lfscloud config storage add` uses that file to create an isolated Application Default Credentials directory, applies private permission modes on Unix platforms, and launches the correctly scoped `gcloud` authorization flow. See the [configuration guide](docs/configuration.md#google-drive-credentials) for the Google Cloud prerequisites and folder-access details.
 
 ### 3. Create `lfscloud.yml`
 
 Create an empty private server configuration file at `${HOME}/lfscloud.yml`. On Windows, LFS Cloud falls back to `%USERPROFILE%\lfscloud.yml` when `HOME` is not set. This is the default path whenever `--config PATH` is omitted. Do not commit the file.
 
 ```bash
-touch "$HOME/lfscloud.yml"
+install -m 600 /dev/null "$HOME/lfscloud.yml"
 ```
 
 On Windows PowerShell:
 
 ```powershell
 New-Item -ItemType File -Force "$HOME\lfscloud.yml"
+$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls "$HOME\lfscloud.yml" /inheritance:r /grant:r "*$($currentSid):(F)" | Out-Null
 ```
 
 Then add the supported providers and repository mapping interactively:
@@ -115,7 +116,7 @@ lfscloud config storage add
 lfscloud repository add
 ```
 
-The menus use Up/Down and Enter. Press Enter at the suggested `github`, `google_drive`, `github.com`, and Drive `root` defaults. Storage setup asks for the downloaded Desktop OAuth client JSON and performs the `gcloud` authorization. Repository setup lists the configured providers and uses authenticated `gh` to obtain GitHub's immutable numeric repository ID.
+The menus use Up/Down and Enter. Press Enter at the suggested `github`, `google_drive`, `github.com`, and Drive `root` defaults. Storage setup asks for the downloaded Desktop OAuth client JSON and performs the `gcloud` authorization. Interactive repository setup requires GitHub CLI (`gh`) to be installed and authenticated so it can obtain GitHub's immutable numeric repository ID.
 
 The resulting configuration has this shape; no `server` section is needed unless overriding a server setting such as `port`:
 
@@ -143,13 +144,15 @@ repositories:
     storage_provider: google_drive
 ```
 
+On Windows, generated configuration uses `${USERPROFILE}` instead of `${HOME}` for the Google Drive credential directory.
+
 The server defaults to port `15370` on `0.0.0.0`, so it accepts connections through loopback, LAN, and direct Tailscale IPv4 addresses without network fields in the config. Git LFS action URLs are inferred from the interface each client connected to. Set `server.public_url` only when clients should receive a different hostname or path, such as a MagicDNS name or reverse proxy URL.
 
 GitHub providers use `https://api.github.com` by default. Set `api_url` only for an alternative REST endpoint such as GitHub Enterprise Server.
 
 For non-interactive setup, supply entry flags. Existing IDs can be updated with only the fields that should change. For example, `--client-secret-file PATH` applies the other Google Drive defaults automatically. See [Manage Configuration From The CLI](docs/configuration.md#manage-configuration-from-the-cli) for every flag plus `list` and `remove`.
 
-If creating a repository mapping entirely with flags, get GitHub's stable numeric repository ID with:
+When creating a repository mapping entirely with flags, supply GitHub's stable numeric repository ID directly. GitHub CLI is one optional way to obtain it:
 
 ```bash
 gh api repos/OWNER/REPOSITORY --jq .id

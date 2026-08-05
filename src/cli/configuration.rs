@@ -684,6 +684,9 @@ fn resolve_setup_path(value: &str) -> CliResult<PathBuf> {
     for variable in ["HOME", "USERPROFILE"] {
         let prefix = format!("${{{variable}}}");
         if let Some(suffix) = value.strip_prefix(&prefix) {
+            if suffix.contains("${") {
+                return Err(unresolved_setup_path_environment_reference());
+            }
             let root = std::env::var_os(variable).ok_or_else(|| CliError::InvalidArguments {
                 message: format!(
                     "gcloud config directory references unset environment variable {variable}"
@@ -693,12 +696,17 @@ fn resolve_setup_path(value: &str) -> CliResult<PathBuf> {
         }
     }
     if value.contains("${") {
-        return Err(CliError::InvalidArguments {
-            message: "gcloud config directory contains an environment reference that setup cannot resolve"
-                .to_owned(),
-        });
+        return Err(unresolved_setup_path_environment_reference());
     }
     Ok(PathBuf::from(value))
+}
+
+fn unresolved_setup_path_environment_reference() -> CliError {
+    CliError::InvalidArguments {
+        message:
+            "gcloud config directory contains an environment reference that setup cannot resolve"
+                .to_owned(),
+    }
 }
 
 #[cfg(unix)]
@@ -744,6 +752,9 @@ fn resolve_github_repository_id_with_executable(
     owner: &str,
     name: &str,
 ) -> CliResult<String> {
+    validate_github_repository_path_component(owner, "repository owner")?;
+    validate_github_repository_path_component(name, "repository name")?;
+
     let mut command = ProcessCommand::new(executable);
     command.arg("api");
     if host != "github.com" {
@@ -776,6 +787,24 @@ fn resolve_github_repository_id_with_executable(
         }
     })?;
     Ok(parsed.to_string())
+}
+
+fn validate_github_repository_path_component(value: &str, label: &str) -> CliResult<()> {
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(CliError::InvalidArguments {
+            message: format!(
+                "{label} must be a route-safe repository component without separators, percent escapes, or traversal segments"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn prompt_value<R, W>(
@@ -1190,6 +1219,44 @@ mod tests {
             Some(default_gcloud_config_reference().as_str())
         );
         assert_eq!(prepared.values.root_folder_id.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn setup_path_rejects_additional_environment_references_after_home_prefix() {
+        for value in [
+            "${HOME}/${OTHER}/gcloud",
+            "${USERPROFILE}\\${OTHER}\\gcloud",
+        ] {
+            let error = resolve_setup_path(value)
+                .expect_err("nested environment references must be rejected before expansion");
+            assert!(matches!(
+                error,
+                CliError::InvalidArguments { message }
+                    if message.contains("contains an environment reference that setup cannot resolve")
+            ));
+        }
+    }
+
+    #[test]
+    fn github_repository_lookup_rejects_invalid_path_components_before_running_gh() {
+        for (owner, name) in [
+            ("", "assets"),
+            (".", "assets"),
+            ("..", "assets"),
+            ("octo..org", "assets"),
+            ("octo/org", "assets"),
+            ("octo-org", ""),
+            ("octo-org", "assets+archive"),
+        ] {
+            let error = resolve_github_repository_id_with_executable(
+                Path::new("definitely-missing-gh"),
+                "github.com",
+                owner,
+                name,
+            )
+            .expect_err("invalid repository components must fail before gh starts");
+            assert!(matches!(error, CliError::InvalidArguments { .. }));
+        }
     }
 
     #[cfg(unix)]
