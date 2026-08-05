@@ -1825,6 +1825,24 @@ repositories:
     }
 
     #[test]
+    fn accepts_consecutive_dots_inside_repository_components() {
+        let config = load_with_test_env(
+            &valid_yaml()
+                .replace(
+                    "id: github-main:owner/repo",
+                    "id: github-main:owner/repo..archive",
+                )
+                .replace("name: repo", "name: repo..archive"),
+        );
+
+        assert_eq!(config.repositories[0].name, "repo..archive");
+        assert_eq!(
+            config.repositories[0].route_path(),
+            "/github.com/owner/repo..archive.git/info/lfs"
+        );
+    }
+
+    #[test]
     fn rejects_repository_names_with_git_suffix() {
         let error = ServerConfig::load_from_str_with_env(
             r#"

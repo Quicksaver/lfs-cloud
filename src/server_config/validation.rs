@@ -57,7 +57,6 @@ pub(super) fn validate_route_component(
     let path = path.into();
     validate_no_outer_whitespace(component, &path)?;
     if matches!(component, "." | "..")
-        || component.contains("..")
         || !component
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))

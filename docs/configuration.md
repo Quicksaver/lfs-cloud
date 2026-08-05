@@ -298,7 +298,7 @@ The server creates a `<metadata filename>.lock` file and an `upload-locks` direc
 - `server.max_batch_objects`, `server.max_provider_calls`, `server.max_concurrent_requests`, `server.max_concurrent_uploads`, and `server.max_concurrent_uploads_per_user` must be greater than zero when configured. The per-user upload limit cannot exceed the process-wide upload limit.
 - Custom Google Drive API base URLs used by embedded runtimes or tests must use HTTPS except for literal loopback IP HTTP endpoints; names such as `localhost` are not accepted.
 - Provider IDs and storage IDs must start with an ASCII letter or digit and use only ASCII letters, digits, `_`, or `-`.
-- Repository route components must be safe path segments. Repository names must not include `.git`.
+- Repository route components must be safe path segments. Interior periods, including consecutive periods, are allowed, but complete `.` and `..` segments are rejected. Repository names must not include `.git`.
 - GitHub repository mappings must include a positive numeric `provider_repository_id` matching GitHub's stable repository ID.
 - Every repository mapping must reference configured repository and storage providers.
 - Duplicate repository IDs and duplicate generated route paths are rejected.
