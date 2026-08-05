@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-05
+
 - [added]: Generate durable-session encryption keys in the native credential store and add confirmed `lfscloud sessions generate-key` rotation that invalidates current sessions.
 - [changed]: Hold an exclusive lifecycle lock for each metadata database so only one server can retain its sessions in memory and key rotation refuses to run while that server is active.
 - [changed]: Listen on `0.0.0.0:15370` by default and infer Git LFS action URLs from each accepted connection, while retaining `server.public_url` for explicit hostname and proxy overrides.
