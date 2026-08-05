@@ -28,7 +28,7 @@ pub(super) fn run_configuration_to_stdio(
     let mut input = stdin.lock();
     let mut output = io::stdout().lock();
 
-    if stdin.is_terminal() {
+    if use_terminal_selection(stdin.is_terminal(), io::stderr().is_terminal()) {
         run_configuration_with_input(
             command,
             config_path,
@@ -71,7 +71,7 @@ where
     W: Write,
     S: FnMut(&mut R) -> CliResult<String>,
     M: FnMut(&mut R, &mut W, &str, &[String], usize) -> CliResult<usize>,
-    A: FnMut(&PreparedStorageProvider) -> CliResult<()>,
+    A: FnMut(&PreparedStorageProvider, &Path) -> CliResult<()>,
     G: FnMut(&str, &str, &str) -> CliResult<String>,
 {
     let config_path = match config_path {
@@ -128,7 +128,7 @@ where
                     command.into_prepared()?
                 };
                 if prepared.client_secret_file.is_some() {
-                    (operations.authorize_drive)(&prepared)?;
+                    (operations.authorize_drive)(&prepared, config.path())?;
                 }
                 let id = prepared.values.id.clone();
                 let outcome = config.upsert_storage_provider(prepared.values)?;
@@ -188,6 +188,10 @@ where
             RepositoryAction::List => write_repository_list(&config, output),
         },
     }
+}
+
+fn use_terminal_selection(stdin_is_terminal: bool, stderr_is_terminal: bool) -> bool {
+    stdin_is_terminal && stderr_is_terminal
 }
 
 impl RepositoryProviderAddCommand {
@@ -605,7 +609,10 @@ fn default_gcloud_config_reference() -> String {
     "${USERPROFILE}/.config/lfscloud/gcloud-drive".to_owned()
 }
 
-fn authorize_google_drive_adc(prepared: &PreparedStorageProvider) -> CliResult<()> {
+fn authorize_google_drive_adc(
+    prepared: &PreparedStorageProvider,
+    config_path: &Path,
+) -> CliResult<()> {
     let client_secret_file = prepared
         .client_secret_file
         .as_deref()
@@ -626,7 +633,8 @@ fn authorize_google_drive_adc(prepared: &PreparedStorageProvider) -> CliResult<(
             .ok_or_else(|| CliError::InvalidArguments {
                 message: "--config-dir is required for Google Drive authorization".to_owned(),
             })?;
-    let config_dir = resolve_setup_path(config_dir)?;
+    let config_base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let config_dir = resolve_setup_path(config_dir, config_base_dir)?;
     fs::create_dir_all(&config_dir).map_err(|source| CliError::Io {
         context: format!(
             "failed to create isolated gcloud config directory {}",
@@ -680,7 +688,8 @@ fn authorize_google_drive_adc(prepared: &PreparedStorageProvider) -> CliResult<(
     set_private_file_permissions(&adc_path)
 }
 
-fn resolve_setup_path(value: &str) -> CliResult<PathBuf> {
+fn resolve_setup_path(value: &str, config_base_dir: &Path) -> CliResult<PathBuf> {
+    let mut expanded_path = None;
     for variable in ["HOME", "USERPROFILE"] {
         let prefix = format!("${{{variable}}}");
         if let Some(suffix) = value.strip_prefix(&prefix) {
@@ -692,13 +701,22 @@ fn resolve_setup_path(value: &str) -> CliResult<PathBuf> {
                     "gcloud config directory references unset environment variable {variable}"
                 ),
             })?;
-            return Ok(PathBuf::from(root).join(suffix.trim_start_matches(['/', '\\'])));
+            expanded_path = Some(PathBuf::from(root).join(suffix.trim_start_matches(['/', '\\'])));
+            break;
         }
     }
-    if value.contains("${") {
-        return Err(unresolved_setup_path_environment_reference());
+    let path = match expanded_path {
+        Some(path) => path,
+        None if value.contains("${") => {
+            return Err(unresolved_setup_path_environment_reference());
+        }
+        None => PathBuf::from(value),
+    };
+    if path.is_absolute() || config_base_dir.as_os_str().is_empty() {
+        Ok(path)
+    } else {
+        Ok(config_base_dir.join(path))
     }
-    Ok(PathBuf::from(value))
 }
 
 fn unresolved_setup_path_environment_reference() -> CliError {
@@ -848,13 +866,19 @@ where
 {
     let maximum_line_bytes = MAX_CONFIG_PROMPT_INPUT_BYTES + 2;
     let mut bytes = Vec::with_capacity(maximum_line_bytes + 1);
-    input
+    let bytes_read = input
         .take((maximum_line_bytes + 1) as u64)
         .read_until(b'\n', &mut bytes)
         .map_err(|source| CliError::Io {
             context: "failed to read interactive configuration input".to_owned(),
             source,
         })?;
+    if bytes_read == 0 {
+        return Err(CliError::InvalidArguments {
+            message: "interactive configuration input ended before a response was received"
+                .to_owned(),
+        });
+    }
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         if bytes.last() == Some(&b'\r') {
@@ -1227,7 +1251,7 @@ mod tests {
             "${HOME}/${OTHER}/gcloud",
             "${USERPROFILE}\\${OTHER}\\gcloud",
         ] {
-            let error = resolve_setup_path(value)
+            let error = resolve_setup_path(value, Path::new("."))
                 .expect_err("nested environment references must be rejected before expansion");
             assert!(matches!(
                 error,
@@ -1267,7 +1291,10 @@ mod tests {
         let temp = TempDir::new().expect("temporary directory should be created");
         let client_secret = temp.path().join("client_secret.json");
         fs::write(&client_secret, "{}\n").expect("client secret fixture should be written");
-        let config_dir = temp.path().join("gcloud-drive");
+        let config_parent = temp.path().join("configuration");
+        fs::create_dir(&config_parent).expect("config directory should be created");
+        let config_path = config_parent.join("lfscloud.yml");
+        let config_dir = config_parent.join("gcloud-drive");
         let args_path = temp.path().join("args.txt");
         let fake_gcloud = temp.path().join("gcloud");
         fs::write(
@@ -1281,15 +1308,18 @@ mod tests {
         fs::set_permissions(&fake_gcloud, fs::Permissions::from_mode(0o700))
             .expect("fake gcloud should be executable");
 
-        authorize_google_drive_adc(&PreparedStorageProvider {
-            values: StorageProviderValues {
-                id: "google_drive".to_owned(),
-                config_dir: Some(config_dir.display().to_string()),
-                executable: Some(fake_gcloud.display().to_string()),
-                ..StorageProviderValues::default()
+        authorize_google_drive_adc(
+            &PreparedStorageProvider {
+                values: StorageProviderValues {
+                    id: "google_drive".to_owned(),
+                    config_dir: Some("gcloud-drive".to_owned()),
+                    executable: Some(fake_gcloud.display().to_string()),
+                    ..StorageProviderValues::default()
+                },
+                client_secret_file: Some(client_secret.clone()),
             },
-            client_secret_file: Some(client_secret.clone()),
-        })
+            &config_path,
+        )
         .expect("Google Drive ADC setup should succeed");
 
         let arguments = fs::read_to_string(args_path).expect("gcloud arguments should be recorded");
@@ -1402,6 +1432,30 @@ repositories:
             "\n",
         );
         assert!(provider.contains("removed repository provider"));
+    }
+
+    #[test]
+    fn numbered_selection_rejects_eof_instead_of_accepting_the_default() {
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let items = vec!["first".to_owned(), "second".to_owned()];
+
+        let error = prompt_select_index(&mut input, &mut output, "Repository to remove", &items, 0)
+            .expect_err("EOF must not select the default entry");
+
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments { message }
+                if message.contains("ended before a response was received")
+        ));
+    }
+
+    #[test]
+    fn terminal_selection_requires_both_input_and_menu_output_terminals() {
+        assert!(use_terminal_selection(true, true));
+        assert!(!use_terminal_selection(true, false));
+        assert!(!use_terminal_selection(false, true));
+        assert!(!use_terminal_selection(false, false));
     }
 
     #[test]
@@ -1580,7 +1634,10 @@ storage_providers:
         String::from_utf8(output).expect("configuration output should be UTF-8")
     }
 
-    fn noop_drive_authorization(_prepared: &PreparedStorageProvider) -> CliResult<()> {
+    fn noop_drive_authorization(
+        _prepared: &PreparedStorageProvider,
+        _config_path: &Path,
+    ) -> CliResult<()> {
         Ok(())
     }
 
