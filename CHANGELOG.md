@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-06
+
 - [added]: Add arrow-key configuration menus for provider and repository setup.
 - [added]: Infer interactive repository mapping IDs from the selected provider, owner, and repository.
 - [added]: Select configured providers and removal targets from interactive menus.
