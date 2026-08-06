@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - [fixed]: Preserve custom Drive roots and ADC directories during provider reauthorization.
 - [fixed]: Accept comment-only private configuration files as empty configurations.
 - [fixed]: Accept valid GitHub repository names containing consecutive periods.
+- [tooling]: Prevent Windows configuration smoke tests from invoking the real GitHub CLI instead of their isolated fixture.
 
 ## [0.2.2] - 2026-08-05
 

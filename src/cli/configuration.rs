@@ -6,6 +6,7 @@ use crate::GOOGLE_DRIVE_FILE_SCOPE;
 const MAX_CONFIG_PROMPT_INPUT_BYTES: usize = 16 * 1024;
 const MAX_GITHUB_REPOSITORY_LOOKUP_OUTPUT_BYTES: usize = 8 * 1024;
 const GITHUB_REPOSITORY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_CLI_EXECUTABLE_ENV: &str = "LFS_CLOUD_GH_EXECUTABLE";
 const DEFAULT_GOOGLE_DRIVE_PROVIDER_ID: &str = "google_drive";
 const DEFAULT_GOOGLE_DRIVE_ROOT_FOLDER_ID: &str = "root";
 const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -871,7 +872,18 @@ fn set_private_file_permissions(_path: &Path) -> CliResult<()> {
 }
 
 fn resolve_github_repository_id(host: &str, owner: &str, name: &str) -> CliResult<String> {
-    resolve_github_repository_id_with_executable(Path::new("gh"), host, owner, name)
+    let executable = github_cli_executable_with_env(|name| std::env::var_os(name));
+    resolve_github_repository_id_with_executable(&executable, host, owner, name)
+}
+
+fn github_cli_executable_with_env<F>(mut environment: F) -> PathBuf
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    environment(GITHUB_CLI_EXECUTABLE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("gh"))
 }
 
 fn resolve_github_repository_id_with_executable(
@@ -1455,6 +1467,23 @@ mod tests {
         .expect("server config environment references should resolve");
 
         assert_eq!(path, PathBuf::from("/credentials/drive"));
+    }
+
+    #[test]
+    fn github_cli_executable_accepts_an_explicit_environment_override() {
+        let executable = github_cli_executable_with_env(|name| {
+            (name == GITHUB_CLI_EXECUTABLE_ENV).then(|| OsString::from("custom-gh.cmd"))
+        });
+
+        assert_eq!(executable, PathBuf::from("custom-gh.cmd"));
+    }
+
+    #[test]
+    fn github_cli_executable_defaults_to_gh() {
+        assert_eq!(
+            github_cli_executable_with_env(|_| None),
+            PathBuf::from("gh")
+        );
     }
 
     #[test]

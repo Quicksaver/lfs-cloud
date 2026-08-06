@@ -636,7 +636,10 @@ async function configurationCommandsSmoke(): Promise<void> {
   );
   await command(binaryPath, ['--config', interactivePath, 'repository', 'add'], {
     input: '\n\nowner\nrepo\n\n',
-    env: { PATH: `${fakeTools}${delimiter}${process.env.PATH ?? ''}` },
+    env: {
+      LFS_CLOUD_GH_EXECUTABLE: fakeGh,
+      PATH: `${fakeTools}${delimiter}${process.env.PATH ?? ''}`,
+    },
   });
   const interactiveRepositories = await command(binaryPath, ['--config', interactivePath, 'repository', 'list']);
   assert(
