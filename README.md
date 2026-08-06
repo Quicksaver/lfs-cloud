@@ -93,20 +93,25 @@ git lfs install
 
 Create a Google Cloud Desktop OAuth client, enable the Google Drive API, and download its client JSON. `lfscloud config storage add` uses that file to create an isolated Application Default Credentials directory, applies private permission modes on Unix platforms, and launches the correctly scoped `gcloud` authorization flow. See the [configuration guide](docs/configuration.md#google-drive-credentials) for the Google Cloud prerequisites and folder-access details.
 
-### 3. Create `lfscloud.yml`
+### 3. Create The Private Server Configuration
 
-Create an empty private server configuration file at `${HOME}/lfscloud.yml`. On Windows, LFS Cloud falls back to `%USERPROFILE%\lfscloud.yml` when `HOME` is not set. This is the default path whenever `--config PATH` is omitted. Do not commit the file.
+Create an empty private server configuration file at `${HOME}/.config/lfscloud/config.yml`. On Windows, the default is `%APPDATA%\lfscloud\config.yml`, with `%USERPROFILE%\AppData\Roaming\lfscloud\config.yml` as a fallback when `APPDATA` is unavailable. These are the default paths whenever `--config PATH` is omitted. Do not commit the file.
 
 ```bash
-install -m 600 /dev/null "$HOME/lfscloud.yml"
+mkdir -p "$HOME/.config/lfscloud"
+chmod 700 "$HOME/.config/lfscloud"
+install -m 600 /dev/null "$HOME/.config/lfscloud/config.yml"
 ```
 
 On Windows PowerShell:
 
 ```powershell
-New-Item -ItemType File -Force "$HOME\lfscloud.yml"
+$configDirectory = Join-Path $env:APPDATA 'lfscloud'
+$configPath = Join-Path $configDirectory 'config.yml'
+New-Item -ItemType Directory -Force $configDirectory | Out-Null
+New-Item -ItemType File -Force $configPath | Out-Null
 $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-icacls "$HOME\lfscloud.yml" /inheritance:r /grant:r "*$($currentSid):(F)" | Out-Null
+icacls $configPath /inheritance:r /grant:r "*$($currentSid):(F)" | Out-Null
 ```
 
 Then add the supported providers and repository mapping interactively:

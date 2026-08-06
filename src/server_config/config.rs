@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use config::{Config, File, FileFormat};
@@ -34,10 +34,11 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Returns the default config path below the current user's home directory.
+    /// Returns the default config path below the current user's config directory.
     ///
-    /// `HOME` identifies the home directory when it is set. On Windows,
-    /// `USERPROFILE` is used when `HOME` is unavailable or empty.
+    /// Unix-like platforms use `${HOME}/.config/lfscloud/config.yml`. Windows
+    /// uses `%APPDATA%\lfscloud\config.yml`, with `%USERPROFILE%\AppData\Roaming`
+    /// as a fallback config root.
     ///
     /// # Examples
     ///
@@ -45,14 +46,14 @@ impl ServerConfig {
     /// use lfscloud::ServerConfig;
     ///
     /// let path = ServerConfig::default_path()?;
-    /// assert!(path.ends_with("lfscloud.yml"));
+    /// assert!(path.ends_with(lfscloud::DEFAULT_CONFIG_PATH));
     /// # Ok::<(), lfscloud::ServerError>(())
     /// ```
     ///
     /// # Errors
     ///
     /// Returns [`ServerError::DefaultConfigHomeUnavailable`] when no supported
-    /// home-directory environment variable is available.
+    /// per-user config-directory environment variable is available.
     pub fn default_path() -> ServerResult<std::path::PathBuf> {
         Self::default_path_with_env(|name| std::env::var_os(name), cfg!(windows))
     }
@@ -61,26 +62,33 @@ impl ServerConfig {
         mut env: impl FnMut(&str) -> Option<OsString>,
         windows: bool,
     ) -> ServerResult<std::path::PathBuf> {
-        let home_directory = env("HOME")
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                windows
-                    .then(|| env("USERPROFILE"))
-                    .flatten()
-                    .filter(|value| !value.is_empty())
-            })
-            .ok_or(ServerError::DefaultConfigHomeUnavailable {
-                environment_variables: if windows {
-                    "HOME or USERPROFILE"
-                } else {
-                    "HOME"
-                },
-            })?;
+        let config_root = if windows {
+            env("APPDATA")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    env("USERPROFILE")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .map(|profile| profile.join("AppData").join("Roaming"))
+                })
+                .ok_or(ServerError::DefaultConfigHomeUnavailable {
+                    environment_variables: "APPDATA or USERPROFILE",
+                })?
+        } else {
+            env("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+                .ok_or(ServerError::DefaultConfigHomeUnavailable {
+                    environment_variables: "HOME",
+                })?
+        };
 
-        Ok(Path::new(&home_directory).join(DEFAULT_CONFIG_PATH))
+        Ok(config_root.join(DEFAULT_CONFIG_PATH))
     }
 
-    /// Loads `lfscloud.yml` from the current user's home directory.
+    /// Loads the default private config from the current user's config directory.
     ///
     /// # Errors
     ///
@@ -881,19 +889,31 @@ storage_providers:
                 false,
             )
             .expect("HOME should resolve the default config path"),
-            std::path::Path::new("/home/alice/lfscloud.yml")
+            std::path::Path::new("/home/alice/.config/lfscloud/config.yml")
         );
     }
 
     #[test]
-    fn default_path_uses_user_profile_on_windows_when_home_is_unavailable() {
+    fn default_path_uses_appdata_on_windows() {
+        assert_eq!(
+            ServerConfig::default_path_with_env(
+                |name| { (name == "APPDATA").then(|| "C:/Users/Alice/AppData/Roaming".into()) },
+                true,
+            )
+            .expect("APPDATA should resolve the Windows default config path"),
+            std::path::Path::new("C:/Users/Alice/AppData/Roaming/lfscloud/config.yml")
+        );
+    }
+
+    #[test]
+    fn default_path_uses_user_profile_roaming_fallback_on_windows() {
         assert_eq!(
             ServerConfig::default_path_with_env(
                 |name| (name == "USERPROFILE").then(|| "C:/Users/Alice".into()),
                 true,
             )
             .expect("USERPROFILE should resolve the Windows default config path"),
-            std::path::Path::new("C:/Users/Alice/lfscloud.yml")
+            std::path::Path::new("C:/Users/Alice/AppData/Roaming/lfscloud/config.yml")
         );
     }
 
@@ -906,6 +926,19 @@ storage_providers:
             error,
             ServerError::DefaultConfigHomeUnavailable {
                 environment_variables: "HOME"
+            }
+        ));
+    }
+
+    #[test]
+    fn default_path_reports_unavailable_windows_config_directories() {
+        let error = ServerConfig::default_path_with_env(|_| None, true)
+            .expect_err("missing Windows config roots must not use the current directory");
+
+        assert!(matches!(
+            error,
+            ServerError::DefaultConfigHomeUnavailable {
+                environment_variables: "APPDATA or USERPROFILE"
             }
         ));
     }

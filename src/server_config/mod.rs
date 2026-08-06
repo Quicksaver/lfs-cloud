@@ -1,4 +1,4 @@
-//! Typed loading and validation for private `lfscloud.yml` server config.
+//! Typed loading and validation for private YAML server config.
 //!
 //! The config file is server-owned state. Repository `.lfsconfig` files only
 //! point Git LFS clients at an LFS Cloud route; this module decides which
@@ -21,8 +21,8 @@ pub use repository::RepositoryMapping;
 pub(crate) use resolution::{resolve_config_directory, resolve_optional};
 pub use settings::{ServerSessionEncryptionSecret, ServerSettings};
 
-/// Default server config filename appended to the user's home directory.
-pub const DEFAULT_CONFIG_PATH: &str = "lfscloud.yml";
+/// Default server config path relative to the platform's per-user config root.
+pub const DEFAULT_CONFIG_PATH: &str = "lfscloud/config.yml";
 /// Default metadata state directory relative to the config file.
 pub const DEFAULT_METADATA_DIR: &str = ".lfscloud";
 /// Default SQLite metadata database filename.

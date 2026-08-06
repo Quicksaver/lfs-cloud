@@ -62,24 +62,51 @@ working_dir="$tmp_dir/working-directory"
 home_dir="$tmp_dir/home-directory"
 mkdir -p "$working_dir" "$home_dir"
 write_config "$working_dir/lfscloud.yml" "working-directory-provider"
-write_config "$home_dir/lfscloud.yml" "home-directory-provider"
 
-home_output="$tmp_dir/home-output"
-(
-  export HOME="$(process_path "$home_dir")"
-  cd "$working_dir"
-  "$lfscloud_bin" config repository list
-) >"$home_output" 2>&1
+default_output="$tmp_dir/default-output"
+if $is_windows; then
+  appdata_dir="$tmp_dir/appdata-directory"
+  profile_dir="$tmp_dir/user-profile-directory"
+  mkdir -p "$appdata_dir/lfscloud" "$profile_dir"
+  write_config "$appdata_dir/lfscloud/config.yml" "appdata-provider"
+  write_config "$profile_dir/lfscloud.yml" "legacy-user-profile-provider"
+  (
+    export APPDATA="$(process_path "$appdata_dir")"
+    export USERPROFILE="$(process_path "$profile_dir")"
+    cd "$working_dir"
+    "$lfscloud_bin" config repository list
+  ) >"$default_output" 2>&1
 
-grep -F "home-directory-provider" "$home_output" >/dev/null
-if grep -F "working-directory-provider" "$home_output" >/dev/null; then
-  echo "default config lookup used the working directory instead of HOME" >&2
+  grep -F "appdata-provider" "$default_output" >/dev/null
+  if grep -F "legacy-user-profile-provider" "$default_output" >/dev/null; then
+    echo "Windows default config lookup used the legacy USERPROFILE file instead of APPDATA" >&2
+    exit 1
+  fi
+else
+  mkdir -p "$home_dir/.config/lfscloud"
+  write_config "$home_dir/.config/lfscloud/config.yml" "home-config-provider"
+  write_config "$home_dir/lfscloud.yml" "legacy-home-provider"
+  (
+    export HOME="$(process_path "$home_dir")"
+    cd "$working_dir"
+    "$lfscloud_bin" config repository list
+  ) >"$default_output" 2>&1
+
+  grep -F "home-config-provider" "$default_output" >/dev/null
+  if grep -F "legacy-home-provider" "$default_output" >/dev/null; then
+    echo "default config lookup used the legacy HOME file instead of HOME/.config" >&2
+    exit 1
+  fi
+fi
+
+if grep -F "working-directory-provider" "$default_output" >/dev/null; then
+  echo "default config lookup used the working directory" >&2
   exit 1
 fi
 
 missing_home_output="$tmp_dir/missing-home-output"
 if (
-  unset HOME USERPROFILE
+  unset APPDATA HOME USERPROFILE
   cd "$working_dir"
   "$lfscloud_bin" config repository list
 ) >"$missing_home_output" 2>&1; then
@@ -89,12 +116,12 @@ fi
 grep -F "cannot resolve the default server config path" "$missing_home_output" >/dev/null
 
 if $is_windows; then
-  profile_dir="$tmp_dir/user-profile-directory"
-  mkdir -p "$profile_dir"
-  write_config "$profile_dir/lfscloud.yml" "user-profile-provider"
+  profile_dir="$tmp_dir/fallback-user-profile-directory"
+  mkdir -p "$profile_dir/AppData/Roaming/lfscloud"
+  write_config "$profile_dir/AppData/Roaming/lfscloud/config.yml" "user-profile-provider"
   profile_output="$tmp_dir/user-profile-output"
   (
-    unset HOME
+    unset APPDATA HOME
     export USERPROFILE="$(process_path "$profile_dir")"
     cd "$working_dir"
     "$lfscloud_bin" config repository list
@@ -102,7 +129,7 @@ if $is_windows; then
 
   grep -F "user-profile-provider" "$profile_output" >/dev/null
   if grep -F "working-directory-provider" "$profile_output" >/dev/null; then
-    echo "Windows default config lookup used the working directory instead of USERPROFILE" >&2
+    echo "Windows default config lookup used the working directory instead of USERPROFILE/AppData/Roaming" >&2
     exit 1
   fi
 fi

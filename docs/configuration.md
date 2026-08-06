@@ -1,8 +1,8 @@
 # Server Configuration
 
-`lfscloud.yml` is private server-owned configuration. Do not commit it to the Git repositories being served: it contains repository-to-storage routing, credential references, Drive folder IDs, and metadata database paths.
+`config.yml` is private server-owned configuration. Do not commit it to the Git repositories being served: it contains repository-to-storage routing, credential references, Drive folder IDs, and metadata database paths.
 
-The default path is `${HOME}/lfscloud.yml`. On Windows, LFS Cloud falls back to `%USERPROFILE%\lfscloud.yml` when `HOME` is not set. Pass `--config PATH` to every command that reads the private server configuration when a different location is required.
+The default path is `${HOME}/.config/lfscloud/config.yml`. On Windows, the default is `%APPDATA%\lfscloud\config.yml`, with `%USERPROFILE%\AppData\Roaming\lfscloud\config.yml` as a fallback when `APPDATA` is unavailable. Pass `--config PATH` to every command that reads the private server configuration when a different location is required.
 
 The committed repository-side `.lfsconfig` should contain only the LFS Cloud endpoint for that repository, for example:
 
@@ -13,7 +13,7 @@ The committed repository-side `.lfsconfig` should contain only the LFS Cloud end
 
 ## Manage Configuration From The CLI
 
-Create an empty `lfscloud.yml` before using the configuration commands. The `server` section is optional and should be omitted unless a server default is being overridden. The commands manage the three provider and routing sections:
+Create the parent directory and an empty `config.yml` before using the configuration commands. The `server` section is optional and should be omitted unless a server default is being overridden. The commands manage the three provider and routing sections:
 
 ```text
 lfscloud config repository  -> repository_providers

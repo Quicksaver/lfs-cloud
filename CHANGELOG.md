@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- [changed]: Store the default private server configuration under the platform's per-user config directory instead of directly in the home directory.
+
 ## [0.2.3] - 2026-08-06
 
 - [added]: Add arrow-key configuration menus for provider and repository setup.
