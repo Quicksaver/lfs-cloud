@@ -15,6 +15,10 @@ pub(super) struct Cli {
     #[arg(long, global = true, value_name = "FILTER")]
     pub(super) log_level: Option<String>,
 
+    /// Use concise error reports without detailed cause values or automatic backtraces.
+    #[arg(long, global = true)]
+    pub(super) quiet: bool,
+
     #[command(subcommand)]
     pub(super) command: Command,
 }
@@ -557,6 +561,21 @@ mod tests {
         RepositoryMapping, SanitizedMessage, ServeOptions, ServerConfig, StorageDeleteOutcome,
         StorageError, StorageProvider, StorageProviderConfig, StorageResult, StoredObject,
     };
+
+    #[test]
+    fn quiet_is_a_global_error_reporting_option() {
+        for args in [
+            ["lfscloud", "--quiet", "status"],
+            ["lfscloud", "status", "--quiet"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("global --quiet should parse");
+            assert!(cli.quiet);
+        }
+
+        let cli = Cli::try_parse_from(["lfscloud", "status"])
+            .expect("status should parse without --quiet");
+        assert!(!cli.quiet);
+    }
 
     #[test]
     fn root_command_exposes_shared_global_flags() {
