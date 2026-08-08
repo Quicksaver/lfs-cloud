@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-08-08
+
 - [changed]: Create a missing private server configuration automatically whenever a command needs it.
 - [changed]: Create missing parent directories for private server configuration automatically.
 
