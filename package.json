@@ -7,6 +7,10 @@
   "private": true,
   "packageManager": "yarn@4.14.1",
   "scripts": {
+    "build:linux-arm64": "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc CC_aarch64_unknown_linux_musl=musl-gcc cargo build --release --target aarch64-unknown-linux-musl",
+    "build:linux-x86-64": "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target x86_64-unknown-linux-musl",
+    "build:macos": "cargo build --release --target aarch64-apple-darwin",
+    "build:windows": "cargo build --release --target x86_64-pc-windows-msvc",
     "lint:check": "yarn lint:prettier",
     "lint:fix": "yarn lint:prettier --write",
     "lint:prettier": "prettier --log-level=warn --check .",
