@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- [tooling]: Add package scripts for building local release binaries for every supported target.
+- [fixed]: Expand a leading `~` in Google Drive gcloud configuration directories instead of nesting them below the server configuration directory.
+
 ## [0.2.6] - 2026-08-08
 
 - [changed]: Create or reuse an app-owned `.lfscloud` Google Drive folder during default storage setup.

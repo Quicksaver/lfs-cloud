@@ -107,7 +107,7 @@ lfscloud config storage add
 lfscloud repository add
 ```
 
-The menus use Up/Down and Enter. Press Enter at the suggested `github`, `google_drive`, `github.com`, and Drive `.lfscloud` defaults. Storage setup accepts `~/...` for the downloaded Desktop OAuth client JSON, performs the `gcloud` authorization, creates or reuses the app-owned `.lfscloud` folder, and stores its actual Drive folder ID. Interactive repository setup requires GitHub CLI (`gh`) to be installed and authenticated so it can obtain GitHub's immutable numeric repository ID.
+The menus use Up/Down and Enter. Press Enter at the suggested `github`, `google_drive`, `github.com`, and Drive `.lfscloud` defaults. Storage setup accepts `~/...` for both the downloaded Desktop OAuth client JSON and the isolated gcloud directory, performs the `gcloud` authorization, creates or reuses the app-owned `.lfscloud` folder, and stores its actual Drive folder ID. Interactive repository setup requires GitHub CLI (`gh`) to be installed and authenticated so it can obtain GitHub's immutable numeric repository ID.
 
 The resulting configuration has this shape; no `server` section is needed unless overriding a server setting such as `port`:
 

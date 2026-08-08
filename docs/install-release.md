@@ -123,12 +123,23 @@ cargo run -- serve --config ./lfscloud.yml
 
 ## Release Build
 
-Build the optimized binary:
+Build the optimized binary for the current supported environment from its native host:
 
 ```bash
-cargo build --release
-./target/release/lfscloud --help
+yarn build:macos
+yarn build:linux-arm64
+yarn build:linux-x86-64
 ```
+
+On Windows PowerShell:
+
+```powershell
+yarn build:windows
+```
+
+The commands target `aarch64-apple-darwin`, `aarch64-unknown-linux-musl`, `x86_64-unknown-linux-musl`, and `x86_64-pc-windows-msvc`, respectively. Linux builds require `musl-gcc`; every build also requires its Rust target to be installed. Binaries are written below `target/<rust-target>/release/` as `lfscloud` or `lfscloud.exe`.
+
+These commands only build local binaries. Use the corresponding `yarn verify:*` command when tests, smoke coverage, packaged archives, manifests, checksums, and commit statuses are required.
 
 For a local PATH install from this checkout:
 

@@ -617,7 +617,12 @@ async function configurationCommandsSmoke(): Promise<void> {
     await chmod(fakeGh, 0o700);
   }
   const clientSecret = join(sandbox, 'interactive-client-secret.json');
-  const interactiveGcloud = join(sandbox, 'interactive-gcloud');
+  const interactiveHome = join(sandbox, 'interactive-home');
+  const interactiveGcloudInput =
+    process.platform === 'win32' ? '~\\.config\\lfscloud\\interactive-gcloud' : '~/.config/lfscloud/interactive-gcloud';
+  const interactiveGcloud = join(interactiveHome, '.config', 'lfscloud', 'interactive-gcloud');
+  const interactiveHomeEnvironment =
+    process.platform === 'win32' ? { USERPROFILE: interactiveHome } : { HOME: interactiveHome };
   await writeFile(clientSecret, '{}\n');
   await command(binaryPath, ['--config', interactivePath, 'config', 'repository', 'add'], {
     input: '\ngithub-interactive\n\n',
@@ -628,11 +633,17 @@ async function configurationCommandsSmoke(): Promise<void> {
     'interactive provider add wrote a server-owned GitHub PAT',
   );
   await command(binaryPath, ['--config', interactivePath, 'config', 'storage', 'add'], {
-    input: `\ndrive-interactive\n${clientSecret}\n${interactiveGcloud}\n${fakeGcloud}\nsmoke-root\nInteractive Drive\n`,
+    input: `\ndrive-interactive\n${clientSecret}\n${interactiveGcloudInput}\n${fakeGcloud}\nsmoke-root\nInteractive Drive\n`,
+    env: interactiveHomeEnvironment,
   });
   assert(
     await pathExists(join(interactiveGcloud, 'application_default_credentials.json')),
     'interactive storage add did not create isolated ADC state',
+  );
+  const interactiveStorageYaml = await readFile(interactivePath, 'utf8');
+  assert(
+    interactiveStorageYaml.includes(interactiveGcloudInput),
+    'interactive storage add did not preserve the portable tilde path',
   );
   await command(binaryPath, ['--config', interactivePath, 'repository', 'add'], {
     input: '\n\nowner\nrepo\n\n',

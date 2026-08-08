@@ -31,7 +31,7 @@ lfscloud repository add
 
 Press Up/Down and Enter to select a menu item. Press Enter at text prompts to accept a displayed default or retain the displayed existing value. Repository and storage provider IDs default to `github` and `google_drive` while those IDs are available. If a default ID already exists, enter another ID explicitly.
 
-Interactive Google Drive setup asks for a Desktop OAuth client JSON, expands a leading `~/` against the current user's home, creates `${HOME}/.config/lfscloud/gcloud-drive` (`${USERPROFILE}` on Windows), runs the isolated `gcloud auth application-default login` flow with the required scopes, and applies private modes where the platform exposes Unix permissions. The default creates or reuses the app-owned `.lfscloud` folder under My Drive and persists its actual folder ID.
+Interactive Google Drive setup asks for a Desktop OAuth client JSON, expands a leading `~/` in both that file path and the isolated gcloud directory against the current user's home, creates `${HOME}/.config/lfscloud/gcloud-drive` (`${USERPROFILE}` on Windows), runs the isolated `gcloud auth application-default login` flow with the required scopes, and applies private modes where the platform exposes Unix permissions. The default creates or reuses the app-owned `.lfscloud` folder under My Drive and persists its actual folder ID.
 
 Interactive repository setup lists the configured repository and storage providers, requires the owner and repository name, defaults the host from the selected GitHub provider, derives the mapping ID as `<repository-provider>:<owner>/<name>`, and obtains GitHub's immutable numeric repository ID through authenticated GitHub CLI (`gh`). Set `LFS_CLOUD_GH_EXECUTABLE` to an explicit executable path when `gh` is installed behind a wrapper or outside the normal executable search path. Interactive setup can update an existing mapping with the derived ID; use flags to update a mapping that has a custom ID.
 
@@ -71,7 +71,7 @@ lfscloud config storage add \
   --client-secret-file "~/.config/lfscloud/client_secret.json"
 ```
 
-A leading `~/` in `--client-secret-file` is expanded by LFS Cloud, including when the path is entered at the interactive prompt or quoted in the shell.
+A leading `~/` in `--client-secret-file` is expanded when entered interactively or quoted in the shell. The same expansion applies to gcloud `config_dir` values entered interactively, supplied with `--config-dir`, or loaded from YAML.
 
 Single-quote environment references so the shell does not expand them before they are written.
 

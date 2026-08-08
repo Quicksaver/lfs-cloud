@@ -164,6 +164,7 @@ pub(super) struct StorageProviderAddCommand {
     pub(super) credentials_type: Option<StorageCredentialKind>,
 
     /// Isolated gcloud configuration directory containing ADC.
+    /// A leading `~/` resolves against the current user's home directory.
     #[arg(long, value_name = "PATH")]
     pub(super) config_dir: Option<PathBuf>,
 
