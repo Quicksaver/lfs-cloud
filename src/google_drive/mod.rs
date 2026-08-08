@@ -71,9 +71,12 @@ const GOOGLE_DRIVE_REPO_NAMESPACE_FORMAT_PROPERTY: &str = "lfsCloudRepoNamespace
 const GOOGLE_DRIVE_REPO_NAMESPACE_SHA256_FORMAT: &str = "sha256";
 const GOOGLE_DRIVE_OBJECT_OID_PROPERTY: &str = "lfsCloudOid";
 const GOOGLE_DRIVE_OBJECT_SIZE_PROPERTY: &str = "lfsCloudSize";
-const GOOGLE_DRIVE_SHARD_KIND_PROPERTY: &str = "lfsCloudFolderKind";
+const GOOGLE_DRIVE_FOLDER_KIND_PROPERTY: &str = "lfsCloudFolderKind";
+const GOOGLE_DRIVE_SHARD_KIND_PROPERTY: &str = GOOGLE_DRIVE_FOLDER_KIND_PROPERTY;
 const GOOGLE_DRIVE_SHARD_KIND: &str = "objectShard";
 const GOOGLE_DRIVE_SHARD_PREFIX_PROPERTY: &str = "lfsCloudShard";
+const GOOGLE_DRIVE_STORAGE_ROOT_KIND: &str = "storageRoot";
+const GOOGLE_DRIVE_ROOT_PARENT_ID: &str = "root";
 
 static DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_OBJECT_METADATA_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -85,6 +88,9 @@ pub const GOOGLE_DRIVE_API_BASE_URL: &str = "https://www.googleapis.com";
 
 /// MVP Google Drive OAuth scope for app-accessible LFS object storage.
 pub const GOOGLE_DRIVE_FILE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
+
+/// Default Google Drive folder created for LFS Cloud object storage.
+pub const GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME: &str = ".lfscloud";
 
 include!("access_token.rs");
 include!("root.rs");

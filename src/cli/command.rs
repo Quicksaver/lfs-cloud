@@ -168,6 +168,7 @@ pub(super) struct StorageProviderAddCommand {
     pub(super) config_dir: Option<PathBuf>,
 
     /// Desktop OAuth client JSON used to authorize isolated Google Drive ADC.
+    /// A leading `~/` resolves against the current user's home directory.
     #[arg(long, value_name = "PATH")]
     pub(super) client_secret_file: Option<PathBuf>,
 
@@ -175,7 +176,7 @@ pub(super) struct StorageProviderAddCommand {
     #[arg(long, value_name = "PATH")]
     pub(super) executable: Option<PathBuf>,
 
-    /// Google Drive root folder ID.
+    /// Google Drive root folder ID. Omit it with a client secret to use `.lfscloud`.
     #[arg(long)]
     pub(super) root_folder_id: Option<String>,
 

@@ -1,20 +1,24 @@
 //! Editing and listing the server's provider and repository configuration.
 
 use super::*;
-use crate::GOOGLE_DRIVE_FILE_SCOPE;
+use crate::{
+    GOOGLE_DRIVE_FILE_SCOPE, GoogleDriveGcloudCredentialsConfig, GoogleDriveGcloudTokenProvider,
+    GoogleDriveStorageConfig, ServerError,
+    google_drive::{GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME, GoogleDriveRootProvisioner},
+};
 
 const MAX_CONFIG_PROMPT_INPUT_BYTES: usize = 16 * 1024;
 const MAX_GITHUB_REPOSITORY_LOOKUP_OUTPUT_BYTES: usize = 8 * 1024;
 const GITHUB_REPOSITORY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_CLI_EXECUTABLE_ENV: &str = "LFS_CLOUD_GH_EXECUTABLE";
 const DEFAULT_GOOGLE_DRIVE_PROVIDER_ID: &str = "google_drive";
-const DEFAULT_GOOGLE_DRIVE_ROOT_FOLDER_ID: &str = "root";
 const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 #[derive(Debug)]
 struct PreparedStorageProvider {
     values: StorageProviderValues,
     client_secret_file: Option<PathBuf>,
+    provision_default_root_folder: bool,
 }
 
 struct ConfigurationOperations<M, A, G> {
@@ -71,7 +75,7 @@ where
     R: BufRead,
     W: Write,
     M: FnMut(&mut R, &mut W, &str, &[String], usize) -> CliResult<usize>,
-    A: FnMut(&PreparedStorageProvider, &Path) -> CliResult<()>,
+    A: FnMut(&PreparedStorageProvider, &Path) -> CliResult<Option<String>>,
     G: FnMut(&str, &str, &str) -> CliResult<String>,
 {
     let config_path = match config_path {
@@ -119,14 +123,18 @@ where
             resource: ConfigResourceCommand::Storage(ConfigStorageCommand { action }),
         }) => match action {
             ConfigStorageAction::Add(command) => {
-                let prepared = if command.is_interactive() {
+                let mut prepared = if command.is_interactive() {
                     prompt_storage_provider(&config, input, output, &mut operations.select)?
                 } else {
                     command.into_prepared(&config)?
                 };
                 if prepared.client_secret_file.is_some() {
                     let authorization = prepared.with_effective_values(&config)?;
-                    (operations.authorize_drive)(&authorization, config.path())?;
+                    if let Some(root_folder_id) =
+                        (operations.authorize_drive)(&authorization, config.path())?
+                    {
+                        prepared.values.root_folder_id = Some(root_folder_id);
+                    }
                 } else {
                     validate_changed_gcloud_config_directory(&config, &prepared)?;
                 }
@@ -244,6 +252,8 @@ impl StorageProviderAddCommand {
         };
         let applies_google_drive_defaults =
             has_client_secret && config.storage_provider(&id)?.is_none();
+        let provision_default_root_folder =
+            applies_google_drive_defaults && self.root_folder_id.is_none();
         let provider_type = self.provider_type.map(|kind| match kind {
             StorageProviderKind::GoogleDrive => "google_drive".to_owned(),
         });
@@ -262,12 +272,13 @@ impl StorageProviderAddCommand {
                 }),
                 executable: optional_path_string(self.executable, "--executable")?,
                 root_folder_id: self.root_folder_id.or_else(|| {
-                    applies_google_drive_defaults
-                        .then(|| DEFAULT_GOOGLE_DRIVE_ROOT_FOLDER_ID.to_owned())
+                    provision_default_root_folder
+                        .then(|| GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME.to_owned())
                 }),
                 display_name: self.display_name,
             },
             client_secret_file: self.client_secret_file,
+            provision_default_root_folder,
         })
     }
 }
@@ -296,6 +307,7 @@ impl PreparedStorageProvider {
                 display_name: self.values.display_name.clone().or(existing.display_name),
             },
             client_secret_file: self.client_secret_file.clone(),
+            provision_default_root_folder: self.provision_default_root_folder,
         })
     }
 }
@@ -445,13 +457,15 @@ where
     let root_folder_id = prompt_value(
         input,
         output,
-        "Google Drive root folder ID",
+        "Google Drive root folder ID (or default folder name)",
         existing
             .root_folder_id
             .as_deref()
-            .or(Some(DEFAULT_GOOGLE_DRIVE_ROOT_FOLDER_ID)),
+            .or(Some(GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME)),
         true,
     )?;
+    let provision_default_root_folder = existing.provider_type.is_none()
+        && root_folder_id.as_deref() == Some(GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME);
     let display_name = prompt_value(
         input,
         output,
@@ -471,6 +485,7 @@ where
             display_name,
         },
         client_secret_file: client_secret_file.map(PathBuf::from),
+        provision_default_root_folder,
     })
 }
 
@@ -709,11 +724,13 @@ fn default_gcloud_config_reference() -> String {
 fn authorize_google_drive_adc(
     prepared: &PreparedStorageProvider,
     config_path: &Path,
-) -> CliResult<()> {
-    let client_secret_file = prepared
-        .client_secret_file
-        .as_deref()
-        .expect("authorization is called only with a client secret file");
+) -> CliResult<Option<String>> {
+    let client_secret_file = expand_tilde_path(
+        prepared
+            .client_secret_file
+            .as_deref()
+            .expect("authorization is called only with a client secret file"),
+    )?;
     if !client_secret_file.is_file() {
         return Err(CliError::InvalidArguments {
             message: format!(
@@ -748,7 +765,7 @@ fn authorize_google_drive_adc(
         .unwrap_or_else(|| default_gcloud_executable());
     let scopes = format!("{GOOGLE_CLOUD_PLATFORM_SCOPE},{GOOGLE_DRIVE_FILE_SCOPE}");
     let mut client_secret_argument = OsString::from("--client-id-file=");
-    client_secret_argument.push(client_secret_file);
+    client_secret_argument.push(&client_secret_file);
     let status = ProcessCommand::new(executable)
         .args(["auth", "application-default", "login"])
         .arg(client_secret_argument)
@@ -782,7 +799,98 @@ fn authorize_google_drive_adc(
             message: format!("gcloud completed without creating {}", adc_path.display()),
         });
     }
-    set_private_file_permissions(&adc_path)
+    set_private_file_permissions(&adc_path)?;
+    if prepared.provision_default_root_folder {
+        return provision_default_google_drive_root(prepared, &config_dir).map(Some);
+    }
+    Ok(None)
+}
+
+fn provision_default_google_drive_root(
+    prepared: &PreparedStorageProvider,
+    config_dir: &Path,
+) -> CliResult<String> {
+    let executable = prepared
+        .values
+        .executable
+        .as_deref()
+        .unwrap_or_else(|| default_gcloud_executable());
+    let storage = GoogleDriveStorageConfig {
+        id: prepared.values.id.clone(),
+        credentials: GoogleDriveGcloudCredentialsConfig {
+            config_dir: config_dir.to_path_buf(),
+            executable: PathBuf::from(executable),
+        },
+        root_folder_id: "root".to_owned(),
+        display_name: prepared.values.display_name.clone(),
+    };
+
+    let setup = std::thread::scope(|scope| {
+        scope
+            .spawn(move || -> CliResult<String> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|source| CliError::Io {
+                        context: "failed to initialize Google Drive setup runtime".to_owned(),
+                        source,
+                    })?;
+                runtime.block_on(async move {
+                    let token = GoogleDriveGcloudTokenProvider::new()
+                        .access_token(&storage.id, &storage.credentials)
+                        .await
+                        .map_err(ServerError::from)?;
+                    GoogleDriveRootProvisioner::new()
+                        .map_err(ServerError::from)?
+                        .ensure_default_root_folder(&storage, &token)
+                        .await
+                        .map_err(ServerError::from)
+                        .map_err(CliError::from)
+                })
+            })
+            .join()
+    });
+
+    match setup {
+        Ok(result) => result,
+        Err(_) => Err(CliError::InvalidArguments {
+            message: "Google Drive default root-folder setup stopped unexpectedly".to_owned(),
+        }),
+    }
+}
+
+fn expand_tilde_path(path: &Path) -> CliResult<PathBuf> {
+    #[cfg(windows)]
+    const HOME_ENVIRONMENT_VARIABLE: &str = "USERPROFILE";
+    #[cfg(not(windows))]
+    const HOME_ENVIRONMENT_VARIABLE: &str = "HOME";
+
+    expand_tilde_path_with_home(path, || std::env::var_os(HOME_ENVIRONMENT_VARIABLE)).map_err(
+        |error| match error {
+            CliError::InvalidArguments { .. } => CliError::InvalidArguments {
+                message: format!(
+                    "cannot expand ~ in --client-secret-file because {HOME_ENVIRONMENT_VARIABLE} is not set or is empty"
+                ),
+            },
+            other => other,
+        },
+    )
+}
+
+fn expand_tilde_path_with_home(
+    path: &Path,
+    mut home: impl FnMut() -> Option<OsString>,
+) -> CliResult<PathBuf> {
+    let Ok(suffix) = path.strip_prefix(Path::new("~")) else {
+        return Ok(path.to_path_buf());
+    };
+    let home =
+        home()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::InvalidArguments {
+                message: "cannot expand ~ because the current user home is unavailable".to_owned(),
+            })?;
+    Ok(PathBuf::from(home).join(suffix))
 }
 
 fn validate_changed_gcloud_config_directory(
@@ -1353,7 +1461,87 @@ mod tests {
             prepared.values.config_dir.as_deref(),
             Some(default_gcloud_config_reference().as_str())
         );
-        assert_eq!(prepared.values.root_folder_id.as_deref(), Some("root"));
+        assert_eq!(
+            prepared.values.root_folder_id.as_deref(),
+            Some(GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME)
+        );
+        assert!(prepared.provision_default_root_folder);
+    }
+
+    #[test]
+    fn client_secret_tilde_expands_to_the_current_user_home() {
+        let home = TempDir::new().expect("temporary home should be created");
+        let client_secret = home.path().join(".config/lfscloud/client_secret.json");
+        fs::create_dir_all(
+            client_secret
+                .parent()
+                .expect("client secret should have a parent"),
+        )
+        .expect("client secret directory should be created");
+        fs::write(&client_secret, "{}\n").expect("client secret should be written");
+        let expanded =
+            expand_tilde_path_with_home(Path::new("~/.config/lfscloud/client_secret.json"), || {
+                Some(home.path().as_os_str().to_owned())
+            })
+            .expect("tilde path should expand");
+
+        assert_eq!(expanded, client_secret);
+        assert!(expanded.is_file());
+        assert_eq!(
+            expand_tilde_path_with_home(Path::new("~alice/client_secret.json"), || None)
+                .expect("named-user tilde should remain a literal relative path"),
+            Path::new("~alice/client_secret.json")
+        );
+    }
+
+    #[test]
+    fn interactive_storage_default_persists_the_provisioned_lfscloud_folder_id() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(&config_path, "").expect("empty config should be written");
+        let path = config_path.to_str().expect("test path should be UTF-8");
+        let cli = Cli::try_parse_from(["lfscloud", "--config", path, "config", "storage", "add"])
+            .expect("configuration command should parse");
+        let super::Command::Config(command) = cli.command else {
+            panic!("config command should parse");
+        };
+        let mut input = io::Cursor::new(b"\n\n/client_secret.json\n\n\n\n\n");
+        let mut output = Vec::new();
+
+        run_configuration_with_input(
+            ConfigurationCommand::Config(command),
+            cli.config,
+            &mut input,
+            &mut output,
+            ConfigurationOperations {
+                select: prompt_select_index,
+                authorize_drive: |prepared: &PreparedStorageProvider, _path: &Path| {
+                    assert!(prepared.provision_default_root_folder);
+                    assert_eq!(
+                        prepared.values.root_folder_id.as_deref(),
+                        Some(GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME)
+                    );
+                    Ok(Some("provisioned-lfscloud-folder-id".to_owned()))
+                },
+                resolve_github_id: fixed_github_repository_id,
+            },
+        )
+        .expect("interactive storage setup should succeed");
+
+        let rendered = String::from_utf8(output).expect("prompt output should be UTF-8");
+        assert!(
+            rendered.contains("Google Drive root folder ID (or default folder name) [.lfscloud]")
+        );
+        assert_eq!(
+            EditableServerConfig::load(&config_path)
+                .expect("saved config should load")
+                .storage_provider(DEFAULT_GOOGLE_DRIVE_PROVIDER_ID)
+                .expect("storage provider should parse")
+                .expect("storage provider should exist")
+                .root_folder_id
+                .as_deref(),
+            Some("provisioned-lfscloud-folder-id")
+        );
     }
 
     #[test]
@@ -1572,6 +1760,7 @@ mod tests {
                     ..StorageProviderValues::default()
                 },
                 client_secret_file: Some(client_secret.clone()),
+                provision_default_root_folder: false,
             },
             &config_path,
         )
@@ -1624,6 +1813,7 @@ mod tests {
                     ..StorageProviderValues::default()
                 },
                 client_secret_file: Some(client_secret),
+                provision_default_root_folder: false,
             },
             &config_path,
         )
@@ -1858,6 +2048,7 @@ repositories:
                 ..StorageProviderValues::default()
             },
             client_secret_file: None,
+            provision_default_root_folder: false,
         };
 
         let error = validate_changed_gcloud_config_directory(&config, &prepared)
@@ -2055,10 +2246,12 @@ storage_providers:
     }
 
     fn noop_drive_authorization(
-        _prepared: &PreparedStorageProvider,
+        prepared: &PreparedStorageProvider,
         _config_path: &Path,
-    ) -> CliResult<()> {
-        Ok(())
+    ) -> CliResult<Option<String>> {
+        Ok(prepared
+            .provision_default_root_folder
+            .then(|| "default-root-folder-id".to_owned()))
     }
 
     fn fixed_github_repository_id(_host: &str, _owner: &str, _name: &str) -> CliResult<String> {

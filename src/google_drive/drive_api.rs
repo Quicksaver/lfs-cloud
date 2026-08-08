@@ -337,6 +337,32 @@ fn drive_file_create_url(api_base_url: Url) -> StorageResult<Url> {
     Ok(api_base_url)
 }
 
+fn drive_default_root_folder_lookup_url(
+    api_base_url: Url,
+    page_token: Option<&str>,
+) -> StorageResult<Url> {
+    let mut api_base_url = drive_files_url(api_base_url, &[])?;
+    api_base_url
+        .query_pairs_mut()
+        .append_pair(
+            "fields",
+            "files(id,name,mimeType,parents,trashed,appProperties),nextPageToken,incompleteSearch",
+        )
+        .append_pair("pageSize", "100")
+        .append_pair("spaces", "drive")
+        .append_pair("corpora", "user")
+        .append_pair("includeItemsFromAllDrives", "true")
+        .append_pair("supportsAllDrives", "true")
+        .append_pair("q", &drive_default_root_folder_lookup_query());
+    if let Some(page_token) = page_token {
+        api_base_url
+            .query_pairs_mut()
+            .append_pair("pageToken", page_token);
+    }
+
+    Ok(api_base_url)
+}
+
 fn drive_resumable_upload_url(api_base_url: Url) -> StorageResult<Url> {
     let mut api_base_url = drive_api_url(api_base_url, DriveApiEndpoint::ResumableUpload)?;
     api_base_url

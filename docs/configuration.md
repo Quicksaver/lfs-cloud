@@ -31,7 +31,7 @@ lfscloud repository add
 
 Press Up/Down and Enter to select a menu item. Press Enter at text prompts to accept a displayed default or retain the displayed existing value. Repository and storage provider IDs default to `github` and `google_drive` while those IDs are available. If a default ID already exists, enter another ID explicitly.
 
-Interactive Google Drive setup asks for a Desktop OAuth client JSON, creates `${HOME}/.config/lfscloud/gcloud-drive` (`${USERPROFILE}` on Windows), runs the isolated `gcloud auth application-default login` flow with the required scopes, and applies private modes where the platform exposes Unix permissions. Its root folder defaults to Drive's `root` alias.
+Interactive Google Drive setup asks for a Desktop OAuth client JSON, expands a leading `~/` against the current user's home, creates `${HOME}/.config/lfscloud/gcloud-drive` (`${USERPROFILE}` on Windows), runs the isolated `gcloud auth application-default login` flow with the required scopes, and applies private modes where the platform exposes Unix permissions. The default creates or reuses the app-owned `.lfscloud` folder under My Drive and persists its actual folder ID.
 
 Interactive repository setup lists the configured repository and storage providers, requires the owner and repository name, defaults the host from the selected GitHub provider, derives the mapping ID as `<repository-provider>:<owner>/<name>`, and obtains GitHub's immutable numeric repository ID through authenticated GitHub CLI (`gh`). Set `LFS_CLOUD_GH_EXECUTABLE` to an explicit executable path when `gh` is installed behind a wrapper or outside the normal executable search path. Interactive setup can update an existing mapping with the derived ID; use flags to update a mapping that has a custom ID.
 
@@ -51,7 +51,7 @@ lfscloud config storage add \
   --config-dir '${HOME}/.config/lfscloud/gcloud-drive' \
   --client-secret-file "$HOME/Downloads/client_secret.json" \
   --executable gcloud \
-  --root-folder-id root \
+  --root-folder-id DRIVE_FOLDER_ID \
   --display-name 'Personal Drive LFS'
 
 lfscloud repository add \
@@ -64,12 +64,14 @@ lfscloud repository add \
   --storage-provider google_drive
 ```
 
-The short Google Drive form is equivalent when all defaults are wanted:
+The short Google Drive form creates or reuses the default `.lfscloud` folder:
 
 ```bash
 lfscloud config storage add \
-  --client-secret-file "$HOME/Downloads/client_secret.json"
+  --client-secret-file "~/.config/lfscloud/client_secret.json"
 ```
+
+A leading `~/` in `--client-secret-file` is expanded by LFS Cloud, including when the path is entered at the interactive prompt or quoted in the shell.
 
 Single-quote environment references so the shell does not expand them before they are written.
 
@@ -137,7 +139,7 @@ storage_providers:
     credentials:
       type: gcloud
       config_dir: ${HOME}/.config/lfscloud/gcloud-drive
-    root_folder_id: root
+    root_folder_id: DRIVE_FOLDER_ID
     display_name: Personal Drive LFS
 
 repositories:
@@ -149,6 +151,8 @@ repositories:
     provider_repository_id: '123456789'
     storage_provider: drive-personal
 ```
+
+`DRIVE_FOLDER_ID` is the actual ID persisted after default setup creates or reuses the `.lfscloud` folder; the display name itself is not passed to the Drive API as an ID.
 
 With that mapping, the repository LFS URL is:
 
@@ -236,7 +240,7 @@ lfscloud config storage add \
   --client-secret-file "$HOME/Downloads/client_secret.json"
 ```
 
-With no flags, `lfscloud config storage add` prompts for the same client JSON and lets you accept the default provider ID, credential directory, executable, and `root` folder ID. LFS Cloud creates the directory, applies private permissions where the platform exposes Unix modes, launches the browser authorization, verifies that `application_default_credentials.json` was created, applies private file permissions, and only then writes the storage entry.
+With no flags, `lfscloud config storage add` prompts for the same client JSON and lets you accept the default provider ID, credential directory, executable, and `.lfscloud` folder name. LFS Cloud creates the directory, applies private permissions where the platform exposes Unix modes, launches the browser authorization, verifies that `application_default_credentials.json` was created, creates or reuses the app-owned Drive folder, and only then writes its actual folder ID to the storage entry.
 
 Keep `--client-secret-file` when reauthorizing expired or revoked ADC. Omitting it from an existing-provider update retains the current ADC without launching authorization. If `gcloud auth application-default login` is run manually without the project-specific client file, Google Cloud CLI can instead use its shared OAuth client, causing Drive requests to fail with quota-project or `SERVICE_DISABLED` errors even though token minting succeeds.
 
@@ -260,7 +264,7 @@ Google Cloud CLI requires `cloud-platform` when explicit ADC scopes are provided
 https://www.googleapis.com/auth/drive.file
 ```
 
-The configured `root_folder_id` must be a folder that the app credential can access and create children in. Google Drive accepts `root` as the alias for the user's My Drive root, so it is the interactive default; set an explicit folder ID to isolate LFS objects in a dedicated folder. Git users never receive Drive tokens or direct Drive access.
+The configured `root_folder_id` must be a folder that the app credential can access and create children in. Default setup isolates objects in the app-owned `.lfscloud` folder. Pass an explicit `--root-folder-id` to use another accessible folder; Google Drive also accepts `root` to use the whole My Drive root. Git users never receive Drive tokens or direct Drive access.
 
 `lfscloud serve` asks `gcloud` for an ADC access token for every configured Drive provider, then performs a non-mutating metadata probe that confirms the root is a live folder with child-write capability. These checks complete before the HTTP listener binds; a missing/invalid credential or unusable root prevents the server from reporting readiness.
 

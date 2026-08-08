@@ -14,6 +14,280 @@ pub struct GoogleDriveRootFolder {
     pub can_add_children: bool,
 }
 
+/// Creates or reuses the app-owned default Google Drive storage folder.
+#[derive(Clone)]
+pub(crate) struct GoogleDriveRootProvisioner {
+    client: Client,
+    api_base_url: Url,
+}
+
+impl GoogleDriveRootProvisioner {
+    /// Creates a provisioner using the default Drive metadata client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the HTTP client or Drive API base URL cannot
+    /// be initialized.
+    pub(crate) fn new() -> StorageResult<Self> {
+        Self::with_client_and_api_base_url(
+            default_google_drive_root_validation_http_client()?,
+            GOOGLE_DRIVE_API_BASE_URL,
+        )
+    }
+
+    /// Creates a provisioner with an explicit client and API base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the API base is not a safe Drive URL.
+    pub(crate) fn with_client_and_api_base_url(
+        client: Client,
+        api_base_url: impl AsRef<str>,
+    ) -> StorageResult<Self> {
+        Ok(Self {
+            client,
+            api_base_url: validate_drive_api_base_url(api_base_url.as_ref())?,
+        })
+    }
+
+    /// Returns the app-owned `.lfscloud` folder ID, creating it when absent.
+    ///
+    /// Matching uses a private app property as well as the folder name and
+    /// parent. This prevents setup from silently adopting an unrelated folder
+    /// that happens to have the same name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when Drive lookup or folder creation fails, or
+    /// when Drive returns malformed or conflicting folder metadata.
+    pub(crate) async fn ensure_default_root_folder(
+        &self,
+        storage: &GoogleDriveStorageConfig,
+        token: &GoogleDriveAccessToken,
+    ) -> StorageResult<String> {
+        let mut folder_ids = Vec::new();
+        let mut page_token = None;
+        let mut seen_page_tokens = BTreeSet::new();
+
+        loop {
+            let response = self
+                .client
+                .get(drive_default_root_folder_lookup_url(
+                    self.api_base_url.clone(),
+                    page_token.as_deref(),
+                )?)
+                .header(ACCEPT, "application/json")
+                .header(AUTHORIZATION, token.authorization_header_value(&storage.id)?)
+                .send()
+                .await
+                .map_err(|source| drive_transport_error(storage, token, source))?;
+            let status = response.status();
+            let response_body = read_google_response_body(response)
+                .await
+                .map_err(|source| drive_transport_error(storage, token, source))?;
+            if !status.is_success() {
+                return Err(parse_drive_root_provision_error(
+                    storage,
+                    token,
+                    status,
+                    &response_body,
+                ));
+            }
+            let page = parse_drive_default_root_folder_page(
+                storage,
+                status,
+                &response_body,
+            )?;
+            folder_ids.extend(page.folder_ids);
+            let Some(next_page_token) = page.next_page_token else {
+                break;
+            };
+            if !seen_page_tokens.insert(next_page_token.clone()) {
+                return Err(StorageError::Retryable {
+                    provider: storage.id.clone(),
+                    message: "Google Drive default root-folder lookup repeated a page token"
+                        .to_owned(),
+                });
+            }
+            page_token = Some(next_page_token);
+        }
+
+        folder_ids.sort_unstable();
+        folder_ids.dedup();
+        if let Some(folder_id) = folder_ids.into_iter().next() {
+            return Ok(folder_id);
+        }
+
+        let response = self
+            .client
+            .post(drive_file_create_url(self.api_base_url.clone())?)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, token.authorization_header_value(&storage.id)?)
+            .json(&drive_default_root_folder_metadata())
+            .send()
+            .await
+            .map_err(|source| drive_transport_error(storage, token, source))?;
+        let status = response.status();
+        let response_body = read_google_response_body(response)
+            .await
+            .map_err(|source| drive_transport_error(storage, token, source))?;
+        if !status.is_success() {
+            return Err(parse_drive_root_provision_error(
+                storage,
+                token,
+                status,
+                &response_body,
+            ));
+        }
+
+        let file = serde_json::from_str::<GoogleDriveObjectFile>(&response_body).map_err(|_| {
+            StorageError::Upstream {
+                provider: storage.id.clone(),
+                status: Some(status.as_u16()),
+                message: SanitizedMessage::new(
+                    "Google Drive default root-folder creation response was invalid JSON",
+                ),
+            }
+        })?;
+        verify_drive_default_root_folder(storage, status, file)
+    }
+}
+
+impl fmt::Debug for GoogleDriveRootProvisioner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoogleDriveRootProvisioner")
+            .field("client", &"<redacted>")
+            .field("api_base_url", &self.api_base_url)
+            .finish()
+    }
+}
+
+struct GoogleDriveDefaultRootFolderPage {
+    folder_ids: Vec<String>,
+    next_page_token: Option<String>,
+}
+
+fn parse_drive_default_root_folder_page(
+    storage: &GoogleDriveStorageConfig,
+    status: StatusCode,
+    body: &str,
+) -> StorageResult<GoogleDriveDefaultRootFolderPage> {
+    let page = serde_json::from_str::<GoogleDriveFileList>(body).map_err(|_| {
+        StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive default root-folder lookup response was invalid JSON",
+            ),
+        }
+    })?;
+    if page.incomplete_search {
+        return Err(StorageError::Retryable {
+            provider: storage.id.clone(),
+            message: "Google Drive default root-folder lookup returned incomplete results"
+                .to_owned(),
+        });
+    }
+    let folder_ids = page
+        .files
+        .into_iter()
+        .map(|file| verify_drive_default_root_folder(storage, status, file))
+        .collect::<StorageResult<Vec<_>>>()?;
+    let next_page_token = validated_drive_page_token(
+        storage,
+        status,
+        page.next_page_token,
+        "Google Drive default root-folder lookup",
+    )?;
+
+    Ok(GoogleDriveDefaultRootFolderPage {
+        folder_ids,
+        next_page_token,
+    })
+}
+
+fn verify_drive_default_root_folder(
+    storage: &GoogleDriveStorageConfig,
+    status: StatusCode,
+    file: GoogleDriveObjectFile,
+) -> StorageResult<String> {
+    let id = file
+        .id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive default root-folder response did not include id",
+            ),
+        })?;
+    let valid = file.name.as_deref() == Some(GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME)
+        && file.mime_type.as_deref() == Some(GOOGLE_DRIVE_FOLDER_MIME_TYPE)
+        && !file.trashed
+        && file
+            .parents
+            .iter()
+            .any(|parent| parent == GOOGLE_DRIVE_ROOT_PARENT_ID)
+        && file
+            .app_properties
+            .get(GOOGLE_DRIVE_FOLDER_KIND_PROPERTY)
+            .map(String::as_str)
+            == Some(GOOGLE_DRIVE_STORAGE_ROOT_KIND);
+    if !valid {
+        return Err(StorageError::Upstream {
+            provider: storage.id.clone(),
+            status: Some(status.as_u16()),
+            message: SanitizedMessage::new(
+                "Google Drive default root-folder response did not match its expected identity",
+            ),
+        });
+    }
+
+    Ok(id)
+}
+
+fn drive_default_root_folder_metadata() -> serde_json::Value {
+    serde_json::json!({
+        "name": GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME,
+        "mimeType": GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+        "parents": [GOOGLE_DRIVE_ROOT_PARENT_ID],
+        "appProperties": {
+            (GOOGLE_DRIVE_FOLDER_KIND_PROPERTY): GOOGLE_DRIVE_STORAGE_ROOT_KIND,
+        },
+    })
+}
+
+fn drive_default_root_folder_lookup_query() -> String {
+    format!(
+        "'{}' in parents and trashed = false and name = '{}' and mimeType = '{}' and appProperties has {{ key='{}' and value='{}' }}",
+        GOOGLE_DRIVE_ROOT_PARENT_ID,
+        escape_drive_query_string(GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME),
+        GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+        GOOGLE_DRIVE_FOLDER_KIND_PROPERTY,
+        GOOGLE_DRIVE_STORAGE_ROOT_KIND,
+    )
+}
+
+fn parse_drive_root_provision_error(
+    storage: &GoogleDriveStorageConfig,
+    token: &GoogleDriveAccessToken,
+    status: StatusCode,
+    body: &str,
+) -> StorageError {
+    let diagnostic = drive_error_message(token, body);
+    if let Some(error) = classify_common_drive_error(storage, status, &diagnostic) {
+        return error;
+    }
+
+    StorageError::Upstream {
+        provider: storage.id.clone(),
+        status: Some(status.as_u16()),
+        message: SanitizedMessage::new(diagnostic.message),
+    }
+}
+
 /// Validates that a configured Google Drive root folder is app-accessible.
 ///
 /// The validator performs a non-mutating `files.get` probe. It confirms that
@@ -237,6 +511,136 @@ fn parse_drive_root_error(
 #[cfg(test)]
 pub(super) mod root_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn root_provisioner_reuses_an_existing_lfscloud_folder() {
+        let queries = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new().route(
+            "/drive/v3/files",
+            get({
+                let queries = queries.clone();
+                move |uri: Uri| {
+                    let queries = queries.clone();
+                    async move {
+                        queries
+                            .lock()
+                            .expect("root-folder query lock should not poison")
+                            .push(uri.query().unwrap_or_default().to_owned());
+                        Json(serde_json::json!({
+                            "files": [{
+                                "id": "lfscloud-root-id",
+                                "name": GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME,
+                                "mimeType": GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+                                "parents": ["root"],
+                                "trashed": false,
+                                "appProperties": {
+                                    (GOOGLE_DRIVE_FOLDER_KIND_PROPERTY): GOOGLE_DRIVE_STORAGE_ROOT_KIND
+                                }
+                            }]
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("root-folder test server should bind");
+        let address = listener.local_addr().expect("server address should resolve");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("root-folder test server should run");
+        });
+        let provisioner = GoogleDriveRootProvisioner::with_client_and_api_base_url(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+        )
+        .expect("root provisioner should build");
+
+        let id = provisioner
+            .ensure_default_root_folder(&storage_config("google-drive-user-a"), &access_token())
+            .await
+            .expect("existing default folder should resolve");
+        task.abort();
+
+        assert_eq!(id, "lfscloud-root-id");
+        let query = form_pairs(
+            queries
+                .lock()
+                .expect("root-folder query lock should not poison")[0]
+                .as_str(),
+        );
+        assert!(query["q"].contains("name = '.lfscloud'"));
+        assert!(query["q"].contains("'root' in parents"));
+        assert!(query["q"].contains("value='storageRoot'"));
+    }
+
+    #[tokio::test]
+    async fn root_provisioner_creates_the_default_lfscloud_folder() {
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new().route(
+            "/drive/v3/files",
+            get(|| async { Json(serde_json::json!({ "files": [] })) }).post({
+                let bodies = bodies.clone();
+                move |body: Bytes| {
+                    let bodies = bodies.clone();
+                    async move {
+                        bodies
+                            .lock()
+                            .expect("root-folder body lock should not poison")
+                            .push(
+                                String::from_utf8(body.to_vec())
+                                    .expect("root-folder body should be UTF-8"),
+                            );
+                        Json(serde_json::json!({
+                            "id": "created-lfscloud-root-id",
+                            "name": GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME,
+                            "mimeType": GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+                            "parents": ["root"],
+                            "trashed": false,
+                            "appProperties": {
+                                (GOOGLE_DRIVE_FOLDER_KIND_PROPERTY): GOOGLE_DRIVE_STORAGE_ROOT_KIND
+                            }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("root-folder test server should bind");
+        let address = listener.local_addr().expect("server address should resolve");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("root-folder test server should run");
+        });
+        let provisioner = GoogleDriveRootProvisioner::with_client_and_api_base_url(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+        )
+        .expect("root provisioner should build");
+
+        let id = provisioner
+            .ensure_default_root_folder(&storage_config("google-drive-user-a"), &access_token())
+            .await
+            .expect("default folder should be created");
+        task.abort();
+
+        assert_eq!(id, "created-lfscloud-root-id");
+        let metadata: serde_json::Value = serde_json::from_str(
+            &bodies
+                .lock()
+                .expect("root-folder body lock should not poison")[0],
+        )
+        .expect("root-folder metadata should be valid JSON");
+        assert_eq!(metadata["name"], GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME);
+        assert_eq!(metadata["parents"], serde_json::json!(["root"]));
+        assert_eq!(
+            metadata["appProperties"][GOOGLE_DRIVE_FOLDER_KIND_PROPERTY],
+            GOOGLE_DRIVE_STORAGE_ROOT_KIND
+        );
+    }
 
     #[tokio::test]
     async fn root_validator_confirms_app_accessible_writable_folder() {

@@ -91,7 +91,7 @@ git lfs install
 
 ### 2. Prepare Google Drive Access
 
-Create a Google Cloud Desktop OAuth client, enable the Google Drive API, and download its client JSON. `lfscloud config storage add` uses that file to create an isolated Application Default Credentials directory, applies private permission modes on Unix platforms, and launches the correctly scoped `gcloud` authorization flow. See the [configuration guide](docs/configuration.md#google-drive-credentials) for the Google Cloud prerequisites and folder-access details.
+Create a Google Cloud Desktop OAuth client, enable the Google Drive API, and download its client JSON. `lfscloud config storage add` uses that file to create an isolated Application Default Credentials directory, applies private permission modes on Unix platforms, launches the correctly scoped `gcloud` authorization flow, and creates an app-owned `.lfscloud` folder in Drive by default. See the [configuration guide](docs/configuration.md#google-drive-credentials) for the Google Cloud prerequisites and folder-access details.
 
 ### 3. Configure The Private Server
 
@@ -107,7 +107,7 @@ lfscloud config storage add
 lfscloud repository add
 ```
 
-The menus use Up/Down and Enter. Press Enter at the suggested `github`, `google_drive`, `github.com`, and Drive `root` defaults. Storage setup asks for the downloaded Desktop OAuth client JSON and performs the `gcloud` authorization. Interactive repository setup requires GitHub CLI (`gh`) to be installed and authenticated so it can obtain GitHub's immutable numeric repository ID.
+The menus use Up/Down and Enter. Press Enter at the suggested `github`, `google_drive`, `github.com`, and Drive `.lfscloud` defaults. Storage setup accepts `~/...` for the downloaded Desktop OAuth client JSON, performs the `gcloud` authorization, creates or reuses the app-owned `.lfscloud` folder, and stores its actual Drive folder ID. Interactive repository setup requires GitHub CLI (`gh`) to be installed and authenticated so it can obtain GitHub's immutable numeric repository ID.
 
 The resulting configuration has this shape; no `server` section is needed unless overriding a server setting such as `port`:
 
@@ -122,7 +122,7 @@ storage_providers:
     credentials:
       type: gcloud
       config_dir: ${HOME}/.config/lfscloud/gcloud-drive
-    root_folder_id: root
+    root_folder_id: DRIVE_FOLDER_ID
 
 repositories:
   - id: github:OWNER/REPOSITORY
@@ -133,6 +133,8 @@ repositories:
     provider_repository_id: '123456789'
     storage_provider: google_drive
 ```
+
+`DRIVE_FOLDER_ID` is the actual ID of the `.lfscloud` folder created or reused by default setup, not the folder's display name.
 
 On Windows, generated configuration uses `${USERPROFILE}` instead of `${HOME}` for the Google Drive credential directory.
 

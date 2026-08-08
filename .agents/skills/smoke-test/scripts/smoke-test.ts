@@ -628,7 +628,7 @@ async function configurationCommandsSmoke(): Promise<void> {
     'interactive provider add wrote a server-owned GitHub PAT',
   );
   await command(binaryPath, ['--config', interactivePath, 'config', 'storage', 'add'], {
-    input: `\ndrive-interactive\n${clientSecret}\n${interactiveGcloud}\n${fakeGcloud}\n\nInteractive Drive\n`,
+    input: `\ndrive-interactive\n${clientSecret}\n${interactiveGcloud}\n${fakeGcloud}\nsmoke-root\nInteractive Drive\n`,
   });
   assert(
     await pathExists(join(interactiveGcloud, 'application_default_credentials.json')),
