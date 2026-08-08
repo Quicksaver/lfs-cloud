@@ -454,9 +454,10 @@ pub(crate) fn validated_migration_source_endpoint(
     }
     if !allow_insecure_http && !crate::http_transport::uses_protected_http_transport(&parsed) {
         return Err(MigrationError::InvalidInput {
-            message: SanitizedMessage::new(
-                "legacy LFS endpoint must use HTTPS unless it targets an exact loopback IP",
-            ),
+            message: SanitizedMessage::new(format!(
+                "legacy LFS endpoint {} must use HTTPS unless it targets an exact loopback IP",
+                crate::git::redacted_url_for_display(source_endpoint),
+            )),
         });
     }
     Ok(parsed.to_string().trim_end_matches('/').to_owned())
@@ -951,6 +952,18 @@ mod fetch_tests {
 
         assert!(matches!(error, MigrationError::InvalidInput { .. }));
         assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn legacy_source_transport_error_identifies_the_safe_endpoint() {
+        let endpoint =
+            "http://100.77.233.92:15370/github.com/owner/repo.git/info/lfs";
+
+        let error = validated_migration_source_endpoint(endpoint, false)
+            .expect_err("non-loopback plaintext HTTP should be rejected");
+
+        assert!(error.to_string().contains(endpoint));
+        assert!(error.to_string().contains("must use HTTPS"));
     }
 
     #[test]

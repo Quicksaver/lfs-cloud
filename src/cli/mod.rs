@@ -38,7 +38,7 @@ use crate::config_edit::{
     StorageProviderValues,
 };
 use crate::git_output::{GitPathOutputError, parse_lfs_filter_attribute_paths};
-use crate::migration::discover_git_lfs_migration_from_remote_excluding_endpoint;
+use crate::migration::discover_git_lfs_migration_from_remote_excluding_endpoints;
 use crate::{
     CliError, CliResult, SanitizedMessage,
     git::redacted_url_for_display,

@@ -101,10 +101,11 @@ where
         command.server.as_deref(),
         command.allow_insecure_http,
     )?;
-    let discovery = discover_git_lfs_migration_from_remote_excluding_endpoint(
+    let target_endpoints = migration_target_endpoints(&repository, &route)?;
+    let discovery = discover_git_lfs_migration_from_remote_excluding_endpoints(
         start_dir,
         &command.source_remote,
-        Some(&route.lfs_url),
+        &target_endpoints,
     )?;
     let scan = migration_pointer_scan(start_dir, &command, &command.source_remote)?;
     let cache_layout = Some(local_cache_layout(command.cache_root.clone())?);
@@ -273,10 +274,11 @@ fn prepare_migration_execution(
         command.server.as_deref(),
         command.allow_insecure_http,
     )?;
-    let discovery = discover_git_lfs_migration_from_remote_excluding_endpoint(
+    let target_endpoints = migration_target_endpoints(&repository, &route)?;
+    let discovery = discover_git_lfs_migration_from_remote_excluding_endpoints(
         start_dir,
         &command.source_remote,
-        Some(&route.lfs_url),
+        &target_endpoints,
     )?;
     if !discovery.installation.installed {
         return Err(CliError::InvalidArguments {
@@ -293,6 +295,33 @@ fn prepare_migration_execution(
         purge_source_lfs: command.purge_source_lfs,
         allow_insecure_http: command.allow_insecure_http,
     })
+}
+
+fn migration_target_endpoints(
+    repository: &GitRepository,
+    route: &LfsInitRoute,
+) -> CliResult<Vec<String>> {
+    let mut endpoints = vec![route.lfs_url.clone()];
+    let Some(configured_url) = repository.configured_lfs_url()? else {
+        return Ok(endpoints);
+    };
+
+    // An explicit server may be another address for the same LFS Cloud process
+    // (for example, loopback instead of its Tailscale IP). Recognize the
+    // repository-shaped configured route as a target alias so it cannot become
+    // the legacy source merely because its origin differs from `--server`.
+    if LfsInitRoute::resolve_from_lfs_url_with_insecure_http(
+        &configured_url,
+        &repository.remote,
+        true,
+    )
+    .is_ok()
+        && !endpoints.contains(&configured_url)
+    {
+        endpoints.push(configured_url);
+    }
+
+    Ok(endpoints)
 }
 
 async fn execute_migration_through_server(
@@ -1571,6 +1600,42 @@ mod tests {
         assert_eq!(format_migration_bytes(2_000_000), "2 MB");
         assert_eq!(format_migration_bytes(3_250_000_000), "3.25 GB");
         assert_eq!(format_migration_bytes(4_000_000_000_000), "4 TB");
+    }
+
+    #[test]
+    fn explicit_server_alias_does_not_turn_the_configured_target_into_the_legacy_source() {
+        require_git();
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        init_git_repo_with_origin(&repo);
+        write_file(
+            &repo.join(".lfsconfig"),
+            concat!(
+                "[lfs]\n",
+                "    url = http://100.77.233.92:15370/github.com/owner/repo.git/info/lfs\n",
+            )
+            .as_bytes(),
+        );
+        let repository = GitRepository::discover(&repo).expect("repository should be discovered");
+        let route = LfsInitRoute::resolve("http://127.0.0.1:15370", &repository.remote)
+            .expect("loopback target route should resolve");
+
+        let excluded_endpoints = migration_target_endpoints(&repository, &route)
+            .expect("target endpoint aliases should resolve");
+        let discovery =
+            crate::migration::discover_git_lfs_migration_from_remote_excluding_endpoints(
+                &repo,
+                "origin",
+                &excluded_endpoints,
+            )
+            .expect("migration discovery should succeed");
+        let source = discovery
+            .source_endpoint
+            .expect("GitHub should remain the legacy source");
+
+        assert_eq!(source.url, "https://github.com/owner/repo.git/info/lfs");
+        assert_eq!(source.source, GitLfsSourceEndpointSource::RemoteUrlDefault);
     }
 
     #[tokio::test]
