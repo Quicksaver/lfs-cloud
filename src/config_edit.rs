@@ -86,6 +86,7 @@ impl EditableServerConfig {
     /// Loads one YAML document from the requested config path.
     pub(crate) fn load(path: impl AsRef<Path>) -> CliResult<Self> {
         let path = path.as_ref().to_path_buf();
+        ServerConfig::ensure_file_exists(&path)?;
         let contents = fs::read_to_string(&path).map_err(|source| CliError::Io {
             context: format!("failed to read server config {}", path.display()),
             source,
@@ -732,6 +733,28 @@ repositories:
             config.save().expect("minimal config should save");
             assert!(ServerConfig::load_from_path(path).is_ok());
         }
+    }
+
+    #[test]
+    fn editable_loading_creates_a_missing_config_and_parent() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let path = temp
+            .path()
+            .join("nested")
+            .join("lfscloud")
+            .join("config.yml");
+
+        let config = EditableServerConfig::load(&path)
+            .expect("a missing editable config and its parent should be created");
+
+        assert_eq!(config.path(), path);
+        assert!(config.repository_providers().unwrap().is_empty());
+        assert!(config.storage_providers().unwrap().is_empty());
+        assert!(config.repositories().unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(&path).expect("created config should be readable"),
+            ""
+        );
     }
 
     #[test]

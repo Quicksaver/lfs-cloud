@@ -104,6 +104,63 @@ if grep -F "working-directory-provider" "$default_output" >/dev/null; then
   exit 1
 fi
 
+automatic_output="$tmp_dir/automatic-output"
+if $is_windows; then
+  automatic_appdata_dir="$tmp_dir/automatic-appdata-directory"
+  mkdir -p "$automatic_appdata_dir"
+  (
+    export APPDATA="$(process_path "$automatic_appdata_dir")"
+    export USERPROFILE="$(process_path "$tmp_dir/unused-automatic-profile")"
+    cd "$working_dir"
+    "$lfscloud_bin" config repository list
+  ) >"$automatic_output" 2>&1
+  automatic_config_dir="$automatic_appdata_dir/lfscloud"
+else
+  automatic_home_dir="$tmp_dir/automatic-home-directory"
+  mkdir -p "$automatic_home_dir"
+  (
+    export HOME="$(process_path "$automatic_home_dir")"
+    cd "$working_dir"
+    "$lfscloud_bin" config repository list
+  ) >"$automatic_output" 2>&1
+  automatic_config_dir="$automatic_home_dir/.config/lfscloud"
+fi
+
+automatic_config_path="$automatic_config_dir/config.yml"
+if [[ ! -d "$automatic_config_dir" ]]; then
+  echo "default config lookup did not create its parent directory" >&2
+  exit 1
+fi
+if [[ ! -f "$automatic_config_path" ]]; then
+  echo "default config lookup did not create its config file" >&2
+  exit 1
+fi
+if [[ -s "$automatic_config_path" ]]; then
+  echo "automatically created default config was not empty" >&2
+  exit 1
+fi
+
+if ! $is_windows; then
+  case "$(uname -s)" in
+    Darwin)
+      directory_mode="$(stat -f '%Lp' "$automatic_config_dir")"
+      file_mode="$(stat -f '%Lp' "$automatic_config_path")"
+      ;;
+    *)
+      directory_mode="$(stat -c '%a' "$automatic_config_dir")"
+      file_mode="$(stat -c '%a' "$automatic_config_path")"
+      ;;
+  esac
+  if [[ "$directory_mode" != "700" ]]; then
+    echo "automatically created config directory mode was $directory_mode instead of 700" >&2
+    exit 1
+  fi
+  if [[ "$file_mode" != "600" ]]; then
+    echo "automatically created config file mode was $file_mode instead of 600" >&2
+    exit 1
+  fi
+fi
+
 missing_home_output="$tmp_dir/missing-home-output"
 if (
   unset APPDATA HOME USERPROFILE

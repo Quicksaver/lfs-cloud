@@ -3,7 +3,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fs,
+    fs::{self, OpenOptions},
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -92,23 +93,28 @@ impl ServerConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError`] when the file cannot be read, parsed, or
-    /// validated.
+    /// Returns [`ServerError`] when the file cannot be initialized, read,
+    /// parsed, or validated.
     pub fn load_default() -> ServerResult<Self> {
         Self::load_from_path(Self::default_path()?)
     }
 
     /// Loads config from an explicit YAML file path.
     ///
+    /// A missing file and its parent directories are created automatically.
+    /// Newly created files use mode `0600` and directories use mode `0700` on
+    /// Unix; other platforms use the current user's inherited access controls.
+    ///
     /// Environment references of the form `${NAME}` are resolved after YAML
     /// parsing so validation errors can name the exact config key.
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError`] when the file cannot be read, parsed, or
-    /// validated.
+    /// Returns [`ServerError`] when the file cannot be initialized, read,
+    /// parsed, or validated.
     pub fn load_from_path(path: impl AsRef<Path>) -> ServerResult<Self> {
         let path = path.as_ref();
+        Self::ensure_file_exists(path)?;
         let contents = fs::read_to_string(path).map_err(|source| ServerError::ConfigRead {
             path: path.to_path_buf(),
             source,
@@ -122,6 +128,44 @@ impl ServerConfig {
             metadata_base_dir,
             |name| std::env::var(name).ok(),
         )
+    }
+
+    /// Creates a missing config path without changing an existing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::ConfigInitialize`] when a required directory or
+    /// the empty config file cannot be created.
+    pub(crate) fn ensure_file_exists(path: &Path) -> ServerResult<()> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            create_private_config_directory(parent).map_err(|source| {
+                ServerError::ConfigInitialize {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600);
+        }
+
+        match options.open(path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(source) => Err(ServerError::ConfigInitialize {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
     }
 
     /// Parses config from a YAML string.
@@ -292,6 +336,18 @@ impl ServerConfig {
             .get(&repository.repo_provider)
             .is_some_and(RepositoryProviderConfig::route_identity_is_case_insensitive)
     }
+}
+
+fn create_private_config_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -849,6 +905,46 @@ storage_providers:
                 .join(DEFAULT_METADATA_DIR)
                 .join(DEFAULT_METADATA_DB_FILE)
         );
+    }
+
+    #[test]
+    fn explicit_path_loading_creates_a_missing_private_config() {
+        let directory = tempfile::tempdir().expect("tempdir should be created");
+        let config_directory = directory.path().join("nested").join("lfscloud");
+        let config_path = config_directory.join("config.yml");
+
+        let config = ServerConfig::load_from_path(&config_path)
+            .expect("a missing config and its parent should be created");
+
+        assert!(config.repository_providers.is_empty());
+        assert!(config.storage_providers.is_empty());
+        assert!(config.repositories.is_empty());
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("created config should be readable"),
+            ""
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&config_directory)
+                    .expect("created config directory metadata should load")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&config_path)
+                    .expect("created config metadata should load")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

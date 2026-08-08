@@ -258,6 +258,16 @@ pub enum ServerError {
         environment_variables: &'static str,
     },
 
+    /// The server configuration file or its parent directory could not be created.
+    #[error("failed to initialize server config {}: {source}", path.display())]
+    ConfigInitialize {
+        /// Configuration path that was being initialized.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The server configuration file could not be read.
     #[error("failed to read server config {}: {source}", path.display())]
     ConfigRead {
