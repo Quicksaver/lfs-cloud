@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-08-08
+
 - [changed]: Create or reuse an app-owned `.lfscloud` Google Drive folder during default storage setup.
 - [fixed]: Expand a leading `~` in Google Drive client-secret paths before checking whether the file exists.
 
