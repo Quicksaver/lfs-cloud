@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- [added]: Stream one flushed progress line for each target-missing migration upload, including its sequence, OID, and size.
 - [added]: Add global `--quiet` error reporting that retains the previous concise failure output.
 - [changed]: Show concrete cause values and automatically captured Rust backtraces for command failures by default.
 - [changed]: Infer repository client server addresses from configured LFS Cloud URLs when `--server` is omitted.

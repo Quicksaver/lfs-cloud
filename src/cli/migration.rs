@@ -234,7 +234,7 @@ where
         &preparation.source_remote.remote_name,
     )?;
     let context = preparation.scan_fetched_refs()?;
-    let result = execute_migration_through_server(&context, &token).await?;
+    let result = execute_migration_through_server(&context, &token, output).await?;
     write_migration_execution_report(output, &context, &result).map_err(output_error)
 }
 
@@ -324,10 +324,14 @@ fn migration_target_endpoints(
     Ok(endpoints)
 }
 
-async fn execute_migration_through_server(
+async fn execute_migration_through_server<W>(
     context: &MigrationExecutionContext,
     token: &LfsSessionToken,
-) -> CliResult<MigrationExecutionResult> {
+    output: &mut W,
+) -> CliResult<MigrationExecutionResult>
+where
+    W: Write,
+{
     if context.scan.objects.is_empty() {
         return Err(CliError::InvalidArguments {
             message: "migration found no non-empty Git LFS objects across the selected history"
@@ -386,6 +390,7 @@ async fn execute_migration_through_server(
         token,
         &source_fetch.after,
         target_plan,
+        output,
     )
     .await?;
 
@@ -558,20 +563,27 @@ async fn request_migration_target_plan(
     })
 }
 
-async fn upload_migration_objects_through_server(
+async fn upload_migration_objects_through_server<W>(
     lfs_url: &str,
     allow_insecure_http: bool,
     token: &LfsSessionToken,
     availability: &LocalMigrationObjectAvailability,
     plan: MigrationTargetPlan,
-) -> CliResult<MigrationServerUpload> {
+    output: &mut W,
+) -> CliResult<MigrationServerUpload>
+where
+    W: Write,
+{
     let target_url = Url::parse(lfs_url).map_err(|_| CliError::InvalidArguments {
         message: "migration target LFS URL is invalid".to_owned(),
     })?;
     let client = redirect_free_http_client("failed to create migration upload client")?;
     let mut uploaded_objects = Vec::new();
+    let upload_count = plan.uploads.len();
 
-    for (object, action) in plan.uploads {
+    for (offset, (object, action)) in plan.uploads.into_iter().enumerate() {
+        let upload_index = offset + 1;
+        write_migration_upload_progress(output, upload_index, upload_count, &object)?;
         let local_object = availability
             .objects
             .iter()
@@ -638,6 +650,25 @@ async fn upload_migration_objects_through_server(
         uploaded_objects,
         already_present_objects: plan.already_present_objects,
     })
+}
+
+fn write_migration_upload_progress<W>(
+    output: &mut W,
+    index: usize,
+    total: usize,
+    object: &LfsObject,
+) -> CliResult<()>
+where
+    W: Write,
+{
+    writeln!(
+        output,
+        "  uploading {index}/{total}: sha256:{} ({})",
+        object.oid,
+        format_migration_bytes(u128::from(object.size.bytes()))
+    )
+    .map_err(output_error)?;
+    output.flush().map_err(output_error)
 }
 
 fn validated_migration_upload_action_url(
@@ -1591,6 +1622,24 @@ mod tests {
         LfsPointer, LfsSessionToken, LocalCacheLayout, SanitizedMessage,
     };
 
+    #[derive(Default)]
+    struct FlushRecordingWriter {
+        bytes: Vec<u8>,
+        flush_count: usize,
+    }
+
+    impl io::Write for FlushRecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_count += 1;
+            Ok(())
+        }
+    }
+
     #[test]
     fn migration_byte_counts_use_readable_decimal_units() {
         assert_eq!(format_migration_bytes(0), "0 bytes");
@@ -1870,14 +1919,30 @@ mod tests {
         assert_eq!(plan.uploads.len(), 1);
         let availability = check_local_migration_objects(&repo, [&missing], None)
             .expect("missing target object should be locally available");
-        let result =
-            upload_migration_objects_through_server(&lfs_url, false, &token, &availability, plan)
-                .await
-                .expect("migration should upload through the LFS server action");
+        let mut progress = FlushRecordingWriter::default();
+        let result = upload_migration_objects_through_server(
+            &lfs_url,
+            false,
+            &token,
+            &availability,
+            plan,
+            &mut progress,
+        )
+        .await
+        .expect("migration should upload through the LFS server action");
         server.abort();
 
-        assert_eq!(result.uploaded_objects, vec![missing]);
+        assert_eq!(result.uploaded_objects, vec![missing.clone()]);
         assert_eq!(result.already_present_objects, vec![existing]);
+        assert_eq!(progress.flush_count, 1);
+        assert_eq!(
+            String::from_utf8(progress.bytes).expect("progress output should be UTF-8"),
+            format!(
+                "  uploading 1/1: sha256:{} ({})\n",
+                missing.oid,
+                format_migration_bytes(u128::from(missing.size.bytes())),
+            )
+        );
         assert_eq!(
             uploaded
                 .lock()
@@ -1982,7 +2047,7 @@ mod tests {
                 mode: MigrationScanMode::AllFetchedRefs,
                 refs_scanned: vec!["refs/heads/main".to_owned()],
                 pointer_file_count: 2,
-                objects: vec![first, second],
+                objects: vec![first.clone(), second.clone()],
             },
             cache_layout: local_cache_layout(Some(temp.path().join("cache")))
                 .expect("cache layout should resolve"),
@@ -1992,7 +2057,8 @@ mod tests {
         let token = LfsSessionToken::from_secret("migration-session-token")
             .expect("migration token should parse");
 
-        let error = execute_migration_through_server(&context, &token)
+        let mut progress = FlushRecordingWriter::default();
+        let error = execute_migration_through_server(&context, &token, &mut progress)
             .await
             .expect_err("second upload should fail migration");
         server.abort();
@@ -2007,6 +2073,11 @@ mod tests {
                 .expect("migration upload count should not poison"),
             2
         );
+        assert_eq!(progress.flush_count, 2);
+        let progress = String::from_utf8(progress.bytes).expect("progress output should be UTF-8");
+        assert!(progress.contains(&format!("uploading 1/2: sha256:{}", first.oid)));
+        assert!(progress.contains(&format!("uploading 2/2: sha256:{}", second.oid)));
+        assert!(!progress.contains("uploaded "));
         assert!(!repo.join(".lfsconfig").exists());
         let local_lfs_url = ProcessCommand::new("git")
             .args(["config", "--local", "--get", "lfs.url"])
