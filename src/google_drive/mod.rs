@@ -76,7 +76,7 @@ const GOOGLE_DRIVE_SHARD_KIND_PROPERTY: &str = GOOGLE_DRIVE_FOLDER_KIND_PROPERTY
 const GOOGLE_DRIVE_SHARD_KIND: &str = "objectShard";
 const GOOGLE_DRIVE_SHARD_PREFIX_PROPERTY: &str = "lfsCloudShard";
 const GOOGLE_DRIVE_STORAGE_ROOT_KIND: &str = "storageRoot";
-const GOOGLE_DRIVE_ROOT_PARENT_ID: &str = "root";
+const GOOGLE_DRIVE_ROOT_PARENT_ALIAS: &str = "root";
 
 static DEFAULT_GOOGLE_DRIVE_ROOT_VALIDATION_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static DEFAULT_GOOGLE_DRIVE_OBJECT_METADATA_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();

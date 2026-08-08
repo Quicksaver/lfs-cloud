@@ -226,10 +226,7 @@ fn verify_drive_default_root_folder(
     let valid = file.name.as_deref() == Some(GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME)
         && file.mime_type.as_deref() == Some(GOOGLE_DRIVE_FOLDER_MIME_TYPE)
         && !file.trashed
-        && file
-            .parents
-            .iter()
-            .any(|parent| parent == GOOGLE_DRIVE_ROOT_PARENT_ID)
+        && has_single_drive_parent(&file.parents)
         && file
             .app_properties
             .get(GOOGLE_DRIVE_FOLDER_KIND_PROPERTY)
@@ -248,11 +245,18 @@ fn verify_drive_default_root_folder(
     Ok(id)
 }
 
+fn has_single_drive_parent(parents: &[String]) -> bool {
+    // Drive accepts `root` as a request alias but returns the canonical My
+    // Drive folder ID. The root-scoped query or create request proves the
+    // location; the response must still describe exactly one concrete parent.
+    matches!(parents, [parent] if !parent.trim().is_empty())
+}
+
 fn drive_default_root_folder_metadata() -> serde_json::Value {
     serde_json::json!({
         "name": GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME,
         "mimeType": GOOGLE_DRIVE_FOLDER_MIME_TYPE,
-        "parents": [GOOGLE_DRIVE_ROOT_PARENT_ID],
+        "parents": [GOOGLE_DRIVE_ROOT_PARENT_ALIAS],
         "appProperties": {
             (GOOGLE_DRIVE_FOLDER_KIND_PROPERTY): GOOGLE_DRIVE_STORAGE_ROOT_KIND,
         },
@@ -262,7 +266,7 @@ fn drive_default_root_folder_metadata() -> serde_json::Value {
 fn drive_default_root_folder_lookup_query() -> String {
     format!(
         "'{}' in parents and trashed = false and name = '{}' and mimeType = '{}' and appProperties has {{ key='{}' and value='{}' }}",
-        GOOGLE_DRIVE_ROOT_PARENT_ID,
+        GOOGLE_DRIVE_ROOT_PARENT_ALIAS,
         escape_drive_query_string(GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME),
         GOOGLE_DRIVE_FOLDER_MIME_TYPE,
         GOOGLE_DRIVE_FOLDER_KIND_PROPERTY,
@@ -531,7 +535,7 @@ pub(super) mod root_tests {
                                 "id": "lfscloud-root-id",
                                 "name": GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME,
                                 "mimeType": GOOGLE_DRIVE_FOLDER_MIME_TYPE,
-                                "parents": ["root"],
+                                "parents": ["canonical-my-drive-root-id"],
                                 "trashed": false,
                                 "appProperties": {
                                     (GOOGLE_DRIVE_FOLDER_KIND_PROPERTY): GOOGLE_DRIVE_STORAGE_ROOT_KIND
@@ -596,7 +600,7 @@ pub(super) mod root_tests {
                             "id": "created-lfscloud-root-id",
                             "name": GOOGLE_DRIVE_DEFAULT_ROOT_FOLDER_NAME,
                             "mimeType": GOOGLE_DRIVE_FOLDER_MIME_TYPE,
-                            "parents": ["root"],
+                            "parents": ["canonical-my-drive-root-id"],
                             "trashed": false,
                             "appProperties": {
                                 (GOOGLE_DRIVE_FOLDER_KIND_PROPERTY): GOOGLE_DRIVE_STORAGE_ROOT_KIND
@@ -640,6 +644,18 @@ pub(super) mod root_tests {
             metadata["appProperties"][GOOGLE_DRIVE_FOLDER_KIND_PROPERTY],
             GOOGLE_DRIVE_STORAGE_ROOT_KIND
         );
+    }
+
+    #[test]
+    fn default_root_response_requires_one_concrete_parent_id() {
+        assert!(has_single_drive_parent(&["canonical-root-id".to_owned()]));
+        assert!(has_single_drive_parent(&["root".to_owned()]));
+        assert!(!has_single_drive_parent(&[]));
+        assert!(!has_single_drive_parent(&[String::new()]));
+        assert!(!has_single_drive_parent(&[
+            "first-root-id".to_owned(),
+            "second-root-id".to_owned(),
+        ]));
     }
 
     #[tokio::test]
