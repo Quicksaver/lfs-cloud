@@ -8,10 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - [added]: Stream one flushed progress line for each target-missing migration upload, including its sequence, OID, and size.
 - [added]: Add global `--quiet` error reporting that retains the previous concise failure output.
+- [changed]: Show parse causes or redacted expected and received URLs when migration rejects an upload action URL.
 - [changed]: Show concrete cause values and automatically captured Rust backtraces for command failures by default.
 - [changed]: Infer repository client server addresses from configured LFS Cloud URLs when `--server` is omitted.
 - [changed]: Display migration object sizes and byte totals with human-readable decimal units.
 - [tooling]: Add package scripts for building local release binaries for every supported target.
+- [fixed]: Accept server-canonical GitHub repository casing in migration upload action URLs.
 - [fixed]: Replace opaque `git credential fill` failures with target-specific `lfscloud login` recovery while retaining the secret-safe underlying cause.
 - [fixed]: Keep a configured LFS Cloud route out of legacy-source discovery when `--server` selects another address for the same repository.
 - [fixed]: Accept Google Drive's canonical My Drive parent ID when creating or reusing the default `.lfscloud` folder.

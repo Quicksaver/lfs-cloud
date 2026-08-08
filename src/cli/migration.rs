@@ -677,35 +677,87 @@ fn validated_migration_upload_action_url(
     allow_insecure_http: bool,
     object: &LfsObject,
 ) -> CliResult<Url> {
-    let parsed = Url::parse(action_url).map_err(|_| CliError::ExternalCommandOutput {
+    let parsed = Url::parse(action_url).map_err(|source| CliError::ExternalCommandOutput {
         command: "migration target upload batch".to_owned(),
-        message: SanitizedMessage::new("server returned an invalid upload action URL"),
+        message: SanitizedMessage::new(format!(
+            "server returned invalid upload action URL {}: {source}",
+            redacted_url_for_display(action_url),
+        )),
     })?;
     let same_origin = parsed.scheme() == target_url.scheme()
         && parsed.host() == target_url.host()
         && parsed.port_or_known_default() == target_url.port_or_known_default();
     let target_path = target_url.path().trim_end_matches('/');
     let expected_path = format!("{target_path}/objects/{}", object.oid);
+    let path_matches =
+        migration_upload_action_path_matches(target_path, parsed.path(), object.oid.as_hex());
     let query = parsed.query_pairs().collect::<Vec<_>>();
     let expected_size = object.size.bytes().to_string();
+    let query_matches = query.len() == 1 && query[0].0 == "size" && query[0].1 == expected_size;
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    let has_fragment = parsed.fragment().is_some();
+    let unsafe_transport =
+        !allow_insecure_http && !crate::http_transport::uses_protected_http_transport(&parsed);
     if !same_origin
-        || parsed.path() != expected_path
-        || query.len() != 1
-        || query[0].0 != "size"
-        || query[0].1 != expected_size
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.fragment().is_some()
-        || (!allow_insecure_http && !crate::http_transport::uses_protected_http_transport(&parsed))
+        || !path_matches
+        || !query_matches
+        || has_userinfo
+        || has_fragment
+        || unsafe_transport
     {
+        let mut reasons = Vec::new();
+        if !same_origin {
+            reasons.push("origin does not match");
+        }
+        if !path_matches {
+            reasons.push("path does not match");
+        }
+        if !query_matches {
+            reasons.push("size query does not match");
+        }
+        if has_userinfo {
+            reasons.push("userinfo is not allowed");
+        }
+        if has_fragment {
+            reasons.push("fragment is not allowed");
+        }
+        if unsafe_transport {
+            reasons.push("transport is not protected");
+        }
+        let mut expected = target_url.clone();
+        expected.set_path(&expected_path);
+        expected.set_query(Some(&format!("size={expected_size}")));
         return Err(CliError::ExternalCommandOutput {
             command: "migration target upload batch".to_owned(),
-            message: SanitizedMessage::new(
-                "server returned an unsafe or out-of-scope upload action URL",
-            ),
+            message: SanitizedMessage::new(format!(
+                "server returned an unsafe or out-of-scope upload action URL: {}; expected {}, received {}",
+                reasons.join(", "),
+                redacted_url_for_display(expected.as_str()),
+                redacted_url_for_display(parsed.as_str()),
+            )),
         });
     }
     Ok(parsed)
+}
+
+fn migration_upload_action_path_matches(target_path: &str, action_path: &str, oid: &str) -> bool {
+    let expected_path = format!("{target_path}/objects/{oid}");
+    if action_path == expected_path {
+        return true;
+    }
+
+    // GitHub repository identities are case-insensitive, while the endpoint
+    // suffix remains an exact protocol path. The server returns its configured
+    // identity casing even when the client reached the same mapping through a
+    // differently-cased Git remote URL.
+    let Some(target_identity) = target_path.strip_suffix(".git/info/lfs") else {
+        return false;
+    };
+    let action_suffix = format!(".git/info/lfs/objects/{oid}");
+    let Some(action_identity) = action_path.strip_suffix(&action_suffix) else {
+        return false;
+    };
+    action_identity.eq_ignore_ascii_case(target_identity)
 }
 
 fn migration_action_headers(
@@ -1802,14 +1854,56 @@ mod tests {
         migration_action_headers(&valid, &token)
             .expect("matching action authorization should be accepted");
 
+        let mixed_case_target =
+            Url::parse("https://cloud.example/github.com/Quicksaver/dupemedia.git/info/lfs")
+                .expect("mixed-case target URL should parse");
+        let configured_case_action = LfsBatchAction {
+            href: format!(
+                "https://cloud.example/github.com/quicksaver/dupemedia.git/info/lfs/objects/{}?size={}",
+                object.oid,
+                object.size.bytes()
+            ),
+            ..valid.clone()
+        };
+        validated_migration_upload_action_url(
+            &mixed_case_target,
+            &configured_case_action.href,
+            false,
+            &object,
+        )
+        .expect("GitHub repository identity casing should not change action scope");
+
         let wrong_oid = LfsBatchAction {
             href: valid.href.replace(object.oid.as_hex(), &"f".repeat(64)),
             ..valid.clone()
         };
+        let error = validated_migration_upload_action_url(&target, &wrong_oid.href, false, &object);
+        let error = error.expect_err("another object path should remain out of scope");
+        assert!(error.to_string().contains("path does not match"));
+        assert!(error.to_string().contains(object.oid.as_hex()));
+        assert!(error.to_string().contains(&"f".repeat(64)));
+
+        let wrong_endpoint_case = LfsBatchAction {
+            href: valid
+                .href
+                .replace("/info/lfs/objects/", "/INFO/lfs/objects/"),
+            ..valid.clone()
+        };
         assert!(
-            validated_migration_upload_action_url(&target, &wrong_oid.href, false, &object)
-                .is_err()
+            validated_migration_upload_action_url(
+                &target,
+                &wrong_endpoint_case.href,
+                false,
+                &object,
+            )
+            .is_err(),
+            "only repository identity casing should be ignored"
         );
+
+        let invalid_url = "https://[";
+        let error = validated_migration_upload_action_url(&target, invalid_url, false, &object)
+            .expect_err("invalid action URLs should be rejected");
+        assert!(error.to_string().contains("invalid IPv6 address"));
 
         let wrong_token = LfsBatchAction {
             header: BTreeMap::from([(
