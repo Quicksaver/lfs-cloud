@@ -17,7 +17,7 @@ fn reject_migration_server_config_path(config_path: Option<&Path>) -> CliResult<
         return Ok(());
     }
     Err(CliError::InvalidArguments {
-        message: "migrate no longer reads --config; authenticate with `lfscloud login --server URL` and rerun without --config"
+        message: "migrate no longer reads --config; rerun without --config and pass --server URL only when the target cannot be inferred from repository configuration"
             .to_owned(),
     })
 }
@@ -96,9 +96,9 @@ where
             ),
         });
     }
-    let route = LfsInitRoute::resolve_with_insecure_http(
-        &command.server,
-        &repository.remote,
+    let route = resolve_repository_lfs_route(
+        &repository,
+        command.server.as_deref(),
         command.allow_insecure_http,
     )?;
     let discovery = discover_git_lfs_migration_from_remote_excluding_endpoint(
@@ -112,7 +112,7 @@ where
         check_local_migration_objects(start_dir, scan.objects.iter(), cache_layout.as_ref())?;
     let readiness_checks = migration_readiness_checks(
         MigrationTargetReadiness {
-            server_url: &command.server,
+            server_url: &route.server_url,
             lfs_url: &route.lfs_url,
         },
         &discovery,
@@ -268,9 +268,9 @@ fn prepare_migration_execution(
             ),
         });
     }
-    let route = LfsInitRoute::resolve_with_insecure_http(
-        &command.server,
-        &repository.remote,
+    let route = resolve_repository_lfs_route(
+        &repository,
+        command.server.as_deref(),
         command.allow_insecure_http,
     )?;
     let discovery = discover_git_lfs_migration_from_remote_excluding_endpoint(
@@ -747,9 +747,9 @@ where
     )?;
     writeln!(
         output,
-        "  objects discovered: {} ({} bytes total)",
+        "  objects discovered: {} ({} total)",
         context.scan.objects.len(),
-        migration_objects_total_bytes(context.scan.objects.iter())
+        format_migration_bytes(migration_objects_total_bytes(context.scan.objects.iter()))
     )?;
     writeln!(
         output,
@@ -1216,9 +1216,9 @@ where
     )?;
     writeln!(
         output,
-        "  objects discovered: {} ({} bytes total)",
+        "  objects discovered: {} ({} total)",
         report.scan.objects.len(),
-        total_bytes
+        format_migration_bytes(total_bytes)
     )?;
     for object in report
         .scan
@@ -1228,9 +1228,9 @@ where
     {
         writeln!(
             output,
-            "    sha256:{} ({} bytes)",
+            "    sha256:{} ({})",
             object.oid,
-            object.size.bytes()
+            format_migration_bytes(u128::from(object.size.bytes()))
         )?;
     }
     if report.scan.objects.len() > MIGRATION_OBJECT_REPORT_LIMIT {
@@ -1246,17 +1246,21 @@ where
     )?;
     writeln!(
         output,
-        "    {fetch_bytes} bytes would fetch, {available_bytes} bytes already local"
+        "    {} would fetch, {} already local",
+        format_migration_bytes(fetch_bytes),
+        format_migration_bytes(available_bytes)
     )?;
     writeln!(
         output,
-        "  source objects: {available_count} local, {fetch_count} missing locally ({available_bytes} local bytes, {fetch_bytes} missing bytes)"
+        "  source objects: {available_count} local, {fetch_count} missing locally ({} local, {} missing)",
+        format_migration_bytes(available_bytes),
+        format_migration_bytes(fetch_bytes)
     )?;
     writeln!(
         output,
-        "  target objects: 0 confirmed new, 0 confirmed existing, {} unknown ({} bytes unknown)",
+        "  target objects: 0 confirmed new, 0 confirmed existing, {} unknown ({} unknown)",
         report.scan.objects.len(),
-        total_bytes
+        format_migration_bytes(total_bytes)
     )?;
     writeln!(
         output,
@@ -1290,6 +1294,59 @@ fn migration_objects_total_bytes<'a>(objects: impl IntoIterator<Item = &'a LfsOb
         .sum()
 }
 
+fn format_migration_bytes(bytes: u128) -> String {
+    const UNITS: [(&str, u128); 9] = [
+        ("bytes", 1),
+        ("kB", 1_000),
+        ("MB", 1_000_000),
+        ("GB", 1_000_000_000),
+        ("TB", 1_000_000_000_000),
+        ("PB", 1_000_000_000_000_000),
+        ("EB", 1_000_000_000_000_000_000),
+        ("ZB", 1_000_000_000_000_000_000_000),
+        ("YB", 1_000_000_000_000_000_000_000_000),
+    ];
+
+    let (unit, divisor) = UNITS
+        .iter()
+        .rev()
+        .find(|(_, divisor)| bytes >= *divisor)
+        .copied()
+        .unwrap_or(UNITS[0]);
+    if divisor == 1 {
+        let suffix = if bytes == 1 { "byte" } else { unit };
+        return format!("{bytes} {suffix}");
+    }
+
+    let whole = bytes / divisor;
+    let precision = if whole >= 100 {
+        0
+    } else if whole >= 10 {
+        1
+    } else {
+        2
+    };
+    let factor = 10_u128.pow(precision);
+    let mut rounded_whole = whole;
+    let mut fraction = ((bytes % divisor) * factor + divisor / 2) / divisor;
+    if fraction == factor {
+        rounded_whole += 1;
+        fraction = 0;
+    }
+    if precision == 0 {
+        return format!("{rounded_whole} {unit}");
+    }
+
+    let number = format!(
+        "{rounded_whole}.{fraction:0width$}",
+        width = precision as usize
+    )
+    .trim_end_matches('0')
+    .trim_end_matches('.')
+    .to_owned();
+    format!("{number} {unit}")
+}
+
 fn write_migration_dry_run_warnings<W>(
     output: &mut W,
     report: &MigrationDryRunReport,
@@ -1315,7 +1372,8 @@ where
         let verb = if fetch_count == 1 { "has" } else { "have" };
         writeln!(
             output,
-            "    warning: {fetch_count} {noun} ({fetch_bytes} bytes) {verb} no verified local source; source fetch and remote availability must succeed during execution"
+            "    warning: {fetch_count} {noun} ({}) {verb} no verified local source; source fetch and remote availability must succeed during execution",
+            format_migration_bytes(fetch_bytes)
         )?;
     }
     writeln!(
@@ -1363,9 +1421,9 @@ where
             writeln!(output, "    automatic purge: unsupported")?;
             writeln!(
                 output,
-                "    planned candidates: {} ({} bytes; upload not verified)",
+                "    planned candidates: {} ({}; upload not verified)",
                 report.scan.objects.len(),
-                total_bytes
+                format_migration_bytes(total_bytes)
             )?;
             writeln!(output, "    GitHub LFS purge requires GitHub Support.")?;
             writeln!(
@@ -1504,6 +1562,17 @@ mod tests {
         LfsPointer, LfsSessionToken, LocalCacheLayout, SanitizedMessage,
     };
 
+    #[test]
+    fn migration_byte_counts_use_readable_decimal_units() {
+        assert_eq!(format_migration_bytes(0), "0 bytes");
+        assert_eq!(format_migration_bytes(999), "999 bytes");
+        assert_eq!(format_migration_bytes(1_000), "1 kB");
+        assert_eq!(format_migration_bytes(1_500), "1.5 kB");
+        assert_eq!(format_migration_bytes(2_000_000), "2 MB");
+        assert_eq!(format_migration_bytes(3_250_000_000), "3.25 GB");
+        assert_eq!(format_migration_bytes(4_000_000_000_000), "4 TB");
+    }
+
     #[tokio::test]
     async fn migration_target_probe_authenticates_the_repository_batch_route() {
         let observed = Arc::new(Mutex::new(None));
@@ -1569,7 +1638,7 @@ mod tests {
         let mut output = Vec::new();
         let error = run_migrate_from_dir(
             MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
                 cache_root: None,
                 source_remote: "origin".to_owned(),
@@ -1968,6 +2037,15 @@ mod tests {
             .expect("temporary repository should be discovered")
             .local_git_config_path()
             .expect("local Git config path should resolve");
+        run_git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "lfs.url",
+                "http://127.0.0.1:8080/github.com/Owner/Repo.git/info/lfs",
+            ],
+        );
         let object = object_for_bytes(b"migration object already local");
         write_file(&repo.join(".gitattributes"), b"*.bin filter=lfs\n");
         write_file(
@@ -1980,7 +2058,7 @@ mod tests {
 
         run_migrate_from_dir(
             MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: None,
                 allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
                 source_remote: "origin".to_owned(),
@@ -2085,7 +2163,7 @@ mod tests {
             ],
         );
         let command = |allow_cross_remote| MigrateCommand {
-            server: "http://127.0.0.1:8080".to_owned(),
+            server: Some("http://127.0.0.1:8080".to_owned()),
             allow_insecure_http: false,
             cache_root: Some(temp.path().join("cache")),
             source_remote: "upstream".to_owned(),
@@ -2152,7 +2230,7 @@ mod tests {
 
         run_migrate_from_dir(
             MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
                 source_remote: "origin".to_owned(),
@@ -2216,7 +2294,7 @@ mod tests {
 
         run_migrate_from_dir(
             MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
                 source_remote: "origin".to_owned(),
@@ -2290,7 +2368,7 @@ mod tests {
 
         run_migrate_from_dir(
             MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root),
                 source_remote: "origin".to_owned(),
@@ -2339,7 +2417,7 @@ mod tests {
 
         run_migrate_from_dir(
             MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root),
                 source_remote: "origin".to_owned(),
@@ -2389,7 +2467,7 @@ mod tests {
 
         run_migrate_from_dir(
             MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root),
                 source_remote: "origin".to_owned(),
@@ -2430,7 +2508,7 @@ mod tests {
 
         let error = prepare_migration_execution(
             MigrateCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
                 cache_root: Some(cache_root.clone()),
                 source_remote: "origin".to_owned(),

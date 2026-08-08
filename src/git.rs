@@ -203,6 +203,23 @@ impl GitRepository {
         })
     }
 
+    /// Reads the repository's configured LFS URL.
+    ///
+    /// Repository-local Git configuration takes precedence over the committed
+    /// `.lfsconfig`, matching the two destinations supported by `lfscloud
+    /// init`. Remote-scoped legacy migration URLs are deliberately excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError`] when Git cannot inspect either configuration
+    /// location.
+    pub(crate) fn configured_lfs_url(&self) -> CliResult<Option<String>> {
+        if let Some(url) = self.read_lfs_url(GitLfsConfigTarget::LocalRepository)? {
+            return Ok(Some(url));
+        }
+        self.read_lfs_url(GitLfsConfigTarget::WorktreeFile)
+    }
+
     /// Writes a remote-scoped legacy LFS endpoint to `.lfsconfig`.
     ///
     /// The remote-scoped value is inert while the repository-wide `lfs.url`

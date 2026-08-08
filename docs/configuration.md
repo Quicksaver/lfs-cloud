@@ -11,6 +11,8 @@ The committed repository-side `.lfsconfig` should contain only the LFS Cloud end
     url = http://127.0.0.1:15370/github.com/octo-org/assets.git/info/lfs
 ```
 
+After `lfscloud init` writes this endpoint, repository client commands derive the server base from the effective `lfs.url`: repository-local Git configuration takes precedence over committed `.lfsconfig`. `login`, `logout`, `status`, and follow-up `migrate` invocations therefore accept an omitted `--server`; an explicit value overrides inference. The URL must exactly match the current Git remote's LFS Cloud route, and non-loopback HTTP still requires `--allow-insecure-http`.
+
 ## Manage Configuration From The CLI
 
 Run the configuration commands directly; no manual file or directory setup is required. The `server` section is optional and should be omitted unless a server default is being overridden. The commands manage the three provider and routing sections:
@@ -126,6 +128,8 @@ The completed migration writes the target URL to both `.lfsconfig` and local Git
 
 This target-first protocol makes follow-up migrations idempotent. A second user can pull the committed `.lfsconfig`, log in to LFS Cloud, and run the same migration: server-present objects are skipped, and only remaining target-missing objects need local or legacy-source bytes.
 
+An initial migration whose effective `lfs.url` still names the legacy provider must supply `--server URL`. After a successful migration writes the LFS Cloud target, login and migration retries infer that server automatically.
+
 ## Minimal Local Config
 
 ```yaml
@@ -162,7 +166,7 @@ http://127.0.0.1:15370/github.com/octo-org/assets.git/info/lfs
 
 Repository `name` omits the `.git` suffix because the route adds it. `provider_repository_id` is GitHub's immutable numeric repository ID. Interactive setup obtains it automatically; flag-based setup can use `gh api repos/OWNER/REPOSITORY --jq .id`. LFS Cloud verifies this value before every permission check so a renamed, transferred, deleted, or reused `owner/name` cannot silently switch the mapping to another repository.
 
-Each user runs `lfscloud login --server URL` with their own GitHub PAT. Login calls GitHub's authenticated-user endpoint to establish identity; it does not grant repository access. For every LFS operation, the server uses that user's retained PAT to check the current GitHub permission on the configured repository. Read or stronger permits downloads; write or admin permits uploads and migration. Token scope, organization SSO policy, expiry, and revocation can still limit otherwise valid repository membership. The PAT is never written to Git's credential helper.
+Each user runs `lfscloud login` from an initialized repository with their own GitHub PAT; `--server URL` is needed only as an override or before an initial migration has saved the target. Login prints its resolved server before requesting the PAT. Review a committed `.lfsconfig` before logging in from an untrusted clone. Login calls GitHub's authenticated-user endpoint to establish identity; it does not grant repository access. For every LFS operation, the server uses that user's retained PAT to check the current GitHub permission on the configured repository. Read or stronger permits downloads; write or admin permits uploads and migration. Token scope, organization SSO policy, expiry, and revocation can still limit otherwise valid repository membership. The PAT is never written to Git's credential helper.
 
 GitHub providers use `https://api.github.com` when `api_url` is omitted. Set it only to override the REST base, most commonly for GitHub Enterprise Server. The provider ID is the stable name referenced by repository mappings, so `github` is the concise default choice. The current authentication composition supports one GitHub provider per server instance.
 

@@ -168,11 +168,13 @@ From the configured Git repository:
 
 ```bash
 lfscloud init --server http://127.0.0.1:15370
-lfscloud login --server http://127.0.0.1:15370
+lfscloud login
 lfscloud status
 ```
 
-`init` writes the repository-specific endpoint to `.lfsconfig`. Use `--local` to write only repository-local Git config instead. `login` verifies your GitHub PAT, creates a short-lived LFS Cloud session, and stores only the opaque local token through Git's credential helper. The PAT stays encrypted on the server for current GitHub permission checks.
+`init` writes the repository-specific endpoint to `.lfsconfig`. Use `--local` to write only repository-local Git config instead. After initialization, `login`, `logout`, `status`, and migration retries infer the server from that repository URL; an explicit `--server URL` remains available as an override. The inferred URL must exactly match the current Git remote's LFS Cloud route. Non-loopback plaintext HTTP still requires `--allow-insecure-http`.
+
+`login` prints the resolved server before requesting your GitHub PAT, creates a short-lived LFS Cloud session, and stores only the opaque local token through Git's credential helper. Because `.lfsconfig` can be committed, review it before logging in from an untrusted clone. The PAT stays encrypted on the server for current GitHub permission checks.
 
 After setup, normal Git and Git LFS pushes and fetches use LFS Cloud. For a new LFS pattern, configure Git LFS as usual:
 
@@ -207,6 +209,8 @@ Migration writes the target to both `.lfsconfig` and repository-local `lfs.url`.
 Follow-up migration fetches request only the target-missing object IDs. Git LFS currently resolves those through one bounded `smudge` invocation per object, so source recovery time scales with the number of missing objects rather than the complete repository inventory.
 
 Execution requires `--all-refs`; narrower current-checkout and `--ref` scopes remain available for dry-run investigation only. `--source-remote` defaults to `origin`. Use `--allow-cross-remote` only for an intentional copy between different repository identities. `--purge-source-lfs` reports cleanup guidance but never automatically deletes source objects.
+
+The initial migration keeps the legacy LFS URL active until all target objects succeed, so supply `--server URL` when that URL does not yet identify LFS Cloud. Once migration writes the target route, retries and follow-up users can omit `--server`.
 
 ## Commands
 

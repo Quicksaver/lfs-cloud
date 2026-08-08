@@ -105,11 +105,17 @@ where
     A: FnMut(GitCredentialApproval) -> CliResult<()>,
 {
     let repository = GitRepository::discover(start_dir.as_ref()).map_err(login_discovery_error)?;
-    let route = LfsInitRoute::resolve_with_insecure_http(
-        &command.server,
-        &repository.remote,
+    let route = resolve_repository_lfs_route(
+        &repository,
+        command.server.as_deref(),
         command.allow_insecure_http,
     )?;
+    writeln!(
+        output,
+        "LFS Cloud server: {}",
+        redacted_url_for_display(&route.server_url)
+    )
+    .map_err(output_error)?;
     write!(output, "GitHub personal access token: ").map_err(output_error)?;
     output.flush().map_err(output_error)?;
     let personal_access_token = read_token()?;
@@ -302,9 +308,9 @@ where
     E: FnMut(GitCredentialRejection) -> CliResult<()>,
 {
     let repository = GitRepository::discover(start_dir.as_ref()).map_err(login_discovery_error)?;
-    let route = LfsInitRoute::resolve_with_insecure_http(
-        &command.server,
-        &repository.remote,
+    let route = resolve_repository_lfs_route(
+        &repository,
+        command.server.as_deref(),
         command.allow_insecure_http,
     )?;
     let token = lookup_credential(&route.lfs_url)?;
@@ -509,7 +515,7 @@ mod tests {
 
         run_login_from_dir(
             LoginCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
             },
             repo.path(),
@@ -558,6 +564,62 @@ mod tests {
         assert!(rendered.contains("username: lfscloud"));
         assert!(!rendered.contains("local-lfs-token"));
         assert!(!rendered.contains("github-pat"));
+    }
+
+    #[test]
+    fn login_infers_server_from_the_repository_lfs_url() {
+        require_git();
+
+        let repo = TempDir::new().expect("temporary repository should be created");
+        run_git(repo.path(), &["init"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        run_git(
+            repo.path(),
+            &[
+                "config",
+                "--file",
+                ".lfsconfig",
+                "lfs.url",
+                "https://lfs.example.com/base/github.com/owner/repo.git/info/lfs",
+            ],
+        );
+        let mut input = io::Cursor::new(b"github-pat\n".to_vec());
+        let mut output = Vec::new();
+
+        run_login_from_dir(
+            LoginCommand {
+                server: None,
+                allow_insecure_http: false,
+            },
+            repo.path(),
+            &mut input,
+            &mut output,
+            |server_url, personal_access_token| {
+                assert_eq!(server_url, "https://lfs.example.com/base");
+                assert_eq!(personal_access_token, "github-pat");
+                LfsSessionToken::from_secret("local-lfs-token").map_err(|error| {
+                    CliError::InvalidArguments {
+                        message: error.to_string(),
+                    }
+                })
+            },
+            |approval| {
+                assert_eq!(
+                    approval.lfs_url().as_str(),
+                    "https://lfs.example.com/base/github.com/owner/repo.git/info/lfs"
+                );
+                Ok(())
+            },
+        )
+        .expect("login should infer the initialized server");
+
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("LFS Cloud server: https://lfs.example.com/base"));
+        assert!(!rendered.contains("github-pat"));
+        assert!(!rendered.contains("local-lfs-token"));
     }
 
     #[test]
@@ -658,7 +720,7 @@ mod tests {
 
         run_logout_from_dir(
             LogoutCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
             },
             repo.path(),
@@ -725,7 +787,7 @@ mod tests {
 
         run_logout_from_dir(
             LogoutCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
             },
             repo.path(),
@@ -763,7 +825,7 @@ mod tests {
 
         let error = run_login_from_dir(
             LoginCommand {
-                server: "http://127.0.0.1:8080".to_owned(),
+                server: Some("http://127.0.0.1:8080".to_owned()),
                 allow_insecure_http: false,
             },
             repo.path(),

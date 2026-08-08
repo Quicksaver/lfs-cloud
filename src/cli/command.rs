@@ -265,9 +265,9 @@ pub(super) struct ServeCommand {
 
 #[derive(Debug, Args, Eq, PartialEq)]
 pub(super) struct LoginCommand {
-    /// Base URL of the running LFS Cloud server.
+    /// Server base URL override; defaults to the repository's LFS Cloud URL.
     #[arg(long, value_name = "URL")]
-    pub(super) server: String,
+    pub(super) server: Option<String>,
 
     /// Allow plaintext HTTP to a non-loopback server on a trusted network.
     #[arg(long)]
@@ -276,9 +276,9 @@ pub(super) struct LoginCommand {
 
 #[derive(Debug, Args, Eq, PartialEq)]
 pub(super) struct LogoutCommand {
-    /// Base URL of the running LFS Cloud server.
+    /// Server base URL override; defaults to the repository's LFS Cloud URL.
     #[arg(long, value_name = "URL")]
-    pub(super) server: String,
+    pub(super) server: Option<String>,
 
     /// Allow plaintext HTTP to a non-loopback server on a trusted network.
     #[arg(long)]
@@ -302,7 +302,7 @@ pub(super) struct InitCommand {
 
 #[derive(Debug, Args, Eq, PartialEq)]
 pub(super) struct StatusCommand {
-    /// Base URL of the running LFS Cloud server.
+    /// Server base URL override; defaults to repository or private config.
     #[arg(long, value_name = "URL")]
     pub(super) server: Option<String>,
 
@@ -361,9 +361,9 @@ pub(super) struct GcCommand {
 
 #[derive(Debug, Args, Eq, PartialEq)]
 pub(super) struct MigrateCommand {
-    /// Base URL of the running LFS Cloud server.
+    /// Server base URL override; defaults to the repository's LFS Cloud URL.
     #[arg(long, value_name = "URL")]
-    pub(super) server: String,
+    pub(super) server: Option<String>,
 
     /// Allow plaintext HTTP to a non-loopback server on a trusted network.
     #[arg(long)]
@@ -842,7 +842,7 @@ mod tests {
             panic!("login subcommand should parse");
         };
 
-        assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert_eq!(command.server, Some("http://127.0.0.1:8080".to_owned()));
         assert!(command.allow_insecure_http);
     }
 
@@ -861,7 +861,7 @@ mod tests {
             panic!("logout subcommand should parse");
         };
 
-        assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert_eq!(command.server, Some("http://127.0.0.1:8080".to_owned()));
         assert!(command.allow_insecure_http);
     }
 
@@ -994,7 +994,7 @@ mod tests {
         };
 
         assert_eq!(cli.config, Some("lfscloud.test.yml".into()));
-        assert_eq!(command.server, "http://127.0.0.1:8080");
+        assert_eq!(command.server, Some("http://127.0.0.1:8080".to_owned()));
         assert!(command.allow_insecure_http);
         assert_eq!(command.source_remote, "upstream");
         assert!(command.allow_cross_remote);
@@ -1181,6 +1181,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repository_client_commands_accept_an_inferred_server() {
+        for args in [
+            vec!["lfscloud", "login"],
+            vec!["lfscloud", "logout"],
+            vec!["lfscloud", "status"],
+            vec!["lfscloud", "migrate", "--dry-run"],
+        ] {
+            Cli::try_parse_from(&args)
+                .unwrap_or_else(|error| panic!("{args:?} should accept no --server: {error}"));
+        }
+    }
+
     #[tokio::test]
     async fn dispatches_every_subcommand_to_its_matching_runner() {
         let cases = [
@@ -1267,7 +1280,7 @@ mod tests {
                     "--allow-insecure-http",
                 ],
                 Invoked::Login(LoginCommand {
-                    server: "http://lfs.example.com".to_owned(),
+                    server: Some("http://lfs.example.com".to_owned()),
                     allow_insecure_http: true,
                 }),
             ),
@@ -1280,7 +1293,7 @@ mod tests {
                     "--allow-insecure-http",
                 ],
                 Invoked::Logout(LogoutCommand {
-                    server: "http://lfs.example.com".to_owned(),
+                    server: Some("http://lfs.example.com".to_owned()),
                     allow_insecure_http: true,
                 }),
             ),
@@ -1382,7 +1395,7 @@ mod tests {
                 ],
                 Invoked::Migrate(
                     MigrateCommand {
-                        server: "http://lfs.example.com".to_owned(),
+                        server: Some("http://lfs.example.com".to_owned()),
                         allow_insecure_http: true,
                         cache_root: Some("/tmp/lfscloud-migrate-cache".into()),
                         source_remote: "upstream".to_owned(),

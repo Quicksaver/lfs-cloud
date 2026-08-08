@@ -66,6 +66,58 @@ impl LfsInitRoute {
             lfs_url: lfs_url.to_string(),
         })
     }
+
+    /// Recovers a server base URL from a repository-specific LFS Cloud URL.
+    ///
+    /// The configured URL must exactly equal the route that LFS Cloud would
+    /// construct for `remote`. This prevents another repository's endpoint or
+    /// an arbitrary legacy LFS URL from becoming an authentication target.
+    pub(crate) fn resolve_from_lfs_url(
+        lfs_url: impl AsRef<str>,
+        remote: &GitRemote,
+    ) -> CliResult<Self> {
+        Self::resolve_from_lfs_url_with_insecure_http(lfs_url, remote, false)
+    }
+
+    /// Recovers a server base URL with an explicit plaintext-HTTP policy.
+    pub(crate) fn resolve_from_lfs_url_with_insecure_http(
+        lfs_url: impl AsRef<str>,
+        remote: &GitRemote,
+        allow_insecure_http: bool,
+    ) -> CliResult<Self> {
+        let configured_url = validate_server_url(lfs_url.as_ref(), allow_insecure_http)?;
+        let mut server_base = configured_url.clone();
+        {
+            let mut segments =
+                server_base
+                    .path_segments_mut()
+                    .map_err(|()| CliError::InvalidArguments {
+                        message: "configured lfs.url cannot be used as an LFS Cloud route"
+                            .to_owned(),
+                    })?;
+            segments.pop_if_empty();
+            for _ in 0..5 {
+                segments.pop();
+            }
+        }
+
+        let route = Self::resolve_with_insecure_http(
+            normalized_server_url(&server_base),
+            remote,
+            allow_insecure_http,
+        )?;
+        let resolved_url = validate_server_url(&route.lfs_url, allow_insecure_http)?;
+        if resolved_url != configured_url {
+            return Err(CliError::InvalidArguments {
+                message: format!(
+                    "configured lfs.url does not match the current repository {}; pass --server URL to select its LFS Cloud server explicitly",
+                    remote.repository_label()
+                ),
+            });
+        }
+
+        Ok(route)
+    }
 }
 
 pub(crate) fn validate_server_url(value: &str, allow_insecure_http: bool) -> CliResult<Url> {
@@ -136,6 +188,38 @@ mod tests {
             route.lfs_url,
             "https://lfs.example.com/custom/base/github.com/owner/.github.git/info/lfs"
         );
+    }
+
+    #[test]
+    fn derives_server_base_from_repository_lfs_url() {
+        let remote = GitRemote::parse("origin", "https://github.com/owner/repo.git")
+            .expect("remote should parse");
+        let route = LfsInitRoute::resolve_from_lfs_url(
+            "https://lfs.example.com/custom/base/github.com/owner/repo.git/info/lfs",
+            &remote,
+        )
+        .expect("repository LFS URL should resolve");
+
+        assert_eq!(route.server_url, "https://lfs.example.com/custom/base");
+        assert_eq!(
+            route.lfs_url,
+            "https://lfs.example.com/custom/base/github.com/owner/repo.git/info/lfs"
+        );
+    }
+
+    #[test]
+    fn rejects_repository_lfs_url_for_another_route() {
+        let remote = GitRemote::parse("origin", "https://github.com/owner/repo.git")
+            .expect("remote should parse");
+
+        let error = LfsInitRoute::resolve_from_lfs_url(
+            "https://lfs.example.com/github.com/attacker/repo.git/info/lfs",
+            &remote,
+        )
+        .expect_err("mismatched repository route should be rejected");
+
+        assert!(matches!(error, CliError::InvalidArguments { message }
+            if message.contains("does not match the current repository")));
     }
 
     #[test]

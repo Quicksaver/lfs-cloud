@@ -88,16 +88,30 @@ where
             None
         }
     };
-    let server_url = command.server.clone().or_else(|| {
-        config
+    let mut server_url = command.server.clone();
+    let mut allow_insecure_http = command.allow_insecure_http;
+    let mut inferred_route = None;
+    let mut inferred_route_error = None;
+    if server_url.is_none()
+        && let Some(repository) = repository.as_ref()
+    {
+        match resolve_optional_repository_lfs_route(repository, None, command.allow_insecure_http) {
+            Ok(Some(route)) => {
+                server_url = Some(route.server_url.clone());
+                inferred_route = Some(route);
+            }
+            Ok(None) => {}
+            Err(error) => inferred_route_error = Some(error),
+        }
+    }
+    if server_url.is_none() && inferred_route_error.is_none() {
+        server_url = config
             .as_ref()
-            .map(|config| config.server.local_client_url())
-    });
-    let allow_insecure_http = command.allow_insecure_http
-        || (command.server.is_none()
-            && config
-                .as_ref()
-                .is_some_and(|config| config.server.allow_insecure_http));
+            .map(|config| config.server.local_client_url());
+        allow_insecure_http |= config
+            .as_ref()
+            .is_some_and(|config| config.server.allow_insecure_http);
+    }
 
     if let Some(server_url) = server_url.as_deref() {
         let server_url_display = redacted_url_for_display(server_url);
@@ -115,24 +129,32 @@ where
         );
     }
 
-    let route = match (server_url.as_deref(), repository.as_ref()) {
-        (Some(server_url), Some(repository)) => {
-            match LfsInitRoute::resolve_with_insecure_http(
-                server_url,
-                &repository.remote,
-                allow_insecure_http,
-            ) {
-                Ok(route) => {
-                    report.ok("route", redacted_url_for_display(&route.lfs_url));
-                    Some(route)
-                }
-                Err(error) => {
-                    report.error("route", format!("{error}"));
-                    None
+    let route = if let Some(route) = inferred_route {
+        report.ok("route", redacted_url_for_display(&route.lfs_url));
+        Some(route)
+    } else if let Some(error) = inferred_route_error {
+        report.error("route", format!("{error}"));
+        None
+    } else {
+        match (server_url.as_deref(), repository.as_ref()) {
+            (Some(server_url), Some(repository)) => {
+                match LfsInitRoute::resolve_with_insecure_http(
+                    server_url,
+                    &repository.remote,
+                    allow_insecure_http,
+                ) {
+                    Ok(route) => {
+                        report.ok("route", redacted_url_for_display(&route.lfs_url));
+                        Some(route)
+                    }
+                    Err(error) => {
+                        report.error("route", format!("{error}"));
+                        None
+                    }
                 }
             }
+            _ => None,
         }
-        _ => None,
     };
 
     let mapping = match (config.as_ref(), repository.as_ref()) {
@@ -470,6 +492,65 @@ mod tests {
                 .contains("storage    ok      google_drive drive-user-a credential is configured")
         );
         assert!(rendered.contains("cache      ok"));
+    }
+
+    #[test]
+    fn status_prefers_the_repository_lfs_url_over_private_server_defaults() {
+        require_git();
+
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repository directory should be created");
+        run_git(&repo, &["init"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
+        );
+        run_git(
+            &repo,
+            &[
+                "config",
+                "--file",
+                ".lfsconfig",
+                "lfs.url",
+                "https://lfs.example.com/base/github.com/Owner/Repo.git/info/lfs",
+            ],
+        );
+        let config_path = temp.path().join("lfscloud.yml");
+        fs::write(&config_path, status_config("http://127.0.0.1:8080"))
+            .expect("status config should be written");
+        let mut output = Vec::new();
+
+        run_status_from_dir(
+            StatusCommand {
+                server: None,
+                allow_insecure_http: false,
+                cache_root: Some(temp.path().join("cache")),
+            },
+            Some(config_path),
+            &repo,
+            &mut output,
+            |server_url| {
+                assert_eq!(server_url, "https://lfs.example.com/base");
+                Ok(())
+            },
+            |lfs_url| {
+                assert_eq!(
+                    lfs_url,
+                    "https://lfs.example.com/base/github.com/Owner/Repo.git/info/lfs"
+                );
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("a missing cache objects directory should remain a warning");
+
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(rendered.contains("server     ok      https://lfs.example.com/base is reachable"));
+        assert!(rendered.contains(
+            "route      ok      https://lfs.example.com/base/github.com/Owner/Repo.git/info/lfs"
+        ));
+        assert!(!rendered.contains("127.0.0.1:8080 is reachable"));
     }
 
     #[test]

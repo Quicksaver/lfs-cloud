@@ -84,6 +84,49 @@ use migration::*;
 use sessions::*;
 use status::*;
 
+fn resolve_optional_repository_lfs_route(
+    repository: &GitRepository,
+    server_url: Option<&str>,
+    allow_insecure_http: bool,
+) -> CliResult<Option<LfsInitRoute>> {
+    if let Some(server_url) = server_url {
+        return LfsInitRoute::resolve_with_insecure_http(
+            server_url,
+            &repository.remote,
+            allow_insecure_http,
+        )
+        .map(Some);
+    }
+
+    repository
+        .configured_lfs_url()?
+        .map(|lfs_url| {
+            if allow_insecure_http {
+                LfsInitRoute::resolve_from_lfs_url_with_insecure_http(
+                    lfs_url,
+                    &repository.remote,
+                    true,
+                )
+            } else {
+                LfsInitRoute::resolve_from_lfs_url(lfs_url, &repository.remote)
+            }
+        })
+        .transpose()
+}
+
+fn resolve_repository_lfs_route(
+    repository: &GitRepository,
+    server_url: Option<&str>,
+    allow_insecure_http: bool,
+) -> CliResult<LfsInitRoute> {
+    resolve_optional_repository_lfs_route(repository, server_url, allow_insecure_http)?.ok_or_else(
+        || CliError::InvalidArguments {
+            message: "missing --server and the current repository has no configured LFS Cloud lfs.url; run `lfscloud init --server URL` or pass --server URL"
+                .to_owned(),
+        },
+    )
+}
+
 #[cfg(test)]
 pub(super) mod test_support {
     use std::{fs, path::Path, process::Command as ProcessCommand};
