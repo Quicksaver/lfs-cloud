@@ -261,10 +261,11 @@ impl GitCredentialLookup {
                 .map_err(suppress_credential_lookup_stderr)?;
 
         if !status.success() {
-            return Err(credential_lookup_command_error(
+            let source = credential_lookup_command_error(
                 command_name.to_owned(),
                 command_status_text(status),
-            ));
+            );
+            return Err(credential_lookup_failed(&self.lfs_url, source));
         }
 
         parse_git_credential_fill_output(&self.lfs_url, &self.username, &stdout)
@@ -1036,6 +1037,21 @@ fn credential_lookup_command_error(command: String, status: String) -> CliError 
     }
 }
 
+fn credential_lookup_failed(lfs_url: &Url, source: CliError) -> CliError {
+    let login_command = if crate::http_transport::uses_protected_http_transport(lfs_url) {
+        "lfscloud login"
+    } else {
+        "lfscloud login --allow-insecure-http"
+    };
+    CliError::GitCredentialLookupFailed {
+        lfs_url: lfs_url.as_str().to_owned(),
+        instructions: SanitizedMessage::new(format!(
+            "run `{login_command}` from this repository before retrying"
+        )),
+        source: Box::new(source),
+    }
+}
+
 fn suppress_credential_lookup_stderr(error: CliError) -> CliError {
     match error {
         CliError::ExternalCommand {
@@ -1566,16 +1582,23 @@ echo "credential helper rejected stored-lfs-token" >&2
 exit 1
 "#,
         );
-        let lookup =
-            GitCredentialLookup::new("https://lfs.example.com/github.com/owner/repo.git/info/lfs")
-                .expect("lookup should parse");
+        let lookup = GitCredentialLookup::new_with_insecure_http(
+            "http://100.77.233.92:15370/github.com/owner/repo.git/info/lfs",
+            true,
+        )
+        .expect("lookup should parse");
 
         let error = lookup
             .lookup_with_git_program(&fake_git)
             .expect_err("helper failure should be surfaced");
         let display = error.to_string();
 
-        assert!(matches!(error, CliError::ExternalCommand { .. }));
+        assert!(matches!(
+            error,
+            CliError::GitCredentialLookupFailed { source, .. }
+                if matches!(*source, CliError::ExternalCommand { .. })
+        ));
+        assert!(display.contains("lfscloud login --allow-insecure-http"));
         assert!(display.contains("git credential fill failed"));
         assert!(display.contains("credential helper stderr suppressed"));
         assert!(!display.contains("credential helper rejected"));
@@ -1611,8 +1634,13 @@ exit 1
         let error = lookup
             .lookup_with_git_program(&fake_git)
             .expect_err("cache miss should return without prompting");
+        let display = error.to_string();
 
-        assert!(matches!(error, CliError::ExternalCommand { .. }));
+        assert!(display.contains(
+            "failed to load local LFS Cloud credential for https://lfs.example.com/github.com/owner/repo.git/info/lfs"
+        ));
+        assert!(display.contains("run `lfscloud login` from this repository before retrying"));
+        assert!(std::error::Error::source(&error).is_some());
         assert_eq!(
             fs::read_to_string(environment_path)
                 .expect("fake Git environment capture should be readable"),

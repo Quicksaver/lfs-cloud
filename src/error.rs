@@ -224,6 +224,18 @@ pub enum CliError {
         /// User-facing recovery instructions that do not contain secrets.
         instructions: SanitizedMessage,
     },
+
+    /// Git could not return a usable local LFS Cloud credential.
+    #[error("failed to load local LFS Cloud credential for {lfs_url}; {instructions}: {source}")]
+    GitCredentialLookupFailed {
+        /// LFS URL whose path-scoped local credential was requested.
+        lfs_url: String,
+        /// User-facing login recovery instructions that do not contain secrets.
+        instructions: SanitizedMessage,
+        /// Underlying helper failure with secret-bearing stderr suppressed.
+        #[source]
+        source: Box<CliError>,
+    },
 }
 
 impl From<ServerError> for CliError {

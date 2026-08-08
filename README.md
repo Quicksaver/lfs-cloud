@@ -233,7 +233,7 @@ The initial migration keeps the legacy LFS URL active until all target objects s
 
 Run `lfscloud <command> --help` for all options.
 
-Command failures print the complete available cause chain, concrete error values, and a Rust backtrace by default. This diagnostic output can include local paths, repository identifiers, and upstream service details, but secret-bearing credential output remains redacted. Pass the global `--quiet` option before or after a subcommand to retain the concise error format without enabling automatic backtrace capture:
+Command failures print the complete available cause chain, concrete error values, and a Rust backtrace by default. This diagnostic output can include local paths, repository identifiers, and upstream service details, but secret-bearing credential output remains redacted. A failed local credential lookup names the affected LFS URL and the matching `lfscloud login` recovery command while retaining the suppressed helper failure in its cause chain. Pass the global `--quiet` option before or after a subcommand to retain the concise error format without enabling automatic backtrace capture:
 
 ```bash
 lfscloud --quiet status

@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - [changed]: Infer repository client server addresses from configured LFS Cloud URLs when `--server` is omitted.
 - [changed]: Display migration object sizes and byte totals with human-readable decimal units.
 - [tooling]: Add package scripts for building local release binaries for every supported target.
+- [fixed]: Replace opaque `git credential fill` failures with target-specific `lfscloud login` recovery while retaining the secret-safe underlying cause.
 - [fixed]: Keep a configured LFS Cloud route out of legacy-source discovery when `--server` selects another address for the same repository.
 - [fixed]: Accept Google Drive's canonical My Drive parent ID when creating or reusing the default `.lfscloud` folder.
 - [fixed]: Expand a leading `~` in Google Drive gcloud configuration directories instead of nesting them below the server configuration directory.
